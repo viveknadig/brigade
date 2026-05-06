@@ -21,6 +21,13 @@ import type { AgentSession } from "@mariozechner/pi-coding-agent";
 
 export type PersonaOverride = string | ((defaultPrompt?: string) => string);
 
+// Latched once per process: the first applyPersonaOverrideToSession call
+// reads the three written fields back to confirm Pi accepted them. If a
+// future Pi minor renames any of those internals, the read-back verifier
+// catches it on first turn and warns the operator instead of letting the
+// agent silently revert to its stock prompt on turn 2.
+let readbackChecked = false;
+
 export function applyPersonaOverrideToSession(
   session: AgentSession,
   override: PersonaOverride,
@@ -37,6 +44,23 @@ export function applyPersonaOverrideToSession(
   };
   internal._baseSystemPrompt = prompt;
   internal._rebuildSystemPrompt = () => prompt;
+
+  if (readbackChecked) return;
+  readbackChecked = true;
+
+  const stateOk = session.agent.state.systemPrompt === prompt;
+  const baseOk = internal._baseSystemPrompt === prompt;
+  const rebuildOk =
+    typeof internal._rebuildSystemPrompt === "function" &&
+    internal._rebuildSystemPrompt([]) === prompt;
+
+  if (!stateOk || !baseOk || !rebuildOk) {
+    console.error(
+      "brigade: persona pin not confirmed after applyPersonaOverrideToSession. " +
+        "Pi may have renamed an internal field — agent could revert to stock " +
+        `prompt on subsequent turns. (stateOk=${stateOk} baseOk=${baseOk} rebuildOk=${rebuildOk})`,
+    );
+  }
 }
 
 // Convenience builder: closes over an assembled prompt so callers can pass

@@ -3,6 +3,8 @@ import path from "node:path";
 
 import { tryLoadWorkspaceTemplate } from "./template-loader.js";
 import { markBootstrapSeeded } from "./state.js";
+import { fileExists } from "./fs-utils.js";
+import { ensureWorkspaceGitRepo } from "./git-init.js";
 
 // The 7 files a fresh brigade install drops into <agentDir>/workspace/.
 // MEMORY.md is intentionally absent — it materialises lazily on the first
@@ -34,10 +36,27 @@ export interface BootstrapResult {
   // Names of templates the loader couldn't find — surfaced so the caller
   // can warn the user that their templates dir is incomplete.
   missingTemplates: WorkspaceFileName[];
+  // True only when this run ran `git init` on a truly fresh workspace.
+  // False on re-onboard, on workspaces that already have `.git/`, and on
+  // hosts where `git` isn't available.
+  gitInitialised: boolean;
+  // True when the workspace looked freshly created (no persona files,
+  // no `memory/`, no `.git/`). Drives whether BOOTSTRAP.md gets seeded
+  // — a customised workspace skips the BOOTSTRAP write so the user's
+  // first-run script doesn't get resurrected.
+  brandNewWorkspace: boolean;
 }
 
 export async function bootstrapWorkspace(workspaceDir: string): Promise<BootstrapResult> {
   await fs.mkdir(workspaceDir, { recursive: true });
+
+  // Brand-new probe: a workspace counts as "freshly created" only when
+  // none of the persona files, memory dir, or git repo are present yet.
+  // On a customised workspace we skip BOOTSTRAP.md (so re-onboard doesn't
+  // resurrect the first-run script) and skip the git init (the user's
+  // existing repo state is theirs).
+  const brandNewWorkspace = await isBrandNewWorkspace(workspaceDir);
+
   // Create memory/ early so a partial failure in the persona-file loop
   // still leaves a usable workspace skeleton; the dream cycle populates
   // it lazily on first run.
@@ -48,6 +67,12 @@ export async function bootstrapWorkspace(workspaceDir: string): Promise<Bootstra
   const missingTemplates: WorkspaceFileName[] = [];
 
   for (const name of WORKSPACE_FILE_NAMES) {
+    // BOOTSTRAP.md is special: only seed it when the workspace is truly
+    // brand-new. A user who's already gone through the first-run flow
+    // (and deleted BOOTSTRAP.md) shouldn't see it reappear when re-running
+    // onboard for any other reason.
+    if (name === "BOOTSTRAP.md" && !brandNewWorkspace) continue;
+
     const filePath = path.join(workspaceDir, name);
 
     const template = await tryLoadWorkspaceTemplate(name);
@@ -83,15 +108,40 @@ export async function bootstrapWorkspace(workspaceDir: string): Promise<Bootstra
     await markBootstrapSeeded(workspaceDir);
   }
 
-  return { workspaceDir, created, preserved, missingTemplates };
+  // git init only on truly brand-new workspaces. The git-init helper
+  // additionally guards on `.git/` already existing, so this is doubly
+  // safe against clobbering an existing repo.
+  let gitInitialised = false;
+  if (brandNewWorkspace) {
+    const result = await ensureWorkspaceGitRepo(workspaceDir);
+    gitInitialised = result.initialised;
+  }
+
+  return {
+    workspaceDir,
+    created,
+    preserved,
+    missingTemplates,
+    gitInitialised,
+    brandNewWorkspace,
+  };
 }
 
-async function fileExists(p: string): Promise<boolean> {
-  try {
-    await fs.access(p);
-    return true;
-  } catch {
-    return false;
+// A workspace is "brand new" iff none of the canonical persona files,
+// the memory dir, the git dir, or the lifecycle marker exist yet. Any
+// of those signals indicates the user has already worked in this
+// workspace and we shouldn't re-seed BOOTSTRAP.md or run `git init`.
+async function isBrandNewWorkspace(workspaceDir: string): Promise<boolean> {
+  const probes = [
+    ...WORKSPACE_FILE_NAMES.map((n) => path.join(workspaceDir, n)),
+    path.join(workspaceDir, "memory"),
+    path.join(workspaceDir, ".git"),
+    path.join(workspaceDir, ".brigade", "workspace-state.json"),
+  ];
+  for (const p of probes) {
+    if (await fileExists(p)) return false;
   }
+  return true;
 }
+
 

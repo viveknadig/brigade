@@ -1,4 +1,4 @@
-import fs from "node:fs";
+import fs from "node:fs/promises";
 import path from "node:path";
 
 import type { ContextFile } from "./types.js";
@@ -24,28 +24,33 @@ const STABLE_FILE_ORDER = [
 // files run a few hundred lines, so this only fires on accidents.
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
-export function loadWorkspaceContextFiles(workspaceDir: string): ContextFile[] {
+export async function loadWorkspaceContextFiles(workspaceDir: string): Promise<ContextFile[]> {
   const out: ContextFile[] = [];
   for (const name of STABLE_FILE_ORDER) {
     const filePath = path.join(workspaceDir, name);
-    const content = readContextFile(filePath);
+    const content = await readContextFile(filePath);
     if (content === undefined) continue;
-    out.push({ name: name.toLowerCase(), path: filePath, content });
+    // Preserve original case in the diagnostic name so a reader debugging
+    // budget output sees `BOOTSTRAP.md`, matching what's on disk. The
+    // assembler uppercases for headings; this is the source of truth.
+    out.push({ name, path: filePath, content });
   }
   return out;
 }
 
-export function loadHeartbeatFile(workspaceDir: string): ContextFile | undefined {
+export async function loadHeartbeatFile(
+  workspaceDir: string,
+): Promise<ContextFile | undefined> {
   const filePath = path.join(workspaceDir, "HEARTBEAT.md");
-  const content = readContextFile(filePath);
+  const content = await readContextFile(filePath);
   if (content === undefined) return undefined;
-  return { name: "heartbeat.md", path: filePath, content };
+  return { name: "HEARTBEAT.md", path: filePath, content };
 }
 
-function readContextFile(filePath: string): string | undefined {
-  let stat: fs.Stats;
+async function readContextFile(filePath: string): Promise<string | undefined> {
+  let stat: Awaited<ReturnType<typeof fs.stat>>;
   try {
-    stat = fs.statSync(filePath);
+    stat = await fs.stat(filePath);
   } catch {
     return undefined;
   }
@@ -56,14 +61,14 @@ function readContextFile(filePath: string): string | undefined {
     // buffer to bytes-actually-read so the converted string isn't padded
     // with zero bytes (which sanitize would strip but which waste cycles
     // and pollute diagnostics).
-    const fd = fs.openSync(filePath, "r");
+    const handle = await fs.open(filePath, "r");
     try {
       const buf = Buffer.alloc(MAX_FILE_BYTES);
-      const bytesRead = fs.readSync(fd, buf, 0, MAX_FILE_BYTES, 0);
+      const { bytesRead } = await handle.read(buf, 0, MAX_FILE_BYTES, 0);
       return sanitizeForPromptLiteral(buf.subarray(0, bytesRead).toString("utf8"));
     } finally {
-      fs.closeSync(fd);
+      await handle.close();
     }
   }
-  return sanitizeForPromptLiteral(fs.readFileSync(filePath, "utf8"));
+  return sanitizeForPromptLiteral(await fs.readFile(filePath, "utf8"));
 }

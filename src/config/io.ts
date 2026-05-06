@@ -6,6 +6,7 @@ import JSON5 from "json5";
 import {
   ensureDir,
   resolveConfigAuditLogPath,
+  resolveConfigHealthPath,
   resolveConfigPath,
   resolveLogsDir,
 } from "./paths.js";
@@ -72,11 +73,49 @@ export function writeConfigSafe(config: BrigadeConfig): void {
       "brigade.json contains an unserialisable value (BigInt, Function, or Symbol).",
     );
   }
-  const tmp = `${cfgPath}.tmp`;
-  fs.writeFileSync(tmp, serialized, "utf8");
-  fs.renameSync(tmp, cfgPath);
+  const tmp = `${cfgPath}.tmp-${process.pid}-${Date.now().toString(36)}`;
+  try {
+    fs.writeFileSync(tmp, serialized, "utf8");
+    fs.renameSync(tmp, cfgPath);
+  } catch (err) {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      // best-effort orphan-tmp cleanup
+    }
+    throw err;
+  }
 
   appendConfigAudit(cfgPath, serialized);
+  writeConfigHealth(cfgPath, serialized);
+}
+
+// Single-file health snapshot — overwritten each time so callers (doctor,
+// recovery flows, debug introspection) can read the most-recent write
+// state in one stat+read without scanning the audit JSONL. Includes a
+// stat-fingerprint of the live config file so a downstream check can
+// detect tampering between writes.
+function writeConfigHealth(cfgPath: string, contents: string): void {
+  try {
+    ensureDir(resolveLogsDir());
+    const sha = createHash("sha256").update(contents).digest("hex");
+    const stat = fs.statSync(cfgPath);
+    const record = {
+      ts: new Date().toISOString(),
+      configPath: cfgPath,
+      bytes: Buffer.byteLength(contents, "utf8"),
+      sha256: sha,
+      mtimeMs: stat.mtimeMs,
+      pid: process.pid,
+      version: CURRENT_VERSION,
+    };
+    const tmp = `${resolveConfigHealthPath()}.tmp-${process.pid}-${Date.now().toString(36)}`;
+    fs.writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    fs.renameSync(tmp, resolveConfigHealthPath());
+  } catch {
+    // Health snapshot is best-effort observability; never block a
+    // successful config write because the snapshot couldn't be saved.
+  }
 }
 
 // Rotation: drop the oldest snapshot, shift each .bak.N down one slot,

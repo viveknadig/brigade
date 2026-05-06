@@ -6,17 +6,13 @@ import {
   DEFAULT_AGENT_ID,
   ensureDir,
   resolveAllPaths,
-  resolveCacheDir,
-  resolveCompletionsDir,
-  resolveCredentialsDir,
-  resolveIdentityDir,
   resolveLogsDir,
-  resolveOauthDir,
   resolveTasksDir,
 } from "../../config/paths.js";
 import { writeConfigSafe, readConfigOrInit } from "../../config/io.js";
 import { initAuthProfiles } from "../../auth/profiles.js";
 import { bootstrapWorkspace } from "../../workspace/bootstrap.js";
+import { ensureDeviceIdentity } from "../../identity/device.js";
 
 interface OnboardOptions {
   agentId: string;
@@ -40,17 +36,17 @@ export async function runOnboard(opts: OnboardOptions): Promise<void> {
   const agentId = opts.agentId ?? DEFAULT_AGENT_ID;
   const paths = resolveAllPaths(agentId, opts.workspace);
 
+  // Eagerly create only the dirs the runtime actively uses. Other dirs
+  // (cache/, oauth/, credentials/, completions/) are created lazily by
+  // their own subsystems on first write — that matches the reference's
+  // pattern and avoids leaving empty-looking dirs behind that suggest
+  // brigade is provisioning more than it actually is.
   ensureDir(paths.stateDir);
   ensureDir(paths.agentDir);
   ensureDir(paths.authDir);
   ensureDir(paths.sessionsDir);
   ensureDir(resolveTasksDir());
   ensureDir(resolveLogsDir());
-  ensureDir(resolveIdentityDir());
-  ensureDir(resolveCompletionsDir());
-  ensureDir(resolveOauthDir());
-  ensureDir(resolveCredentialsDir());
-  ensureDir(resolveCacheDir());
 
   // brigade.json — create only if missing so we never clobber user config.
   const config = readConfigOrInit();
@@ -77,13 +73,23 @@ export async function runOnboard(opts: OnboardOptions): Promise<void> {
 
   // 7 workspace files (AGENTS, BOOTSTRAP, IDENTITY, SOUL, TOOLS, HEARTBEAT, USER).
   // Content is loaded from templates/workspace/ on disk via the loader.
+  // bootstrapWorkspace is also responsible for git-init on truly fresh
+  // workspaces and for honouring the brand-new-workspace probe so
+  // re-onboard against a customised workspace doesn't resurrect BOOTSTRAP.md.
   const ws = await bootstrapWorkspace(paths.workspaceDir);
+
+  // Ed25519 device identity. Written once on first onboard; subsequent
+  // calls are a no-op. Required for any future device-pairing primitive.
+  const identity = await ensureDeviceIdentity();
 
   printOnboardSummary({
     agentId,
     paths,
     createdWorkspaceFiles: ws.created.length,
     missingTemplates: ws.missingTemplates,
+    workspaceGitInitialised: ws.gitInitialised,
+    deviceIdCreated: identity.created,
+    deviceId: identity.identity.deviceId,
   });
 
   if (opts.installDaemon) {
@@ -99,6 +105,9 @@ function printOnboardSummary(args: {
   paths: ReturnType<typeof resolveAllPaths>;
   createdWorkspaceFiles: number;
   missingTemplates: readonly string[];
+  workspaceGitInitialised: boolean;
+  deviceIdCreated: boolean;
+  deviceId: string;
 }): void {
   const { agentId, paths, createdWorkspaceFiles, missingTemplates } = args;
   console.log("Brigade onboarded.");
@@ -111,6 +120,12 @@ function printOnboardSummary(args: {
   console.log(`  Sessions          ${paths.sessionsDir}`);
   console.log(`  Workspace         ${paths.workspaceDir}`);
   console.log(`  Workspace files   ${createdWorkspaceFiles} created`);
+  console.log(
+    `  Workspace git     ${args.workspaceGitInitialised ? "initialised" : "skipped (existing or git unavailable)"}`,
+  );
+  console.log(
+    `  Device identity   ${args.deviceIdCreated ? "generated" : "existing"} (${args.deviceId.slice(0, 8)}…)`,
+  );
   console.log(`  Tasks db          ${paths.tasksDbPath} (lazy)`);
   if (missingTemplates.length > 0) {
     console.log("");

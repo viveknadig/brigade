@@ -103,10 +103,20 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   // ModelRegistry.find returns undefined when the provider+modelId pair isn't
   // registered. Surface a clear error so the user knows to seed models.json
   // (or wire `brigade auth login` once that command lands).
-  const model = (modelRegistry as { find: (p: string, m: string) => unknown }).find(
-    args.provider,
-    args.modelId,
-  );
+  //
+  // Pi version drift guard: if a future Pi minor renames or removes `find`,
+  // throw a curated error rather than letting a raw `TypeError: undefined
+  // is not a function` surface from inside Pi.
+  const registryAsFinder = modelRegistry as { find?: (p: string, m: string) => unknown };
+  if (typeof registryAsFinder.find !== "function") {
+    throw new Error(
+      "Pi ModelRegistry.find is not a function — likely a Pi SDK version drift. " +
+        "Brigade was built against the 0.70.x ModelRegistry surface. " +
+        "Pin `@mariozechner/pi-coding-agent` to a known-compatible version, or " +
+        "update brigade's agent-loop to match the new Pi API.",
+    );
+  }
+  const model = registryAsFinder.find(args.provider, args.modelId);
   if (!model) {
     throw new Error(
       `Model not registered: provider=${args.provider} model=${args.modelId}.\n` +
@@ -152,7 +162,7 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   // before prompt() so the model sees the brigade-flavoured persona on
   // turn 1 and on every subsequent turn (the pi-injection helper patches
   // the rebuild hook so tool-list changes don't clobber it).
-  const personaPrompt = buildPersonaPrompt({
+  const personaPrompt = await buildPersonaPrompt({
     agentId,
     workspaceDir,
     cwd,
@@ -207,20 +217,20 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
 //      them through the assembler.
 //   3. Empty workspace → return empty so Pi keeps its stock prompt rather
 //      than getting an empty system message it might balk at.
-function buildPersonaPrompt(args: {
+async function buildPersonaPrompt(args: {
   agentId: string;
   workspaceDir: string;
   cwd: string;
   modelLabel: string;
   thinkingLevel: string;
   bootstrapPhase: BootstrapPhase;
-}): string {
+}): Promise<string> {
   const config = readConfigOrInit();
   const override = resolveSystemPromptOverride({ config, agentId: args.agentId });
   if (override) return override;
 
-  const personaFiles = loadWorkspaceContextFiles(args.workspaceDir);
-  const heartbeatFile = loadHeartbeatFile(args.workspaceDir);
+  const personaFiles = await loadWorkspaceContextFiles(args.workspaceDir);
+  const heartbeatFile = await loadHeartbeatFile(args.workspaceDir);
   if (personaFiles.length === 0 && !heartbeatFile) return "";
 
   const runtime = resolveRuntimeParams({

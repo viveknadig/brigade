@@ -4,6 +4,7 @@ import { applyBudget, DEFAULT_BUDGET, type BudgetResult } from "./bootstrap-budg
 import { sanitizeForPromptLiteral } from "./sanitize.js";
 import { formatRuntimeLine, type RuntimeParams } from "./runtime-params.js";
 import type { ContextFile } from "./types.js";
+import type { BootstrapPhase } from "../workspace/state.js";
 
 // Top-level assembler.
 //
@@ -12,12 +13,6 @@ import type { ContextFile } from "./types.js";
 // → workspace persona → cache boundary → dynamic suffix (heartbeat, time
 // of turn, sub-agent context). Anthropic prompt-caching sees the boundary
 // and caches everything above it; everything below changes per turn.
-
-export type AssemblerBootstrapPhase =
-  | "unseeded"
-  | "first-turn"
-  | "in-progress"
-  | "complete";
 
 export interface AssembleArgs {
   // Resolved per-turn runtime context (host, tz, model, channel, …).
@@ -31,12 +26,12 @@ export interface AssembleArgs {
   // Optional per-turn additions (sub-agent task framing, ephemeral notes).
   // Lives below the cache boundary so it doesn't bust the prefix.
   ephemeralSuffix?: string;
-  // Lifecycle phase from the workspace state file. When "first-turn" the
-  // assembler injects an introduction block instructing the agent to
-  // follow BOOTSTRAP.md verbatim — that's how the agent learns it should
-  // greet the user, ask their name, and otherwise behave like a fresh
-  // crew member meeting the operator for the first time.
-  bootstrapPhase?: AssemblerBootstrapPhase;
+  // Lifecycle phase from the workspace state file. The assembler doesn't
+  // currently emit synthetic guidance based on this — first-turn behaviour
+  // is driven by AGENTS.md + BOOTSTRAP.md content alone — but it's
+  // threaded through so future layers (e.g. provider-specific first-turn
+  // hints) can branch on it without re-plumbing.
+  bootstrapPhase?: BootstrapPhase;
 }
 
 export interface ToolDescription {
@@ -64,31 +59,16 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   );
   lines.push("");
 
-  // First-turn guidance. Sits above the persona block so the agent reads
-  // it before it gets to the rest of the prompt. Only emitted when the
-  // workspace lifecycle says BOOTSTRAP.md is present and the user hasn't
-  // yet driven a turn that consumed it.
+  // First-turn nudge. Smaller models (gpt-4o-mini, llama-3.1-8b, etc.)
+  // don't reliably follow the implicit "First Run" pointer in AGENTS.md
+  // without a system-level anchor — they default to a stock greeting and
+  // skip BOOTSTRAP.md entirely. One-line nudge here is enough to redirect
+  // attention; the actual greeting wording stays under the user's control
+  // via BOOTSTRAP.md content.
   if (args.bootstrapPhase === "first-turn") {
-    lines.push("## First Turn — Follow BOOTSTRAP.md");
     lines.push(
-      "This is the user's first turn since brigade was onboarded. Read the " +
-        "`## BOOTSTRAP` block in this prompt and follow its instructions for " +
-        "how to greet the user. Typical first-turn behaviours:",
-    );
-    lines.push(
-      "- Introduce yourself by name (from IDENTITY.md). State that you're " +
-        "the user's Brigade Assistant.",
-    );
-    lines.push(
-      "- Ask the user what they would like to be called and any other " +
-        "context BOOTSTRAP.md asks for.",
-    );
-    lines.push(
-      "- Once BOOTSTRAP.md's first-run script has been completed, delete " +
-        "the file so subsequent turns skip the greeting. (If you cannot " +
-        "delete files yet because the tool surface is empty, simply mention " +
-        "to the user that they can remove BOOTSTRAP.md to dismiss the " +
-        "first-run hint.)",
+      "**First turn:** read the `## BOOTSTRAP` section below and follow its " +
+        "first-run script verbatim. Do not produce a generic greeting.",
     );
     lines.push("");
   }

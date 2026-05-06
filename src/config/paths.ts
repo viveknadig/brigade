@@ -58,11 +58,20 @@ export function resolveSessionTranscriptPath(agentId: string, sessionId: string)
   return path.join(resolveSessionsDir(agentId), `${sessionId}.jsonl`);
 }
 
-// Workspace is configurable per-agent in brigade.json. Default lives next to
-// the auth dir so the whole agent state is co-located.
-export function resolveAgentWorkspaceDir(agentId: string, override?: string): string {
+// Workspace lives at the state-dir level (NOT under <agentDir>/) so personas
+// are shared across agents. This matches the reference's layout — one set of
+// IDENTITY/SOUL/AGENTS/USER/TOOLS/HEARTBEAT/BOOTSTRAP files per host, not
+// per-agent. The `agentId` parameter is kept on the signature for forward
+// compatibility (a future per-agent override could honour it) but ignored
+// today; the optional `override` and `BRIGADE_PROFILE` env var are the only
+// paths that diverge from the canonical `<stateDir>/workspace/`.
+export function resolveAgentWorkspaceDir(_agentId: string, override?: string): string {
   if (override && override.length > 0) return path.resolve(override);
-  return path.join(resolveAgentDir(agentId), "workspace");
+  const profile = process.env.BRIGADE_PROFILE?.trim();
+  if (profile && profile.toLowerCase() !== "default") {
+    return path.join(resolveStateDir(), `workspace-${profile}`);
+  }
+  return path.join(resolveStateDir(), "workspace");
 }
 
 export function resolveTasksDir(): string {
@@ -99,6 +108,13 @@ export function resolveCacheDir(): string {
 
 export function resolveConfigAuditLogPath(): string {
   return path.join(resolveLogsDir(), "config-audit.jsonl");
+}
+
+// Single-file rolling health snapshot — overwritten on every successful
+// config write so callers can inspect the most-recent state without
+// scanning the audit JSONL.
+export function resolveConfigHealthPath(): string {
+  return path.join(resolveLogsDir(), "config-health.json");
 }
 
 export function ensureDir(dir: string): void {

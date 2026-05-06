@@ -64,11 +64,12 @@ export async function resolveWorkspaceTemplateDir(
     return cachedTemplateDir;
   })();
 
-  try {
-    return await resolvingTemplateDir;
-  } finally {
-    resolvingTemplateDir = undefined;
-  }
+  // Don't clear `resolvingTemplateDir` after the await — the `cachedTemplateDir`
+  // short-circuit at the top of this function is what dedupes subsequent
+  // callers, and clearing the in-flight promise here was misleading rather
+  // than helpful (it suggested re-resolution after success, which would be
+  // wrong).
+  return resolvingTemplateDir;
 }
 
 export interface LoadedTemplate {

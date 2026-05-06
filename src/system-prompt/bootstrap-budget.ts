@@ -68,7 +68,10 @@ export function applyBudget(
 
     // If even the truncated content overflows the *total* budget, drop the
     // file. We don't try to partially fit — partial files inject ambiguous
-    // signal into the model's persona.
+    // signal into the model's persona. Surface a stderr warning so the
+    // user notices when their persona corpus has outgrown the budget;
+    // BOOTSTRAP.md silently falling out is the kind of bug that's
+    // invisible to debug from the agent's reply alone.
     if (runningTotal + content.length > options.totalMaxChars) {
       diagnostics.push({
         name: file.name,
@@ -77,6 +80,11 @@ export function applyBudget(
         truncated,
         dropped: true,
       });
+      console.error(
+        `brigade: workspace file ${file.name} dropped from system prompt — ` +
+          `total persona budget exhausted (limit ${options.totalMaxChars.toLocaleString()} chars). ` +
+          `Trim earlier files or raise the budget.`,
+      );
       continue;
     }
 

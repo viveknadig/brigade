@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { fileExists } from "./fs-utils.js";
+
 // Lifecycle markers for the agent's workspace.
 //
 // On a fresh onboard, brigade writes BOOTSTRAP.md as a one-shot greeting
@@ -65,9 +67,22 @@ export async function writeWorkspaceState(
 ): Promise<void> {
   const statePath = resolveWorkspaceStatePath(workspaceDir);
   await fs.mkdir(path.dirname(statePath), { recursive: true });
-  const tmp = `${statePath}.tmp`;
-  await fs.writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-  await fs.rename(tmp, statePath);
+  // PID + base36 timestamp in the tmp filename so two concurrent
+  // brigade processes (e.g. an interactive turn and a heartbeat tick)
+  // don't trip on each other's `.tmp` while one is mid-write. Without
+  // the suffix, both would write to `state.tmp` and the second renamer
+  // could rename a partial file written by the first.
+  const tmp = `${statePath}.tmp-${process.pid}-${Date.now().toString(36)}`;
+  try {
+    await fs.writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await fs.rename(tmp, statePath);
+  } catch (err) {
+    // Best-effort cleanup of the orphan tmp on any error before the
+    // rename — leaving stale `.tmp-…` files in the workspace would be
+    // visible noise on subsequent `ls` / git status.
+    await fs.rm(tmp, { force: true }).catch(() => undefined);
+    throw err;
+  }
 }
 
 // Decide which lifecycle bucket a workspace is in. Reads the state file +
@@ -111,11 +126,3 @@ export async function markSetupCompleted(workspaceDir: string): Promise<void> {
   });
 }
 
-async function fileExists(p: string): Promise<boolean> {
-  try {
-    await fs.access(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
