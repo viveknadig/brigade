@@ -1,0 +1,431 @@
+// Auth-profile cooldown + ordering.
+//
+// Tracks per-profile failure state in `<authDir>/profile-state.json` so that:
+//
+//   • A profile that hit a transient failure (rate_limit / overloaded /
+//     timeout) goes on cooldown for an escalating duration (30s → 1m → 5m)
+//     based on its recent error count, and is skipped during selection
+//     until the cooldown expires.
+//
+//   • A profile that hit a permanent failure (billing / auth_permanent) goes
+//     on a longer "disabled" backoff (10m base for auth_permanent, 5h base
+//     for billing, doubling per repeated failure, capped at 60m / 24h).
+//
+//   • Profile selection prefers most-recently-successful (`lastUsed`-asc
+//     round-robin) and pushes cooled / disabled profiles to the bottom of
+//     the order, sorted by soonest-expiry first (so a probe at expiry has
+//     a fresh slot).
+//
+//   • Error counts decay: if a profile hasn't failed in 24h, the next failure
+//     starts the count fresh rather than escalating off the old number. A
+//     profile with one failure last week shouldn't be treated like one with
+//     ten failures in the last hour.
+//
+// The state file is JSON, atomically written via PID-suffixed tmp + rename.
+// Failure to read or write the state file is a soft failure — profile
+// selection falls back to "pick first matching" (current Brigade behaviour)
+// rather than blocking the run on observability state.
+
+import fs from "node:fs";
+import path from "node:path";
+
+import type { RetryReason } from "../agents/error-classifier.js";
+import { ensureDir, resolveAuthDir } from "../config/paths.js";
+import { createSubsystemLogger } from "../logging/subsystem-logger.js";
+
+const log = createSubsystemLogger("auth/cooldown");
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Schema. Loose at the boundary; strict in the helper functions.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface ProfileUsageStats {
+  lastUsed?: number;          // ms since epoch on last success
+  cooldownUntil?: number;     // transient lane (rate_limit / overloaded / timeout / unknown)
+  cooldownReason?: RetryReason;
+  cooldownModel?: string;     // optional model-scoped rate limit
+  disabledUntil?: number;     // permanent lane (billing / auth_permanent)
+  disabledReason?: RetryReason;
+  errorCount?: number;        // attenuates over the failure window
+  failureCounts?: Partial<Record<RetryReason, number>>;
+  lastFailureAt?: number;
+}
+
+export interface ProfileStateFile {
+  version: 1;
+  // Optional explicit ordering per provider.
+  order?: Record<string, string[]>;
+  lastGood?: Record<string, string>;
+  // Per-profileId stats.
+  usageStats?: Record<string, ProfileUsageStats>;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants. Match the OpenClaw observed defaults but are configurable here
+// so brigade.json can override later without an API change.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const COOLDOWN_MS_TIER_1 = 30_000;        // first transient failure
+const COOLDOWN_MS_TIER_2 = 60_000;        // second
+const COOLDOWN_MS_TIER_MAX = 5 * 60_000;  // third+
+const DISABLED_BACKOFF_AUTH_BASE_MS = 10 * 60_000;
+const DISABLED_BACKOFF_AUTH_MAX_MS = 60 * 60_000;
+const DISABLED_BACKOFF_BILLING_BASE_MS = 5 * 60 * 60_000;
+const DISABLED_BACKOFF_BILLING_MAX_MS = 24 * 60 * 60_000;
+const FAILURE_WINDOW_MS = 24 * 60 * 60_000;
+
+const TRANSIENT_REASONS: ReadonlySet<RetryReason> = new Set<RetryReason>([
+  "rate_limit",
+  "overloaded",
+  "timeout",
+  "unknown",
+]);
+const DISABLED_REASONS: ReadonlySet<RetryReason> = new Set<RetryReason>([
+  "billing",
+  "auth_permanent",
+]);
+
+export function calculateCooldownMs(errorCount: number): number {
+  const n = Math.max(1, errorCount);
+  if (n <= 1) return COOLDOWN_MS_TIER_1;
+  if (n <= 2) return COOLDOWN_MS_TIER_2;
+  return COOLDOWN_MS_TIER_MAX;
+}
+
+export function calculateDisabledMs(reason: RetryReason, errorCount: number): number {
+  const base = reason === "billing" ? DISABLED_BACKOFF_BILLING_BASE_MS : DISABLED_BACKOFF_AUTH_BASE_MS;
+  const max = reason === "billing" ? DISABLED_BACKOFF_BILLING_MAX_MS : DISABLED_BACKOFF_AUTH_MAX_MS;
+  const exp = Math.min(15, Math.max(0, errorCount - 1));
+  return Math.min(max, base * 2 ** exp);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// State file IO. Soft failures everywhere — we never want a corrupted state
+// file to block a real `brigade agent` run.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function resolveProfileStatePath(agentId: string): string {
+  return path.join(resolveAuthDir(agentId), "profile-state.json");
+}
+
+export function loadProfileState(agentId: string): ProfileStateFile {
+  const p = resolveProfileStatePath(agentId);
+  if (!fs.existsSync(p)) return { version: 1, usageStats: {} };
+  try {
+    const raw = fs.readFileSync(p, "utf8");
+    const parsed = JSON.parse(raw) as ProfileStateFile;
+    if (parsed && typeof parsed === "object" && parsed.version === 1) {
+      return { ...parsed, version: 1 };
+    }
+  } catch (err) {
+    log.warn("failed to load profile state; falling back to empty", {
+      path: p,
+      error: (err as Error).message,
+    });
+  }
+  return { version: 1, usageStats: {} };
+}
+
+export function saveProfileState(agentId: string, state: ProfileStateFile): void {
+  const p = resolveProfileStatePath(agentId);
+  ensureDir(path.dirname(p));
+  const tmp = `${p}.tmp-${process.pid}-${Date.now().toString(36)}`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), "utf8");
+    fs.renameSync(tmp, p);
+  } catch (err) {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      // best-effort
+    }
+    log.warn("failed to save profile state", { path: p, error: (err as Error).message });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Read paths. Eligibility + ordering. Pure functions over the loaded state.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface CooldownStatus {
+  cooled: boolean;
+  disabled: boolean;
+  cooldownUntil?: number;
+  disabledUntil?: number;
+  reason?: RetryReason;
+}
+
+export function getCooldownStatus(
+  stats: ProfileUsageStats | undefined,
+  options: { now?: number; forModel?: string } = {},
+): CooldownStatus {
+  const now = options.now ?? Date.now();
+  if (!stats) return { cooled: false, disabled: false };
+  const status: CooldownStatus = { cooled: false, disabled: false };
+
+  if (typeof stats.disabledUntil === "number" && stats.disabledUntil > now) {
+    status.disabled = true;
+    status.disabledUntil = stats.disabledUntil;
+    status.reason = stats.disabledReason;
+  }
+
+  if (typeof stats.cooldownUntil === "number" && stats.cooldownUntil > now) {
+    // Model-scoped rate limit only counts when we're asking about that model.
+    if (
+      stats.cooldownModel &&
+      options.forModel &&
+      stats.cooldownModel !== options.forModel
+    ) {
+      // Different model — cooldown doesn't apply.
+    } else {
+      status.cooled = true;
+      status.cooldownUntil = stats.cooldownUntil;
+      status.reason = stats.cooldownReason;
+    }
+  }
+
+  return status;
+}
+
+export function isProfileEligible(
+  state: ProfileStateFile,
+  profileId: string,
+  options: { now?: number; forModel?: string } = {},
+): boolean {
+  const stats = state.usageStats?.[profileId];
+  const status = getCooldownStatus(stats, options);
+  return !status.cooled && !status.disabled;
+}
+
+export interface ProfileOrderArgs {
+  state: ProfileStateFile;
+  provider: string;
+  profileIds: string[];
+  preferredProfile?: string;
+  now?: number;
+  forModel?: string;
+}
+
+// Sort profileIds: eligible first (lastUsed asc — fairer round-robin), then
+// cooled/disabled appended in soonest-expiry-first order so a probe can
+// hit a profile right at its cooldown boundary.
+export function orderProfilesForSelection(args: ProfileOrderArgs): string[] {
+  const now = args.now ?? Date.now();
+  const usageStats = args.state.usageStats ?? {};
+  const explicitOrder = args.state.order?.[args.provider];
+
+  const seen = new Set<string>();
+  const eligible: string[] = [];
+  const cooled: string[] = [];
+
+  // Honour preferredProfile by floating it to the head of its bucket.
+  const orderedSource: string[] = [];
+  if (args.preferredProfile && args.profileIds.includes(args.preferredProfile)) {
+    orderedSource.push(args.preferredProfile);
+  }
+  if (explicitOrder) {
+    for (const id of explicitOrder) {
+      if (args.profileIds.includes(id)) orderedSource.push(id);
+    }
+  }
+  for (const id of args.profileIds) orderedSource.push(id);
+
+  for (const id of orderedSource) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (isProfileEligible(args.state, id, { now, forModel: args.forModel })) {
+      eligible.push(id);
+    } else {
+      cooled.push(id);
+    }
+  }
+
+  // Round-robin: eligible profiles sorted by lastUsed asc (oldest first) so
+  // we don't keep hammering the same profile turn after turn. The
+  // preferredProfile, when supplied AND eligible, is pulled to the head
+  // *after* the sort so the caller's preference wins over rotation.
+  eligible.sort((a, b) => {
+    const aUsed = usageStats[a]?.lastUsed ?? 0;
+    const bUsed = usageStats[b]?.lastUsed ?? 0;
+    return aUsed - bUsed;
+  });
+  if (args.preferredProfile) {
+    const idx = eligible.indexOf(args.preferredProfile);
+    if (idx > 0) {
+      eligible.splice(idx, 1);
+      eligible.unshift(args.preferredProfile);
+    }
+  }
+
+  // Cooled: soonest-expiry first.
+  cooled.sort((a, b) => {
+    const ax = expiryOf(usageStats[a], now);
+    const bx = expiryOf(usageStats[b], now);
+    return ax - bx;
+  });
+
+  return [...eligible, ...cooled];
+}
+
+function expiryOf(stats: ProfileUsageStats | undefined, now: number): number {
+  if (!stats) return now;
+  const c = typeof stats.cooldownUntil === "number" && stats.cooldownUntil > now ? stats.cooldownUntil : Infinity;
+  const d = typeof stats.disabledUntil === "number" && stats.disabledUntil > now ? stats.disabledUntil : Infinity;
+  const e = Math.min(c, d);
+  return e === Infinity ? now : e;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mutation paths. All return the next state by value (immutable update) and
+// then save it. Callers that want to batch mutations can pass `{ save:false }`
+// and call saveProfileState themselves.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface MarkSuccessArgs {
+  agentId: string;
+  state: ProfileStateFile;
+  profileId: string;
+  provider: string;
+  save?: boolean;
+}
+
+export function markProfileSuccess(args: MarkSuccessArgs): ProfileStateFile {
+  const next = cloneState(args.state);
+  const stats = readStats(next, args.profileId);
+  stats.lastUsed = Date.now();
+  // Clear ALL failure state on success. The profile is healthy.
+  delete stats.cooldownUntil;
+  delete stats.cooldownReason;
+  delete stats.cooldownModel;
+  delete stats.disabledUntil;
+  delete stats.disabledReason;
+  delete stats.errorCount;
+  delete stats.failureCounts;
+  delete stats.lastFailureAt;
+  writeStats(next, args.profileId, stats);
+  next.lastGood = { ...(next.lastGood ?? {}), [args.provider]: args.profileId };
+  if (args.save !== false) saveProfileState(args.agentId, next);
+  return next;
+}
+
+export interface MarkFailureArgs {
+  agentId: string;
+  state: ProfileStateFile;
+  profileId: string;
+  reason: RetryReason;
+  modelId?: string;
+  save?: boolean;
+}
+
+export function markProfileFailure(args: MarkFailureArgs): ProfileStateFile {
+  const next = cloneState(args.state);
+  const stats = readStats(next, args.profileId);
+  const now = Date.now();
+
+  // Decay error count if the last failure was outside the rolling window.
+  const lastFailureAt = stats.lastFailureAt ?? 0;
+  const decay = lastFailureAt > 0 && now - lastFailureAt > FAILURE_WINDOW_MS;
+  const baseErrorCount = decay ? 0 : stats.errorCount ?? 0;
+  const nextErrorCount = baseErrorCount + 1;
+
+  stats.errorCount = nextErrorCount;
+  stats.lastFailureAt = now;
+  stats.failureCounts = {
+    ...(decay ? {} : stats.failureCounts ?? {}),
+    [args.reason]: ((decay ? 0 : stats.failureCounts?.[args.reason]) ?? 0) + 1,
+  };
+
+  if (DISABLED_REASONS.has(args.reason)) {
+    const dur = calculateDisabledMs(args.reason, nextErrorCount);
+    stats.disabledUntil = now + dur;
+    stats.disabledReason = args.reason;
+    log.warn("profile disabled", {
+      profileId: args.profileId,
+      reason: args.reason,
+      disabledForMs: dur,
+      errorCount: nextErrorCount,
+    });
+  } else if (TRANSIENT_REASONS.has(args.reason)) {
+    const dur = calculateCooldownMs(nextErrorCount);
+    stats.cooldownUntil = now + dur;
+    stats.cooldownReason = args.reason;
+    if (args.modelId && args.reason === "rate_limit") {
+      stats.cooldownModel = args.modelId;
+    } else {
+      delete stats.cooldownModel;
+    }
+    log.info("profile cooled", {
+      profileId: args.profileId,
+      reason: args.reason,
+      cooldownMs: dur,
+      modelId: args.modelId,
+      errorCount: nextErrorCount,
+    });
+  } else {
+    // format / model_not_found / auth / session_expired — record but no cooldown.
+    log.debug("profile failure recorded (no cooldown)", {
+      profileId: args.profileId,
+      reason: args.reason,
+      errorCount: nextErrorCount,
+    });
+  }
+
+  writeStats(next, args.profileId, stats);
+  if (args.save !== false) saveProfileState(args.agentId, next);
+  return next;
+}
+
+// Sweep expired cooldowns/disabled windows in-place. Cheap to call before
+// a selection so the order computed above doesn't include slots that have
+// already aged out.
+export function clearExpiredCooldowns(state: ProfileStateFile, now: number = Date.now()): ProfileStateFile {
+  let mutated = false;
+  const next = cloneState(state);
+  const stats = next.usageStats ?? {};
+  for (const id of Object.keys(stats)) {
+    const s = stats[id];
+    if (!s) continue;
+    if (typeof s.cooldownUntil === "number" && s.cooldownUntil <= now) {
+      delete s.cooldownUntil;
+      delete s.cooldownReason;
+      delete s.cooldownModel;
+      // Cooldown expired — half-open the breaker by zeroing recent error count.
+      s.errorCount = 0;
+      mutated = true;
+    }
+    if (typeof s.disabledUntil === "number" && s.disabledUntil <= now) {
+      delete s.disabledUntil;
+      delete s.disabledReason;
+      mutated = true;
+    }
+  }
+  return mutated ? next : state;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tiny helpers.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function cloneState(state: ProfileStateFile): ProfileStateFile {
+  return {
+    version: 1,
+    order: state.order ? { ...state.order } : undefined,
+    lastGood: state.lastGood ? { ...state.lastGood } : undefined,
+    usageStats: state.usageStats
+      ? Object.fromEntries(
+          Object.entries(state.usageStats).map(([k, v]) => [k, { ...v }]),
+        )
+      : {},
+  };
+}
+
+function readStats(state: ProfileStateFile, profileId: string): ProfileUsageStats {
+  state.usageStats = state.usageStats ?? {};
+  state.usageStats[profileId] = state.usageStats[profileId] ?? {};
+  return { ...state.usageStats[profileId] };
+}
+
+function writeStats(state: ProfileStateFile, profileId: string, stats: ProfileUsageStats): void {
+  state.usageStats = state.usageStats ?? {};
+  state.usageStats[profileId] = stats;
+}

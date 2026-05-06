@@ -68,18 +68,46 @@ export async function runAgentTurn(opts: AgentOptions): Promise<void> {
       `sessionKey=${sessionKey} state=${paths.stateDir}`,
   );
 
-  // No try/catch — let runtime errors propagate to run-main's
-  // mapErrorToExitCode, which prefixes with `brigade:` and returns the
-  // right exit code for entry.ts to surface.
-  const result = await runSingleTurn({
-    agentId,
-    provider,
-    modelId,
-    message: opts.message,
-    sessionKey,
-    workspaceDir: opts.workspace,
-    thinkingLevel: opts.thinkingLevel ?? "off",
-  });
+  // Ctrl-C / kill propagates as an AbortSignal into the agent loop. The
+  // first SIGINT requests a graceful abort (drains in-flight retries);
+  // a second SIGINT within the same process tears the run down hard
+  // by exiting with 130 (the conventional shell signal-code).
+  const abortController = new AbortController();
+  let sigintCount = 0;
+  const onSigint = () => {
+    sigintCount++;
+    if (sigintCount === 1) {
+      console.error("\n[brigade] interrupt received — aborting run gracefully (Ctrl-C again to force exit)");
+      abortController.abort(new Error("Interrupted by user"));
+      return;
+    }
+    console.error("\n[brigade] forced exit on second interrupt");
+    process.exit(130);
+  };
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigint);
+
+  let result: Awaited<ReturnType<typeof runSingleTurn>>;
+  try {
+    // No try/catch around runSingleTurn for the *non-abort* path — runtime
+    // errors propagate to run-main's mapErrorToExitCode, which prefixes
+    // with `brigade:` and returns the right exit code for entry.ts to
+    // surface. The try/finally exists only to clean up the signal
+    // listeners regardless of outcome.
+    result = await runSingleTurn({
+      agentId,
+      provider,
+      modelId,
+      message: opts.message,
+      sessionKey,
+      workspaceDir: opts.workspace,
+      thinkingLevel: opts.thinkingLevel ?? "off",
+      signal: abortController.signal,
+    });
+  } finally {
+    process.off("SIGINT", onSigint);
+    process.off("SIGTERM", onSigint);
+  }
 
   if (result.isNewSession) {
     console.error(`[brigade] new session: ${result.sessionId}`);

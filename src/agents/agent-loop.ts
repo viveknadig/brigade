@@ -58,6 +58,39 @@ import {
   hasDeliveredBootstrapToSession,
   markBootstrapDeliveredToSession,
 } from "../sessions/bootstrap-marker.js";
+import { createSubsystemLogger } from "../logging/subsystem-logger.js";
+import { runWithRetry } from "./retry-policy.js";
+import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
+import { buildBrigadeTransformContext } from "./payload-mutators.js";
+import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
+import {
+  clearExpiredCooldowns,
+  loadProfileState,
+  markProfileFailure,
+  markProfileSuccess,
+} from "../auth/profile-cooldown.js";
+import { orderProfilesForSelection } from "../auth/profile-cooldown.js";
+import {
+  wrapStreamFnWithIdleTimeout,
+  wrapStreamFnWithStopReasonRecovery,
+  wrapStreamFnWithToolCallRepair,
+} from "./stream-wrappers.js";
+
+const log = createSubsystemLogger("loop/turn");
+
+// Default idle-timeout for a streaming provider response. Bypassed by setting
+// `BRIGADE_LLM_IDLE_TIMEOUT_SECONDS=0`. Tuned to 90s — comfortably above the
+// slowest Anthropic Opus reasoning warmup, well below the limit at which a
+// hung connection wastes a session's worth of tokens of headroom.
+const DEFAULT_LLM_IDLE_TIMEOUT_MS = 90_000;
+
+function resolveIdleTimeoutMs(): number {
+  const raw = process.env.BRIGADE_LLM_IDLE_TIMEOUT_SECONDS?.trim();
+  if (!raw) return DEFAULT_LLM_IDLE_TIMEOUT_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_LLM_IDLE_TIMEOUT_MS;
+  return Math.floor(n * 1000);
+}
 
 export interface RunSingleTurnArgs {
   agentId: string;
@@ -76,6 +109,12 @@ export interface RunSingleTurnArgs {
   // Pi accepts "off" | "low" | "medium" | "high". Some providers (e.g. Gemini
   // 2.5 Pro) reject "off" — derive from model.reasoning when wiring tools.
   thinkingLevel?: "off" | "low" | "medium" | "high";
+  // Caller-provided cancellation. Wired into the retry loop so a Ctrl-C from
+  // the CLI / a WS disconnect from the gateway aborts cleanly. Pi 0.70.x's
+  // session.prompt does not accept a signal, so the abort takes effect at
+  // the *next* retry boundary; callers wanting hard mid-stream cancellation
+  // should call session.abort() directly in the signal listener.
+  signal?: AbortSignal;
 }
 
 export interface RunSingleTurnResult {
@@ -101,7 +140,20 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
     overrides: { provider: args.provider, modelId: args.modelId },
   });
 
-  const authStorage = buildAuthStorage(authProfilesPath);
+  // Profile cooldown gate. The on-disk profile-state.json tracks per-profile
+  // failure history, cooldown windows, and disabled-until timestamps. We
+  // sweep expired windows up-front so a profile that was rate-limited an
+  // hour ago is eligible again now, then pass the eligibility filter to
+  // the credential-map builder so cooled profiles don't get handed to Pi.
+  let cooldownState = loadProfileState(agentId);
+  cooldownState = clearExpiredCooldowns(cooldownState);
+  const authBuild = buildAuthStorage(authProfilesPath, {
+    cooldownState,
+    provider: args.provider,
+    modelId: args.modelId,
+  });
+  const authStorage = authBuild.storage;
+  const selectedProfileId = authBuild.selectedProfileId;
   const modelRegistry = buildModelRegistry(authStorage, modelsFile);
 
   // ModelRegistry.find returns undefined when the provider+modelId pair isn't
@@ -133,9 +185,35 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
     );
   }
 
+  // Repair any malformed JSONL lines in the transcript before Pi opens it.
+  // A power-loss / SIGKILL during a previous append can leave a partial
+  // last line that throws on JSON.parse — without this pass the next run
+  // would crash on session open with no obvious cause. The repair is
+  // idempotent + atomic (writes a `.bak-<pid>-<ts>` snapshot first), so a
+  // failed repair leaves the original file intact.
+  const repairReport = await repairSessionFileIfNeeded({
+    sessionFile: resolved.transcriptPath,
+  });
+  if (repairReport.repaired) {
+    log.warn("session file repaired before open", {
+      sessionId: resolved.sessionId,
+      droppedLines: repairReport.droppedLines,
+      backupPath: repairReport.backupPath,
+    });
+  }
+
   // SessionManager.open creates the JSONL on first write; passing the
   // canonical transcript path keeps Pi and brigade aligned on filenames.
   const sessionManager = SessionManager.open(resolved.transcriptPath);
+
+  // Anthropic models are the only family today that enforce a hard
+  // cache_control breakpoint cap (Anthropic accepts ≤4). Run the sweep
+  // unconditionally — it's a safe no-op for non-Anthropic providers because
+  // their messages don't carry cache_control blocks. The scrubber pass
+  // (refusal sentinel) always runs.
+  const transformContext = buildBrigadeTransformContext({
+    applyAnthropicSweep: args.provider === "anthropic" || args.provider.startsWith("anthropic"),
+  });
 
   const { session } = await createAgentSession({
     cwd,
@@ -148,10 +226,42 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
     customTools: [],
     sessionManager,
     resourceLoader: new DefaultResourceLoader({ cwd, agentDir }),
+    transformContext,
   } as never);
 
   if (!session) {
     throw new Error("Pi createAgentSession returned no session.");
+  }
+
+  // Compose stream-fn wrappers around Pi's auth-aware streamFn. Order
+  // matters and is from-the-outside-in: the outermost wrapper sees events
+  // last (closest to Pi's consumer), the innermost sees them first
+  // (closest to the provider). We chain idle-timeout outermost so a hung
+  // provider trips the timer regardless of inner repair work; tool-call
+  // repair is innermost so even a malformed delta from the wire gets
+  // cleaned before the stop-reason wrapper sees it.
+  //
+  // Crucially — never REPLACE Pi's streamFn (a brigade memory note locks
+  // this in: replacement loses the auth wrapping and every call goes
+  // silently keyless). Wrapping preserves Pi's wrapper at the bottom of
+  // the call stack.
+  const sessionAgent = (session as AgentSession & {
+    agent?: { streamFn?: import("./stream-wrappers.js").BrigadeStreamFn };
+  }).agent;
+  if (sessionAgent && typeof sessionAgent.streamFn === "function") {
+    const baseStreamFn = sessionAgent.streamFn;
+    const idleTimeoutMs = resolveIdleTimeoutMs();
+    sessionAgent.streamFn = wrapStreamFnWithIdleTimeout(
+      wrapStreamFnWithStopReasonRecovery(
+        wrapStreamFnWithToolCallRepair(baseStreamFn),
+      ),
+      { timeoutMs: idleTimeoutMs },
+    );
+    log.debug("stream wrappers installed", {
+      idleTimeoutMs,
+      provider: args.provider,
+      model: args.modelId,
+    });
   }
 
   // Detect lifecycle phase BEFORE the turn. Two layers stack here:
@@ -202,12 +312,83 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   // Do NOT use steer() here: steer is for *mid-turn* injection. With no
   // active run it just enqueues into the steering buffer and returns
   // immediately — the assistant never speaks and brigade prints nothing.
-  await (session as AgentSession).prompt(args.message);
+  //
+  // Wrapped in runWithRetry so a transient provider failure (rate limit,
+  // overload, timeout) is automatically retried with backoff + jitter
+  // instead of surfacing as a hard turn error to the caller. Same-model
+  // retries only — multi-model fallback is one layer up (see
+  // model-fallback.ts), which is wired in by the resilient agent runner.
+  //
+  // The user message is scrubbed of the Anthropic refusal-trigger magic
+  // string before Pi sees it; otherwise a paste-through of that literal
+  // would coerce Claude into refusing the next turn.
+  const scrubbedMessage = scrubAnthropicRefusalSentinel(args.message);
+  log.info("turn starting", {
+    agentId,
+    sessionId: resolved.sessionId,
+    isNewSession: resolved.isNew,
+    provider: args.provider,
+    model: args.modelId,
+    bootstrapPhase: effectivePhase,
+  });
 
-  // Defensive settle wait. prompt() should already have settled the run,
-  // but if Pi adds queued steers or background compactions in a future
-  // minor, this catches the late activity.
-  await waitForStreamSettled(session as AgentSession);
+  await runWithRetry({
+    ctx: { provider: args.provider, model: args.modelId },
+    signal: args.signal,
+    onAttemptFailed: (info) => {
+      const fields = {
+        agentId,
+        sessionId: resolved.sessionId,
+        provider: args.provider,
+        model: args.modelId,
+        attempt: info.attemptIndex,
+        reason: info.reason,
+        willRetry: info.willRetry,
+        backoffMs: info.backoffMs,
+        error: info.errorSummary,
+        profileId: selectedProfileId,
+      };
+      if (info.willRetry) log.warn("turn attempt failed, retrying", fields);
+      else log.error("turn attempt failed, surfacing", fields);
+      // Update the on-disk cooldown state so this profile rotates out on
+      // the next run if its failure category warrants a cooldown. Skipped
+      // when no profile id was tracked (single-profile fallback path).
+      if (selectedProfileId) {
+        cooldownState = markProfileFailure({
+          agentId,
+          state: cooldownState,
+          profileId: selectedProfileId,
+          reason: info.reason,
+          modelId: args.modelId,
+        });
+      }
+    },
+    attempt: async (_attemptIndex, _signal) => {
+      await (session as AgentSession).prompt(scrubbedMessage);
+      // Defensive settle wait. prompt() should already have settled the
+      // run, but if Pi adds queued steers or background compactions in a
+      // future minor, this catches the late activity.
+      await waitForStreamSettled(session as AgentSession);
+    },
+  });
+
+  // Successful turn — clear any prior failure state on the profile so the
+  // next run prefers it again under the round-robin order.
+  if (selectedProfileId) {
+    cooldownState = markProfileSuccess({
+      agentId,
+      state: cooldownState,
+      profileId: selectedProfileId,
+      provider: args.provider,
+    });
+  }
+
+  log.info("turn settled", {
+    agentId,
+    sessionId: resolved.sessionId,
+    provider: args.provider,
+    model: args.modelId,
+  });
 
   const reply = extractLastAssistantText(session as AgentSession);
 
@@ -285,18 +466,43 @@ async function buildPersonaPrompt(args: {
 // AuthStorage in Pi 0.70.x exposes multiple factories across versions
 // (inMemory, fromStorage). We prefer inMemory with the parsed profile blob
 // because brigade's auth-profiles.json is small enough to load eagerly.
-function buildAuthStorage(authProfilesPath: string): unknown {
-  const credentials = readAuthProfilesAsCredentialMap(authProfilesPath);
+//
+// `cooldownFilter` (optional) is the profile-cooldown gate: profiles that
+// are currently cooled or disabled are skipped during credential-map build,
+// and within an eligible bucket the most-recently-successful profiles are
+// preferred. Falls back to the original "first matching wins" behaviour
+// when the filter is omitted (back-compat for tests + bootstrap callsites).
+interface AuthStorageCooldownFilter {
+  cooldownState: import("../auth/profile-cooldown.js").ProfileStateFile;
+  provider: string;
+  modelId?: string;
+}
+
+interface AuthStorageBuildResult {
+  storage: unknown;
+  // The profileId that was selected for the active provider, if any. Used
+  // by the run lifecycle to update cooldown state on success/failure.
+  selectedProfileId?: string;
+}
+
+function buildAuthStorage(
+  authProfilesPath: string,
+  cooldownFilter?: AuthStorageCooldownFilter,
+): AuthStorageBuildResult {
+  const { credentials, selectedProfileId } = readAuthProfilesAsCredentialMap(
+    authProfilesPath,
+    cooldownFilter,
+  );
   const Storage = AuthStorage as unknown as {
     inMemory?: (data?: unknown) => unknown;
     fromStorage?: (storage: unknown) => unknown;
   };
+  let storage: unknown;
   if (typeof Storage.inMemory === "function") {
-    return Storage.inMemory(credentials);
-  }
-  if (typeof Storage.fromStorage === "function") {
+    storage = Storage.inMemory(credentials);
+  } else if (typeof Storage.fromStorage === "function") {
     // Fallback path for Pi minors that removed inMemory.
-    return Storage.fromStorage({
+    storage = Storage.fromStorage({
       withLock<T>(
         update: (current: string) => { result: T; next?: string },
       ): T {
@@ -304,19 +510,43 @@ function buildAuthStorage(authProfilesPath: string): unknown {
         return result;
       },
     });
+  } else {
+    throw new Error(
+      "Pi AuthStorage exposes neither inMemory nor fromStorage; pin to 0.70.x or update brigade.",
+    );
   }
-  throw new Error(
-    "Pi AuthStorage exposes neither inMemory nor fromStorage; pin to 0.70.x or update brigade.",
-  );
+  return { storage, selectedProfileId };
 }
 
 // Brigade's auth-profiles.json shape matches the Pi SDK contract: profiles
 // are keyed by `<provider>:<alias>` and discriminated on `type`. Pi's
 // in-memory storage expects the credential map keyed by provider id with
-// `{type: "api_key", key}`. Translate by walking profiles and picking the
-// first usable one per provider — alias-aware selection comes later.
-function readAuthProfilesAsCredentialMap(authProfilesPath: string): Record<string, unknown> {
-  if (!fs.existsSync(authProfilesPath)) return {};
+// `{type: "api_key", key}`.
+//
+// When a `cooldownFilter` is supplied we apply two extra passes:
+//
+//   1. Eligibility — drop profiles whose entry in profile-state.json is in
+//      cooldown / disabled for the active provider+model. If every profile
+//      for a provider is cooled, fall back to the soonest-expiry one as a
+//      probe (so the run still has a chance to recover instead of hard-
+//      failing on "no eligible auth").
+//
+//   2. Ordering — within the eligible bucket, prefer profiles by
+//      `lastUsed`-asc round-robin so we don't keep hitting the same key
+//      turn after turn. The first eligible profile per provider wins.
+interface ReadCredentialsResult {
+  credentials: Record<string, unknown>;
+  // Profile id selected for the active provider (if cooldownFilter was
+  // supplied). Used downstream to mark cooldown success/failure on the
+  // exact profile that ran.
+  selectedProfileId?: string;
+}
+
+function readAuthProfilesAsCredentialMap(
+  authProfilesPath: string,
+  cooldownFilter?: AuthStorageCooldownFilter,
+): ReadCredentialsResult {
+  if (!fs.existsSync(authProfilesPath)) return { credentials: {} };
   let parsed: {
     profiles?: Record<
       string,
@@ -326,23 +556,50 @@ function readAuthProfilesAsCredentialMap(authProfilesPath: string): Record<strin
   try {
     parsed = JSON.parse(fs.readFileSync(authProfilesPath, "utf8"));
   } catch {
-    return {};
+    return { credentials: {} };
   }
   const out: Record<string, unknown> = {};
-  for (const profile of Object.values(parsed.profiles ?? {})) {
+  let selectedProfileId: string | undefined;
+  // Bucket profiles by provider so we can apply the cooldown ordering before
+  // collapsing to "first wins" per provider.
+  const byProvider = new Map<
+    string,
+    { profileId: string; provider: string; resolvedKey: string }[]
+  >();
+  for (const [profileId, profile] of Object.entries(parsed.profiles ?? {})) {
     if (!profile?.provider || profile.type !== "api_key") continue;
-    // `key` wins over `keyRef`. `${VAR}` expansion lets a profile point at
-    // an env var instead of persisting the secret to disk.
     const literal = profile.key ?? profile.keyRef ?? "";
-    const resolved = expandEnvRef(literal, profile.provider);
-    if (!resolved) continue;
-    // First profile per provider wins — alias-aware ordering comes when
-    // auth-state.json's `order`/`lastGood` is wired into the kernel.
-    if (!out[profile.provider]) {
-      out[profile.provider] = { type: "api_key", key: resolved };
+    const resolvedKey = expandEnvRef(literal, profile.provider);
+    if (!resolvedKey) continue;
+    const list = byProvider.get(profile.provider) ?? [];
+    list.push({ profileId, provider: profile.provider, resolvedKey });
+    byProvider.set(profile.provider, list);
+  }
+
+  for (const [provider, list] of byProvider) {
+    if (cooldownFilter && provider === cooldownFilter.provider) {
+      const ordered = orderProfilesForSelection({
+        state: cooldownFilter.cooldownState,
+        provider,
+        profileIds: list.map((p) => p.profileId),
+        forModel: cooldownFilter.modelId,
+      });
+      // Pick the first eligible profile (orderProfilesForSelection puts
+      // eligibles first, then cooled by soonest-expiry as probes).
+      let selected = list.find((p) => p.profileId === ordered[0]);
+      // If the cooldown filter excluded everyone, fall back to the first
+      // available so the run gets at least one attempt.
+      if (!selected) selected = list[0];
+      if (selected) {
+        out[provider] = { type: "api_key", key: selected.resolvedKey };
+        selectedProfileId = selected.profileId;
+      }
+    } else {
+      const first = list[0];
+      if (first) out[provider] = { type: "api_key", key: first.resolvedKey };
     }
   }
-  return out;
+  return { credentials: out, selectedProfileId };
 }
 
 const ENV_REF_PATTERN = /^\$\{([A-Z_][A-Z0-9_]*)\}$/;
