@@ -74,7 +74,7 @@ test("repairArgumentJson: malformed beyond repair returns null", () => {
   assert.equal(repairArgumentJson(`{"name": broken everywhere`), null);
 });
 
-test("wrapStreamFnWithStopReasonRecovery: rewrites unhandled stop reason event", async () => {
+test("wrapStreamFnWithStopReasonRecovery: rewrites unhandled stop reason event as error", async () => {
   const base = () =>
     arrayToAsyncIterable([
       { type: "delta", text: "hi" },
@@ -95,6 +95,56 @@ test("wrapStreamFnWithStopReasonRecovery: passes through unrelated events", asyn
   const events: unknown[] = [];
   for await (const ev of wrapped() as AsyncIterable<unknown>) events.push(ev);
   assert.equal(events.length, 1);
+});
+
+test("wrapStreamFnWithStopReasonRecovery: pause_turn 'unhandled' is converted to a signal, not an error", async () => {
+  const base = () =>
+    arrayToAsyncIterable([
+      { type: "stop_reason", message: "Unhandled stop reason: pause_turn" },
+    ]);
+  const wrapped = wrapStreamFnWithStopReasonRecovery(base);
+  const events: { type: string }[] = [];
+  for await (const ev of wrapped() as AsyncIterable<{ type: string }>) events.push(ev);
+  // Should NOT be rewritten as error — pause_turn is actionable, not failure.
+  assert.equal(events[0]!.type, "stop_reason_signal");
+});
+
+test("wrapStreamFnWithStopReasonRecovery: max_tokens stop_reason emits both original and signal", async () => {
+  const base = () =>
+    arrayToAsyncIterable([
+      { type: "delta", text: "partial answer" },
+      { type: "message_stop", stop_reason: "max_tokens" },
+    ]);
+  const wrapped = wrapStreamFnWithStopReasonRecovery(base);
+  const events: { type: string }[] = [];
+  for await (const ev of wrapped() as AsyncIterable<{ type: string }>) events.push(ev);
+  // delta, original message_stop, then signal.
+  assert.equal(events.length, 3);
+  assert.equal(events[1]!.type, "message_stop");
+  assert.equal(events[2]!.type, "stop_reason_signal");
+});
+
+test("wrapStreamFnWithStopReasonRecovery: end_turn passes through cleanly", async () => {
+  const base = () =>
+    arrayToAsyncIterable([{ type: "message_stop", stop_reason: "end_turn" }]);
+  const wrapped = wrapStreamFnWithStopReasonRecovery(base);
+  const events: { type: string }[] = [];
+  for await (const ev of wrapped() as AsyncIterable<{ type: string }>) events.push(ev);
+  // No signal — end_turn is benign.
+  assert.equal(events.length, 1);
+  assert.equal(events[0]!.type, "message_stop");
+});
+
+test("wrapStreamFnWithStopReasonRecovery: malformed_response stop_reason is rewritten as error", async () => {
+  const base = () =>
+    arrayToAsyncIterable([{ type: "message_stop", stop_reason: "malformed_response" }]);
+  const wrapped = wrapStreamFnWithStopReasonRecovery(base);
+  const events: { type: string; message?: string }[] = [];
+  for await (const ev of wrapped() as AsyncIterable<{ type: string; message?: string }>) {
+    events.push(ev);
+  }
+  assert.equal(events[0]!.type, "error");
+  assert.match(events[0]!.message!, /malformed_response/);
 });
 
 test("wrapStreamFnWithToolCallRepair: repairs malformed toolcall arguments", async () => {

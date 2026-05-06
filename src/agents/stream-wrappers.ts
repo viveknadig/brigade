@@ -121,13 +121,60 @@ function pickAsyncIterable(value: unknown): AsyncIterable<unknown> | null {
 // ─────────────────────────────────────────────────────────────────────────────
 // Stop-reason recovery.
 //
-// Re-emit any "unhandled stop reason: X" event from the wrapped iterable as
-// a synthetic `{ type: "error", message }` event so downstream classification
-// can treat it like any other transient/permanent failure rather than
-// crashing on an unexpected enum value.
+// Stop reasons fall into three buckets:
+//
+//   1. NORMAL — the response completed cleanly. `end_turn`, `stop_sequence`,
+//      `tool_use`. Pass through untouched.
+//
+//   2. PASS-THROUGH-WITH-METADATA — the response is incomplete in a way the
+//      caller can act on without it being an error: `max_tokens`,
+//      `pause_turn` (Anthropic extended thinking), `refusal` (model
+//      explicitly refused; the refusal content IS the answer). For these
+//      we emit the original `stop_reason` event AND a sibling
+//      `{type:"stop_reason_signal"}` event so downstream code (the agent
+//      loop's after-turn handler) can branch — auto-continue on
+//      `max_tokens`, surface refusal text, etc.
+//
+//   3. ERROR — anything Pi flags as unhandled, plus the actual error stop
+//      reasons (`error`, `malformed_response`). Rewrite to a clean
+//      `{type:"error", message}` event so the classifier can map it to a
+//      retry reason.
+//
+// `pause_turn` is the trickiest. The original Brigade wrapper rewrote ALL
+// "unhandled stop reason: X" events as errors — which would convert a
+// thinking-mode pause into a fake error. The new wrapper passes pause
+// through and lets Pi handle the continuation.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const UNHANDLED_STOP_REASON_RE = /^Unhandled stop reason:\s*(.+)$/i;
+
+// Stop reasons we treat as benign — let them flow without rewriting.
+const BENIGN_STOP_REASONS: ReadonlySet<string> = new Set([
+  "end_turn",
+  "stop_sequence",
+  "tool_use",
+]);
+
+// Stop reasons that need caller awareness but aren't errors. We tag the
+// stream so the agent loop's after-turn handler can react.
+const ACTIONABLE_STOP_REASONS: ReadonlySet<string> = new Set([
+  "max_tokens",
+  "pause_turn",
+  "refusal",
+]);
+
+// Stop reasons that ARE errors. Rewrite as error events.
+const ERROR_STOP_REASONS: ReadonlySet<string> = new Set([
+  "error",
+  "malformed_response",
+  "network_error",
+]);
+
+export interface StopReasonSignal {
+  type: "stop_reason_signal";
+  reason: string;
+  source: "pi" | "wrapper";
+}
 
 export function wrapStreamFnWithStopReasonRecovery<F extends BrigadeStreamFn>(base: F): F {
   const wrapped = (async function* (this: unknown, ...args: unknown[]) {
@@ -139,14 +186,51 @@ export function wrapStreamFnWithStopReasonRecovery<F extends BrigadeStreamFn>(ba
     }
     for await (const ev of iterable) {
       if (ev && typeof ev === "object") {
-        const e = ev as { type?: unknown; message?: unknown };
-        if (typeof e.message === "string") {
-          const m = UNHANDLED_STOP_REASON_RE.exec(e.message);
-          if (m) {
+        const e = ev as { type?: unknown; message?: unknown; stop_reason?: unknown };
+
+        // Path A: Pi already attached `stop_reason` to the event.
+        if (typeof e.stop_reason === "string") {
+          const reason = e.stop_reason.toLowerCase();
+          if (BENIGN_STOP_REASONS.has(reason)) {
+            yield ev;
+            continue;
+          }
+          if (ACTIONABLE_STOP_REASONS.has(reason)) {
+            yield ev; // preserve the original
+            yield { type: "stop_reason_signal", reason, source: "pi" } as StopReasonSignal;
+            continue;
+          }
+          if (ERROR_STOP_REASONS.has(reason)) {
             yield {
               ...e,
               type: "error",
-              message: `provider returned unhandled stop reason: ${m[1] ?? "unknown"}`,
+              message: `provider returned ${reason} stop reason`,
+            };
+            continue;
+          }
+          // Unknown enum value — pass through with an alert so the
+          // caller can decide. We don't crash — Pi may be ahead of us
+          // with a new stop reason from a provider update.
+          yield ev;
+          yield { type: "stop_reason_signal", reason, source: "wrapper" } as StopReasonSignal;
+          continue;
+        }
+
+        // Path B: Pi raised an "Unhandled stop reason: X" string error.
+        if (typeof e.message === "string") {
+          const m = UNHANDLED_STOP_REASON_RE.exec(e.message);
+          if (m) {
+            const reason = (m[1] ?? "unknown").toLowerCase();
+            if (ACTIONABLE_STOP_REASONS.has(reason)) {
+              // Pi flagged it as unhandled but we know how to handle it.
+              // Drop the error rewrite and emit a signal instead.
+              yield { type: "stop_reason_signal", reason, source: "wrapper" } as StopReasonSignal;
+              continue;
+            }
+            yield {
+              ...e,
+              type: "error",
+              message: `provider returned unhandled stop reason: ${reason}`,
             };
             continue;
           }

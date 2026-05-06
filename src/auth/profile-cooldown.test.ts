@@ -17,12 +17,28 @@ function freshState(): ProfileStateFile {
   return { version: 1, usageStats: {} };
 }
 
-test("calculateCooldownMs: tier ladder", () => {
-  assert.equal(calculateCooldownMs(0), 30_000);
-  assert.equal(calculateCooldownMs(1), 30_000);
-  assert.equal(calculateCooldownMs(2), 60_000);
-  assert.equal(calculateCooldownMs(3), 5 * 60_000);
-  assert.equal(calculateCooldownMs(10), 5 * 60_000);
+test("calculateCooldownMs: tier ladder (with ±10% jitter)", () => {
+  // Jitter means we can't assert exact equality. Run each tier ten times
+  // and assert the result is within ±10% of the tier base.
+  function inRange(value: number, base: number): boolean {
+    const tolerance = base * 0.105; // tiny slack for rounding
+    return value >= base - tolerance && value <= base + tolerance;
+  }
+  for (let i = 0; i < 10; i++) {
+    assert.ok(inRange(calculateCooldownMs(0), 30_000), `tier 1 in range`);
+    assert.ok(inRange(calculateCooldownMs(1), 30_000), `tier 1 in range`);
+    assert.ok(inRange(calculateCooldownMs(2), 60_000), `tier 2 in range`);
+    assert.ok(inRange(calculateCooldownMs(3), 5 * 60_000), `tier 3 in range`);
+    assert.ok(inRange(calculateCooldownMs(10), 5 * 60_000), `tier 3+ in range`);
+  }
+});
+
+test("calculateCooldownMs: jitter actually varies the result across calls", () => {
+  // 50 calls at the same tier should produce at least 5 distinct values —
+  // otherwise the jitter function isn't doing its job.
+  const samples = new Set<number>();
+  for (let i = 0; i < 50; i++) samples.add(calculateCooldownMs(1));
+  assert.ok(samples.size >= 5, `expected ≥5 distinct samples, got ${samples.size}`);
 });
 
 test("calculateDisabledMs: auth_permanent base 10m, doubles, capped at 60m", () => {
@@ -73,7 +89,7 @@ test("getCooldownStatus: model-scoped cooldown bypasses for other models", () =>
   assert.equal(otherModel.cooled, false);
 });
 
-test("markProfileFailure: rate_limit sets cooldownUntil for at least 30s", () => {
+test("markProfileFailure: rate_limit sets cooldownUntil for ~30s (with ±10% jitter)", () => {
   const before = Date.now();
   // save:false so we don't actually write to disk in tests
   const next = markProfileFailure({
@@ -85,7 +101,11 @@ test("markProfileFailure: rate_limit sets cooldownUntil for at least 30s", () =>
   });
   const stats = next.usageStats!["anthropic:default"]!;
   assert.equal(stats.cooldownReason, "rate_limit");
-  assert.ok(stats.cooldownUntil! >= before + 30_000);
+  // Tier-1 base is 30s. Jitter is ±10% so cooldown lands in [27s, 33s].
+  // Allow a tiny extra slack for clock skew between `before` and the
+  // internal Date.now() inside markProfileFailure.
+  const elapsed = stats.cooldownUntil! - before;
+  assert.ok(elapsed >= 26_000 && elapsed <= 34_000, `expected ~30s ± jitter, got ${elapsed}ms`);
   assert.equal(stats.errorCount, 1);
 });
 

@@ -114,6 +114,29 @@ export async function runWithModelFallback<T>(
       // Bare aborts surface immediately — never roll past a user cancel.
       if (isAbortError(err)) throw err;
 
+      // Live model switch — caller signalled mid-attempt that the active
+      // turn should rotate to a different (provider, modelId). Splice the
+      // requested candidate to the head of the remaining queue and re-enter
+      // the loop without consuming a probe slot or recording the request
+      // as a "failure". The previous attempt's actual outcome (whatever it
+      // was) is discarded — the user asked for a different model, they
+      // get the result of the new model.
+      if (isLiveSessionModelSwitchError(err)) {
+        log.info("live model switch requested mid-attempt", {
+          from: `${candidate.provider}/${candidate.model}`,
+          to: `${err.nextProvider}/${err.nextModel}`,
+        });
+        const switched: ModelCandidate = {
+          provider: err.nextProvider,
+          model: err.nextModel,
+          isPrimary: false,
+        };
+        // Insert as the next-to-try without disturbing the rest of the
+        // chain. `i` stays put; the for-loop's i++ will land on this.
+        candidates.splice(i + 1, 0, switched);
+        continue;
+      }
+
       const reason = classifyError(err);
       const status = isBrigadeRetryError(err) ? err.status : undefined;
       const errorSummary = summariseError(err);
@@ -178,9 +201,20 @@ export async function runWithModelFallback<T>(
   throw new FallbackExhaustedError(attempts);
 }
 
-// Live-session model switch error. Thrown from the attempt fn when the user
-// asks for a different model mid-run; the outer runner catches this, updates
-// the session entry, and re-enters runWithModelFallback with the new primary.
+// Live-session model switch error.
+//
+// Thrown from inside an `attempt` callback when a different (provider,
+// modelId) should serve the in-flight turn. The resilient runner catches
+// this in `runWithModelFallback` / `runResilient` and rotates to the
+// requested candidate before retrying — no FallbackExhaustedError is
+// raised, no probe-slot is consumed.
+//
+// Today's CLI can't throw this mid-stream because Pi 0.70.x's
+// `session.prompt` doesn't accept an AbortSignal — a `/model X` command
+// at the CLI persists to sessions.json and takes effect on the NEXT
+// turn (see cli/commands/agent.ts). Future channel adapters (gateway
+// WebSocket, IDE bridge, etc.) that DO have a side channel into the
+// agent loop can throw this from a hook to drive a true live switch.
 export class LiveSessionModelSwitchError extends Error {
   readonly nextProvider: string;
   readonly nextModel: string;

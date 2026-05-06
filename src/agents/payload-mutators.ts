@@ -22,6 +22,7 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 
 import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
+import { sanitizeToolUseResultPairing } from "../sessions/transcript-repair.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // History-image prune.
@@ -228,8 +229,20 @@ export interface BrigadeTransformContextOptions {
   pruneOldImages?: boolean;
 }
 
+export interface BrigadeTransformContextHooks {
+  // Notified once per turn if the transcript-pairing repair had to act.
+  // Useful for surfacing "we synthesised N missing tool_result blocks" up
+  // through the loop's logger.
+  onTranscriptRepaired?: (info: {
+    syntheticToolResultsAdded: number;
+    orphanedToolResultsDropped: number;
+    unmatchedToolUseIds: string[];
+  }) => void;
+}
+
 export function buildBrigadeTransformContext(
   options: BrigadeTransformContextOptions = {},
+  hooks: BrigadeTransformContextHooks = {},
 ): (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]> {
   const applyAnthropicSweep = options.applyAnthropicSweep ?? true;
   const pruneOldImages = options.pruneOldImages ?? true;
@@ -239,6 +252,24 @@ export function buildBrigadeTransformContext(
       working = scrubRefusalSentinelInTranscript(working);
     } catch {
       // safe fallback per Pi contract
+    }
+    // Transcript-level pairing repair runs BEFORE image prune and cache
+    // sweep so any synthesised tool_result blocks are themselves swept by
+    // those passes. Critical for power-loss recovery: an orphan tool_use
+    // (valid JSON but no matching tool_result on disk) survives the
+    // file-level repair and would otherwise crash Pi on the next request.
+    try {
+      const repair = sanitizeToolUseResultPairing(working as unknown as { role: string; content?: unknown }[]);
+      if (repair.report.mutated && hooks.onTranscriptRepaired) {
+        hooks.onTranscriptRepaired({
+          syntheticToolResultsAdded: repair.report.syntheticToolResultsAdded,
+          orphanedToolResultsDropped: repair.report.orphanedToolResultsDropped,
+          unmatchedToolUseIds: repair.report.unmatchedToolUseIds,
+        });
+      }
+      working = repair.messages as unknown as AgentMessage[];
+    } catch {
+      // safe fallback
     }
     if (pruneOldImages) {
       try {

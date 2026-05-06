@@ -63,6 +63,13 @@ import { runWithRetry } from "./retry-policy.js";
 import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
 import { buildBrigadeTransformContext } from "./payload-mutators.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
+import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
+import { evaluateCompactionDecision } from "./smart-compaction.js";
+import {
+  runWithModelFallback,
+  type ModelCandidate,
+  type FallbackAttempt,
+} from "./model-fallback.js";
 import {
   clearExpiredCooldowns,
   loadProfileState,
@@ -123,6 +130,13 @@ export interface RunSingleTurnResult {
   isNewSession: boolean;
   reply: string;
   messages: unknown[];
+  // Filled when this turn was actually served by a fallback candidate
+  // (resilient-turn path) — left undefined for the primary-only path.
+  servedBy?: { provider: string; modelId: string };
+  // Fallback attempts the resilient runner walked through before this
+  // result, including the primary if it failed. Empty when the primary
+  // succeeded on first try.
+  fallbackAttempts?: Array<{ provider: string; modelId: string; reason: string; error: string }>;
 }
 
 export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleTurnResult> {
@@ -185,22 +199,77 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
     );
   }
 
-  // Repair any malformed JSONL lines in the transcript before Pi opens it.
-  // A power-loss / SIGKILL during a previous append can leave a partial
-  // last line that throws on JSON.parse — without this pass the next run
-  // would crash on session open with no obvious cause. The repair is
-  // idempotent + atomic (writes a `.bak-<pid>-<ts>` snapshot first), so a
-  // failed repair leaves the original file intact.
-  const repairReport = await repairSessionFileIfNeeded({
+  // Cross-process lock to prevent two `brigade agent` runs from interleaving
+  // appends to the same JSONL. The lock is PID-tagged with a 10-min stale
+  // window, so a crashed peer doesn't block us forever; the timeout below
+  // surfaces an honest error if a real peer is genuinely active.
+  const sessionLock = await acquireSessionWriteLock({
     sessionFile: resolved.transcriptPath,
+    signal: args.signal,
+    timeoutMs: 30_000,
   });
-  if (repairReport.repaired) {
-    log.warn("session file repaired before open", {
-      sessionId: resolved.sessionId,
-      droppedLines: repairReport.droppedLines,
-      backupPath: repairReport.backupPath,
+
+  let result: RunSingleTurnResult;
+  try {
+    // Repair any malformed JSONL lines in the transcript before Pi opens it.
+    // A power-loss / SIGKILL during a previous append can leave a partial
+    // last line that throws on JSON.parse — without this pass the next run
+    // would crash on session open with no obvious cause. The repair is
+    // idempotent + atomic (writes a `.bak-<pid>-<ts>` snapshot first), so a
+    // failed repair leaves the original file intact.
+    const repairReport = await repairSessionFileIfNeeded({
+      sessionFile: resolved.transcriptPath,
     });
+    if (repairReport.repaired) {
+      log.warn("session file repaired before open", {
+        sessionId: resolved.sessionId,
+        droppedLines: repairReport.droppedLines,
+        backupPath: repairReport.backupPath,
+      });
+    }
+
+    result = await runSingleTurnLocked({
+      args,
+      agentId,
+      agentDir,
+      cwd,
+      workspaceDir,
+      modelsFile,
+      authProfilesPath,
+      resolved,
+      cooldownState,
+      authStorage,
+      modelRegistry,
+      selectedProfileId,
+      model,
+    });
+  } finally {
+    await sessionLock.release();
   }
+
+  return result;
+}
+
+interface RunSingleTurnLockedArgs {
+  args: RunSingleTurnArgs;
+  agentId: string;
+  agentDir: string;
+  cwd: string;
+  workspaceDir: string;
+  modelsFile: string;
+  authProfilesPath: string;
+  resolved: ReturnType<typeof resolveOrCreateSession>;
+  cooldownState: import("../auth/profile-cooldown.js").ProfileStateFile;
+  authStorage: unknown;
+  modelRegistry: unknown;
+  selectedProfileId: string | undefined;
+  model: unknown;
+}
+
+async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingleTurnResult> {
+  const { args, agentId, agentDir, cwd, workspaceDir, resolved, model, authStorage, modelRegistry } = p;
+  let cooldownState = p.cooldownState;
+  const selectedProfileId = p.selectedProfileId;
 
   // SessionManager.open creates the JSONL on first write; passing the
   // canonical transcript path keeps Pi and brigade aligned on filenames.
@@ -211,9 +280,21 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   // unconditionally — it's a safe no-op for non-Anthropic providers because
   // their messages don't carry cache_control blocks. The scrubber pass
   // (refusal sentinel) always runs.
-  const transformContext = buildBrigadeTransformContext({
-    applyAnthropicSweep: args.provider === "anthropic" || args.provider.startsWith("anthropic"),
-  });
+  const transformContext = buildBrigadeTransformContext(
+    {
+      applyAnthropicSweep:
+        args.provider === "anthropic" || args.provider.startsWith("anthropic"),
+    },
+    {
+      onTranscriptRepaired: (info) => {
+        log.warn("transcript paired-repair fired", {
+          sessionId: resolved.sessionId,
+          syntheticAdded: info.syntheticToolResultsAdded,
+          orphansDropped: info.orphanedToolResultsDropped,
+        });
+      },
+    },
+  );
 
   const { session } = await createAgentSession({
     cwd,
@@ -332,6 +413,18 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
     bootstrapPhase: effectivePhase,
   });
 
+  // Pre-emptive compaction. When estimated context usage crosses the
+  // 85% threshold, ask Pi to compact NOW rather than rolling into the
+  // turn and discovering mid-flight that we've blown the window. The
+  // estimator is rough (chars/4) but conservative — better to compact
+  // a turn early than fail mid-stream.
+  await maybeTriggerCompaction({
+    session: session as AgentSession,
+    model: model as { contextWindow?: number } | unknown,
+    agentId,
+    sessionId: resolved.sessionId,
+  });
+
   await runWithRetry({
     ctx: { provider: args.provider, model: args.modelId },
     signal: args.signal,
@@ -371,6 +464,43 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
       await waitForStreamSettled(session as AgentSession);
     },
   });
+
+  // max_tokens auto-continuation. If the model hit its output cap rather
+  // than ending naturally, drive a follow-up turn that asks it to continue
+  // the previous response. Bounded to 3 continuations per user message so
+  // a runaway response can't spin forever; each continuation runs through
+  // the same retry loop so transient failures during continuation are
+  // handled identically.
+  let continuations = 0;
+  const MAX_CONTINUATIONS = 3;
+  while (
+    continuations < MAX_CONTINUATIONS &&
+    detectMaxTokensStop(session as AgentSession)
+  ) {
+    continuations++;
+    log.info("max_tokens stop detected — auto-continuing", {
+      agentId,
+      sessionId: resolved.sessionId,
+      continuationIndex: continuations,
+    });
+    await runWithRetry({
+      ctx: { provider: args.provider, model: args.modelId },
+      signal: args.signal,
+      attempt: async () => {
+        await (session as AgentSession).prompt(
+          "Please continue your previous response from where you left off. Don't repeat what you've already said.",
+        );
+        await waitForStreamSettled(session as AgentSession);
+      },
+    });
+  }
+  if (continuations >= MAX_CONTINUATIONS && detectMaxTokensStop(session as AgentSession)) {
+    log.warn("max_tokens continuation limit reached", {
+      agentId,
+      sessionId: resolved.sessionId,
+      attempted: continuations,
+    });
+  }
 
   // Successful turn — clear any prior failure state on the profile so the
   // next run prefers it again under the round-robin order.
@@ -682,4 +812,205 @@ function flattenAssistantContent(content: unknown): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Resilient turn — runSingleTurn with multi-model fallback.
+//
+// Public path callers (gateway, future TUI streaming layer) opt into this
+// when they have a configured fallback chain. If the primary candidate
+// fails for any non-format / non-session_expired reason, the next candidate
+// is tried with a fresh session+auth set. Same-model retries still happen
+// inside runSingleTurn's runWithRetry; this layer rotates ACROSS models.
+//
+// The CLI's `brigade agent` command keeps using runSingleTurn directly
+// because most users don't have multiple-model setups. Callers that want
+// fallback declare it explicitly via this entry.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface RunResilientTurnArgs extends RunSingleTurnArgs {
+  // Ordered fallback candidates. If the primary fails non-fatally, each
+  // is tried in turn. Empty array → behaves identically to runSingleTurn.
+  fallbacks?: Array<{ provider: string; modelId: string }>;
+}
+
+export async function runResilientTurn(args: RunResilientTurnArgs): Promise<RunSingleTurnResult> {
+  const fallbacks = args.fallbacks ?? [];
+  if (fallbacks.length === 0) {
+    return runSingleTurn(args);
+  }
+
+  // Lift the run inside runWithModelFallback's `attempt` callback. Each
+  // candidate gets its own runSingleTurn invocation — fresh session, fresh
+  // credential map, fresh stream wrappers. The cost is one extra session
+  // open per failed candidate, which is fine since fallbacks are rare.
+  const fallbackResult = await runWithModelFallback({
+    primary: { provider: args.provider, model: args.modelId, isPrimary: true },
+    fallbacks: fallbacks.map((f) => ({
+      provider: f.provider,
+      model: f.modelId,
+      isPrimary: false,
+    })),
+    signal: args.signal,
+    attempt: async (candidate: ModelCandidate, signal?: AbortSignal) => {
+      const r = await runSingleTurn({
+        ...args,
+        provider: candidate.provider,
+        modelId: candidate.model,
+        signal,
+      });
+      return r;
+    },
+  });
+
+  return {
+    ...fallbackResult.result,
+    servedBy: {
+      provider: fallbackResult.candidate.provider,
+      modelId: fallbackResult.candidate.model,
+    },
+    fallbackAttempts: fallbackResult.attempts.map((a: FallbackAttempt) => ({
+      provider: a.provider,
+      modelId: a.model,
+      reason: a.reason,
+      error: a.errorSummary,
+    })),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Compaction trigger.
+//
+// Estimate whether context usage has crossed the 85% trigger threshold and,
+// if so, ask Pi to compact NOW rather than discovering mid-turn that we've
+// blown the window. The estimator walks the session messages and divides
+// total stringified char-count by 4 (rough chars-per-token across modern
+// tokenizers). Imprecise but conservative — over-compacting is cheaper
+// than running out of context.
+//
+// Pi's auto-compaction handles the actual fallback if the request exceeds
+// the window despite this pre-emptive check; this module's value is in
+// avoiding the "we're streaming and it failed" failure mode by compacting
+// at a calm boundary instead.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const APPROX_CHARS_PER_TOKEN = 4;
+
+async function maybeTriggerCompaction(args: {
+  session: AgentSession;
+  model: { contextWindow?: number } | unknown;
+  agentId: string;
+  sessionId: string;
+}): Promise<void> {
+  const contextWindow = (args.model as { contextWindow?: number })?.contextWindow;
+  if (!contextWindow || !Number.isFinite(contextWindow) || contextWindow <= 0) {
+    // No context window metadata — skip; Pi's auto-compaction is the
+    // fallback if usage actually overflows.
+    return;
+  }
+  const estimatedTokens = estimateUsageTokens(args.session.messages);
+  const decision = evaluateCompactionDecision({
+    contextWindowTokens: contextWindow,
+    estimatedUsageTokens: estimatedTokens,
+  });
+  if (!decision.shouldRecommendCompaction) {
+    log.debug("compaction not needed", {
+      agentId: args.agentId,
+      sessionId: args.sessionId,
+      estimatedTokens,
+      contextWindow,
+      reason: decision.reason,
+    });
+    return;
+  }
+  log.info("triggering pre-emptive compaction", {
+    agentId: args.agentId,
+    sessionId: args.sessionId,
+    estimatedTokens,
+    contextWindow,
+    promptBudgetTokens: decision.promptBudgetTokens,
+    reason: decision.reason,
+  });
+  try {
+    const compactor = (args.session as AgentSession & {
+      compact?: (instructions?: string) => Promise<unknown>;
+    }).compact;
+    if (typeof compactor !== "function") {
+      log.warn("session has no compact() method — skipping", {
+        sessionId: args.sessionId,
+      });
+      return;
+    }
+    await compactor.call(args.session);
+    log.info("pre-emptive compaction completed", {
+      agentId: args.agentId,
+      sessionId: args.sessionId,
+    });
+  } catch (err) {
+    // Compaction failure isn't fatal — Pi's auto-compaction gets a chance
+    // to run during the prompt, and worst case the request fails with a
+    // context-window error that the retry policy classifies as transient.
+    log.warn("pre-emptive compaction failed; proceeding anyway", {
+      agentId: args.agentId,
+      sessionId: args.sessionId,
+      error: (err as Error).message,
+    });
+  }
+}
+
+function estimateUsageTokens(messages: unknown[]): number {
+  if (!Array.isArray(messages)) return 0;
+  let chars = 0;
+  for (const m of messages) {
+    if (!m) continue;
+    chars += approxMessageChars(m);
+  }
+  return Math.ceil(chars / APPROX_CHARS_PER_TOKEN);
+}
+
+// Detect whether the most-recent assistant message ended on a max_tokens
+// stop reason. We check both the assistant message's `stopReason` field
+// (Pi's normalised key) and the raw `stop_reason` (provider passthrough)
+// because not all Pi minors normalise consistently.
+function detectMaxTokensStop(session: AgentSession): boolean {
+  const messages = session.messages as unknown as Array<{
+    role?: string;
+    stopReason?: string;
+    stop_reason?: string;
+  }>;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m.role !== "assistant") continue;
+    const reason = (m.stopReason ?? m.stop_reason ?? "").toLowerCase();
+    return reason === "max_tokens";
+  }
+  return false;
+}
+
+function approxMessageChars(message: unknown): number {
+  if (typeof message === "string") return message.length;
+  if (!message || typeof message !== "object") return 0;
+  const m = message as { content?: unknown };
+  const content = m.content;
+  if (typeof content === "string") return content.length;
+  if (!Array.isArray(content)) return 0;
+  let total = 0;
+  for (const block of content) {
+    if (typeof block === "string") {
+      total += block.length;
+      continue;
+    }
+    if (!block || typeof block !== "object") continue;
+    const b = block as { text?: unknown; content?: unknown; input?: unknown };
+    if (typeof b.text === "string") total += b.text.length;
+    if (typeof b.content === "string") total += b.content.length;
+    if (b.input !== undefined) {
+      try {
+        total += JSON.stringify(b.input).length;
+      } catch {
+        // ignore unserialisable
+      }
+    }
+  }
+  return total;
 }

@@ -85,11 +85,22 @@ const DISABLED_REASONS: ReadonlySet<RetryReason> = new Set<RetryReason>([
   "auth_permanent",
 ]);
 
+// Per-key jitter (±10% of the base, uniform) so N profiles that hit a
+// quota cap in the same second don't all expire their cooldowns at exactly
+// the same future second and stampede the provider again. Without this, 5
+// keys behind a single quota retry-storm on every cooldown boundary.
+const COOLDOWN_JITTER_RATIO = 0.20; // 20% range = ±10% from base
+
 export function calculateCooldownMs(errorCount: number): number {
   const n = Math.max(1, errorCount);
-  if (n <= 1) return COOLDOWN_MS_TIER_1;
-  if (n <= 2) return COOLDOWN_MS_TIER_2;
-  return COOLDOWN_MS_TIER_MAX;
+  let base: number;
+  if (n <= 1) base = COOLDOWN_MS_TIER_1;
+  else if (n <= 2) base = COOLDOWN_MS_TIER_2;
+  else base = COOLDOWN_MS_TIER_MAX;
+  // (random - 0.5) * 0.20 → uniform on [-0.10, +0.10) of base. Floor the
+  // multiplied milliseconds so we don't return fractional ms.
+  const jitter = Math.floor((Math.random() - 0.5) * base * COOLDOWN_JITTER_RATIO);
+  return base + jitter;
 }
 
 export function calculateDisabledMs(reason: RetryReason, errorCount: number): number {

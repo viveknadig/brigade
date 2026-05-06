@@ -158,3 +158,30 @@ test("isLiveSessionModelSwitchError: positive + negatives", () => {
   assert.equal(isLiveSessionModelSwitchError(null), false);
   assert.equal(isLiveSessionModelSwitchError({ name: "LiveSessionModelSwitchError" }), true);
 });
+
+test("runWithModelFallback: LiveSessionModelSwitchError rotates to the requested model and runs it", async () => {
+  let calls = 0;
+  const seen: string[] = [];
+  const result = await runWithModelFallback({
+    primary: { provider: "anthropic", model: "opus", isPrimary: true },
+    fallbacks: [{ provider: "openai", model: "gpt-4", isPrimary: false }],
+    attempt: async (candidate) => {
+      calls++;
+      seen.push(`${candidate.provider}/${candidate.model}`);
+      if (calls === 1) {
+        // First attempt — caller asks to switch to a brand new model that
+        // wasn't in the original chain.
+        throw new LiveSessionModelSwitchError({
+          provider: "google",
+          model: "gemini-2.5-pro",
+        });
+      }
+      return `served-by-${candidate.provider}/${candidate.model}`;
+    },
+  });
+  assert.equal(result.result, "served-by-google/gemini-2.5-pro");
+  assert.deepEqual(seen, ["anthropic/opus", "google/gemini-2.5-pro"]);
+  // The switch should NOT have been recorded as a failed attempt.
+  assert.equal(result.attempts.length, 0);
+});
+

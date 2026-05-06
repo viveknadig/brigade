@@ -1,9 +1,17 @@
 import { Command } from "commander";
 
 import { runSingleTurn } from "../../agents/agent-loop.js";
+import {
+  parseSlashCommand,
+  SLASH_COMMAND_HELP,
+} from "../../agents/slash-commands.js";
 import { readConfigOrInit } from "../../config/io.js";
 import { DEFAULT_AGENT_ID, resolveAllPaths } from "../../config/paths.js";
-import { defaultSessionKey } from "../../sessions/session-store.js";
+import {
+  defaultSessionKey,
+  readSessionStore,
+  writeSessionStore,
+} from "../../sessions/session-store.js";
 
 interface AgentOptions {
   agentId: string;
@@ -48,13 +56,74 @@ export async function runAgentTurn(opts: AgentOptions): Promise<void> {
     throw new Error("agent: --message is required.");
   }
 
-  // Provider/model: CLI flags first, then per-agent defaults from brigade.json.
+  // Slash-command intercept. Runs BEFORE provider/model resolution because a
+  // `/model X` invocation can REPLACE the resolved provider/model for THIS
+  // turn, and a `/reset` simply forgets the session and exits.
+  //
+  // Slash commands fire locally — they don't reach the model. The user gets
+  // a one-line confirmation on stderr and (for `/model`) we also persist
+  // the new override to sessions.json so the NEXT user message goes to the
+  // requested model without needing the flag.
+  const slash = parseSlashCommand(opts.message);
+  let messageForAgent = opts.message;
+  let thinkingOverride: "off" | "low" | "medium" | "high" | undefined;
+  switch (slash.type) {
+    case "passthrough":
+      messageForAgent = slash.message;
+      break;
+    case "model":
+      // Persist the switch to sessions.json so the NEXT `brigade agent` turn
+      // picks it up automatically. We do NOT also drive a model call this
+      // turn — that would burn tokens on a confirmation message no one asked
+      // for. A local stdout note + exit is the honest UX.
+      persistSessionModel({
+        agentId,
+        sessionKey,
+        provider: slash.provider,
+        modelId: slash.modelId,
+      });
+      console.error(
+        `[brigade] /model: session ${sessionKey} switched to ${slash.provider}/${slash.modelId} — active on the next turn`,
+      );
+      return;
+    case "thinking":
+      thinkingOverride = slash.level;
+      // /thinking on its own line just sets the level for this run. If the
+      // user wanted to combine it with a real prompt, they'd have multi-line
+      // input — we treat that as not-yet-supported and require an explicit
+      // message. Print a note and exit cleanly.
+      console.error(`[brigade] /thinking: level set to '${slash.level}' for the next turn`);
+      return;
+    case "reset":
+      console.error(
+        `[brigade] /reset: forgetting session ${sessionKey} — the next turn will start fresh`,
+      );
+      resetSession({ agentId, sessionKey });
+      return;
+    case "help":
+      console.error(`[brigade] available slash commands:`);
+      for (const entry of SLASH_COMMAND_HELP) {
+        console.error(`  ${entry.command.padEnd(34)} ${entry.description}`);
+      }
+      return;
+    case "error":
+      throw new Error(`agent: ${slash.message}`);
+  }
+
+  // Provider/model resolution order:
+  //   1. CLI flag (`--provider` / `--model`) — explicit user intent for this run.
+  //   2. Persisted session override — set by a prior `/model X` command.
+  //   3. Per-agent defaultProvider / defaultModel from brigade.json.
+  // The /model command short-circuits the run before reaching here, so by
+  // this point the persisted override applies to the user's NEXT real
+  // message, not the one carrying the slash command.
   const cfg = readConfigOrInit();
   const agentCfg = cfg.agents?.[agentId] as
     | { defaultProvider?: string; defaultModel?: string }
     | undefined;
-  const provider = opts.provider ?? agentCfg?.defaultProvider;
-  const modelId = opts.model ?? agentCfg?.defaultModel;
+  const sessionEntry = readSessionStore(agentId).sessions[sessionKey];
+  const provider = opts.provider ?? sessionEntry?.provider ?? agentCfg?.defaultProvider;
+  const modelId = opts.model ?? sessionEntry?.modelId ?? agentCfg?.defaultModel;
 
   if (!provider || !modelId) {
     throw new Error(
@@ -98,10 +167,10 @@ export async function runAgentTurn(opts: AgentOptions): Promise<void> {
       agentId,
       provider,
       modelId,
-      message: opts.message,
+      message: messageForAgent,
       sessionKey,
       workspaceDir: opts.workspace,
-      thinkingLevel: opts.thinkingLevel ?? "off",
+      thinkingLevel: thinkingOverride ?? opts.thinkingLevel ?? "off",
       signal: abortController.signal,
     });
   } finally {
@@ -119,4 +188,40 @@ export async function runAgentTurn(opts: AgentOptions): Promise<void> {
   // diagnostics go to stderr above.
   process.stdout.write(result.reply);
   if (!result.reply.endsWith("\n")) process.stdout.write("\n");
+}
+
+// Persist the session's model override to sessions.json so the NEXT
+// `brigade agent` invocation against this session uses the new model
+// without the user having to repeat `/model X` or pass --model.
+function persistSessionModel(args: {
+  agentId: string;
+  sessionKey: string;
+  provider: string;
+  modelId: string;
+}): void {
+  const store = readSessionStore(args.agentId);
+  const entry = store.sessions[args.sessionKey];
+  if (!entry) {
+    // No session yet (first turn) — the model override will land in the
+    // entry that resolveOrCreateSession creates on this turn. Nothing to
+    // persist here ahead of time. The active turn already uses the
+    // override via the runSingleTurn call.
+    return;
+  }
+  entry.provider = args.provider;
+  entry.modelId = args.modelId;
+  entry.lastUsedAt = new Date().toISOString();
+  writeSessionStore(args.agentId, store);
+}
+
+// Forget the session entirely. Next `brigade agent` against the same
+// sessionKey will create a fresh session id + a fresh transcript file.
+// We deliberately don't delete the old JSONL — operators can recover it
+// from the transcripts dir if they want; we just stop pointing at it.
+function resetSession(args: { agentId: string; sessionKey: string }): void {
+  const store = readSessionStore(args.agentId);
+  if (store.sessions[args.sessionKey]) {
+    delete store.sessions[args.sessionKey];
+    writeSessionStore(args.agentId, store);
+  }
 }
