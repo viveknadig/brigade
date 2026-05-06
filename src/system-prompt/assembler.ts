@@ -48,14 +48,17 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   const lines: string[] = [];
 
   // Identity opener — kept short so it doesn't dominate the cached prefix.
-  // Stay domain-neutral here: the user's IDENTITY.md / SOUL.md / AGENTS.md
-  // files in `# Project Context` (below) are where role and scope are
-  // declared. Pinning a domain here ("engineering work") would override
-  // the user's own framing on every turn.
+  // Lead with "Brigade assistant" as the role identifier so the model picks
+  // it up as the primary noun phrase when introducing itself. The user's
+  // IDENTITY.md / SOUL.md / AGENTS.md files in `# Project Context` (below)
+  // can override or refine this — that's where domain, name, voice, and
+  // behavioural rules live. Domain-neutral here on purpose: pinning a
+  // role like "engineering work" at the system level would shadow the
+  // user's own framing on every turn.
   lines.push(
-    "You are a personal assistant running inside the user's Brigade crew. " +
-      "Defer to the workspace persona files below for who you are, what " +
-      "you care about, and how you should respond.",
+    "You are the user's Brigade assistant — a personal AI inside their " +
+      "Brigade crew. Defer to the workspace persona files below for your " +
+      "specific identity, values, and behavioural rules.",
   );
   lines.push("");
 

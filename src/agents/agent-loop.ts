@@ -54,6 +54,10 @@ import {
   markSetupCompleted,
   type BootstrapPhase,
 } from "../workspace/state.js";
+import {
+  hasDeliveredBootstrapToSession,
+  markBootstrapDeliveredToSession,
+} from "../sessions/bootstrap-marker.js";
 
 export interface RunSingleTurnArgs {
   agentId: string;
@@ -150,12 +154,29 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
     throw new Error("Pi createAgentSession returned no session.");
   }
 
-  // Detect lifecycle phase BEFORE the turn. If BOOTSTRAP.md is present
-  // and we haven't completed setup, the assembler injects a one-shot
-  // first-run guidance block on top of the persona — the agent reads
-  // BOOTSTRAP.md, follows its instructions (introduce itself, ask what
-  // to call the user), and is expected to delete BOOTSTRAP.md when done.
+  // Detect lifecycle phase BEFORE the turn. Two layers stack here:
+  //   1. Workspace-level phase from workspace-state.json. Scopes to
+  //      "has this workspace been onboarded? has BOOTSTRAP.md been
+  //      consumed?" Persists across sessions.
+  //   2. Per-session bootstrap-delivery marker in the JSONL transcript.
+  //      Scopes to "has the full bootstrap context already been
+  //      delivered to *this* session, and not invalidated by a
+  //      compaction since?" Lets sub-agent forks and post-compaction
+  //      recovery emit the first-turn nudge again when needed, while
+  //      the workspace has long since completed setup.
   const phaseBefore = await evaluateBootstrapPhase(workspaceDir);
+  const sessionAlreadyHasBootstrap = await hasDeliveredBootstrapToSession(
+    resolved.transcriptPath,
+  );
+  // The assembler should only emit the synthetic first-turn nudge when
+  // BOTH conditions hold: workspace says first-turn AND this session
+  // hasn't received the bootstrap context yet. This is what stops the
+  // nudge from re-firing on every continuing-session turn just because
+  // BOOTSTRAP.md still happens to be on disk.
+  const effectivePhase: BootstrapPhase =
+    phaseBefore === "first-turn" && sessionAlreadyHasBootstrap
+      ? "in-progress"
+      : phaseBefore;
 
   // Pin the assembled persona before the first turn. Done after
   // createAgentSession (which has already set up Pi's stock prompt) but
@@ -168,7 +189,7 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
     cwd,
     modelLabel: `${args.provider}/${args.modelId}`,
     thinkingLevel: args.thinkingLevel ?? "off",
-    bootstrapPhase: phaseBefore,
+    bootstrapPhase: effectivePhase,
   });
   if (personaPrompt) {
     applyPersonaOverrideToSession(session as AgentSession, personaPrompt);
@@ -190,12 +211,22 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
 
   const reply = extractLastAssistantText(session as AgentSession);
 
-  // After-turn lifecycle: stamp setupCompletedAt the first time we observe
-  // BOOTSTRAP.md is gone after seeding. The check fires on EVERY turn (not
-  // just on a within-turn first-turn → complete transition) because
-  // BOOTSTRAP.md can be deleted out of band — by the user from another
-  // shell, or by the previous turn's reply. markSetupCompleted is
-  // idempotent so re-running doesn't re-stamp.
+  // After-turn lifecycle:
+  //
+  // 1. If we just delivered the full bootstrap context to this session
+  //    (workspace was first-turn AND session hadn't received it before),
+  //    emit the per-session marker into the JSONL transcript. Subsequent
+  //    turns short-circuit the nudge because the model already has the
+  //    context cached.
+  if (phaseBefore === "first-turn" && !sessionAlreadyHasBootstrap) {
+    markBootstrapDeliveredToSession(sessionManager);
+  }
+
+  // 2. Stamp setupCompletedAt the first time we observe BOOTSTRAP.md is
+  //    gone after seeding. The check fires on EVERY turn (not just on a
+  //    within-turn first-turn → complete transition) because BOOTSTRAP.md
+  //    can be deleted out of band — by the user from another shell, or
+  //    by the previous turn's reply. markSetupCompleted is idempotent.
   const phaseAfter = await evaluateBootstrapPhase(workspaceDir);
   if (phaseAfter === "complete") {
     await markSetupCompleted(workspaceDir);
