@@ -1,0 +1,49 @@
+{
+  "name": "brigade",
+  "version": "0.1.0",
+  "description": "Brigade — AI crew framework",
+  "type": "module",
+  "bin": {
+    "brigade": "./brigade.mjs"
+  },
+  "files": [
+    "brigade.mjs",
+    "dist/**/*",
+    "templates/**/*",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:watch": "tsc -p tsconfig.json --watch",
+    "brigade": "node brigade.mjs",
+    "dev": "tsx src/entry.ts",
+    "clean": "node -e \"import('node:fs').then(fs => fs.rmSync('dist', { recursive: true, force: true }))\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test src/**/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "^0.70.6",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "json5": "^2.2.3",
+    "prompts": "^2.4.2",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/prompts": "^2.4.9",
+    "tsx": "^4.20.0",
+    "typescript": "^5.6.3"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "cli",
+    "brigade"
+  ],
+  "license": "MIT"
+}
