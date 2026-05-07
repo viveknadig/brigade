@@ -8,44 +8,77 @@
 // COMPOSE on top — wrap the auth-aware streamFn so the auth wrapper still
 // sits at the bottom of the call stack.
 //
+// Critical shape constraint:
+//
+//   Pi's agent-loop calls `await streamFunction(model, ctx, opts)` and
+//   then does BOTH `for await (const ev of response)` (event iteration)
+//   AND `await response.result()` (final assistant message). The base
+//   streamFn returns pi-ai's `EventStream`, which exposes both surfaces.
+//
+//   Earlier versions of these wrappers used `async function*` and
+//   produced an `AsyncGenerator` instead — which is iterable but has no
+//   `.result()` method. Pi's call to `response.result()` would silently
+//   fail and the whole turn would settle with an empty `session.messages`,
+//   producing no reply and no JSONL transcript. The fix below preserves
+//   the EventStream shape by returning a proxy object that DELEGATES
+//   `.result()` to the base stream and iterates via our own intercepted
+//   iterator.
+//
 // This module ships three composable wrappers:
 //
 //   • wrapStreamFnWithIdleTimeout — bound the time we'll wait for a
-//     streaming response without progress. A hung provider (TCP open, no
-//     bytes coming) would otherwise tie up the run forever.
+//     streaming response without progress.
 //
-//   • wrapStreamFnWithStopReasonRecovery — when a provider returns an
-//     "unhandled stop reason" (some proxies emit unexpected values), remap
-//     to a clean `error` stop with a normalised message so downstream
-//     classification + retry can see a real reason.
+//   • wrapStreamFnWithStopReasonRecovery — re-bucket stop-reason events
+//     into BENIGN / ACTIONABLE / ERROR per the taxonomy below.
 //
 //   • wrapStreamFnWithToolCallRepair — best-effort cleanup of malformed
-//     tool-call argument JSON (truncated, HTML-entity encoded, leading or
-//     trailing garbage). Same pattern several proxy providers use.
-//
-// Pi's Agent.streamFn signature isn't exported as a public type, so we
-// preserve it via `typeof session.agent.streamFn` at the call site. The
-// wrappers here are typed against an opaque `BrigadeStreamFn` and expect
-// the caller to thread Pi's actual function in/out.
+//     tool-call argument JSON.
 
 export type BrigadeStreamFn = (...args: unknown[]) => unknown;
+
+// Pi's EventStream has at minimum these two surfaces. We don't import the
+// type because the wrappers must work against any future Pi shape that
+// preserves both — duck typing keeps us unwedged when Pi's internals
+// evolve.
+interface EventStreamLike {
+  [Symbol.asyncIterator](): AsyncIterator<unknown>;
+  result(): Promise<unknown>;
+}
+
+function isEventStreamLike(value: unknown): value is EventStreamLike {
+  if (!value || (typeof value !== "object" && typeof value !== "function")) {
+    return false;
+  }
+  const v = value as { [Symbol.asyncIterator]?: unknown; result?: unknown };
+  return typeof v[Symbol.asyncIterator] === "function" && typeof v.result === "function";
+}
+
+// Build a proxy that exposes the SAME surface as the inner stream
+// (`[Symbol.asyncIterator]` + `result()` + any other own enumerable
+// properties), but routes iteration through `iteratorFactory`. Used by
+// every wrapper below — keeps the consumer-visible shape intact while
+// letting us intercept events.
+function makeStreamProxy<S extends EventStreamLike>(
+  inner: S,
+  iteratorFactory: (inner: S) => AsyncIterator<unknown>,
+): EventStreamLike {
+  return {
+    [Symbol.asyncIterator]: () => iteratorFactory(inner),
+    result: () => inner.result(),
+  };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Idle-timeout wrapper.
 //
-// The base streamFn returns either:
-//   • a Promise that resolves with `{ result, stream }` where `stream` is
-//     an async iterable of events; or
-//   • an async iterable directly.
-//
-// In either case we race a timer against the iterator's `next()`. If the
-// timer wins, we signal cancel (via the abort signal we forward) and throw
-// a TimeoutError that the classifier maps to `timeout`.
+// Race each `iterator.next()` call against a timer; if the timer wins, throw
+// `BrigadeIdleTimeoutError` (whose `name` is "TimeoutError" so the
+// classifier maps it to the timeout retry-policy bucket).
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface IdleTimeoutOptions {
   timeoutMs: number;
-  // Optional observation hook fired when the timer trips.
   onIdleTimeout?: (elapsedMs: number) => void;
 }
 
@@ -66,56 +99,36 @@ export function wrapStreamFnWithIdleTimeout<F extends BrigadeStreamFn>(
     // Timeout disabled — return base unchanged.
     return base;
   }
-  const wrapped = (async function* (this: unknown, ...args: unknown[]) {
-    const result = await Promise.resolve(base.apply(this, args));
-    const iterable = pickAsyncIterable(result);
-    if (!iterable) {
-      // Result wasn't an iterable; pass through. Most provider stream
-      // functions return one, but the wrapper is conservative.
-      yield result;
-      return;
-    }
-    const startedAt = Date.now();
-    const iterator = iterable[Symbol.asyncIterator]();
-
-    while (true) {
-      const next = iterator.next();
-      const timer = new Promise<never>((_, reject) => {
-        const t = setTimeout(() => {
-          options.onIdleTimeout?.(Date.now() - startedAt);
-          reject(new BrigadeIdleTimeoutError(options.timeoutMs));
-        }, options.timeoutMs);
-        // Don't let an unfinished timer keep the process alive.
-        if (typeof (t as { unref?: () => void }).unref === "function") {
-          (t as { unref: () => void }).unref();
-        }
-        next.finally(() => clearTimeout(t));
-      });
-      const step = (await Promise.race([next, timer])) as IteratorResult<unknown>;
-      if (step.done) return;
-      yield step.value;
-    }
+  const wrapped = (async function (this: unknown, ...args: unknown[]) {
+    const stream = await Promise.resolve(base.apply(this, args));
+    if (!isEventStreamLike(stream)) return stream;
+    return makeStreamProxy(stream, (inner) => idleTimeoutIterator(inner, options));
   }) as unknown as F;
   return wrapped;
 }
 
-function pickAsyncIterable(value: unknown): AsyncIterable<unknown> | null {
-  if (!value) return null;
-  if (typeof value !== "object" && typeof value !== "function") return null;
-  const iterable = (value as { [Symbol.asyncIterator]?: () => AsyncIterator<unknown> })[
-    Symbol.asyncIterator
-  ];
-  if (typeof iterable === "function") return value as AsyncIterable<unknown>;
-  // Some streamFns return `{ result, stream: AsyncIterable }`; surface the
-  // stream when present.
-  const inner = (value as { stream?: unknown }).stream;
-  if (inner && typeof inner === "object") {
-    const innerIter = (inner as { [Symbol.asyncIterator]?: () => AsyncIterator<unknown> })[
-      Symbol.asyncIterator
-    ];
-    if (typeof innerIter === "function") return inner as AsyncIterable<unknown>;
+async function* idleTimeoutIterator(
+  inner: EventStreamLike,
+  options: IdleTimeoutOptions,
+): AsyncGenerator<unknown> {
+  const startedAt = Date.now();
+  const iterator = inner[Symbol.asyncIterator]();
+  while (true) {
+    const next = iterator.next();
+    const timer = new Promise<never>((_, reject) => {
+      const t = setTimeout(() => {
+        options.onIdleTimeout?.(Date.now() - startedAt);
+        reject(new BrigadeIdleTimeoutError(options.timeoutMs));
+      }, options.timeoutMs);
+      if (typeof (t as { unref?: () => void }).unref === "function") {
+        (t as { unref: () => void }).unref();
+      }
+      next.finally(() => clearTimeout(t));
+    });
+    const step = (await Promise.race([next, timer])) as IteratorResult<unknown>;
+    if (step.done) return;
+    yield step.value;
   }
-  return null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -123,47 +136,36 @@ function pickAsyncIterable(value: unknown): AsyncIterable<unknown> | null {
 //
 // Stop reasons fall into three buckets:
 //
-//   1. NORMAL — the response completed cleanly. `end_turn`, `stop_sequence`,
-//      `tool_use`. Pass through untouched.
+//   • NORMAL — `end_turn`, `stop_sequence`, `tool_use`. Pass through
+//     untouched.
 //
-//   2. PASS-THROUGH-WITH-METADATA — the response is incomplete in a way the
-//      caller can act on without it being an error: `max_tokens`,
-//      `pause_turn` (Anthropic extended thinking), `refusal` (model
-//      explicitly refused; the refusal content IS the answer). For these
-//      we emit the original `stop_reason` event AND a sibling
-//      `{type:"stop_reason_signal"}` event so downstream code (the agent
-//      loop's after-turn handler) can branch — auto-continue on
-//      `max_tokens`, surface refusal text, etc.
+//   • ACTIONABLE — `max_tokens`, `pause_turn`, `refusal`. Emit the
+//     original event AND a sibling `{type:"stop_reason_signal"}` event so
+//     downstream code (the agent loop's after-turn handler) can branch.
 //
-//   3. ERROR — anything Pi flags as unhandled, plus the actual error stop
-//      reasons (`error`, `malformed_response`). Rewrite to a clean
-//      `{type:"error", message}` event so the classifier can map it to a
-//      retry reason.
+//   • ERROR — `error`, `malformed_response`, `network_error`. Rewrite to a
+//     clean `{type:"error", message}` event so the classifier can map it
+//     to a retry reason.
 //
-// `pause_turn` is the trickiest. The original Brigade wrapper rewrote ALL
-// "unhandled stop reason: X" events as errors — which would convert a
-// thinking-mode pause into a fake error. The new wrapper passes pause
-// through and lets Pi handle the continuation.
+// `pause_turn` is the trickiest — earlier wrappers rewrote ALL "unhandled
+// stop reason" events as errors, which would convert thinking-mode pauses
+// into fake errors. The new logic passes pause through.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const UNHANDLED_STOP_REASON_RE = /^Unhandled stop reason:\s*(.+)$/i;
 
-// Stop reasons we treat as benign — let them flow without rewriting.
 const BENIGN_STOP_REASONS: ReadonlySet<string> = new Set([
   "end_turn",
   "stop_sequence",
   "tool_use",
 ]);
 
-// Stop reasons that need caller awareness but aren't errors. We tag the
-// stream so the agent loop's after-turn handler can react.
 const ACTIONABLE_STOP_REASONS: ReadonlySet<string> = new Set([
   "max_tokens",
   "pause_turn",
   "refusal",
 ]);
 
-// Stop reasons that ARE errors. Rewrite as error events.
 const ERROR_STOP_REASONS: ReadonlySet<string> = new Set([
   "error",
   "malformed_response",
@@ -177,105 +179,97 @@ export interface StopReasonSignal {
 }
 
 export function wrapStreamFnWithStopReasonRecovery<F extends BrigadeStreamFn>(base: F): F {
-  const wrapped = (async function* (this: unknown, ...args: unknown[]) {
-    const result = await Promise.resolve(base.apply(this, args));
-    const iterable = pickAsyncIterable(result);
-    if (!iterable) {
-      yield result;
-      return;
-    }
-    for await (const ev of iterable) {
-      if (ev && typeof ev === "object") {
-        const e = ev as { type?: unknown; message?: unknown; stop_reason?: unknown };
-
-        // Path A: Pi already attached `stop_reason` to the event.
-        if (typeof e.stop_reason === "string") {
-          const reason = e.stop_reason.toLowerCase();
-          if (BENIGN_STOP_REASONS.has(reason)) {
-            yield ev;
-            continue;
-          }
-          if (ACTIONABLE_STOP_REASONS.has(reason)) {
-            yield ev; // preserve the original
-            yield { type: "stop_reason_signal", reason, source: "pi" } as StopReasonSignal;
-            continue;
-          }
-          if (ERROR_STOP_REASONS.has(reason)) {
-            yield {
-              ...e,
-              type: "error",
-              message: `provider returned ${reason} stop reason`,
-            };
-            continue;
-          }
-          // Unknown enum value — pass through with an alert so the
-          // caller can decide. We don't crash — Pi may be ahead of us
-          // with a new stop reason from a provider update.
-          yield ev;
-          yield { type: "stop_reason_signal", reason, source: "wrapper" } as StopReasonSignal;
-          continue;
-        }
-
-        // Path B: Pi raised an "Unhandled stop reason: X" string error.
-        if (typeof e.message === "string") {
-          const m = UNHANDLED_STOP_REASON_RE.exec(e.message);
-          if (m) {
-            const reason = (m[1] ?? "unknown").toLowerCase();
-            if (ACTIONABLE_STOP_REASONS.has(reason)) {
-              // Pi flagged it as unhandled but we know how to handle it.
-              // Drop the error rewrite and emit a signal instead.
-              yield { type: "stop_reason_signal", reason, source: "wrapper" } as StopReasonSignal;
-              continue;
-            }
-            yield {
-              ...e,
-              type: "error",
-              message: `provider returned unhandled stop reason: ${reason}`,
-            };
-            continue;
-          }
-        }
-      }
-      yield ev;
-    }
+  const wrapped = (async function (this: unknown, ...args: unknown[]) {
+    const stream = await Promise.resolve(base.apply(this, args));
+    if (!isEventStreamLike(stream)) return stream;
+    return makeStreamProxy(stream, (inner) => stopReasonIterator(inner));
   }) as unknown as F;
   return wrapped;
+}
+
+async function* stopReasonIterator(inner: EventStreamLike): AsyncGenerator<unknown> {
+  for await (const ev of inner) {
+    if (ev && typeof ev === "object") {
+      const e = ev as { type?: unknown; message?: unknown; stop_reason?: unknown };
+
+      // Path A: Pi already attached `stop_reason` to the event.
+      if (typeof e.stop_reason === "string") {
+        const reason = e.stop_reason.toLowerCase();
+        if (BENIGN_STOP_REASONS.has(reason)) {
+          yield ev;
+          continue;
+        }
+        if (ACTIONABLE_STOP_REASONS.has(reason)) {
+          yield ev;
+          yield { type: "stop_reason_signal", reason, source: "pi" } as StopReasonSignal;
+          continue;
+        }
+        if (ERROR_STOP_REASONS.has(reason)) {
+          yield {
+            ...e,
+            type: "error",
+            message: `provider returned ${reason} stop reason`,
+          };
+          continue;
+        }
+        // Unknown enum value — pass through with a signal.
+        yield ev;
+        yield { type: "stop_reason_signal", reason, source: "wrapper" } as StopReasonSignal;
+        continue;
+      }
+
+      // Path B: Pi raised an "Unhandled stop reason: X" string error.
+      if (typeof e.message === "string") {
+        const m = UNHANDLED_STOP_REASON_RE.exec(e.message);
+        if (m) {
+          const reason = (m[1] ?? "unknown").toLowerCase();
+          if (ACTIONABLE_STOP_REASONS.has(reason)) {
+            yield { type: "stop_reason_signal", reason, source: "wrapper" } as StopReasonSignal;
+            continue;
+          }
+          yield {
+            ...e,
+            type: "error",
+            message: `provider returned unhandled stop reason: ${reason}`,
+          };
+          continue;
+        }
+      }
+    }
+    yield ev;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool-call argument repair.
 //
-// When a `toolcall_delta` event accumulates argument JSON, retry parsing on
-// each delta. If the raw text fails JSON.parse but a balanced JSON prefix is
-// extractable, repair it: HTML-entity decode, strip safe leading text, strip
-// trailing garbage, and substitute the cleaned arguments on the event.
-//
-// Conservative — only repair when the original text fails to parse and a
-// strict balanced extract succeeds. Any ambiguity = pass through unchanged.
+// When a `toolcall_delta` event accumulates argument JSON that fails to
+// parse, attempt repair: HTML-entity decode, balanced-JSON extraction,
+// strip leading/trailing garbage. Only repair when the raw text fails
+// JSON.parse AND a strict balanced extract succeeds.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function wrapStreamFnWithToolCallRepair<F extends BrigadeStreamFn>(base: F): F {
-  const wrapped = (async function* (this: unknown, ...args: unknown[]) {
-    const result = await Promise.resolve(base.apply(this, args));
-    const iterable = pickAsyncIterable(result);
-    if (!iterable) {
-      yield result;
-      return;
-    }
-    for await (const ev of iterable) {
-      yield maybeRepairToolCallEvent(ev);
-    }
+  const wrapped = (async function (this: unknown, ...args: unknown[]) {
+    const stream = await Promise.resolve(base.apply(this, args));
+    if (!isEventStreamLike(stream)) return stream;
+    return makeStreamProxy(stream, (inner) => toolCallRepairIterator(inner));
   }) as unknown as F;
   return wrapped;
 }
 
+async function* toolCallRepairIterator(inner: EventStreamLike): AsyncGenerator<unknown> {
+  for await (const ev of inner) {
+    yield maybeRepairToolCallEvent(ev);
+  }
+}
+
 function maybeRepairToolCallEvent(ev: unknown): unknown {
   if (!ev || typeof ev !== "object") return ev;
-  const e = ev as { type?: unknown; arguments?: unknown; argumentsDelta?: unknown };
+  const e = ev as { type?: unknown; arguments?: unknown };
   if (e.type !== "toolcall" && e.type !== "toolcall_delta") return ev;
   const raw = typeof e.arguments === "string" ? e.arguments : undefined;
   if (!raw) return ev;
-  // Quick path: already valid JSON.
   try {
     JSON.parse(raw);
     return ev;
@@ -290,7 +284,6 @@ function maybeRepairToolCallEvent(ev: unknown): unknown {
 const LEADING_GARBAGE_RE = /^[a-z0-9\s"'`.:/_\\-]{1,96}/i;
 
 export function repairArgumentJson(raw: string): string | null {
-  // Strip leading non-JSON garbage if it's short and "safe-ish".
   let candidate = raw;
   const leadingMatch = LEADING_GARBAGE_RE.exec(candidate);
   if (leadingMatch && !candidate.trimStart().startsWith("{") && !candidate.trimStart().startsWith("[")) {

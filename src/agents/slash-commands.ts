@@ -131,17 +131,22 @@ function parseModelCommand(rest: string[]): SlashCommandResult {
     };
   }
   const ref = rest[0]!;
+  // Split on the FIRST slash — provider names never contain slashes, but
+  // model IDs do. OpenRouter uses `openrouter` as provider and routes via
+  // model IDs like `openai/gpt-5.4-mini`, so `/model openrouter/openai/gpt-5.4-mini`
+  // must produce provider=`openrouter`, modelId=`openai/gpt-5.4-mini`.
   const slash = ref.indexOf("/");
   if (slash <= 0 || slash >= ref.length - 1) {
     return {
       type: "error",
       message:
-        "/model argument must be in 'provider/modelId' form (e.g. anthropic/claude-opus-4-7)",
+        "/model argument must be in 'provider/modelId' form " +
+        "(e.g. anthropic/claude-opus-4-7 or openrouter/openai/gpt-5.4-mini)",
     };
   }
   const provider = ref.slice(0, slash).trim();
   const modelId = ref.slice(slash + 1).trim();
-  if (!isValidIdentifier(provider) || !isValidIdentifier(modelId)) {
+  if (!isValidProvider(provider) || !isValidModelId(modelId)) {
     return {
       type: "error",
       message: "/model provider and modelId must be non-empty identifiers",
@@ -170,10 +175,19 @@ function parseThinkingCommand(rest: string[]): SlashCommandResult {
   };
 }
 
-function isValidIdentifier(value: string): boolean {
-  // Loose — providers and model IDs use a wide character set across vendors
-  // (numbers, hyphens, dots, slashes for sub-namespaces). We mostly want to
-  // refuse whitespace and shell metacharacters.
-  if (value.length === 0 || value.length > 128) return false;
+function isValidProvider(value: string): boolean {
+  // Provider names are short, never contain slashes (we split on the first
+  // slash to separate provider from modelId).
+  if (value.length === 0 || value.length > 64) return false;
   return /^[a-z0-9._\-:@]+$/i.test(value);
+}
+
+function isValidModelId(value: string): boolean {
+  // Model IDs are wider — OpenRouter routes via `openai/gpt-5.4-mini`,
+  // `anthropic/claude-opus-4-7`, `mistralai/mixtral-8x7b-instruct` etc.,
+  // so we MUST permit slashes in the modelId portion. Bedrock + others
+  // also use colons (e.g. `anthropic.claude-3-5-sonnet-20241022-v2:0`).
+  // We just refuse whitespace and shell metacharacters.
+  if (value.length === 0 || value.length > 128) return false;
+  return /^[a-z0-9._\-:@/]+$/i.test(value);
 }

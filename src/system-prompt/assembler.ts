@@ -112,14 +112,30 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   lines.push("");
 
   // Tooling block.
-  lines.push("## Tools");
+  //
+  // Brigade pins this whole prompt over Pi's natural system-prompt
+  // assembly (3-write hack), which means Pi's own tool-section never
+  // reaches the model. The model only knows about the tools we list HERE.
+  // When `toolDescriptions` is non-empty we enumerate every tool by name
+  // + summary so the model picks exact names on the first try and doesn't
+  // invent aliases like `cat` / `ls -la`. The "case-sensitive" note is
+  // load-bearing — without it some models lower-case tool names from
+  // habit and the call fails. Empty list = sub-agent / scoped-tools
+  // run, render a permissive line so the model still trusts whatever Pi
+  // wired into the API request.
+  lines.push("## Tooling");
   if (args.toolDescriptions.length === 0) {
-    lines.push("Available tools: (none)");
-    lines.push("This turn has no tool surface — produce a chat reply only.");
+    lines.push(
+      "Tools are wired into this turn. When the user asks you to do " +
+        "something that needs filesystem, shell, or search access, USE the " +
+        "tools you have — do not tell the user you can't.",
+    );
   } else {
-    lines.push("Available tools:");
+    lines.push("Tool availability (you may call any of these):");
+    lines.push("Tool names are case-sensitive. Call tools exactly as listed.");
     for (const t of args.toolDescriptions) {
-      lines.push(`- \`${t.name}\` — ${t.summary}`);
+      const summary = t.summary?.trim();
+      lines.push(summary ? `- ${t.name}: ${summary}` : `- ${t.name}`);
     }
   }
   lines.push("");

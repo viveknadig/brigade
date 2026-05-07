@@ -65,6 +65,7 @@ import { buildBrigadeTransformContext } from "./payload-mutators.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
 import { evaluateCompactionDecision } from "./smart-compaction.js";
+import { resolveToolSummary } from "./tool-summaries.js";
 import {
   runWithModelFallback,
   type ModelCandidate,
@@ -296,6 +297,19 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     },
   );
 
+  // Pi's `tools` field is an ALLOWLIST OF NAMES (string[]), not Tool
+  // objects — `customTools` is the slot for Tool objects. The earlier
+  // smoke run hit exactly this bug: we passed Tool objects into `tools`,
+  // Pi treated each Tool object as a tool-name string, none matched any
+  // real tool, and the model correctly said "I have no file access."
+  //
+  // Naming the seven coding tools explicitly (vs omitting `tools` entirely
+  // and letting Pi default to its 4 base tools) gives us the full surface
+  // including grep / find / ls — closer to what OpenClaw exposes. The cwd
+  // is the agent run's cwd, NOT the agent state dir, so tools operate on
+  // the user's actual workspace.
+  const enabledToolNames: string[] = ["read", "write", "edit", "bash", "grep", "find", "ls"];
+
   const { session } = await createAgentSession({
     cwd,
     agentDir,
@@ -303,7 +317,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     modelRegistry,
     model: model as never,
     thinkingLevel: args.thinkingLevel ?? "off",
-    tools: [],
+    tools: enabledToolNames,
     customTools: [],
     sessionManager,
     resourceLoader: new DefaultResourceLoader({ cwd, agentDir }),
@@ -369,6 +383,25 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       ? "in-progress"
       : phaseBefore;
 
+  // Query the actual tool names Pi wired to this session, then map each to
+  // a one-line summary. We pass the resolved descriptions through to the
+  // assembler so the system prompt enumerates the live tool surface (model
+  // calls them by exact name + knows what each does). Pi 0.70.x exposes
+  // `getActiveToolNames()`; older minors may not — fall back to our
+  // configured allowlist so the prompt still has a useful list.
+  const sessionWithTools = session as AgentSession & {
+    getActiveToolNames?: () => string[];
+  };
+  const activeToolNames = (
+    typeof sessionWithTools.getActiveToolNames === "function"
+      ? sessionWithTools.getActiveToolNames()
+      : enabledToolNames
+  ).slice();
+  const toolDescriptions = activeToolNames.map((name) => ({
+    name,
+    summary: resolveToolSummary(name) ?? "",
+  }));
+
   // Pin the assembled persona before the first turn. Done after
   // createAgentSession (which has already set up Pi's stock prompt) but
   // before prompt() so the model sees the brigade-flavoured persona on
@@ -381,6 +414,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     modelLabel: `${args.provider}/${args.modelId}`,
     thinkingLevel: args.thinkingLevel ?? "off",
     bootstrapPhase: effectivePhase,
+    toolDescriptions,
   });
   if (personaPrompt) {
     applyPersonaOverrideToSession(session as AgentSession, personaPrompt);
@@ -566,6 +600,10 @@ async function buildPersonaPrompt(args: {
   modelLabel: string;
   thinkingLevel: string;
   bootstrapPhase: BootstrapPhase;
+  // Tool surface to advertise in the system prompt. Caller resolves these
+  // from the live Pi session (`getActiveToolNames`) so the model gets the
+  // real list, not a guess.
+  toolDescriptions?: Array<{ name: string; summary: string }>;
 }): Promise<string> {
   const config = readConfigOrInit();
   const override = resolveSystemPromptOverride({ config, agentId: args.agentId });
@@ -587,7 +625,7 @@ async function buildPersonaPrompt(args: {
     runtime,
     personaFiles,
     heartbeatFile,
-    toolDescriptions: [],
+    toolDescriptions: args.toolDescriptions ?? [],
     bootstrapPhase: args.bootstrapPhase,
   });
   return assembled.text;

@@ -29,6 +29,28 @@ test("parseSlashCommand: /model anthropic/claude-opus-4-7", () => {
   }
 });
 
+test("parseSlashCommand: /model openrouter/openai/gpt-5.4-mini (modelId contains a slash)", () => {
+  // OpenRouter routes via family-prefixed model IDs — must split on FIRST
+  // slash and keep everything after it as the modelId. Earlier validator
+  // forbade slashes in the modelId portion, which broke OpenRouter entirely.
+  const r = parseSlashCommand("/model openrouter/openai/gpt-5.4-mini");
+  assert.equal(r.type, "model");
+  if (r.type === "model") {
+    assert.equal(r.provider, "openrouter");
+    assert.equal(r.modelId, "openai/gpt-5.4-mini");
+  }
+});
+
+test("parseSlashCommand: /model bedrock/anthropic.claude-3-5-sonnet:0 (modelId contains colon)", () => {
+  // Bedrock model ARNs use colons in the version suffix.
+  const r = parseSlashCommand("/model bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0");
+  assert.equal(r.type, "model");
+  if (r.type === "model") {
+    assert.equal(r.provider, "bedrock");
+    assert.equal(r.modelId, "anthropic.claude-3-5-sonnet-20241022-v2:0");
+  }
+});
+
 test("parseSlashCommand: /model with no args returns help-style result", () => {
   const r = parseSlashCommand("/model");
   assert.equal(r.type, "help");
