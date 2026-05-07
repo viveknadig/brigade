@@ -113,7 +113,10 @@ export async function runAgentTurn(opts: AgentOptions): Promise<void> {
   // Provider/model resolution order:
   //   1. CLI flag (`--provider` / `--model`) — explicit user intent for this run.
   //   2. Persisted session override — set by a prior `/model X` command.
-  //   3. Per-agent defaultProvider / defaultModel from brigade.json.
+  //   3. Per-agent legacy slot (`agents.<id>.defaultProvider/defaultModel`)
+  //      — kept for back-compat with pre-wizard configs.
+  //   4. Onboard-wizard defaults (`agents.defaults.{provider, model.primary}`)
+  //      — the canonical onboarding output post-2026-05.
   // The /model command short-circuits the run before reaching here, so by
   // this point the persisted override applies to the user's NEXT real
   // message, not the one carrying the slash command.
@@ -121,14 +124,25 @@ export async function runAgentTurn(opts: AgentOptions): Promise<void> {
   const agentCfg = cfg.agents?.[agentId] as
     | { defaultProvider?: string; defaultModel?: string }
     | undefined;
+  const wizardDefaults = cfg.agents?.defaults as
+    | { provider?: string; model?: { primary?: string } }
+    | undefined;
   const sessionEntry = readSessionStore(agentId).sessions[sessionKey];
-  const provider = opts.provider ?? sessionEntry?.provider ?? agentCfg?.defaultProvider;
-  const modelId = opts.model ?? sessionEntry?.modelId ?? agentCfg?.defaultModel;
+  const provider =
+    opts.provider ??
+    sessionEntry?.provider ??
+    agentCfg?.defaultProvider ??
+    wizardDefaults?.provider;
+  const modelId =
+    opts.model ??
+    sessionEntry?.modelId ??
+    agentCfg?.defaultModel ??
+    wizardDefaults?.model?.primary;
 
   if (!provider || !modelId) {
     throw new Error(
       "agent: --provider and --model are required " +
-        "(or set defaultProvider/defaultModel in brigade.json under agents.<id>).",
+        "(or run `brigade onboard --provider X --api-key Y --model Z` to persist defaults).",
     );
   }
 

@@ -246,6 +246,7 @@ export function applyModelSelection(
   params: {
     primary: string;
     fallbacks?: string[];
+    provider?: string;
     aliases?: Record<string, string>;
   },
 ): BrigadeConfig {
@@ -261,6 +262,8 @@ export function applyModelSelection(
     }
   }
   defaults.models = models;
+
+  if (params.provider) defaults.provider = params.provider;
 
   defaults.model = {
     primary: params.primary,

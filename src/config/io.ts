@@ -55,6 +55,13 @@ export interface BrigadeAgentsConfig {
 
 export interface BrigadeAgentDefaults {
   workspace?: string;
+  // The provider id that owns `model.primary` — Brigade-only extension to
+  // the reference shape so the agent runner can resolve the provider in a
+  // single read without sniffing plugins.entries or model id prefixes.
+  // The reference defers provider resolution to a separate `models.providers`
+  // catalog block; Brigade's catalog lives in code (providers.ts) for now,
+  // so we stamp the active provider here at onboard time.
+  provider?: string;
   models?: Record<string, BrigadeModelEntry>;
   model?: BrigadeModelSelection;
   [key: string]: unknown;

@@ -194,6 +194,7 @@ export function runNonInteractiveSetup(
   next = applyModelSelection(next, {
     primary: primaryModelId,
     fallbacks,
+    provider: provider.id,
     aliases: buildAliasFragment(
       provider,
       fallbacks ? [primaryModelId, ...fallbacks] : [primaryModelId],
