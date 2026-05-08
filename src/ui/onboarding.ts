@@ -13,7 +13,6 @@
  * language is consistent across the app.
  */
 
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { getEnvApiKey, getModels, type KnownProvider, type Model } from "@mariozechner/pi-ai";
@@ -21,11 +20,16 @@ import type { AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
 import { CancellableLoader, Input, type SelectItem, SelectList, Text, TUI } from "@mariozechner/pi-tui";
 
 import { upsertApiKeyProfile, upsertApiKeyRefProfile } from "../auth/profiles.js";
-import { DEFAULT_AGENT_ID } from "../config/paths.js";
-import { BRIGADE_DIR, getBrigadeWorkspaceDir, saveConfig } from "../core/config.js";
-import { isIdentityNameUnset, seedDefaultPrompts } from "../core/system-prompt.js";
+import { DEFAULT_AGENT_ID, resolveAuthProfilesPath } from "../config/paths.js";
+import { BRIGADE_DIR, saveConfig } from "../core/config.js";
 import { discoverOllamaModels, writeOllamaToModelsJson } from "../integrations/ollama.js";
-import { findProvider, PROVIDERS, readProviderEnvKey, type ProviderInfo } from "../providers/catalog.js";
+import {
+	findProvider,
+	PROVIDERS,
+	readProviderEnvKey,
+	resolveProviderEnvVarSource,
+	type ProviderInfo,
+} from "../providers/catalog.js";
 import { validateApiKeyOnline } from "../providers/validate-key.js";
 import { renderBrandHeader } from "./brand.js";
 import { brand, selectListTheme } from "./theme.js";
@@ -141,7 +145,7 @@ export async function runOnboarding(
 
 	while (true) {
 		if (step === "provider") {
-			renderScreen(tui, "Step 1 of 4 · Pick a provider");
+			renderScreen(tui, "Step 1 of 3 · Pick a provider");
 			provider = await pickProvider(tui); // throws "onboarding-cancelled" on Esc
 			step = "key";
 			continue;
@@ -176,7 +180,7 @@ export async function runOnboarding(
 		}
 
 		// step === "model"
-		renderScreen(tui, "Step 3 of 4 · Default model");
+		renderScreen(tui, "Step 3 of 3 · Default model");
 		const result = await pickModel(tui, modelRegistry, provider);
 		if (result === "back") {
 			step = "provider"; // go all the way back so they can change provider too
@@ -186,22 +190,10 @@ export async function runOnboarding(
 		break;
 	}
 
-	// Step 4 — name the agent. Done LAST so it lands on a workspace whose
-	// IDENTITY.md has been seeded (seedDefaultPrompts is idempotent + cheap).
-	// Skipped entirely when IDENTITY.md already has a Name — re-onboarding
-	// shouldn't pester established agents.
-	//
-	// Why we collect the name here, not by conversation: empirically (May 2026,
-	// Sonnet 4.6 + Gemini), strong instruction-tuned models default to
-	// "I'm a coding assistant" on greeting/identity questions and ignore
-	// BOOTSTRAP.md's name-discovery script. Setting the Name field directly
-	// in IDENTITY.md sidesteps that entire failure mode — when the model
-	// reads the workspace files on first turn, it sees a real Name and
-	// adopts it. clawdbot ships the same answer (`clawdbot agents identity
-	// set --name`) for the same empirical reason.
-	await seedDefaultPrompts(); // idempotent; ensures IDENTITY.md exists to write into
-	await pickAgentName(tui);
-
+	// No agent-naming step — mirrors OpenClaw's onboarding shape (its wizard
+	// ends at provider+auth+model, with the agent's identity left for the
+	// agent itself to discover via BOOTSTRAP.md on first turn). Workspace
+	// scaffolding still happens at agent boot via `buildAgent → seedDefaultPrompts`.
 	await saveConfig({ defaultProvider: provider, defaultModelId: modelId });
 
 	renderScreen(tui, ""); // brand-only frame for the "Ready." moment
@@ -228,115 +220,6 @@ function renderScreen(tui: TUI, subheader: string): void {
 }
 
 /* ────────────────────────────── steps ─────────────────────────────────── */
-
-/**
- * Step 4 — name the agent. Writes the chosen name into IDENTITY.md's Name
- * field. Skipped silently when IDENTITY.md already has a Name (re-onboarding
- * shouldn't rename an established agent without explicit user action).
- *
- * Behaviour:
- *   - Already-named workspace → no-op, returns immediately, no UI shown.
- *   - Empty input + Enter → uses fallback "friend" so the workspace is never
- *     left in the broken "no Name set" state where the model defaults to
- *     "I'm a coding assistant" and ignores BOOTSTRAP.md.
- *   - Esc → also accepts "friend" as the fallback. We do NOT bail to the
- *     model picker; by this point the user has invested 3 wizard steps
- *     and we want them to land in a usable state. They can edit
- *     ~/.brigade/workspace/IDENTITY.md directly later.
- *
- * Why "friend" as the fallback: it's neutral, warm, and obviously a
- * placeholder the user can change. Anything more specific (a generated
- * name, a model-derived name) would feel like a decision was made FOR them.
- */
-async function pickAgentName(tui: TUI): Promise<void> {
-	const identityPath = path.join(getBrigadeWorkspaceDir(), "IDENTITY.md");
-	let identityText: string;
-	try {
-		identityText = await fs.readFile(identityPath, "utf8");
-	} catch {
-		// IDENTITY.md missing — the seedDefaultPrompts call before us should
-		// have created it. If it didn't (permission error, race), bail out
-		// quietly; the workspace is in an unusual state but we don't want
-		// to crash the wizard at the finish line.
-		return;
-	}
-
-	if (!isIdentityNameUnset(identityText)) {
-		// Already named — re-onboard shouldn't rename. Silent no-op.
-		return;
-	}
-
-	renderScreen(tui, "Step 4 of 4 · Name your agent");
-	tui.addChild(new Text("  What should we call your agent?", 0, 0));
-	tui.addChild(
-		new Text(
-			brand.dim("  Pick anything you like — a name, a creature, a vibe. You can change it later by editing IDENTITY.md."),
-			0,
-			0,
-		),
-	);
-	tui.addChild(new Text(brand.dim("  Enter to confirm  ·  blank line accepts \"friend\""), 0, 0));
-	tui.addChild(new Text("", 0, 0));
-
-	const input = new Input();
-	tui.addChild(input);
-	tui.setFocus(input);
-	tui.requestRender();
-
-	const raw = await new Promise<string>((resolve) => {
-		input.onSubmit = (value: string) => resolve(value.trim());
-		input.onEscape = () => resolve(""); // Esc → fallback
-	});
-	const chosen = raw.length > 0 ? raw : "friend";
-
-	// Write the Name back into IDENTITY.md. Match the exact `**Name:**` line
-	// format the default template ships with so isIdentityNameUnset's parser
-	// recognises it (literal `**Name:**` token, name on the same line after
-	// a space — see isIdentityNameUnset for the matching rules).
-	const updated = writeNameIntoIdentity(identityText, chosen);
-	try {
-		await fs.writeFile(identityPath, updated, "utf8");
-	} catch {
-		// I/O error — don't crash the wizard. The user lands in chat with an
-		// unnamed agent, same as before this step existed.
-	}
-}
-
-/**
- * Replace the entire IDENTITY.md content with a clean, model-friendly
- * declaration of the chosen name. Empirically (Sonnet 4.6, May 2026) the
- * default placeholder-littered template confused models into ignoring
- * the Name even when it was set — too many "*(pick something you like)*"
- * lines made the file look "still being filled in." This produces a
- * minimal file with one assertion the model can't miss, plus optional
- * fields at the bottom the user can edit later.
- *
- * Idempotent: re-running with the same name produces identical output.
- */
-function writeNameIntoIdentity(_existingText: string, name: string): string {
-	// Two redundant assertions of the name:
-	//   1. A direct sentence at the top — empirically the most reliable signal
-	//      to the model. Sonnet 4.6 was observed to ignore the bullet-list
-	//      `- **Name:**` format when surrounded by placeholder lines.
-	//   2. A `- **Name:** Felix` line — preserves compatibility with
-	//      `isIdentityNameUnset`'s parser, which scans for that token.
-	// Optional fields below are blank but unambiguously named (no italic
-	// placeholders to confuse the model into thinking they're still TBD).
-	return `# IDENTITY
-
-Your name is **${name}**.
-
-When asked who you are or what to call you, identify yourself as ${name}. Do not introduce yourself by the runtime, the project, the underlying model, or a generic role label like "AI assistant" or "coding assistant".
-
-- **Name:** ${name}
-- **Creature:**
-- **Vibe:**
-- **Emoji:**
-- **Avatar:**
-
-*(Edit the optional fields above to flesh out the persona. Blank fields are fine.)*
-`;
-}
 
 async function pickProvider(tui: TUI): Promise<string> {
 	// Re-order providers so any with a credential the user already has —
@@ -462,21 +345,28 @@ async function tryAutoSelectFromEnv(
 
 	// Same OpenClaw-shape persistence as the manual env-accept branch:
 	// plaintext writes literal `key`, ref writes `keyRef` pointing at the
-	// env var. Both land in `~/.brigade/agents/<id>/agent/auth-profiles.json`
-	// under the same profileId. Plus seed Pi's in-memory authStorage so the
-	// agent we're about to boot can use the key without a restart.
-	if (secretInputMode === "ref" && provider.envVar) {
+	// env var that ACTUALLY satisfied the read (handles envVarFallbacks).
+	// Both land in `~/.brigade/agents/<id>/agent/auth-profiles.json` under
+	// the same profileId. In ref mode we deliberately skip `authStorage.set`
+	// so Pi's `~/.brigade/auth.json` doesn't capture the literal — keeping
+	// the disk-leak surface minimal. Runtime reads via `loadBrigadeAuthStorage`
+	// → `resolveProfileKey` → `process.env[keyRef.id]`.
+	const envSource = resolveProviderEnvVarSource(provider);
+	if (secretInputMode === "ref" && envSource) {
 		upsertApiKeyRefProfile(DEFAULT_AGENT_ID, {
 			provider: providerId,
-			keyRef: { source: "env", provider: "default", id: provider.envVar },
+			keyRef: { source: "env", provider: "default", id: envSource.name },
 		});
+		// Belt-and-suspenders — value already in process.env (that's where we
+		// read it). Ensure the in-process agent sees the same name we pinned.
+		process.env[envSource.name] = envSource.value;
 	} else {
 		upsertApiKeyProfile(DEFAULT_AGENT_ID, {
 			provider: providerId,
 			key: envValue,
 		});
+		authStorage.set(providerId, { type: "api_key", key: envValue });
 	}
-	authStorage.set(providerId, { type: "api_key", key: envValue });
 	// Refresh the registry so the model picker can see provider-specific
 	// catalog entries Pi populates after a key lands in env.
 	modelRegistry.refresh();
@@ -539,19 +429,25 @@ export async function ensureApiKey(
 	// never silently consults `$env:OPENROUTER_API_KEY` or its peers.
 	const stored = opts.noEnvDetect ? "" : await authStorage.getApiKey(providerId);
 	const envKey = opts.noEnvDetect ? undefined : readProviderEnvKey(provider);
-	const existing = stored || envKey || "";
+	// Detect ref-stored profiles too — Pi's `authStorage.getApiKey` reads
+	// from ~/.brigade/auth.json (which is empty in ref mode by design); the
+	// canonical credential lives in auth-profiles.json with a `keyRef`. We
+	// resolve it the same way the runtime does (auth-bridge.ts:resolveProfileKey).
+	const refResolvedKey = !stored ? readKeyRefFromProfilesFile(providerId) : "";
+	const existing = stored || refResolvedKey || envKey || "";
 	if (existing) {
 		// `fromEnv` drives whether we show "saved credentials" (skip confirm)
-		// or "shell environment" (confirm with default=Yes). Pi's
-		// `getEnvApiKey` checks the primary `envVar` only — Brigade's
-		// `readProviderEnvKey` ALSO checks `envVarFallbacks`, so the OR
-		// catches both shapes (e.g. ANTHROPIC_OAUTH_TOKEN won't match Pi's
-		// check but will match Brigade's). When stored=non-empty, we treat
-		// the key as "saved" even if env also has it — saved beats env.
-		const fromEnv = !stored && (!!getEnvApiKey(providerId as KnownProvider) || !!envKey);
+		// or "shell environment" (confirm with default=Yes). A ref-resolved
+		// key counts as "saved" — the operator already deliberately stored a
+		// keyRef profile pointing at this env var; we shouldn't make them
+		// re-confirm on every onboard. Saved (literal or ref) beats env.
+		const fromEnv =
+			!stored &&
+			!refResolvedKey &&
+			(!!getEnvApiKey(providerId as KnownProvider) || !!envKey);
 		if (!fromEnv) {
 			// Saved credential — passed validation when first stored. Fast accept.
-			renderScreen(tui, `Step 2 of 4 · ${provider.name}`);
+			renderScreen(tui, `Step 2 of 3 · ${provider.name}`);
 			tui.addChild(
 				new Text(
 					`  ${brand.amber("✓")} ${provider.name} is already connected (using ${brand.white("your saved credentials")}).`,
@@ -582,7 +478,7 @@ export async function ensureApiKey(
 		// explicit so they immediately know the key originated from THEIR shell,
 		// not from a stale brigade.json.
 		const envVar = provider.envVar ?? "the env var";
-		renderScreen(tui, `Step 2 of 4 · ${provider.name}`);
+		renderScreen(tui, `Step 2 of 3 · ${provider.name}`);
 		tui.addChild(
 			new Text(
 				brand.dim(`  Brigade detected this key in your shell environment.`),
@@ -645,7 +541,7 @@ export async function ensureApiKey(
 			// and let them paste their own. The typed-key loop below treats
 			// `lastError === null` as a clean first iteration, so no stale
 			// error text leaks in.
-			renderScreen(tui, `Step 2 of 4 · Connect ${provider.name}`);
+			renderScreen(tui, `Step 2 of 3 · Connect ${provider.name}`);
 			// Fall through to typed-key loop without `lastError` set.
 			// (Variable declared just below the env block.)
 			return await promptTypedKey(tui, authStorage, provider, providerId, null);
@@ -674,47 +570,49 @@ export async function ensureApiKey(
 		if (envCheck.ok) {
 			// Two persistence shapes, mirroring OpenClaw's `--secret-input-mode`
 			// (see openclaw `provider-auth-helpers.ts:84-111`). Both write to
-			// the SAME location — `~/.brigade/agents/<id>/agent/auth-profiles.json`
-			// — under the same `profileId(provider)`. The shape on disk differs:
+			// `~/.brigade/agents/<id>/agent/auth-profiles.json` under the same
+			// `profileId(provider)`; the shape on disk differs:
 			//
 			//   PLAINTEXT (default):
-			//     {
-			//       "type": "api_key",
-			//       "provider": "openrouter",
-			//       "key": "sk-or-v1-abc…"      ← literal value
-			//     }
+			//     { type: "api_key", provider, key: "sk-or-v1-abc…" }
 			//
 			//   REF:
-			//     {
-			//       "type": "api_key",
-			//       "provider": "openrouter",
-			//       "keyRef": { "source": "env", "provider": "default",
-			//                   "id": "OPENROUTER_API_KEY" }   ← reference only
-			//     }
+			//     { type: "api_key", provider,
+			//       keyRef: { source: "env", provider: "default", id: "<MATCHED_VAR>" } }
 			//
-			// Plaintext = OpenClaw's default + ours. Survives shell restart and
-			// machine moves. Ref = openclaw's `--secret-input-mode ref` shape:
-			// the literal value NEVER lands on disk, runtime resolves
-			// `process.env[id]` lazily on every request via
-			// core/auth-bridge.ts:resolveProfileKey.
+			// Critical for ref mode: the `id` MUST be the env var that
+			// actually held the value (could be `provider.envVar` OR a
+			// `provider.envVarFallbacks[i]` like `ANTHROPIC_OAUTH_TOKEN`).
+			// Pinning to `provider.envVar` blindly would leave the agent unable
+			// to resolve the key at runtime when a fallback satisfied the read.
 			//
-			// Also seed Pi's authStorage so the about-to-boot in-process agent
-			// has the key without a restart — Pi's authStorage is in-memory only,
-			// it doesn't re-read auth-profiles.json after construction.
+			// In-process seeding (so the wizard can immediately use the key):
+			//   - PLAINTEXT: `authStorage.set` writes Pi's in-memory store AND
+			//     ~/.brigade/auth.json. Fine — it's the same literal value
+			//     auth-profiles.json holds.
+			//   - REF: `authStorage.set` would persist the LITERAL value to
+			//     ~/.brigade/auth.json, defeating ref mode (literal would land
+			//     in TWO files on disk). Skip it; rely on `process.env` already
+			//     holding the value (it's where we read it from). The runtime
+			//     reads via `loadBrigadeAuthStorage` → `resolveProfileKey` →
+			//     `process.env[keyRef.id]` (auth-bridge.ts:101-117).
 			const mode = opts.secretInputMode ?? "plaintext";
-			if (mode === "ref" && provider.envVar) {
+			const envSource = resolveProviderEnvVarSource(provider);
+			if (mode === "ref" && envSource) {
 				upsertApiKeyRefProfile(DEFAULT_AGENT_ID, {
 					provider: providerId,
-					keyRef: { source: "env", provider: "default", id: provider.envVar },
+					keyRef: { source: "env", provider: "default", id: envSource.name },
 				});
-				process.env[provider.envVar] = existing;
+				// process.env already has it (we just read from it). Belt-and-
+				// suspenders: ensure it sticks for the in-process agent.
+				process.env[envSource.name] = envSource.value;
 			} else {
 				upsertApiKeyProfile(DEFAULT_AGENT_ID, {
 					provider: providerId,
 					key: existing,
 				});
+				authStorage.set(providerId, { type: "api_key", key: existing });
 			}
-			authStorage.set(providerId, { type: "api_key", key: existing });
 			const pinShape = mode === "ref" ? "your environment (kept as a reference)" : "your environment";
 			tui.addChild(
 				new Text(
@@ -763,7 +661,7 @@ async function promptTypedKey(
 	let lastError: string | null = seedError;
 
 	while (true) {
-		renderScreen(tui, `Step 2 of 4 · Connect ${provider.name}`);
+		renderScreen(tui, `Step 2 of 3 · Connect ${provider.name}`);
 
 		if (lastError) {
 			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
@@ -819,13 +717,17 @@ async function promptTypedKey(
 		}
 
 		// Step 3: only persist after both checks pass.
-		// `authStorage.set` populates Pi's in-memory store; the post-wizard
-		// bridge in cli/commands/onboard.ts:bridgeOnboardingResultToBrigadeNative
-		// reads it back and writes to auth-profiles.json with the literal
-		// `key` field. Mirrors OpenClaw's `setCredential(apiKey, "plaintext")`
-		// → `buildApiKeyCredential` → `upsertAuthProfile` shape. No separate
-		// brigade.json::env write — auth-profiles.json IS the canonical home
-		// for the credential, and `rm -rf ~/.brigade` wipes both.
+		// Wizard owns ALL persistence (mirrors OpenClaw's pattern — no
+		// post-wizard bridge mirror that could clobber a keyRef profile):
+		//   - upsertApiKeyProfile → ~/.brigade/agents/<id>/agent/auth-profiles.json
+		//     (the canonical credential store; `rm -rf ~/.brigade` wipes it)
+		//   - authStorage.set → Pi's in-memory store + ~/.brigade/auth.json
+		//     (so the wizard process can immediately use the key for the model
+		//     picker that runs next; on disk it's a redundant mirror of the
+		//     same literal value, fine for plaintext)
+		// Typed-paste is always plaintext — there's no env var to reference,
+		// the value originated in a TUI input box.
+		upsertApiKeyProfile(DEFAULT_AGENT_ID, { provider: providerId, key });
 		authStorage.set(providerId, { type: "api_key", key });
 		authStorage.reload();
 
@@ -896,7 +798,7 @@ async function ensureLocalOllama(
 	let lastError: string | null = null;
 
 	while (true) {
-		renderScreen(tui, "Step 2 of 4 · Connect Ollama");
+		renderScreen(tui, "Step 2 of 3 · Connect Ollama");
 
 		if (lastError) {
 			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
@@ -1064,6 +966,58 @@ export function formatApiKeyPreview(raw: string, opts: { head?: number; tail?: n
  * env var (env-key path) — better to log and continue than abort the
  * onboarding the user has already invested time in.
  */
+
+/**
+ * Read auth-profiles.json synchronously and return the resolved API key for
+ * `providerId` if a profile exists, or "" otherwise.
+ *
+ * Mirrors `core/auth-bridge.ts:resolveProfileKey` so the wizard's
+ * fast-accept path treats keyRef profiles the same as plaintext ones —
+ * without this, ref-stored profiles look "missing" because Pi's authStorage
+ * (which reads ~/.brigade/auth.json) doesn't see them and the operator
+ * gets re-prompted on every onboard run.
+ *
+ * Sync read is fine here: the file is at most a few KB, the wizard has
+ * already opened a TUI session (so we're past hot-cold-start), and async
+ * would force the caller into a chain of awaits in tight UI logic.
+ */
+function readKeyRefFromProfilesFile(providerId: string): string {
+	try {
+		const profilesPath = resolveAuthProfilesPath(DEFAULT_AGENT_ID);
+		const fsSync = require("node:fs") as typeof import("node:fs");
+		if (!fsSync.existsSync(profilesPath)) return "";
+		const raw = fsSync.readFileSync(profilesPath, "utf8");
+		const parsed = JSON.parse(raw) as {
+			profiles?: Record<
+				string,
+				{
+					provider?: string;
+					key?: string;
+					keyRef?: { source?: string; id?: string } | string;
+				}
+			>;
+		};
+		const profile = Object.values(parsed.profiles ?? {}).find(
+			(p) => p?.provider === providerId,
+		);
+		if (!profile) return "";
+		// Plaintext wins if both shapes are somehow present (shouldn't happen).
+		if (typeof profile.key === "string" && profile.key.length > 0) return profile.key;
+		const ref = profile.keyRef;
+		if (!ref) return "";
+		if (typeof ref === "string") {
+			const m = /^\$\{([A-Z_][A-Z0-9_]*)\}$/.exec(ref);
+			if (m && m[1]) return process.env[m[1]] ?? "";
+			return "";
+		}
+		if (ref.source === "env" && ref.id) {
+			return process.env[ref.id] ?? "";
+		}
+		return "";
+	} catch {
+		return "";
+	}
+}
 
 function clear(tui: TUI): void {
 	for (const child of [...tui.children]) tui.removeChild(child);

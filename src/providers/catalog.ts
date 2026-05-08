@@ -162,14 +162,29 @@ export function findProvider(id: string): ProviderInfo | undefined {
  * this helper is the Brigade-side extension that surfaces the fallbacks.
  */
 export function readProviderEnvKey(provider: ProviderInfo): string | undefined {
+	return resolveProviderEnvVarSource(provider)?.value;
+}
+
+/**
+ * Like `readProviderEnvKey` but returns BOTH the value AND the env var name
+ * that satisfied the read. Critical for `--secret-input-mode ref` — the keyRef
+ * persisted to disk must point at the env var that ACTUALLY held the value,
+ * not blindly at `provider.envVar`. Otherwise, when a user is authed via a
+ * fallback (e.g. `ANTHROPIC_OAUTH_TOKEN` instead of `ANTHROPIC_API_KEY`), the
+ * stored `keyRef.id = "ANTHROPIC_API_KEY"` resolves to undefined at runtime
+ * and the credential silently disappears.
+ */
+export function resolveProviderEnvVarSource(
+	provider: ProviderInfo,
+): { name: string; value: string } | undefined {
 	const primary = provider.envVar;
 	if (primary) {
 		const v = process.env[primary];
-		if (typeof v === "string" && v.trim().length > 0) return v;
+		if (typeof v === "string" && v.trim().length > 0) return { name: primary, value: v };
 	}
 	for (const fallback of provider.envVarFallbacks ?? []) {
 		const v = process.env[fallback];
-		if (typeof v === "string" && v.trim().length > 0) return v;
+		if (typeof v === "string" && v.trim().length > 0) return { name: fallback, value: v };
 	}
 	return undefined;
 }

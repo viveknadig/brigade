@@ -43,7 +43,12 @@ export function buildProgram(): Command {
   program
     .command("onboard")
     .description("Pick a provider and model — interactive Pi-TUI wizard")
-    .option("--no-env-detect", "ignore API keys from the shell environment", false)
+    // Commander's `--no-X` pattern: with no third arg the option defaults to
+    // `true`, and passing `--no-env-detect` flips it to `false`. Passing an
+    // explicit `false` default broke the inverted semantics — it pinned the
+    // value to `false` regardless of what the user typed, so env-detection
+    // was silently OFF on every `brigade onboard` run. Drop the default.
+    .option("--no-env-detect", "ignore API keys from the shell environment")
     .option(
       "--secret-input-mode <mode>",
       "how accepted env-keys persist: 'plaintext' (default, copies value into ~/.brigade/) or 'ref' (stores a keyRef; literal value never lands on disk)",
@@ -74,7 +79,8 @@ export function buildProgram(): Command {
   program
     .command("tui", { isDefault: true })
     .description("Launch the in-process Brigade chat TUI (default subcommand)")
-    .option("--no-env-detect", "ignore API keys from the shell environment", false)
+    // Same Commander `--no-X` pattern as `onboard` above — no third arg.
+    .option("--no-env-detect", "ignore API keys from the shell environment")
     .action(async (opts: { envDetect?: boolean }) => {
       const { runChatCommand } = await import("../commands/chat.js");
       await runChatCommand({ noEnvDetect: opts.envDetect === false });

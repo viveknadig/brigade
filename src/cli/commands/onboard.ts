@@ -18,7 +18,6 @@
  */
 
 import * as fsAsync from "node:fs/promises";
-import * as path from "node:path";
 import process from "node:process";
 
 import { AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
@@ -155,42 +154,47 @@ async function bridgeOnboardingResultToBrigadeNative(args: {
 	modelId: string;
 	authStorage: AuthStorage;
 }): Promise<void> {
-	// Pull the key Pi just stored. The wizard always sets a key for non-noAuth
-	// providers; for local providers (Ollama) `getApiKey` returns undefined
-	// and we skip the auth-profile bridge entirely.
-	const key = await args.authStorage.getApiKey(args.provider);
-	if (typeof key === "string" && key.length > 0) {
-		// Skip if a profile already exists with this exact key — avoids
-		// rewriting auth-profiles.json on every re-onboard.
+	// Credential-mirror step: the wizard now owns ALL credential persistence
+	// (typed-paste, env-accept, env-auto-select all call `upsertApiKeyProfile`
+	// or `upsertApiKeyRefProfile` directly inside `runOnboarding`). This bridge
+	// used to re-write the profile by reading `authStorage.getApiKey` — but
+	// that's a literal value, so re-writing would CLOBBER any keyRef profile
+	// the wizard just persisted in `--secret-input-mode ref`, defeating ref
+	// mode entirely.
+	//
+	// Defensive net only: if (and ONLY if) the wizard somehow didn't write a
+	// profile for this provider (e.g. a code path that pre-dates the direct
+	// upsert), do a one-time mirror so the user isn't left without a credential.
+	// Any existing profile (literal `key` OR `keyRef`) is left untouched.
+	try {
+		const profilesPath = resolveAuthProfilesPath(DEFAULT_AGENT_ID);
+		let providerHasProfile = false;
 		try {
-			const profilesPath = resolveAuthProfilesPath(DEFAULT_AGENT_ID);
-			let alreadyHasMatch = false;
-			try {
-				const raw = await fsAsync.readFile(profilesPath, "utf8");
-				const parsed = JSON.parse(raw) as {
-					profiles?: Record<string, { provider?: string; key?: string }>;
-				};
-				alreadyHasMatch = Object.values(parsed.profiles ?? {}).some(
-					(p) => p?.provider === args.provider && p.key === key,
-				);
-			} catch {
-				// No file yet, or unreadable — fall through to the upsert.
-			}
-			if (!alreadyHasMatch) {
+			const raw = await fsAsync.readFile(profilesPath, "utf8");
+			const parsed = JSON.parse(raw) as {
+				profiles?: Record<string, { provider?: string; key?: string; keyRef?: unknown }>;
+			};
+			providerHasProfile = Object.values(parsed.profiles ?? {}).some(
+				(p) => p?.provider === args.provider && (p.key !== undefined || p.keyRef !== undefined),
+			);
+		} catch {
+			// No file yet or unreadable — fall through; the upsert below creates it.
+		}
+		if (!providerHasProfile) {
+			const key = await args.authStorage.getApiKey(args.provider);
+			if (typeof key === "string" && key.length > 0) {
 				upsertApiKeyProfile(DEFAULT_AGENT_ID, { provider: args.provider, key });
 			}
-		} catch (err) {
-			// Don't block onboarding success on the bridge failing — surface a
-			// breadcrumb instead. The user can re-run `brigade onboard` to
-			// retry, or hand-edit auth-profiles.json themselves.
-			process.stderr.write(
-				chalk.yellow(
-					`\nbrigade: warning — couldn't mirror key to ${path.basename(
-						resolveAuthProfilesPath(DEFAULT_AGENT_ID),
-					)}: ${(err as Error).message}\n`,
-				),
-			);
 		}
+	} catch (err) {
+		// Don't block onboarding success on the bridge failing — surface a
+		// breadcrumb instead. The user can re-run `brigade onboard` to
+		// retry, or hand-edit auth-profiles.json themselves.
+		process.stderr.write(
+			chalk.yellow(
+				`\nbrigade: warning — couldn't verify auth-profiles.json: ${(err as Error).message}\n`,
+			),
+		);
 	}
 
 	// Migrate brigade.json's flat shape (written by ui/onboarding.ts:144) into

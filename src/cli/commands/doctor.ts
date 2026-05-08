@@ -218,13 +218,54 @@ function checkConfiguredProvider(config: Awaited<ReturnType<typeof loadConfig>> 
 	if (fs.existsSync(profilesPath)) {
 		try {
 			const parsed = JSON.parse(fs.readFileSync(profilesPath, "utf8")) as {
-				profiles?: Record<string, { provider?: string; key?: string }>;
+				profiles?: Record<
+					string,
+					{
+						provider?: string;
+						key?: string;
+						keyRef?: { source?: string; id?: string } | string;
+					}
+				>;
 			};
-			const hasKey = Object.values(parsed.profiles ?? {}).some(
-				(p) => p?.provider === provider && typeof p.key === "string" && p.key.length > 0,
+			// Plaintext profiles: any non-empty `key` field counts.
+			const profile = Object.values(parsed.profiles ?? {}).find(
+				(p) => p?.provider === provider,
 			);
-			if (hasKey) {
-				return { name: "default provider", status: "ok", message: `${provider}/${modelId}` };
+			if (profile) {
+				if (typeof profile.key === "string" && profile.key.length > 0) {
+					return { name: "default provider", status: "ok", message: `${provider}/${modelId}` };
+				}
+				// Ref profiles: resolve the env var the keyRef points at and
+				// surface a precise message (helps the user diagnose
+				// "I have a profile but the env is unset" without grepping).
+				const ref = profile.keyRef;
+				if (ref && typeof ref === "object" && ref.source === "env" && ref.id) {
+					const envValue = process.env[ref.id];
+					if (typeof envValue === "string" && envValue.length > 0) {
+						return {
+							name: "default provider",
+							status: "ok",
+							message: `${provider}/${modelId} (keyRef → ${ref.id})`,
+						};
+					}
+					return {
+						name: "default provider",
+						status: "warn",
+						message: `${provider}/${modelId} — profile pins keyRef → ${ref.id}, but the env var is unset`,
+						hint: `export ${ref.id}=... in your shell, or run \`brigade onboard\` to switch the credential shape.`,
+					};
+				}
+				if (typeof ref === "string") {
+					// Legacy `${VAR}` literal form.
+					const m = /^\$\{([A-Z_][A-Z0-9_]*)\}$/.exec(ref);
+					if (m && m[1] && process.env[m[1]]) {
+						return {
+							name: "default provider",
+							status: "ok",
+							message: `${provider}/${modelId} (keyRef → ${m[1]})`,
+						};
+					}
+				}
 			}
 		} catch {
 			// fall through
