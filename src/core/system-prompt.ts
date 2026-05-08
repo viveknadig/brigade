@@ -52,6 +52,34 @@ export async function seedDefaultPrompts(workspaceDir?: string): Promise<void> {
 }
 
 /**
+ * Per-turn refresh options. All fields optional — defaults match v1
+ * single-user single-agent behaviour. Callers (chat.ts main loop, gateway,
+ * sub-agent dispatcher in Primitive #6) layer in capabilities + ephemeral
+ * task-framing as those primitives land.
+ */
+export interface RefreshSessionSystemPromptOptions {
+  /** Working directory for the runtime line. Defaults to process.cwd(). */
+  cwd?: string;
+  /**
+   * Per-turn-only addition pinned BELOW the cache boundary so it never busts
+   * the cached prefix. Sub-agents (Primitive #6) use this to inject the
+   * task brief; ephemeral system messages use it for one-shot directives.
+   * Empty / undefined → omitted entirely.
+   */
+  ephemeralSuffix?: string;
+  /**
+   * Capability gates — turn on the matching guidance block when the session
+   * has the corresponding tool wired in. Off-by-default keeps the cached
+   * prefix small until primitives #4-6 ship.
+   */
+  capabilities?: {
+    memory?: boolean;
+    skills?: boolean;
+    subAgents?: boolean;
+  };
+}
+
+/**
  * Re-assemble the full system prompt and pin it to the Pi session via the
  * 3-write hack so subsequent turns don't get clobbered by Pi's natural
  * re-assembly. Used by the lifted TUI's per-turn refresh hook.
@@ -59,11 +87,16 @@ export async function seedDefaultPrompts(workspaceDir?: string): Promise<void> {
  * Workspace files (AGENTS.md, SOUL.md, etc.) are re-read every call so a
  * mid-session edit (e.g., the user updates IDENTITY.md after onboarding)
  * lands on the next turn.
+ *
+ * `cwdOrOpts` accepts the legacy `string` form (just the cwd) OR the new
+ * options-bag form so existing call-sites don't have to change.
  */
 export async function refreshSessionSystemPrompt(
   session: AgentSession,
-  cwd?: string,
+  cwdOrOpts?: string | RefreshSessionSystemPromptOptions,
 ): Promise<void> {
+  const opts: RefreshSessionSystemPromptOptions =
+    typeof cwdOrOpts === "string" ? { cwd: cwdOrOpts } : (cwdOrOpts ?? {});
   const workspaceDir = resolveAgentWorkspaceDir(DEFAULT_AGENT_ID);
   const personaFiles = await loadWorkspaceContextFiles(workspaceDir);
   const heartbeatFile = await loadHeartbeatFile(workspaceDir);
@@ -73,18 +106,23 @@ export async function refreshSessionSystemPrompt(
   };
   const provider = sessionAny.model?.provider ?? "unknown";
   const modelId = sessionAny.model?.modelId ?? "unknown";
+  const thinkingLevel = sessionAny.thinkingLevel ?? "off";
   const runtime = resolveRuntimeParams({
     agentId: DEFAULT_AGENT_ID,
     workspaceDir,
-    cwd: cwd ?? process.cwd(),
+    cwd: opts.cwd ?? process.cwd(),
     modelLabel: `${provider}/${modelId}`,
-    thinkingLevel: sessionAny.thinkingLevel ?? "off",
+    thinkingLevel,
   });
   const assembled = assembleSystemPrompt({
     runtime,
     personaFiles,
     heartbeatFile,
     toolDescriptions: [],
+    modelId,
+    thinkingLevel,
+    capabilities: opts.capabilities,
+    ephemeralSuffix: opts.ephemeralSuffix,
   });
   applyPersonaOverrideToSession(session, assembled.text);
 }

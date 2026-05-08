@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   BrigadeRetryError,
-  classifyError,
+  classifyErrorReason,
   isBrigadeRetryError,
   scrubAnthropicRefusalSentinel,
   summariseError,
@@ -11,66 +11,66 @@ import {
 
 test("classifyError: HTTP 429 → rate_limit", () => {
   const err = Object.assign(new Error("Too many requests"), { status: 429 });
-  assert.equal(classifyError(err), "rate_limit");
+  assert.equal(classifyErrorReason(err), "rate_limit");
 });
 
 test("classifyError: HTTP 503 with 'overloaded' message → overloaded", () => {
   const err = Object.assign(new Error("service unavailable; overloaded"), { status: 503 });
-  assert.equal(classifyError(err), "overloaded");
+  assert.equal(classifyErrorReason(err), "overloaded");
 });
 
 test("classifyError: HTTP 503 without overload hint → timeout", () => {
   const err = Object.assign(new Error("internal error"), { status: 503 });
-  assert.equal(classifyError(err), "timeout");
+  assert.equal(classifyErrorReason(err), "timeout");
 });
 
 test("classifyError: HTTP 402 with 'insufficient credits' → billing", () => {
   const err = Object.assign(new Error("insufficient credits"), { status: 402 });
-  assert.equal(classifyError(err), "billing");
+  assert.equal(classifyErrorReason(err), "billing");
 });
 
 test("classifyError: HTTP 402 with 'try again later' (rate-limit hint) → rate_limit", () => {
   const err = Object.assign(new Error("daily limit reached, try again later"), { status: 402 });
-  assert.equal(classifyError(err), "rate_limit");
+  assert.equal(classifyErrorReason(err), "rate_limit");
 });
 
 test("classifyError: HTTP 401 with 'key revoked' → auth_permanent", () => {
   const err = Object.assign(new Error("API key has been revoked"), { status: 401 });
-  assert.equal(classifyError(err), "auth_permanent");
+  assert.equal(classifyErrorReason(err), "auth_permanent");
 });
 
 test("classifyError: HTTP 401 generic → auth", () => {
   const err = Object.assign(new Error("invalid api key"), { status: 401 });
-  assert.equal(classifyError(err), "auth");
+  assert.equal(classifyErrorReason(err), "auth");
 });
 
 test("classifyError: HTTP 408 → timeout", () => {
   const err = Object.assign(new Error("request timeout"), { status: 408 });
-  assert.equal(classifyError(err), "timeout");
+  assert.equal(classifyErrorReason(err), "timeout");
 });
 
 test("classifyError: ECONNRESET on Node fetch → timeout", () => {
   const err = Object.assign(new Error("network error"), { code: "ECONNRESET" });
-  assert.equal(classifyError(err), "timeout");
+  assert.equal(classifyErrorReason(err), "timeout");
 });
 
 test("classifyError: TimeoutError name → timeout", () => {
   const err = new Error("deadline exceeded");
   err.name = "TimeoutError";
-  assert.equal(classifyError(err), "timeout");
+  assert.equal(classifyErrorReason(err), "timeout");
 });
 
 test("classifyError: AbortError name → unknown (caller short-circuits via isAbortError)", () => {
   const err = new Error("aborted");
   err.name = "AbortError";
-  assert.equal(classifyError(err), "unknown");
+  assert.equal(classifyErrorReason(err), "unknown");
 });
 
 test("classifyError: walks cause chain", () => {
   const inner = Object.assign(new Error("rate limit exceeded"), { status: 429 });
   const outer = new Error("wrapper");
   (outer as { cause?: unknown }).cause = inner;
-  assert.equal(classifyError(outer), "rate_limit");
+  assert.equal(classifyErrorReason(outer), "rate_limit");
 });
 
 test("classifyError: handles circular cause without infinite loop", () => {
@@ -79,41 +79,53 @@ test("classifyError: handles circular cause without infinite loop", () => {
   a.cause = b;
   b.cause = a;
   // Should terminate, not hang. Result irrelevant — we just need no crash.
-  assert.equal(classifyError(a), "unknown");
+  assert.equal(classifyErrorReason(a), "unknown");
 });
 
 test("classifyError: statusCode (camelCase) is read alongside .status", () => {
   const err = Object.assign(new Error("rate limited"), { statusCode: 429 });
-  assert.equal(classifyError(err), "rate_limit");
+  assert.equal(classifyErrorReason(err), "rate_limit");
 });
 
 test("classifyError: BrigadeRetryError short-circuits to its own reason", () => {
   const err = new BrigadeRetryError({ message: "x", reason: "billing" });
-  assert.equal(classifyError(err), "billing");
+  assert.equal(classifyErrorReason(err), "billing");
 });
 
-test("classifyError: 'context window exceeded' free text → unknown (caller decides what to do)", () => {
-  // Not yet a first-class category; we want it not to match an unrelated
-  // category and to fall through to unknown.
+test("classifyError: 'context window exceeded' free text → context_overflow (compaction recovery path)", () => {
+  // Was `unknown` before context_overflow landed in the taxonomy; tools
+  // flooding context now route through the compaction-then-retry path.
   const err = new Error("context window exceeded");
-  assert.equal(classifyError(err), "unknown");
+  assert.equal(classifyErrorReason(err), "context_overflow");
+});
+
+test("classifyError: 'prompt is too long' (Anthropic phrasing) → context_overflow", () => {
+  const err = new Error("prompt is too long: 210000 tokens > 200000 maximum");
+  assert.equal(classifyErrorReason(err), "context_overflow");
+});
+
+test("classifyError: 'maximum context length' (OpenAI phrasing) → context_overflow", () => {
+  const err = new Error(
+    "This model's maximum context length is 128000 tokens. Please reduce the length of the messages.",
+  );
+  assert.equal(classifyErrorReason(err), "context_overflow");
 });
 
 test("classifyError: ZAI quota code 1311 → billing", () => {
   const err = new Error('{"code": 1311, "message":"quota"}');
-  assert.equal(classifyError(err), "billing");
+  assert.equal(classifyErrorReason(err), "billing");
 });
 
 test("classifyError: ZAI revoked code 1113 → auth_permanent", () => {
   const err = new Error('{"code": 1113, "message":"key revoked"}');
-  assert.equal(classifyError(err), "auth_permanent");
+  assert.equal(classifyErrorReason(err), "auth_permanent");
 });
 
 test("classifyError: null / undefined / empty → unknown", () => {
-  assert.equal(classifyError(null), "unknown");
-  assert.equal(classifyError(undefined), "unknown");
-  assert.equal(classifyError(""), "unknown");
-  assert.equal(classifyError({}), "unknown");
+  assert.equal(classifyErrorReason(null), "unknown");
+  assert.equal(classifyErrorReason(undefined), "unknown");
+  assert.equal(classifyErrorReason(""), "unknown");
+  assert.equal(classifyErrorReason({}), "unknown");
 });
 
 test("isBrigadeRetryError: positive + negatives", () => {

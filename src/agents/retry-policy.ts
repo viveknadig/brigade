@@ -23,7 +23,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 
 import {
-  classifyError,
+  classifyErrorReason,
   isBrigadeRetryError,
   summariseError,
   type ClassificationContext,
@@ -145,6 +145,21 @@ export function getRetryPolicy(reason: RetryReason): RetryPolicy {
         rotateModel: false,
         consumesProbeSlot: false,
       };
+    case "context_overflow":
+      // Context overflow is recoverable on the SAME model, but the recovery
+      // is "run smart compaction" — not "retry with the same body". The loop
+      // owns the compaction step; this policy just signals "don't burn a
+      // probe slot, don't rotate, give the loop one shot to compact + retry".
+      // baseBackoffMs=0 because compaction is the gate, not wall-clock.
+      return {
+        reason,
+        transient: true,
+        maxRetries: 1,
+        baseBackoffMs: 0,
+        rotateAuthProfile: false,
+        rotateModel: false,
+        consumesProbeSlot: false,
+      };
   }
 }
 
@@ -251,7 +266,7 @@ export async function runWithRetry<T>(args: RunWithRetryArgs<T>): Promise<T> {
       // (e.g. "Interrupted by user"), not the inner error.
       if (args.signal?.aborted) throw args.signal.reason ?? err;
 
-      const reason = classifyError(err, args.ctx);
+      const reason = classifyErrorReason(err, args.ctx);
       const policy = getRetryPolicy(reason);
       const remaining = policy.maxRetries - attemptIndex;
       const willRetry = policy.transient && remaining > 0 && !args.signal?.aborted;

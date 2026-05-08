@@ -99,6 +99,18 @@ export interface BuildAgentOptions {
 	cwd: string;
 	/** Optional override for Brigade's default system prompt. */
 	systemPrompt?: string;
+	/**
+	 * Optional pre-built SessionManager. When omitted, buildAgent calls
+	 * `SessionManager.continueRecent(cwd)` for chat-style auto-resume. Pass
+	 * this when the caller drives session lookup by key (e.g. `brigade agent
+	 * --session-key foo`) instead of by cwd.
+	 *
+	 * This is the integration point that lets the single-turn CLI path and
+	 * the multi-turn TUI path share ONE runtime — matches OpenClaw's
+	 * `agentCommandInternal` shape where both surfaces route through the
+	 * same agent factory.
+	 */
+	sessionManager?: SessionManager;
 	/** Loop hooks. All optional. See type docs above. */
 	beforeToolCall?: BeforeToolCallHook;
 	afterToolCall?: AfterToolCallHook;
@@ -112,11 +124,14 @@ export async function buildAgent(opts: BuildAgentOptions): Promise<AgentSession>
 	// when files are missing or unreadable.
 	await seedDefaultPrompts();
 
-	// Auto-resume the most recent conversation in this cwd, or start fresh if none.
-	// Pass a Brigade-rooted session dir so transcripts live under ~/.brigade/sessions/
-	// (Pi's default would be ~/.pi/agent/sessions/ — we want Brigade self-contained
-	// so "delete my chat" is a single rm under one Brigade folder).
-	const sessionManager = SessionManager.continueRecent(opts.cwd, getBrigadeSessionDir(opts.cwd));
+	// Session resolution. Caller can supply a pre-built SessionManager (used
+	// by the single-turn CLI path that resolves by session-key); when absent,
+	// auto-resume the most recent conversation in this cwd or start fresh.
+	// Either way, transcripts live under ~/.brigade/sessions/ — Pi's default
+	// would be ~/.pi/agent/sessions/ but we want Brigade self-contained.
+	const sessionManager =
+		opts.sessionManager ??
+		SessionManager.continueRecent(opts.cwd, getBrigadeSessionDir(opts.cwd));
 
 	// Per-model SAFE default. See model-caps.ts for the rationale (reasoning-only
 	// models like Gemini 2.5 Pro reject "off"; non-reasoning models ignore it).

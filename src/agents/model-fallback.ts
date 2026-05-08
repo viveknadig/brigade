@@ -19,7 +19,7 @@
 // asked for it.
 
 import {
-  classifyError,
+  classifyErrorReason,
   isBrigadeRetryError,
   summariseError,
   type RetryReason,
@@ -137,7 +137,7 @@ export async function runWithModelFallback<T>(
         continue;
       }
 
-      const reason = classifyError(err);
+      const reason = classifyErrorReason(err);
       const status = isBrigadeRetryError(err) ? err.status : undefined;
       const errorSummary = summariseError(err);
       const info: FallbackAttempt = {

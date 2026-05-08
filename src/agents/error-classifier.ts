@@ -17,16 +17,17 @@
 //   • Already-classified BrigadeRetryError thrown from a prior layer
 
 export type RetryReason =
-  | "auth"            // bad/expired credential — try a different profile, not retry-in-place
-  | "auth_permanent"  // key disabled/revoked — never retry this profile
-  | "format"          // request shape rejected — retrying with the same body is useless
-  | "rate_limit"      // 429 / quota — backoff + cooldown + rotate profile
-  | "overloaded"      // 503 / 529 / "high demand" — backoff, then probe
-  | "billing"         // 402 / insufficient credits — semi-persistent, may need user action
-  | "timeout"         // network/connect/read timeout — retry transient
-  | "model_not_found" // provider doesn't know this model — rotate to fallback
-  | "session_expired" // upstream session/conversation expired — fail fast or refresh
-  | "unknown";        // catch-all; treated as transient at the policy layer
+  | "auth"             // bad/expired credential — try a different profile, not retry-in-place
+  | "auth_permanent"   // key disabled/revoked — never retry this profile
+  | "format"           // request shape rejected — retrying with the same body is useless
+  | "rate_limit"       // 429 / quota — backoff + cooldown + rotate profile
+  | "overloaded"       // 503 / 529 / "high demand" — backoff, then probe
+  | "billing"          // 402 / insufficient credits — semi-persistent, may need user action
+  | "timeout"          // network/connect/read timeout — retry transient
+  | "context_overflow" // input + output exceeds context — compact then retry, don't burn fallbacks
+  | "model_not_found"  // provider doesn't know this model — rotate to fallback
+  | "session_expired"  // upstream session/conversation expired — fail fast or refresh
+  | "unknown";         // catch-all; treated as transient at the policy layer
 
 export interface ClassificationContext {
   provider?: string;
@@ -163,6 +164,25 @@ const FORMAT_PATTERNS: RegExp[] = [
   /messages\.\d+\.content\.\d+\.tool_use\.id/i,
 ];
 
+// Context-overflow patterns. Tool calls (especially `bash` / `read` on large
+// files / `grep` returning many matches) flood the context window faster
+// than any other surface. Without a dedicated bucket these errors fall into
+// `format` (terminal, no retry) or `unknown` (retries with the same body
+// that just exceeded the limit) — both wrong. The right response is to run
+// smart compaction and retry. Mirrors the detailed classifier's
+// CONTEXT_OVERFLOW_PATTERNS_DETAILED set so the two stay aligned.
+const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
+  /context\s+(?:length|size|window)/i,
+  /maximum\s+context/i,
+  /token\s+limit/i,
+  /too\s+many\s+tokens/i,
+  /reduce\s+the\s+length/i,
+  /exceeds?\s+the\s+(?:limit|maximum)/i,
+  /prompt\s+is\s+too\s+long/i,
+  /context_window_exceeded/i,
+  /context_length_exceeded/i,
+];
+
 const MODEL_NOT_FOUND_PATTERNS: RegExp[] = [
   /model[_ ]?not[_ ]?found/i,
   /unknown model/i,
@@ -225,7 +245,20 @@ function classifyByStatus(status: number, message: string): RetryReason | null {
 // status/message lives one or two layers deep — common for fetch wrappers.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function classifyError(value: unknown, _ctx?: ClassificationContext): RetryReason {
+/**
+ * RetryReason classifier. Returns one of the 11 retry-policy categories so
+ * `getRetryPolicy(reason)` can pick the right backoff / rotation strategy.
+ *
+ * NOTE: there is a SECOND classifier in this file (`classifyErrorDetailed`)
+ * that returns a richer object shape used by the lifted v0.1.3 wrappers in
+ * `core/agent.ts`. They are NOT interchangeable — the names differ
+ * deliberately so a future careless edit can't swap them silently.
+ *
+ * For an alias view, `core/agent.ts` imports `classifyErrorDetailed as
+ * classifyError` — that's its OWN file's local name, not the one exported
+ * here. This file's `classifyError` always returns a string RetryReason.
+ */
+export function classifyErrorReason(value: unknown, _ctx?: ClassificationContext): RetryReason {
   if (isBrigadeRetryError(value)) return value.reason;
   if (value === null || value === undefined) return "unknown";
 
@@ -309,6 +342,10 @@ function classifyByMessage(message: string): RetryReason | null {
   if (matchAny(message, AUTH_PATTERNS)) return "auth";
   if (matchAny(message, MODEL_NOT_FOUND_PATTERNS)) return "model_not_found";
   if (matchAny(message, SESSION_EXPIRED_PATTERNS)) return "session_expired";
+  // context_overflow MUST be checked before format. A "prompt is too long"
+  // error often arrives with a 400 status that would otherwise hit FORMAT
+  // patterns first. Wrong classification here drops compaction recovery.
+  if (matchAny(message, CONTEXT_OVERFLOW_PATTERNS)) return "context_overflow";
   if (matchAny(message, FORMAT_PATTERNS)) return "format";
   if (matchAny(message, TIMEOUT_PATTERNS)) return "timeout";
   return null;

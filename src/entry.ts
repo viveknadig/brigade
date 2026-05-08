@@ -1,4 +1,14 @@
 import { isRootHelpInvocation, isRootVersionInvocation } from "./cli/argv.js";
+import { installTerminalCleanupHandler } from "./ui/terminal-cleanup.js";
+
+// Install the process-wide terminal cleanup handler ONCE, before any subcommand
+// has a chance to spawn Pi-TUI / mutate terminal modes. Each subcommand still
+// installs its own SIGINT handler (because they have UI state to tear down —
+// abort an in-flight turn first, save sessions, etc.), but SIGTERM / SIGHUP /
+// uncaught exceptions / pi-event-handler throws would otherwise leak the kitty
+// keyboard protocol push and bracketed-paste mode into the user's shell. This
+// catches every exit path including crashes during chat / connect.
+installTerminalCleanupHandler();
 
 // Brigade entry point. Mirrors OpenClaw's entry.ts dispatch shape:
 //

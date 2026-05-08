@@ -1363,9 +1363,14 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 						},
 					),
 				onFallback: (reason: string) => {
+					// `cfg.fallbackModelId` was the v0.1.3 flat shape; current config
+					// lives at `agents.defaults.model.fallbacks[0]` (read above into
+					// `fallbackModelId`). Without this the user saw "trying undefined…"
+					// every time the primary failed.
+					const target = fallbackModelId ?? "fallback";
 					insertBeforeEditor(
 						new Text(
-							`  ${brand.dim(`↻ primary failed (${friendlyError(reason, cleanProviderError)}) — trying ${cfg.fallbackModelId}…`)}`,
+							`  ${brand.dim(`↻ primary failed (${friendlyError(reason, cleanProviderError)}) — trying ${target}…`)}`,
 							0,
 							0,
 						),
