@@ -24,7 +24,7 @@ import { loadBrigadeConfig, writeBrigadeConfig } from "../core/brigade-config.js
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, saveConfig } from "../core/config.js";
 import { isIdentityNameUnset, seedDefaultPrompts } from "../core/system-prompt.js";
 import { discoverOllamaModels, writeOllamaToModelsJson } from "../integrations/ollama.js";
-import { findProvider, PROVIDERS, type ProviderInfo } from "../providers/catalog.js";
+import { findProvider, PROVIDERS, readProviderEnvKey, type ProviderInfo } from "../providers/catalog.js";
 import { validateApiKeyOnline } from "../providers/validate-key.js";
 import { renderBrandHeader } from "./brand.js";
 import { brand, selectListTheme } from "./theme.js";
@@ -80,6 +80,35 @@ export async function runOnboarding(
 	let step: "provider" | "key" | "model" = "provider";
 	let provider = "";
 	let modelId = "";
+
+	// Auto-select shortcut: when EXACTLY ONE provider has a key in the shell
+	// environment, the user's intent is unambiguous — skip the picker AND
+	// skip the env-key confirmation prompt. Validate the key online; on
+	// success, fast-path straight to the model picker. On failure, fall
+	// through to the normal interactive flow with the failure reason
+	// surfaced so the user knows what to fix.
+	//
+	// `--no-env-detect` opts out of this entirely (operator/CI escape hatch).
+	// Multi-key cases still go through the picker — the user has a real
+	// choice to make and we don't want to silently grab the alphabetically-
+	// first provider.
+	if (!opts.noEnvDetect) {
+		// Detect via Brigade's `readProviderEnvKey` (which honors per-provider
+		// fallbacks like ANTHROPIC_OAUTH_TOKEN) — Pi's `getEnvApiKey` only
+		// checks the primary env var.
+		const envProviders = PROVIDERS.filter((p) => !p.local && !p.noAuth && !!readProviderEnvKey(p));
+		if (envProviders.length === 1) {
+			const auto = envProviders[0]!;
+			const autoResult = await tryAutoSelectFromEnv(tui, authStorage, modelRegistry, auto.id);
+			if (autoResult.ok) {
+				provider = auto.id;
+				step = "model";
+			}
+			// On failure, leave step === "provider" so the wizard renders
+			// normally. autoResult.message (if present) carries the reason
+			// the auto-path bailed (e.g. "key in env failed validation").
+		}
+	}
 
 	while (true) {
 		if (step === "provider") {
@@ -286,7 +315,10 @@ async function pickProvider(tui: TUI): Promise<string> {
 	const detected: SelectItem[] = [];
 	const undetected: SelectItem[] = [];
 	for (const p of PROVIDERS) {
-		const hasEnvKey = !!getEnvApiKey(p.id as KnownProvider);
+		// `readProviderEnvKey` checks `envVar` AND any `envVarFallbacks` —
+		// Anthropic users with `ANTHROPIC_OAUTH_TOKEN` set get the detected
+		// badge alongside the standard `ANTHROPIC_API_KEY` path.
+		const hasEnvKey = !!readProviderEnvKey(p);
 		const noAuth = p.noAuth === true;
 		const item: SelectItem = {
 			value: p.id,
@@ -316,6 +348,98 @@ async function pickProvider(tui: TUI): Promise<string> {
 	});
 
 	return chosen.value;
+}
+
+/**
+ * Auto-select shortcut for the single-env-key case. Caller (`runOnboarding`)
+ * fires this BEFORE the wizard loop when exactly one curated provider has a
+ * value in the shell environment, the assumption being: "if the user has
+ * exactly one provider key exported, they meant for Brigade to use that one."
+ *
+ * Behaviour:
+ *   - Read the env key (Pi's `getEnvApiKey` — same source the picker uses)
+ *   - Validate it online (catches stale leftover exports before the user
+ *     reaches chat with a dead key)
+ *   - On success: persist to brigade.json::env (state-isolation contract),
+ *     show a one-line confirmation, return `{ ok: true }`
+ *   - On failure: render a stale-key notice, return `{ ok: false, message }`
+ *     so the caller falls through to the normal interactive picker
+ *
+ * Idempotent w.r.t. brigade.json — `persistEnvKeyToBrigadeConfig` is the
+ * same writer the interactive path uses; running auto-select repeatedly is
+ * safe.
+ */
+async function tryAutoSelectFromEnv(
+	tui: TUI,
+	_authStorage: AuthStorage,
+	modelRegistry: ModelRegistry,
+	providerId: string,
+): Promise<{ ok: boolean; message?: string }> {
+	const provider = findProvider(providerId);
+	if (!provider) return { ok: false };
+	const envValue = getEnvApiKey(providerId as KnownProvider);
+	if (!envValue) return { ok: false };
+
+	const envVar = provider.envVar ?? "the env var";
+	renderScreen(tui, `Auto-detected · ${provider.name}`);
+	tui.addChild(
+		new Text(
+			brand.dim(`  Found ${envVar} in your shell environment — using it.`),
+			0,
+			0,
+		),
+	);
+	tui.addChild(new Text("", 0, 0));
+
+	const loader = new CancellableLoader(
+		tui,
+		(s) => brand.amber(s),
+		(s) => brand.dim(s),
+		`Verifying ${provider.name}…`,
+	);
+	tui.addChild(loader);
+	tui.requestRender();
+
+	const check = await validateApiKeyOnline(providerId, envValue);
+	tui.removeChild(loader);
+
+	if (!check.ok) {
+		// Stale env value — surface the reason so the user knows their export
+		// is bad, then fall through to the normal interactive flow.
+		tui.addChild(
+			new Text(
+				`  ${brand.error("✗")} ${envVar} didn't validate: ${brand.dim(check.reason)}`,
+				0,
+				0,
+			),
+		);
+		tui.addChild(
+			new Text(
+				brand.dim(`  Falling back to the provider picker so you can choose another option.`),
+				0,
+				0,
+			),
+		);
+		tui.requestRender();
+		await delay(1200);
+		return { ok: false, message: check.reason };
+	}
+
+	await persistEnvKeyToBrigadeConfig(provider, envValue);
+	// Refresh the registry so the model picker can see provider-specific
+	// catalog entries Pi populates after a key lands in env.
+	modelRegistry.refresh();
+
+	tui.addChild(
+		new Text(
+			`  ${brand.amber("✓")} ${provider.name} connected (${formatApiKeyPreview(envValue)}).`,
+			0,
+			0,
+		),
+	);
+	tui.requestRender();
+	await delay(700);
+	return { ok: true };
 }
 
 /**
@@ -370,12 +494,15 @@ export async function ensureApiKey(
 			return "ok";
 		}
 
-		// Env-supplied key: ALWAYS confirm with the user before adopting it.
-		// Just because OPENROUTER_API_KEY (etc.) is exported in the user's
-		// shell does NOT mean they want this onboarding session to consume it.
-		// Auto-accepting silently led to the "I never typed a key, why is it
-		// already connected?" footgun. Default to No (defensive opt-in) so
-		// pressing Enter falls through to the typed-key prompt.
+		// Env-supplied key: confirm with the user before adopting it.
+		//
+		// We're here in the MULTI-key case (the single-env-key auto-select
+		// at the top of `runOnboarding` fires before this branch is reached
+		// when exactly one provider has a key set). The user explicitly
+		// picked THIS provider from a list that included multiple env-keyed
+		// providers — that's a deliberate choice. Default to YES so a quick
+		// Enter accepts the obvious next step. Pick "No" to paste a fresh
+		// key instead.
 		//
 		// Wording rationale: "shell environment" is portable across PowerShell,
 		// bash, zsh, fish, cmd, etc. The previous "(env, sk-…)" label was too
@@ -419,14 +546,14 @@ export async function ensureApiKey(
 
 		const confirmList = new SelectList(
 			[
-				{ value: "no", label: "No, let me paste a different key" },
 				{ value: "yes", label: "Yes, use the shell-env value" },
+				{ value: "no", label: "No, let me paste a different key" },
 			],
 			2,
 			selectListTheme,
 			{ minPrimaryColumnWidth: 36, maxPrimaryColumnWidth: 48 },
 		);
-		confirmList.setSelectedIndex(0); // defensive: default = No
+		confirmList.setSelectedIndex(0); // user explicitly picked this provider — default Yes
 		tui.addChild(confirmList);
 		tui.setFocus(confirmList);
 		tui.requestRender();

@@ -27,7 +27,11 @@ import chalk from "chalk";
 import type { Command } from "commander";
 import JSON5 from "json5";
 
-import { BRIGADE_CONFIG_FILENAME } from "../../core/brigade-config.js";
+import {
+	BrigadeConfigSchema,
+	BRIGADE_CONFIG_FILENAME,
+	collectBrigadeConfigErrors,
+} from "../../core/brigade-config.js";
 import { BRIGADE_DIR, loadConfig, saveConfig } from "../../core/config.js";
 
 const REDACTED_SENTINEL = "__BRIGADE_REDACTED__";
@@ -50,27 +54,66 @@ export interface ConfigListOptions {
 
 /* ───────────────────────── path helpers ───────────────────────── */
 
+/**
+ * Parse a config path into segments. Supports:
+ *
+ *   - dot-notation:        `agents.defaults.provider`
+ *   - escaped dot:         `keys.foo\.bar`         → ["keys", "foo.bar"]
+ *   - bracket array index: `agents.fallbacks[0]`   → ["agents", "fallbacks", "0"]
+ *   - bracket literal key: `secrets.providers["my.vault"]` → ["secrets", "providers", "my.vault"]
+ *
+ * Mirrors openclaw's `parsePath` (`src/cli/config-cli.ts:111-161`) — bracket
+ * support is the genuine ergonomic win (operators editing array slots in
+ * `agents.defaults.model.fallbacks[]` shouldn't have to fall through to
+ * `--strict-json` whole-array overwrites).
+ */
 function parsePath(raw: string): string[] {
 	const trimmed = raw.trim();
 	if (trimmed.length === 0) {
 		throw new Error("config path is empty");
 	}
-	// Split on `.` but allow `\.` to escape a literal dot inside a key.
 	const segments: string[] = [];
 	let buf = "";
 	for (let i = 0; i < trimmed.length; i++) {
 		const ch = trimmed[i];
+		// Escape a literal dot inside a key.
 		if (ch === "\\" && trimmed[i + 1] === ".") {
 			buf += ".";
 			i++;
 			continue;
 		}
+		// Dot separator.
 		if (ch === ".") {
 			if (buf.length === 0) {
 				throw new Error(`empty segment in config path "${raw}"`);
 			}
 			segments.push(buf);
 			buf = "";
+			continue;
+		}
+		// Bracket: either array index `[0]` or literal key `["foo.bar"]`.
+		if (ch === "[") {
+			if (buf.length > 0) {
+				segments.push(buf);
+				buf = "";
+			}
+			const close = trimmed.indexOf("]", i);
+			if (close === -1) {
+				throw new Error(`unclosed "[" in config path "${raw}"`);
+			}
+			let inside = trimmed.slice(i + 1, close).trim();
+			// Strip optional surrounding quotes — accept both `[0]` and `["key"]`.
+			if (
+				(inside.startsWith('"') && inside.endsWith('"')) ||
+				(inside.startsWith("'") && inside.endsWith("'"))
+			) {
+				inside = inside.slice(1, -1);
+			}
+			if (inside.length === 0) {
+				throw new Error(`empty bracket segment in config path "${raw}"`);
+			}
+			segments.push(inside);
+			i = close;
 			continue;
 		}
 		buf += ch;
@@ -82,38 +125,71 @@ function parsePath(raw: string): string[] {
 	return segments;
 }
 
+/** True iff the segment looks like a non-negative integer (array index). */
+function isIndexSegment(seg: string): boolean {
+	return /^[0-9]+$/.test(seg);
+}
+
 function getNested(root: unknown, segments: string[]): unknown {
 	let cur: unknown = root;
 	for (const seg of segments) {
-		if (!cur || typeof cur !== "object") return undefined;
+		if (cur === null || cur === undefined) return undefined;
+		if (Array.isArray(cur) && isIndexSegment(seg)) {
+			cur = cur[Number(seg)];
+			continue;
+		}
+		if (typeof cur !== "object") return undefined;
 		cur = (cur as Record<string, unknown>)[seg];
 	}
 	return cur;
 }
 
 function setNested(root: Record<string, unknown>, segments: string[], value: unknown): void {
-	let cur: Record<string, unknown> = root;
+	let cur: any = root;
 	for (let i = 0; i < segments.length - 1; i++) {
 		const seg = segments[i] ?? "";
-		const next = cur[seg];
-		if (!next || typeof next !== "object" || Array.isArray(next)) {
-			cur[seg] = {};
+		const nextSeg = segments[i + 1] ?? "";
+		const wantArray = isIndexSegment(nextSeg);
+		const existing = Array.isArray(cur) && isIndexSegment(seg) ? cur[Number(seg)] : cur[seg];
+		if (existing === undefined || existing === null || typeof existing !== "object") {
+			// Create container in the right shape for the NEXT segment.
+			const fresh = wantArray ? [] : {};
+			if (Array.isArray(cur) && isIndexSegment(seg)) {
+				cur[Number(seg)] = fresh;
+			} else {
+				cur[seg] = fresh;
+			}
+			cur = fresh;
+		} else {
+			cur = Array.isArray(cur) && isIndexSegment(seg) ? cur[Number(seg)] : cur[seg];
 		}
-		cur = cur[seg] as Record<string, unknown>;
 	}
-	cur[segments[segments.length - 1] ?? ""] = value;
+	const tail = segments[segments.length - 1] ?? "";
+	if (Array.isArray(cur) && isIndexSegment(tail)) {
+		cur[Number(tail)] = value;
+	} else {
+		cur[tail] = value;
+	}
 }
 
 function deleteNested(root: Record<string, unknown>, segments: string[]): boolean {
-	let cur: Record<string, unknown> | undefined = root;
+	let cur: any = root;
 	for (let i = 0; i < segments.length - 1; i++) {
 		const seg = segments[i] ?? "";
-		const next = cur?.[seg];
-		if (!next || typeof next !== "object" || Array.isArray(next)) return false;
-		cur = next as Record<string, unknown>;
+		const next = Array.isArray(cur) && isIndexSegment(seg) ? cur[Number(seg)] : cur?.[seg];
+		if (next === undefined || next === null || typeof next !== "object") return false;
+		cur = next;
 	}
 	const tail = segments[segments.length - 1] ?? "";
-	if (cur && tail in cur) {
+	if (Array.isArray(cur) && isIndexSegment(tail)) {
+		const idx = Number(tail);
+		if (idx < cur.length) {
+			cur.splice(idx, 1); // shift down — matches array-mutation semantics
+			return true;
+		}
+		return false;
+	}
+	if (cur && typeof cur === "object" && tail in cur) {
 		delete cur[tail];
 		return true;
 	}
@@ -241,6 +317,70 @@ export async function runConfigFile(opts: { json?: boolean } = {}): Promise<numb
 		process.stdout.write(`${filePath}\n`);
 	}
 	return 0;
+}
+
+/**
+ * Print the brigade.json TypeBox schema as JSON. Mirrors openclaw's
+ * `openclaw config schema` (`src/cli/config-cli.ts:1265-1273`) — useful for
+ * IDE / external-tool autocompletion against the live shape.
+ *
+ * The output is the in-memory TypeBox schema descriptor (with `type`,
+ * `properties`, `required`, etc.) — JSON-Schema-compatible enough to feed
+ * into a JSON-Schema-aware editor.
+ */
+export async function runConfigSchema(_opts: {} = {}): Promise<number> {
+	process.stdout.write(`${JSON.stringify(BrigadeConfigSchema, null, 2)}\n`);
+	return 0;
+}
+
+/**
+ * Validate the on-disk brigade.json against the TypeBox schema. Reports a
+ * pass/fail line plus per-issue path + message when invalid. Mirrors
+ * openclaw's `openclaw config validate` (`src/cli/config-cli.ts:1275-1324`).
+ *
+ * Exit codes:
+ *   0 — config is valid (or doesn't exist yet — empty file is benign)
+ *   1 — config is invalid; issues listed
+ */
+export async function runConfigValidate(opts: { json?: boolean } = {}): Promise<number> {
+	const filePath = path.join(BRIGADE_DIR, BRIGADE_CONFIG_FILENAME);
+	let cfg: unknown;
+	try {
+		cfg = loadConfig();
+	} catch (err) {
+		const message = (err as Error).message;
+		if (opts.json) {
+			process.stdout.write(`${JSON.stringify({ valid: false, path: filePath, error: message }, null, 2)}\n`);
+		} else {
+			process.stderr.write(`${chalk.red("✗")} couldn't read ${filePath}: ${message}\n`);
+		}
+		return 1;
+	}
+
+	const issues = collectBrigadeConfigErrors(cfg);
+
+	if (issues.length === 0) {
+		if (opts.json) {
+			process.stdout.write(`${JSON.stringify({ valid: true, path: filePath }, null, 2)}\n`);
+		} else {
+			process.stdout.write(`${chalk.green("✓")} valid: ${filePath}\n`);
+		}
+		return 0;
+	}
+
+	if (opts.json) {
+		process.stdout.write(
+			`${JSON.stringify({ valid: false, path: filePath, issues }, null, 2)}\n`,
+		);
+	} else {
+		process.stderr.write(`${chalk.red("✗")} ${issues.length} issue${issues.length === 1 ? "" : "s"} in ${filePath}:\n`);
+		for (const issue of issues) {
+			const where = issue.path || "(root)";
+			process.stderr.write(`  ${chalk.dim("·")} ${chalk.yellow(where)}: ${issue.message}\n`);
+		}
+		process.stderr.write(`\n${chalk.dim("Tip: run `brigade config get <path>` to inspect a specific field.")}\n`);
+	}
+	return 1;
 }
 
 /* ───────────────────────── registration ──────────────────────── */

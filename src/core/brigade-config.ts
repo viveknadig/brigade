@@ -279,7 +279,12 @@ function isoTimestampForFilename(): string {
 	return new Date().toISOString().replace(/[:]/g, "-");
 }
 
-function collectErrors(value: unknown): BrigadeConfigValidationIssue[] {
+/**
+ * Validate any value against the BrigadeConfigSchema and return a flat list
+ * of issues (empty array = valid). Public so the `brigade config validate`
+ * subcommand can reuse the same TypeBox machinery.
+ */
+export function collectBrigadeConfigErrors(value: unknown): BrigadeConfigValidationIssue[] {
 	const issues: BrigadeConfigValidationIssue[] = [];
 	for (const err of Errors(BrigadeConfigSchema, value)) {
 		issues.push({
@@ -289,6 +294,9 @@ function collectErrors(value: unknown): BrigadeConfigValidationIssue[] {
 	}
 	return issues;
 }
+
+// Backwards-compat alias used by writers in this file.
+const collectErrors = collectBrigadeConfigErrors;
 
 async function tryReadJson(p: string): Promise<unknown> {
 	const buf = await fs.readFile(p, "utf8");

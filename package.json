@@ -65,7 +65,9 @@
     "doctor:strict": "node brigade.mjs doctor --strict",
 
     "config:list": "node brigade.mjs config list",
-    "config:file": "node brigade.mjs config file"
+    "config:file": "node brigade.mjs config file",
+    "config:schema": "node brigade.mjs config schema",
+    "config:validate": "node brigade.mjs config validate"
   },
   "engines": {
     "node": ">=22.12"

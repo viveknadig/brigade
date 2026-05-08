@@ -184,6 +184,22 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	let activeAssistant: Markdown | null = null;
 	let activeLoader: CancellableLoader | null = null;
 	const pendingTools = new Map<string, Text>();
+	// Elapsed-time tracker for the running agent. Started on `agent_start`,
+	// cleared on `agent_end`. Read by the 1s ticker below to refresh the
+	// header so the user can see "thinking… 12s" / "thinking… 1m 4s" instead
+	// of a static "thinking…". Mirrors openclaw's `tui-waiting.ts` shimmer +
+	// elapsed but Brigade-shape (no phrase rotation, just clean numbers).
+	let agentStartedAt: number | null = null;
+	// Thinking-block visibility toggle. Default `false` matches today's UX
+	// (thinking blocks excluded from `extractAssistantText` filter). When
+	// flipped to `true` via the `/show-thinking` slash command, the
+	// extractor includes `{ type: "thinking" }` block text alongside the
+	// regular text blocks, dimmed so it stays distinct from the agent's
+	// final reply. Mirrors the `Ctrl+T` toggle openclaw exposes on its
+	// custom-editor (Brigade uses the base Pi-TUI Editor which doesn't
+	// expose key handlers, so we surface the same behaviour through the
+	// slash-command path).
+	let showThinking = false;
 
 	const updateHeader = (extra?: string): void => {
 		const provider = lastSnapshot?.provider ?? "?";
@@ -201,12 +217,34 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 			const colored = pct >= 75 ? brand.amber(`${pct}% ctx`) : brand.dim(`${pct}% ctx`);
 			usageStr = ` · ${colored}`;
 		}
+		// Elapsed time during a running turn. Hidden when idle; shown as
+		// `· 12s` (under a minute) or `· 1m 4s` so the user has a sense of
+		// "is the model still working or has it stalled?".
+		let elapsed = "";
+		if (isAgentRunning && agentStartedAt != null) {
+			const ms = Date.now() - agentStartedAt;
+			elapsed = ` · ${formatElapsed(ms)}`;
+		}
 		const tail = extra ? ` · ${extra}` : "";
 		const dot = isAgentRunning ? brand.amber("●") : brand.dim("○");
 		header.setText(
-			`  ${dot} ${brand.white("Brigade")}  ${brand.dim(`${provider} · ${modelId}${tokens}${cost}`)}${usageStr}${brand.dim(tail)}`,
+			`  ${dot} ${brand.white("Brigade")}  ${brand.dim(`${provider} · ${modelId}${tokens}${cost}`)}${usageStr}${brand.dim(elapsed)}${brand.dim(tail)}`,
 		);
 	};
+
+	/**
+	 * Tick the elapsed-time display every second while the agent is busy.
+	 * Cheap (one timer per connect session, not per-turn) and unref'd so it
+	 * doesn't keep the process alive past `process.exit`. Cleared in the
+	 * abort/close path below.
+	 */
+	const elapsedTimer = setInterval(() => {
+		if (isAgentRunning && agentStartedAt != null) {
+			updateHeader();
+			tui.requestRender();
+		}
+	}, 1000);
+	if (typeof elapsedTimer.unref === "function") elapsedTimer.unref();
 	updateHeader();
 
 	const editor = new Editor(tui, editorTheme);
@@ -226,7 +264,7 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	);
 	tui.addChild(
 		new Text(
-			brand.dim("  Enter to send · Ctrl+C abort · Ctrl+D quit · /model /thinking /compact /help"),
+			brand.dim("  Enter to send · Ctrl+C abort · /usage /abort /show-thinking · /help for full list"),
 			0,
 			0,
 		),
@@ -253,10 +291,38 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 
 	const extractAssistantText = (message: any): string => {
 		if (!message || !Array.isArray(message.content)) return "";
-		return message.content
-			.filter((b: any) => b && b.type === "text" && typeof b.text === "string")
-			.map((b: any) => b.text)
-			.join("");
+		const parts: string[] = [];
+		for (const b of message.content) {
+			if (!b) continue;
+			if (b.type === "text" && typeof b.text === "string") {
+				parts.push(b.text);
+				continue;
+			}
+			// Thinking blocks: hidden by default; surfaced (dimmed) when the
+			// user flips `/show-thinking on`. The dim wrap keeps them
+			// visually distinct from the agent's actual reply.
+			if (showThinking && b.type === "thinking" && typeof b.text === "string") {
+				parts.push(brand.dim(`> ${b.text.split("\n").join("\n> ")}`));
+			}
+		}
+		return parts.join("\n\n");
+	};
+
+	/**
+	 * Format an elapsed-millisecond duration into a compact label for the
+	 * status line. Matches the `12s` / `1m 4s` / `2h 3m` shape openclaw's
+	 * `tui-waiting.ts` uses, minus the shimmer animation (Brigade keeps the
+	 * loader Pi-TUI provides; only the elapsed counter is new).
+	 */
+	const formatElapsed = (ms: number): string => {
+		const total = Math.max(0, Math.floor(ms / 1000));
+		if (total < 60) return `${total}s`;
+		const m = Math.floor(total / 60);
+		const s = total % 60;
+		if (m < 60) return s === 0 ? `${m}m` : `${m}m ${s}s`;
+		const h = Math.floor(m / 60);
+		const mm = m % 60;
+		return mm === 0 ? `${h}h` : `${h}h ${mm}m`;
 	};
 
 	// Auto-kickoff state. Mirrors openclaw's TUI behaviour: when we attach to
@@ -333,6 +399,7 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		switch (event?.type) {
 			case "agent_start": {
 				isAgentRunning = true;
+				agentStartedAt = Date.now();
 				editor.disableSubmit = true;
 				updateHeader("thinking…");
 				activeLoader = new CancellableLoader(
@@ -461,6 +528,7 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 			}
 			case "agent_end": {
 				isAgentRunning = false;
+				agentStartedAt = null;
 				editor.disableSubmit = false;
 				activeAssistant = null;
 				if (activeLoader) {
@@ -501,9 +569,98 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 						`- ${chalk.bold("/model <id>")} — switch to a configured model on the gateway\n` +
 						`- ${chalk.bold("/thinking <level>")} — set reasoning effort (off|minimal|low|medium|high|xhigh)\n` +
 						`- ${chalk.bold("/compact")} — summarize older turns to free up context\n` +
-						`- ${chalk.bold("Ctrl+C")} — abort the current turn\n` +
+						`- ${chalk.bold("/abort")} — stop the in-flight turn\n` +
+						`- ${chalk.bold("/usage")} — show token + cost totals for this session\n` +
+						`- ${chalk.bold("/show-thinking [on|off]")} — toggle thinking-block visibility (default off)\n` +
+						`- ${chalk.bold("Ctrl+C")} — abort the current turn (same as /abort)\n` +
 						`- ${chalk.bold("Ctrl+D")} — quit\n\n` +
 						brand.dim("To add a new provider, run `brigade onboard` on the gateway machine."),
+					1,
+					0,
+					markdownTheme,
+				),
+			);
+			return;
+		}
+
+		// /abort — explicit slash-form for the same action Ctrl+C performs.
+		// Returning true from `handle.abort()` means a turn was running; the
+		// chat loop's SIGINT path uses the same primitive.
+		if (trimmed === "/abort") {
+			editor.setText("");
+			if (!isAgentRunning) {
+				insertBeforeEditor(new Text(`  ${brand.dim("nothing to abort — agent is idle")}`, 0, 0));
+				return;
+			}
+			try {
+				await client.request("abort");
+				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.dim("aborted")}`, 0, 0));
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0));
+			}
+			return;
+		}
+
+		// /show-thinking [on|off] — toggle whether the assistant's thinking
+		// blocks render in the transcript. Pi pushes them via `pi` events
+		// regardless; this is purely a local view filter applied in
+		// `extractAssistantText`. Mirrors openclaw's Ctrl+T toggle on its
+		// custom-editor (Brigade uses base Pi-TUI Editor with no key-handler
+		// surface, so we expose the same behaviour through a slash command).
+		if (trimmed === "/show-thinking" || trimmed.startsWith("/show-thinking ")) {
+			editor.setText("");
+			const arg = trimmed === "/show-thinking" ? "" : trimmed.slice("/show-thinking ".length).trim().toLowerCase();
+			if (arg === "on" || arg === "true" || arg === "1") {
+				showThinking = true;
+			} else if (arg === "off" || arg === "false" || arg === "0") {
+				showThinking = false;
+			} else if (arg.length === 0) {
+				showThinking = !showThinking; // bare `/show-thinking` toggles
+			} else {
+				insertBeforeEditor(
+					new Text(`  ${brand.error("✗")} ${brand.dim(`unknown value: "${arg}" — use on|off|toggle`)}`, 0, 0),
+				);
+				return;
+			}
+			insertBeforeEditor(
+				new Text(
+					`  ${brand.amber("✓")} ${brand.dim(`thinking blocks are ${showThinking ? "visible" : "hidden"}`)}`,
+					0,
+					0,
+				),
+			);
+			return;
+		}
+
+		// /usage — render the cumulative usage block from the latest state
+		// snapshot. Mirrors openclaw's `/usage` slash command (`src/tui/
+		// commands.ts:56-149`). All fields come from the server's
+		// SessionStateSnapshot — no extra RPC needed.
+		if (trimmed === "/usage") {
+			editor.setText("");
+			const snap = lastSnapshot;
+			if (!snap) {
+				insertBeforeEditor(new Text(`  ${brand.dim("no usage yet — server hasn't sent a state snapshot")}`, 0, 0));
+				return;
+			}
+			const tokenIn = snap.totalTokensIn.toLocaleString();
+			const tokenOut = snap.totalTokensOut.toLocaleString();
+			const tokenTotal = (snap.totalTokensIn + snap.totalTokensOut).toLocaleString();
+			const costStr = snap.totalCostUsd > 0 ? `$${snap.totalCostUsd.toFixed(4)}` : "$0.0000";
+			const ctxStr = snap.contextUsagePercent != null ? `${Math.round(snap.contextUsagePercent)}%` : "—";
+			insertBeforeEditor(
+				new Markdown(
+					`${brand.dim("usage")}\n` +
+						`- ${chalk.bold("model:")}    ${snap.provider ?? "?"} · ${snap.modelId ?? "?"}\n` +
+						`- ${chalk.bold("turns:")}    ${snap.messageCount}\n` +
+						`- ${chalk.bold("tokens:")}   ${tokenIn} in · ${tokenOut} out · ${tokenTotal} total\n` +
+						`- ${chalk.bold("cost:")}     ${costStr}\n` +
+						`- ${chalk.bold("context:")}  ${ctxStr} used\n` +
+						`- ${chalk.bold("thinking:")} ${snap.thinkingLevel}` +
+						(snap.supportsThinking
+							? brand.dim(` (available: ${snap.availableThinkingLevels.join(", ")})`)
+							: brand.dim(" (model doesn't support reasoning)")),
 					1,
 					0,
 					markdownTheme,
@@ -666,6 +823,7 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 			if (!isAgentRunning) return false;
 			void client.request("abort").catch(() => {});
 			isAgentRunning = false;
+			agentStartedAt = null;
 			editor.disableSubmit = false;
 			if (activeLoader) {
 				removeChild(activeLoader);

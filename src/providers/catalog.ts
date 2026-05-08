@@ -24,6 +24,19 @@ export interface ProviderInfo {
 	/** Env var Pi will auto-detect (matches Pi's findEnvKeys). Empty for local providers. */
 	envVar: string;
 	/**
+	 * Optional fallback env vars Brigade-side detection will try when `envVar`
+	 * itself isn't set. Mirrors openclaw's per-provider candidate list
+	 * (`src/secrets/provider-env-vars.ts:8-15`) — e.g. Anthropic accepts
+	 * either `ANTHROPIC_API_KEY` or `ANTHROPIC_OAUTH_TOKEN`. When ANY of
+	 * these is set, the auto-select path treats the provider as
+	 * "env-detected".
+	 *
+	 * Note: Pi's own `getEnvApiKey` only checks the primary `envVar`; this
+	 * extra layer is Brigade-side and is consulted by the auto-select
+	 * shortcut + the provider picker's "detected" badge.
+	 */
+	envVarFallbacks?: string[];
+	/**
 	 * Provider does not require an API key (Ollama, LM Studio, etc.). Onboarding
 	 * skips the key-entry step and instead validates the local server is reachable.
 	 */
@@ -52,6 +65,10 @@ export const PROVIDERS: ProviderInfo[] = [
 		description: "Claude — best for tool use & long context",
 		keyUrl: "https://console.anthropic.com/settings/keys",
 		envVar: "ANTHROPIC_API_KEY",
+		// Anthropic's CLI tools also export `ANTHROPIC_OAUTH_TOKEN` (claude-cli
+		// subscription auth). Treat it as a valid fallback so users on the
+		// CLI subscription path get the env-detect badge + auto-select.
+		envVarFallbacks: ["ANTHROPIC_OAUTH_TOKEN"],
 	},
 	{
 		id: "openai",
@@ -131,4 +148,28 @@ export const PROVIDERS: ProviderInfo[] = [
 
 export function findProvider(id: string): ProviderInfo | undefined {
 	return PROVIDERS.find((p) => p.id === id);
+}
+
+/**
+ * Look for the provider's API key across `envVar` and any `envVarFallbacks`,
+ * in order. Returns the first non-empty value found, or `undefined` if none
+ * are set. Used by the onboard auto-select shortcut and the provider picker's
+ * "detected" badge — they need to recognise users who have the OAuth token
+ * exported (Anthropic CLI subscriptions) just as readily as the standard
+ * API-key env var.
+ *
+ * Pi's own `getEnvApiKey` only consults the primary env var per provider;
+ * this helper is the Brigade-side extension that surfaces the fallbacks.
+ */
+export function readProviderEnvKey(provider: ProviderInfo): string | undefined {
+	const primary = provider.envVar;
+	if (primary) {
+		const v = process.env[primary];
+		if (typeof v === "string" && v.trim().length > 0) return v;
+	}
+	for (const fallback of provider.envVarFallbacks ?? []) {
+		const v = process.env[fallback];
+		if (typeof v === "string" && v.trim().length > 0) return v;
+	}
+	return undefined;
 }

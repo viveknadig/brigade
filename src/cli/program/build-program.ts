@@ -246,5 +246,22 @@ export function buildProgram(): Command {
       process.exit(await runConfigFile({ json: opts.json }));
     });
 
+  cfg
+    .command("schema")
+    .description("Print the brigade.json TypeBox schema as JSON")
+    .action(async () => {
+      const { runConfigSchema } = await import("../commands/config-cmd.js");
+      process.exit(await runConfigSchema());
+    });
+
+  cfg
+    .command("validate")
+    .description("Validate brigade.json against the schema; exit non-zero on issues")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runConfigValidate } = await import("../commands/config-cmd.js");
+      process.exit(await runConfigValidate({ json: opts.json }));
+    });
+
   return program;
 }
