@@ -40,6 +40,14 @@ export interface OnboardCommandOptions {
 	 * through from the `--no-env-detect` CLI flag.
 	 */
 	noEnvDetect?: boolean;
+	/**
+	 * Storage shape for accepted env-key credentials. Mirrors OpenClaw's
+	 * `--secret-input-mode` flag.
+	 *   - "plaintext" (default) — copy the literal value into Brigade's state.
+	 *   - "ref" — write a `keyRef` pointer; literal value never lands on disk.
+	 * Threaded through from the `--secret-input-mode` CLI flag.
+	 */
+	secretInputMode?: "plaintext" | "ref";
 }
 
 /**
@@ -81,6 +89,7 @@ export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promi
 	try {
 		const result = await runOnboarding(tui, authStorage, modelRegistry, {
 			noEnvDetect: opts.noEnvDetect,
+			secretInputMode: opts.secretInputMode,
 		});
 		tui.stop();
 		restoreTerminal();

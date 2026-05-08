@@ -44,9 +44,18 @@ export function buildProgram(): Command {
     .command("onboard")
     .description("Pick a provider and model — interactive Pi-TUI wizard")
     .option("--no-env-detect", "ignore API keys from the shell environment", false)
-    .action(async (opts: { envDetect?: boolean }) => {
+    .option(
+      "--secret-input-mode <mode>",
+      "how accepted env-keys persist: 'plaintext' (default, copies value into ~/.brigade/) or 'ref' (stores a keyRef; literal value never lands on disk)",
+      "plaintext",
+    )
+    .action(async (opts: { envDetect?: boolean; secretInputMode?: string }) => {
       const { runOnboardCommand } = await import("../commands/onboard.js");
-      const code = await runOnboardCommand({ noEnvDetect: opts.envDetect === false });
+      const mode = opts.secretInputMode === "ref" ? "ref" : "plaintext";
+      const code = await runOnboardCommand({
+        noEnvDetect: opts.envDetect === false,
+        secretInputMode: mode,
+      });
       process.exit(code);
     });
 

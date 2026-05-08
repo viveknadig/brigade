@@ -20,7 +20,8 @@ import { getEnvApiKey, getModels, type KnownProvider, type Model } from "@marioz
 import type { AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
 import { CancellableLoader, Input, type SelectItem, SelectList, Text, TUI } from "@mariozechner/pi-tui";
 
-import { loadBrigadeConfig, writeBrigadeConfig } from "../core/brigade-config.js";
+import { upsertApiKeyProfile, upsertApiKeyRefProfile } from "../auth/profiles.js";
+import { DEFAULT_AGENT_ID } from "../config/paths.js";
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, saveConfig } from "../core/config.js";
 import { isIdentityNameUnset, seedDefaultPrompts } from "../core/system-prompt.js";
 import { discoverOllamaModels, writeOllamaToModelsJson } from "../integrations/ollama.js";
@@ -65,6 +66,28 @@ export interface OnboardingOptions {
 	 * auth and never wants Brigade to silently consult a shell-exported var.
 	 */
 	noEnvDetect?: boolean;
+	/**
+	 * Storage shape for accepted env-key credentials. Mirrors OpenClaw's
+	 * `--secret-input-mode` flag (see openclaw `provider-auth-helpers.ts`).
+	 *
+	 *   - "plaintext" (DEFAULT) — accepted env value is COPIED into Brigade's
+	 *     own state (brigade.json::env + auth-profiles.json with literal `key`).
+	 *     Persists across shell restarts and machine moves. Same as today's
+	 *     behaviour, same as OpenClaw's default.
+	 *
+	 *   - "ref" — accepted env value is NEVER written to disk. Auth-profiles.json
+	 *     stores `keyRef: { source: "env", id: "OPENROUTER_API_KEY" }`; the
+	 *     runtime re-reads `process.env.OPENROUTER_API_KEY` on every request.
+	 *     The shell env stays the canonical home of the secret. Use this for
+	 *     CI / Vault-backed / paranoid-operator flows where literal keys must
+	 *     not leave their original storage location.
+	 *
+	 * Pass-through: the wizard plumbs this into the env-accept branch only.
+	 * The typed-key (paste) path always writes plaintext — there's nothing to
+	 * reference because the value originated from a TUI input box, not the
+	 * environment.
+	 */
+	secretInputMode?: "plaintext" | "ref";
 }
 
 export async function runOnboarding(
@@ -99,7 +122,13 @@ export async function runOnboarding(
 		const envProviders = PROVIDERS.filter((p) => !p.local && !p.noAuth && !!readProviderEnvKey(p));
 		if (envProviders.length === 1) {
 			const auto = envProviders[0]!;
-			const autoResult = await tryAutoSelectFromEnv(tui, authStorage, modelRegistry, auto.id);
+			const autoResult = await tryAutoSelectFromEnv(
+				tui,
+				authStorage,
+				modelRegistry,
+				auto.id,
+				opts.secretInputMode ?? "plaintext",
+			);
 			if (autoResult.ok) {
 				provider = auto.id;
 				step = "model";
@@ -133,7 +162,10 @@ export async function runOnboarding(
 				continue;
 			}
 
-			const result = await ensureApiKey(tui, authStorage, provider, { noEnvDetect: opts.noEnvDetect });
+			const result = await ensureApiKey(tui, authStorage, provider, {
+				noEnvDetect: opts.noEnvDetect,
+				secretInputMode: opts.secretInputMode,
+			});
 			if (result === "back") {
 				step = "provider";
 				continue;
@@ -360,20 +392,23 @@ async function pickProvider(tui: TUI): Promise<string> {
  *   - Read the env key (Pi's `getEnvApiKey` — same source the picker uses)
  *   - Validate it online (catches stale leftover exports before the user
  *     reaches chat with a dead key)
- *   - On success: persist to brigade.json::env (state-isolation contract),
- *     show a one-line confirmation, return `{ ok: true }`
+ *   - On success: persist to `~/.brigade/agents/<id>/agent/auth-profiles.json`
+ *     in either plaintext (literal `key`) or ref (`keyRef`) shape — mirrors
+ *     OpenClaw's `--secret-input-mode` storage. Show confirmation, return
+ *     `{ ok: true }`.
  *   - On failure: render a stale-key notice, return `{ ok: false, message }`
  *     so the caller falls through to the normal interactive picker
  *
- * Idempotent w.r.t. brigade.json — `persistEnvKeyToBrigadeConfig` is the
- * same writer the interactive path uses; running auto-select repeatedly is
- * safe.
+ * Idempotent w.r.t. auth-profiles.json — `upsertApiKeyProfile` /
+ * `upsertApiKeyRefProfile` are the same writers the interactive path uses;
+ * running auto-select repeatedly is safe.
  */
 async function tryAutoSelectFromEnv(
 	tui: TUI,
-	_authStorage: AuthStorage,
+	authStorage: AuthStorage,
 	modelRegistry: ModelRegistry,
 	providerId: string,
+	secretInputMode: "plaintext" | "ref" = "plaintext",
 ): Promise<{ ok: boolean; message?: string }> {
 	const provider = findProvider(providerId);
 	if (!provider) return { ok: false };
@@ -425,7 +460,23 @@ async function tryAutoSelectFromEnv(
 		return { ok: false, message: check.reason };
 	}
 
-	await persistEnvKeyToBrigadeConfig(provider, envValue);
+	// Same OpenClaw-shape persistence as the manual env-accept branch:
+	// plaintext writes literal `key`, ref writes `keyRef` pointing at the
+	// env var. Both land in `~/.brigade/agents/<id>/agent/auth-profiles.json`
+	// under the same profileId. Plus seed Pi's in-memory authStorage so the
+	// agent we're about to boot can use the key without a restart.
+	if (secretInputMode === "ref" && provider.envVar) {
+		upsertApiKeyRefProfile(DEFAULT_AGENT_ID, {
+			provider: providerId,
+			keyRef: { source: "env", provider: "default", id: provider.envVar },
+		});
+	} else {
+		upsertApiKeyProfile(DEFAULT_AGENT_ID, {
+			provider: providerId,
+			key: envValue,
+		});
+	}
+	authStorage.set(providerId, { type: "api_key", key: envValue });
 	// Refresh the registry so the model picker can see provider-specific
 	// catalog entries Pi populates after a key lands in env.
 	modelRegistry.refresh();
@@ -456,29 +507,48 @@ export async function ensureApiKey(
 	tui: TUI,
 	authStorage: AuthStorage,
 	providerId: string,
-	opts: { noEnvDetect?: boolean } = {},
+	opts: { noEnvDetect?: boolean; secretInputMode?: "plaintext" | "ref" } = {},
 ): Promise<"ok" | "back"> {
 	const provider = findProvider(providerId);
 	if (!provider) throw new Error(`Unknown provider: ${providerId}`);
 
-	// Already configured? (env var OR previously stored)
-	// CRITICAL: an env var being PRESENT doesn't mean it WORKS — stale leftover
-	// values (from old experiments, exported by .bashrc, etc.) silently auto-
-	// completed onboarding and let users reach chat with a dead key. We now
-	// always run the online validation. Stored credentials get the fast accept
-	// only if they previously passed validation when first saved (which is
-	// always — see the typed-key path below — so saved keys are trustworthy
-	// enough to skip the re-check).
+	// Already configured? (saved on disk OR set in shell env)
 	//
-	// `noEnvDetect` short-circuits the entire env-detection path: when true we
-	// pretend no credential exists, regardless of what `authStorage` returns
-	// from a shell env fallback. The typed-key prompt fires immediately. This
-	// is the enterprise / CI escape hatch — operators who want TYPED-only auth
-	// can flip the flag and Brigade never silently consults `$env:OPENROUTER_API_KEY`
-	// or its peers.
-	const existing = opts.noEnvDetect ? "" : await authStorage.getApiKey(providerId);
+	// Two sources, checked in order:
+	//   1. `authStorage.getApiKey(providerId)` — Pi's stored credentials
+	//      (~/.brigade/auth.json). Saved keys passed validation when first
+	//      written, so we can fast-accept without re-pinging the provider.
+	//   2. `readProviderEnvKey(provider)` — Brigade's shell-env reader. Honors
+	//      the primary `envVar` PLUS `envVarFallbacks` (e.g. ANTHROPIC_OAUTH_TOKEN
+	//      as a fallback for ANTHROPIC_API_KEY). Pi's `authStorage.getApiKey`
+	//      does NOT consult shell env, so this fallback is what makes the
+	//      env-confirmation flow below actually fire — without it, a user
+	//      with `OPENROUTER_API_KEY` exported sees the paste-key prompt
+	//      instead of "Use existing OPENROUTER_API_KEY?". Mirrors OpenClaw's
+	//      `resolveEnvApiKey()` which reads `process.env` directly at
+	//      key-entry time (post-provider-selection).
+	//
+	// CRITICAL: an env var being PRESENT doesn't mean it WORKS — stale
+	// leftover values silently auto-completed onboarding before, letting
+	// users reach chat with a dead key. The confirm-then-validate path
+	// below catches that.
+	//
+	// `noEnvDetect` short-circuits the env path entirely: when true we
+	// pretend no credential exists. This is the enterprise / CI escape
+	// hatch — operators wanting TYPED-only auth flip the flag and Brigade
+	// never silently consults `$env:OPENROUTER_API_KEY` or its peers.
+	const stored = opts.noEnvDetect ? "" : await authStorage.getApiKey(providerId);
+	const envKey = opts.noEnvDetect ? undefined : readProviderEnvKey(provider);
+	const existing = stored || envKey || "";
 	if (existing) {
-		const fromEnv = !!getEnvApiKey(providerId as KnownProvider);
+		// `fromEnv` drives whether we show "saved credentials" (skip confirm)
+		// or "shell environment" (confirm with default=Yes). Pi's
+		// `getEnvApiKey` checks the primary `envVar` only — Brigade's
+		// `readProviderEnvKey` ALSO checks `envVarFallbacks`, so the OR
+		// catches both shapes (e.g. ANTHROPIC_OAUTH_TOKEN won't match Pi's
+		// check but will match Brigade's). When stored=non-empty, we treat
+		// the key as "saved" even if env also has it — saved beats env.
+		const fromEnv = !stored && (!!getEnvApiKey(providerId as KnownProvider) || !!envKey);
 		if (!fromEnv) {
 			// Saved credential — passed validation when first stored. Fast accept.
 			renderScreen(tui, `Step 2 of 4 · ${provider.name}`);
@@ -602,16 +672,53 @@ export async function ensureApiKey(
 		tui.removeChild(envLoader);
 
 		if (envCheck.ok) {
-			// State-isolation contract: everything Brigade needs lives under
-			// `~/.brigade/`. The env var that fed us this key is owned by the
-			// user's shell, so without persisting it here, `rm -rf ~/.brigade`
-			// would NOT actually wipe auth — the key would sneak back in via
-			// env detection on the next boot. Mirror it into brigade.json::env
-			// so the file is the canonical home for the credential.
-			await persistEnvKeyToBrigadeConfig(provider, existing);
+			// Two persistence shapes, mirroring OpenClaw's `--secret-input-mode`
+			// (see openclaw `provider-auth-helpers.ts:84-111`). Both write to
+			// the SAME location — `~/.brigade/agents/<id>/agent/auth-profiles.json`
+			// — under the same `profileId(provider)`. The shape on disk differs:
+			//
+			//   PLAINTEXT (default):
+			//     {
+			//       "type": "api_key",
+			//       "provider": "openrouter",
+			//       "key": "sk-or-v1-abc…"      ← literal value
+			//     }
+			//
+			//   REF:
+			//     {
+			//       "type": "api_key",
+			//       "provider": "openrouter",
+			//       "keyRef": { "source": "env", "provider": "default",
+			//                   "id": "OPENROUTER_API_KEY" }   ← reference only
+			//     }
+			//
+			// Plaintext = OpenClaw's default + ours. Survives shell restart and
+			// machine moves. Ref = openclaw's `--secret-input-mode ref` shape:
+			// the literal value NEVER lands on disk, runtime resolves
+			// `process.env[id]` lazily on every request via
+			// core/auth-bridge.ts:resolveProfileKey.
+			//
+			// Also seed Pi's authStorage so the about-to-boot in-process agent
+			// has the key without a restart — Pi's authStorage is in-memory only,
+			// it doesn't re-read auth-profiles.json after construction.
+			const mode = opts.secretInputMode ?? "plaintext";
+			if (mode === "ref" && provider.envVar) {
+				upsertApiKeyRefProfile(DEFAULT_AGENT_ID, {
+					provider: providerId,
+					keyRef: { source: "env", provider: "default", id: provider.envVar },
+				});
+				process.env[provider.envVar] = existing;
+			} else {
+				upsertApiKeyProfile(DEFAULT_AGENT_ID, {
+					provider: providerId,
+					key: existing,
+				});
+			}
+			authStorage.set(providerId, { type: "api_key", key: existing });
+			const pinShape = mode === "ref" ? "your environment (kept as a reference)" : "your environment";
 			tui.addChild(
 				new Text(
-					`  ${brand.amber("✓")} ${provider.name} is already connected (using ${brand.white("your environment")}).`,
+					`  ${brand.amber("✓")} ${provider.name} is already connected (using ${brand.white(pinShape)}).`,
 					0,
 					0,
 				),
@@ -712,14 +819,15 @@ async function promptTypedKey(
 		}
 
 		// Step 3: only persist after both checks pass.
+		// `authStorage.set` populates Pi's in-memory store; the post-wizard
+		// bridge in cli/commands/onboard.ts:bridgeOnboardingResultToBrigadeNative
+		// reads it back and writes to auth-profiles.json with the literal
+		// `key` field. Mirrors OpenClaw's `setCredential(apiKey, "plaintext")`
+		// → `buildApiKeyCredential` → `upsertAuthProfile` shape. No separate
+		// brigade.json::env write — auth-profiles.json IS the canonical home
+		// for the credential, and `rm -rf ~/.brigade` wipes both.
 		authStorage.set(providerId, { type: "api_key", key });
 		authStorage.reload();
-		// Mirror the credential into brigade.json::env so the unified
-		// super-config remains the canonical state-isolation boundary —
-		// `rm -rf ~/.brigade` reliably wipes everything, including any env
-		// fallback Pi might pick up on a future boot. No-op for providers
-		// that don't have a documented env var (custom OpenAI-compatible).
-		await persistEnvKeyToBrigadeConfig(provider, key);
 
 		const successLine = onlineCheck.modelCount
 			? `${provider.name} connected · ${onlineCheck.modelCount} model${onlineCheck.modelCount === 1 ? "" : "s"} available`
@@ -956,33 +1064,6 @@ export function formatApiKeyPreview(raw: string, opts: { head?: number; tail?: n
  * env var (env-key path) — better to log and continue than abort the
  * onboarding the user has already invested time in.
  */
-async function persistEnvKeyToBrigadeConfig(provider: ProviderInfo, key: string): Promise<void> {
-	const envVar = provider.envVar;
-	if (!envVar || envVar.length === 0) return;
-	if (!key || key.length === 0) return;
-	try {
-		const cfg = await loadBrigadeConfig(BRIGADE_DIR);
-		const env = { ...(cfg.env ?? {}) };
-		// Skip a redundant write if the value is already pinned correctly —
-		// avoids a useless .bak rotation (and a useless fsync) when the user
-		// re-runs onboarding with an unchanged env-supplied credential.
-		if (env[envVar] === key) {
-			process.env[envVar] = key;
-			return;
-		}
-		env[envVar] = key;
-		await writeBrigadeConfig(BRIGADE_DIR, { ...cfg, env });
-		// Make the credential visible to the about-to-boot agent without a
-		// restart. brigade.json is now the canonical source; this just
-		// short-circuits "wait for the next process to load it."
-		process.env[envVar] = key;
-	} catch (err) {
-		// Surface to stderr but don't crash onboarding — the credential is
-		// already valid in the running process, so the user can keep chatting.
-		const msg = err instanceof Error ? err.message : String(err);
-		process.stderr.write(`brigade: warning: couldn't persist ${envVar} to brigade.json (${msg})\n`);
-	}
-}
 
 function clear(tui: TUI): void {
 	for (const child of [...tui.children]) tui.removeChild(child);
