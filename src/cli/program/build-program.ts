@@ -143,7 +143,13 @@ export function buildProgram(): Command {
 
   program
     .command("connect")
-    .description("Connect to a running Brigade gateway from a thin TUI client")
+    .description(
+      "Connect to a running Brigade gateway from a thin TUI client.\n" +
+        "  Examples:\n" +
+        "    brigade connect                          # default 127.0.0.1:7777\n" +
+        "    brigade connect --host 192.168.1.5 -p 7777\n" +
+        "    brigade connect --timeout 120000",
+    )
     .option("-h, --host <host>", "gateway host (default: 127.0.0.1)")
     .option("-p, --port <port>", "gateway port", (v) => parseInt(v, 10))
     .option("--timeout <ms>", "request timeout in ms", (v) => parseInt(v, 10))
@@ -174,7 +180,13 @@ export function buildProgram(): Command {
 
   program
     .command("doctor")
-    .description("Run health checks against ~/.brigade/, providers, workspace, and the gateway")
+    .description(
+      "Run health checks against ~/.brigade/, providers, workspace, and the gateway.\n" +
+        "  Examples:\n" +
+        "    brigade doctor                  # human-readable output\n" +
+        "    brigade doctor --json           # machine-readable\n" +
+        "    brigade doctor --strict         # exit 1 on warnings (CI mode)",
+    )
     .option("-h, --host <host>", "gateway host to probe (default: 127.0.0.1)")
     .option("-p, --port <port>", "gateway port to probe (default: 7777)", (v) => parseInt(v, 10))
     .option("--json", "emit JSON instead of human-readable text", false)
@@ -204,7 +216,13 @@ export function buildProgram(): Command {
 
   cfg
     .command("get <path>")
-    .description("Read a value by dot-notation key (e.g. agents.defaults.provider)")
+    .description(
+      "Read a value by dot-notation key.\n" +
+        "  Examples:\n" +
+        "    brigade config get agents.defaults.provider\n" +
+        "    brigade config get agents.defaults.model.fallbacks[0]\n" +
+        '    brigade config get \'secrets.providers["my.vault"]\'',
+    )
     .option("--json", "emit JSON instead of bare-string output", false)
     .action(async (rawPath: string, opts: { json?: boolean }) => {
       const { runConfigGet } = await import("../commands/config-cmd.js");
@@ -213,7 +231,14 @@ export function buildProgram(): Command {
 
   cfg
     .command("set <path> <value>")
-    .description("Write a value (JSON5-parsed by default; falls back to string)")
+    .description(
+      "Write a value (JSON5-parsed by default; falls back to string).\n" +
+        "  Examples:\n" +
+        "    brigade config set agents.defaults.provider openai\n" +
+        "    brigade config set agents.defaults.thinking medium\n" +
+        '    brigade config set agents.defaults.model.fallbacks \'["claude-sonnet-4-6", "gpt-5"]\'\n' +
+        "    brigade config set gateway.port 7777 --strict-json",
+    )
     .option("--strict-json", "require strict JSON syntax for the value", false)
     .option("--dry-run", "show what would be written without persisting", false)
     .option("--json", "emit JSON status instead of human text", false)
@@ -230,7 +255,10 @@ export function buildProgram(): Command {
 
   cfg
     .command("unset <path>")
-    .description("Remove a key by dot-notation path")
+    .description(
+      "Remove a key by dot-notation path.\n" +
+        "  Example: brigade config unset agents.defaults.thinking",
+    )
     .option("--json", "emit JSON status instead of human text", false)
     .action(async (rawPath: string, opts: { json?: boolean }) => {
       const { runConfigUnset } = await import("../commands/config-cmd.js");

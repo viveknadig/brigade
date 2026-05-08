@@ -34,6 +34,7 @@ import { Markdown } from "../../ui/markdown.js";
 import { renderBrandHeader } from "../../ui/brand.js";
 import { restoreTerminal } from "../../ui/terminal-cleanup.js";
 import { brand, editorTheme, markdownTheme } from "../../ui/theme.js";
+import { summarizeToolResult } from "../../ui/tool-result.js";
 import { BrigadeClient } from "../../tui/client.js";
 import type { ModelSummary, SessionStateSnapshot } from "../../protocol.js";
 
@@ -190,6 +191,24 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	// of a static "thinking…". Mirrors openclaw's `tui-waiting.ts` shimmer +
 	// elapsed but Brigade-shape (no phrase rotation, just clean numbers).
 	let agentStartedAt: number | null = null;
+	// Whimsical phrase rotator for the loader. Mirrors openclaw's verb rotation
+	// in tui-waiting.ts — rotates in the header tail every 4s while the agent
+	// is busy. Pi-TUI's CancellableLoader doesn't expose a label setter so we
+	// pipe the phrase into the header `extra` slot instead.
+	const WHIMSICAL_PHRASES = [
+		"thinking",
+		"flibbertigibbeting",
+		"kerfuffling",
+		"dillydallying",
+		"twiddling thumbs",
+		"noodling",
+		"bamboozling",
+		"moseying",
+		"hobnobbing",
+		"pondering",
+		"conjuring",
+	];
+	let whimsicalIdx = 0;
 	// Thinking-block visibility toggle. Default `false` matches today's UX
 	// (thinking blocks excluded from `extractAssistantText` filter). When
 	// flipped to `true` via the `/show-thinking` slash command, the
@@ -245,6 +264,19 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		}
 	}, 1000);
 	if (typeof elapsedTimer.unref === "function") elapsedTimer.unref();
+
+	// Rotate the whimsical phrase shown in the header tail every 4s. Restarts
+	// on each agent_start so the user sees the same phrase for the first
+	// few seconds (no jarring rotation right after they hit Enter).
+	const whimsicalTimer = setInterval(() => {
+		if (isAgentRunning && activeLoader) {
+			whimsicalIdx = (whimsicalIdx + 1) % WHIMSICAL_PHRASES.length;
+			const phrase = WHIMSICAL_PHRASES[whimsicalIdx]!;
+			updateHeader(phrase);
+			tui.requestRender();
+		}
+	}, 4000);
+	if (typeof whimsicalTimer.unref === "function") whimsicalTimer.unref();
 	updateHeader();
 
 	const editor = new Editor(tui, editorTheme);
@@ -400,8 +432,9 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 			case "agent_start": {
 				isAgentRunning = true;
 				agentStartedAt = Date.now();
+				whimsicalIdx = 0; // reset so the first phrase is always "thinking"
 				editor.disableSubmit = true;
-				updateHeader("thinking…");
+				updateHeader(WHIMSICAL_PHRASES[0]);
 				activeLoader = new CancellableLoader(
 					tui,
 					(s) => brand.amber(s),
@@ -450,7 +483,11 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 				const indicator = pendingTools.get(event.toolCallId);
 				if (indicator) {
 					const mark = event.isError ? brand.error("✗") : brand.tool("✓");
-					indicator.setText(`  ${mark} ${brand.tool(event.toolName)}`);
+					// Append a short preview of what the tool produced so the
+					// connect view matches `brigade chat` ("✓ bash · output").
+					const summary = summarizeToolResult(event.result);
+					const preview = summary.hasContent ? ` ${brand.dim(`· ${summary.preview}`)}` : "";
+					indicator.setText(`  ${mark} ${brand.tool(event.toolName)}${preview}`);
 					tui.requestRender();
 					pendingTools.delete(event.toolCallId);
 				}

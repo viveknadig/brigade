@@ -234,6 +234,9 @@ export async function runConfigGet(rawPath: string, opts: ConfigGetOptions = {})
 	const value = getNested(cfg, segments);
 	if (value === undefined) {
 		process.stderr.write(`brigade config: key "${rawPath}" not found\n`);
+		process.stderr.write(
+			`${chalk.dim("  hint: run `brigade config list` to see all keys, or `brigade config schema` for the shape.")}\n`,
+		);
 		return 1;
 	}
 	const redacted = redactDeep(value);
@@ -255,6 +258,9 @@ export async function runConfigSet(rawPath: string, rawValue: string, opts: Conf
 		parsed = parseValue(rawValue, { strictJson: opts.strictJson });
 	} catch (err) {
 		process.stderr.write(`brigade config: failed to parse value: ${(err as Error).message}\n`);
+		process.stderr.write(
+			`${chalk.dim("  hint: wrap strings in quotes (e.g. \\\"my value\\\"), or use --strict-json for arrays/objects.")}\n`,
+		);
 		return 1;
 	}
 	setNested(cfg as unknown as Record<string, unknown>, segments, parsed);
@@ -285,6 +291,9 @@ export async function runConfigUnset(rawPath: string, opts: { json?: boolean } =
 			process.stdout.write(`${JSON.stringify({ ok: false, path: rawPath, reason: "not found" })}\n`);
 		} else {
 			process.stderr.write(`brigade config: key "${rawPath}" not found\n`);
+			process.stderr.write(
+				`${chalk.dim("  hint: run `brigade config list` to see all keys.")}\n`,
+			);
 		}
 		return 1;
 	}

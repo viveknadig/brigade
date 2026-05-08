@@ -25,7 +25,7 @@ import type { Command } from "commander";
 
 import { DEFAULT_AGENT_ID, resolveAuthProfilesPath, resolveSessionsDir } from "../../config/paths.js";
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, loadConfig } from "../../core/config.js";
-import { getTodayLogPath } from "../../core/event-logger.js";
+import { getLastLoggedError, getTodayLogPath } from "../../core/event-logger.js";
 import { probeGateway } from "../../core/gateway-probe.js";
 
 export interface StatusCommandOptions {
@@ -54,6 +54,7 @@ interface StatusReport {
 		messageCount?: number;
 	};
 	logPath: string;
+	lastError?: { ts: string; message: string; type?: string };
 }
 
 export async function runStatusCommand(opts: StatusCommandOptions = {}): Promise<void> {
@@ -99,6 +100,7 @@ async function collectStatusReport(opts: StatusCommandOptions): Promise<StatusRe
 			messageCount: probe.state?.messageCount,
 		},
 		logPath: getTodayLogPath(),
+		lastError: getLastLoggedError(),
 	};
 }
 
@@ -166,10 +168,22 @@ function formatStatusText(r: StatusReport): string {
 		if (r.gateway.error) {
 			lines.push(`  reason:        ${chalk.dim(r.gateway.error)}`);
 		}
+		// Actionable next-step hint mirrors openclaw's "Recommendation: run
+		// `openclaw doctor`" line in status.print.ts:101-104. Helps the user
+		// know what to do instead of staring at a bare error.
+		lines.push(`  hint:          ${chalk.dim("run `brigade gateway` to start it, or `brigade doctor` for a full health check.")}`);
 	}
 	lines.push("");
 	lines.push(chalk.dim("Logs"));
 	lines.push(`  today:         ${r.logPath}`);
+	// Surface the most-recent error from today's log so operators can diagnose
+	// failures without `tail -f`. Mirrors openclaw's status.print.ts:172-193.
+	// Only shown when an error exists — keeps the happy-path output clean.
+	if (r.lastError) {
+		const ts = r.lastError.ts ? new Date(r.lastError.ts).toLocaleTimeString() : "";
+		const tsStr = ts ? `${chalk.dim(ts)} ` : "";
+		lines.push(`  last error:    ${tsStr}${chalk.red(r.lastError.message)}`);
+	}
 	lines.push("");
 	return lines.join("\n");
 }

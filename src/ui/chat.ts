@@ -53,6 +53,7 @@ import { validateApiKeyOnline } from "../providers/validate-key.js";
 import { renderBrandHeader } from "./brand.js";
 import { restoreTerminal } from "./terminal-cleanup.js";
 import { brand, editorTheme, markdownTheme, selectListTheme } from "./theme.js";
+import { summarizeToolResult } from "./tool-result.js";
 
 const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 type ThinkingLevelName = (typeof VALID_THINKING_LEVELS)[number];
@@ -122,6 +123,22 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 	// Also includes per-model capabilities (thinking level, vision, ctx, $/Mtok)
 	// derived from the live `session.model` + `session.thinkingLevel` so it stays
 	// accurate across thinking-level changes and (future) model swaps.
+	/**
+	 * Format an elapsed-millisecond duration into a compact label for the
+	 * status line: `12s` / `1m 4s` / `2h 3m`. Mirrors connect.ts's formatter
+	 * and openclaw's tui-waiting.ts shape.
+	 */
+	const formatElapsed = (ms: number): string => {
+		const total = Math.max(0, Math.floor(ms / 1000));
+		if (total < 60) return `${total}s`;
+		const m = Math.floor(total / 60);
+		const s = total % 60;
+		if (m < 60) return s === 0 ? `${m}m` : `${m}m ${s}s`;
+		const h = Math.floor(m / 60);
+		const mm = m % 60;
+		return mm === 0 ? `${h}h` : `${h}h ${mm}m`;
+	};
+
 	const updateHeader = (extra?: string): void => {
 		const providerName = findProvider(provider)?.name ?? provider;
 		const caps = session.model
@@ -143,12 +160,48 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 			usageStr = ` · ${colored}`;
 		}
 
+		// Elapsed time during a running turn. Hidden when idle.
+		let elapsed = "";
+		if (isAgentRunning && agentStartedAt != null) {
+			const ms = Date.now() - agentStartedAt;
+			elapsed = ` · ${formatElapsed(ms)}`;
+		}
+
 		const tail = extra ? ` · ${extra}` : "";
+		const dot = isAgentRunning ? brand.amber("●") : brand.amber("●");
 		header.setText(
-			`  ${brand.amber("●")} ${brand.white("Brigade")}  ${brand.dim(`${providerName} · ${modelId}${capsStr}${tokens}${cost}`)}${usageStr}${brand.dim(tail)}`,
+			`  ${dot} ${brand.white("Brigade")}  ${brand.dim(`${providerName} · ${modelId}${capsStr}${tokens}${cost}`)}${usageStr}${brand.dim(elapsed)}${brand.dim(tail)}`,
 		);
 	};
 	updateHeader();
+
+	// Tick the elapsed-time + whimsical-phrase displays every second while the
+	// agent is busy. Cheap (one timer per chat session) and unref'd so it
+	// doesn't keep the process alive past process.exit.
+	const elapsedTimer = setInterval(() => {
+		if (isAgentRunning && agentStartedAt != null) {
+			updateHeader();
+			tui.requestRender();
+		}
+	}, 1000);
+	if (typeof elapsedTimer.unref === "function") elapsedTimer.unref();
+
+	// Rotate the whimsical phrase shown in the loader every 4s. Restarts on
+	// each agent_start so the user always sees the same phrase for the first
+	// few seconds (no jarring rotation right after they hit Enter).
+	const whimsicalTimer = setInterval(() => {
+		if (isAgentRunning && activeLoader) {
+			whimsicalIdx = (whimsicalIdx + 1) % WHIMSICAL_PHRASES.length;
+			const phrase = WHIMSICAL_PHRASES[whimsicalIdx]!;
+			// Pi-TUI's CancellableLoader doesn't expose a label setter, so the
+			// phrase rotation is best-effort: we update the header tail (which
+			// users glance at while waiting) instead of the loader text itself.
+			// This still gives them a sense of "the system is alive".
+			updateHeader(phrase);
+			tui.requestRender();
+		}
+	}, 4000);
+	if (typeof whimsicalTimer.unref === "function") whimsicalTimer.unref();
 
 	// ── editor ──────────────────────────────────────────────────────────
 	const editor = new Editor(tui, editorTheme);
@@ -157,7 +210,7 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 
 	// Hint line below the editor
 	tui.addChild(
-		new Text(brand.dim("  Enter to send · Ctrl+C abort · Ctrl+D quit · /model /provider /thinking /compact /help"), 0, 0),
+		new Text(brand.dim("  Enter to send · Ctrl+C abort · Ctrl+D quit · /model /provider /thinking /compact /usage /show-thinking /help"), 0, 0),
 	);
 
 	// ── streaming state ─────────────────────────────────────────────────
@@ -165,6 +218,32 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 	let activeAssistant: Markdown | null = null;
 	let activeLoader: CancellableLoader | null = null;
 	let pendingTools = new Map<string, Text>();
+	// Elapsed-time tracker for the running agent. Started on `agent_start`,
+	// cleared on `agent_end`. Read by the 1s ticker below to refresh the
+	// header so the user sees "thinking… 12s" instead of a static "thinking…".
+	let agentStartedAt: number | null = null;
+	// Thinking-block visibility toggle. Default `false` matches today's UX
+	// (thinking blocks excluded by `extractAssistantText` filter). When flipped
+	// to `true` via `/show-thinking`, the extractor includes thinking-block
+	// text dimmed inline so the user can see the model's reasoning trail.
+	let showThinking = false;
+	// Whimsical phrase rotator for the loader. Mirrors openclaw's verb rotation
+	// in tui-waiting.ts — small delight, replaces the boring static "thinking"
+	// label with `flibbertigibbeting`, `kerfuffling`, etc. Rotates every 4s.
+	const WHIMSICAL_PHRASES = [
+		"thinking",
+		"flibbertigibbeting",
+		"kerfuffling",
+		"dillydallying",
+		"twiddling thumbs",
+		"noodling",
+		"bamboozling",
+		"moseying",
+		"hobnobbing",
+		"pondering",
+		"conjuring",
+	];
+	let whimsicalIdx = 0;
 
 	/**
 	 * Extract concatenated text from an assistant message's content blocks.
@@ -178,8 +257,16 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 	const extractAssistantText = (message: any): string => {
 		if (!message || !Array.isArray(message.content)) return "";
 		return message.content
-			.filter((b: any) => b && b.type === "text" && typeof b.text === "string")
-			.map((b: any) => b.text)
+			.filter(
+				(b: any) =>
+					b &&
+					((b.type === "text" && typeof b.text === "string") ||
+						(showThinking && b.type === "thinking" && typeof b.thinking === "string")),
+			)
+			.map((b: any) => {
+				if (b.type === "thinking") return brand.dim(`[thinking] ${b.thinking}`);
+				return b.text;
+			})
 			.join("");
 	};
 
@@ -346,13 +433,15 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 		switch (event.type) {
 			case "agent_start": {
 				isAgentRunning = true;
+				agentStartedAt = Date.now();
+				whimsicalIdx = 0; // restart rotation so the user always sees "thinking" first
 				editor.disableSubmit = true;
-				updateHeader("thinking…");
+				updateHeader(WHIMSICAL_PHRASES[0]);
 				activeLoader = new CancellableLoader(
 					tui,
 					(s) => brand.amber(s),
 					(s) => brand.dim(s),
-					"thinking",
+					WHIMSICAL_PHRASES[0]!,
 				);
 				insertBeforeEditor(activeLoader);
 				break;
@@ -417,7 +506,14 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 				const indicator = pendingTools.get(event.toolCallId);
 				if (indicator) {
 					const mark = event.isError ? brand.error("✗") : brand.tool("✓");
-					indicator.setText(`  ${mark} ${brand.tool(event.toolName)}`);
+					// Append a short preview of what the tool produced so the user
+					// can see "✓ bash · 7 packages installed" rather than just
+					// "✓ bash". Errors stay flagged in the same line. Empty
+					// results (Pi's edit/write success cases) collapse to just
+					// the mark + name to keep the chat compact.
+					const summary = summarizeToolResult(event.result);
+					const preview = summary.hasContent ? ` ${brand.dim(`· ${summary.preview}`)}` : "";
+					indicator.setText(`  ${mark} ${brand.tool(event.toolName)}${preview}`);
 					tui.requestRender();
 					pendingTools.delete(event.toolCallId);
 				}
@@ -472,12 +568,14 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 			}
 			case "agent_end": {
 				isAgentRunning = false;
+				agentStartedAt = null;
 				editor.disableSubmit = false;
 				activeAssistant = null;
 				if (activeLoader) {
 					removeChild(activeLoader);
 					activeLoader = null;
 				}
+				updateHeader();
 
 				// Last-resort safety net: if no text was ever rendered (no message_update,
 				// no message_end), surface the final message text or any error message
@@ -678,6 +776,9 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 						`- ${chalk.bold("/provider")} — add a new provider mid-session\n` +
 						`- ${chalk.bold("/thinking <level>")} — set reasoning effort (off|minimal|low|medium|high|xhigh)\n` +
 						`- ${chalk.bold("/compact")} — summarize older turns to free up context\n` +
+						`- ${chalk.bold("/abort")} — abort the in-flight turn (same as Ctrl+C)\n` +
+						`- ${chalk.bold("/usage")} — show token totals + estimated cost so far\n` +
+						`- ${chalk.bold("/show-thinking")} — toggle reasoning-block visibility (default: hidden)\n` +
 						`- ${chalk.bold("Ctrl+C")} — abort the current turn\n` +
 						`- ${chalk.bold("Ctrl+D")} — quit`,
 					1,
@@ -686,6 +787,51 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 				),
 			);
 			editor.setText("");
+			return;
+		}
+
+		// /abort — same as Ctrl+C but discoverable through /help. No-op when
+		// idle so users don't get a scary "nothing was running" trace.
+		if (trimmed === "/abort") {
+			editor.setText("");
+			if (isAgentRunning) {
+				session.abort().catch(() => {});
+				insertBeforeEditor(new Text(`  ${brand.dim("aborting current turn…")}`, 0, 0));
+			} else {
+				insertBeforeEditor(new Text(`  ${brand.dim("nothing to abort — no turn in flight.")}`, 0, 0));
+			}
+			return;
+		}
+
+		// /usage — print the running totals (tokens in/out, cost) inline so the
+		// user can audit spend without parsing the header. Keeps the same
+		// hide-cost-when-zero rule as the header.
+		if (trimmed === "/usage") {
+			editor.setText("");
+			const lines: string[] = [];
+			lines.push(`${brand.dim("usage so far")}`);
+			lines.push(`- input tokens:  ${chalk.bold(totalIn.toLocaleString())}`);
+			lines.push(`- output tokens: ${chalk.bold(totalOut.toLocaleString())}`);
+			lines.push(`- total tokens:  ${chalk.bold((totalIn + totalOut).toLocaleString())}`);
+			if (totalCost > 0) lines.push(`- est. cost:     ${chalk.bold(`$${totalCost.toFixed(4)}`)}`);
+			else lines.push(`- est. cost:     ${brand.dim("(provider does not report cost)")}`);
+			insertBeforeEditor(new Markdown(lines.join("\n"), 1, 0, markdownTheme));
+			return;
+		}
+
+		// /show-thinking — flip the reasoning-block filter so the user can peek
+		// at the model's chain-of-thought (when the provider streams it). Off
+		// by default to keep the chat clean. Echoes the new state inline.
+		if (trimmed === "/show-thinking") {
+			editor.setText("");
+			showThinking = !showThinking;
+			insertBeforeEditor(
+				new Text(
+					`  ${brand.dim(showThinking ? "showing reasoning blocks (dimmed)." : "hiding reasoning blocks.")}`,
+					0,
+					0,
+				),
+			);
 			return;
 		}
 
@@ -1291,7 +1437,7 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 	if (opts.firstRun) {
 		insertBeforeEditor(
 			new Text(
-				`  ${brand.dim("tip: type /help for slash commands (/model · /provider · /thinking · /compact)")}`,
+				`  ${brand.dim("tip: type /help for slash commands (/model · /provider · /thinking · /compact · /usage · /show-thinking)")}`,
 				0,
 				0,
 			),
