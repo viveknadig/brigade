@@ -21,20 +21,46 @@ const MOCK_RUNTIME = {
 	repoRoot: undefined,
 };
 
-describe("assembleSystemPrompt — always-on guidance always present", () => {
-	it("includes Safety / Execution / Tool-call style / Tool-use enforcement", () => {
+describe("assembleSystemPrompt — inline guidance (Safety + Interaction Style)", () => {
+	// At commit c1894db (verified working with gpt-5.4) the assembler
+	// emitted just THREE short inline blocks: Safety, Interaction Style,
+	// Tooling. The 6-block guidance composition added in a7db967 was
+	// found to overconstrain first-turn replies. The simple inline blocks
+	// are what the model actually responds well to — the BOOTSTRAP.md
+	// signal stays dominant.
+	it("includes inline Safety + Interaction Style sections", () => {
 		const out = assembleSystemPrompt({
 			runtime: MOCK_RUNTIME,
 			personaFiles: [],
 			toolDescriptions: [],
 		});
-		assert.match(out.text, /# Safety baseline/);
-		assert.match(out.text, /# Execution bias/);
-		assert.match(out.text, /# Tool-call style/);
-		assert.match(out.text, /# Tool-use discipline/);
+		assert.match(out.text, /## Safety/);
+		assert.match(out.text, /## Interaction Style/);
+		assert.match(out.text, /Decline requests that would compromise/);
+		assert.match(out.text, /start doing it. Skip preambles/);
 	});
 
-	it("Tool-use discipline appears BEFORE the cache boundary (cached prefix)", () => {
+	it("does NOT inject the 6-block guidance composition", () => {
+		// Sanity: the larger guidance blocks (`# Safety baseline`, `# Tool-use
+		// discipline`, etc.) must NOT appear. Their constants still live in
+		// guidance.ts but the assembler doesn't import them.
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+			modelId: "gpt-4o",
+			thinkingLevel: "high",
+		});
+		assert.doesNotMatch(out.text, /# Safety baseline/);
+		assert.doesNotMatch(out.text, /# Execution bias/);
+		assert.doesNotMatch(out.text, /# Tool-call style/);
+		assert.doesNotMatch(out.text, /# Tool-use discipline/);
+		assert.doesNotMatch(out.text, /# Reasoning format/);
+		assert.doesNotMatch(out.text, /Execution discipline \(extra\)/);
+		assert.doesNotMatch(out.text, /Operational directives \(extra\)/);
+	});
+
+	it("inline Safety sits above the cache boundary (stays in cached prefix)", () => {
 		const out = assembleSystemPrompt({
 			runtime: MOCK_RUNTIME,
 			personaFiles: [
@@ -42,24 +68,17 @@ describe("assembleSystemPrompt — always-on guidance always present", () => {
 			],
 			toolDescriptions: [],
 		});
-		const enforceIdx = out.text.indexOf("# Tool-use discipline");
+		const safetyIdx = out.text.indexOf("## Safety");
 		const boundaryIdx = out.text.indexOf(CACHE_BOUNDARY_MARKER_LINE);
-		assert.ok(enforceIdx > 0, "tool-use enforcement must be in the output");
+		assert.ok(safetyIdx > 0, "Safety section must be in the output");
 		assert.ok(boundaryIdx > 0, "cache boundary must be in the output");
-		assert.ok(
-			enforceIdx < boundaryIdx,
-			"tool-use enforcement MUST sit above the cache boundary or it busts the prefix",
-		);
+		assert.ok(safetyIdx < boundaryIdx, "Safety MUST sit above the cache boundary");
 	});
 });
 
-describe("assembleSystemPrompt — no `<think>` tag instructions", () => {
-	// Mirrors OpenClaw: no `<think>...</think>` tag guidance is ever emitted,
-	// regardless of model or thinking level. Reasoning lives in Pi's
-	// structured `block.type === "thinking"` content; never as inline
-	// markup that could leak into the rendered chat output.
-	it("never includes `# Reasoning format` block (any model, any thinking level)", () => {
-		for (const modelId of ["claude-opus-4-7", "gemini-2.5-pro", "gpt-4o", "o3-mini", "custom-reasoner-7b"]) {
+describe("assembleSystemPrompt — no `<think>` tag instructions (any model)", () => {
+	it("never mentions <think> tags regardless of model + thinking level", () => {
+		for (const modelId of ["claude-opus-4-7", "gemini-2.5-pro", "gpt-4o", "o3-mini", "custom-7b"]) {
 			for (const thinkingLevel of ["off", "low", "medium", "high"]) {
 				const out = assembleSystemPrompt({
 					runtime: MOCK_RUNTIME,
@@ -70,11 +89,6 @@ describe("assembleSystemPrompt — no `<think>` tag instructions", () => {
 				});
 				assert.doesNotMatch(
 					out.text,
-					/# Reasoning format/,
-					`should not emit reasoning format for ${modelId} thinking=${thinkingLevel}`,
-				);
-				assert.doesNotMatch(
-					out.text,
 					/<think>/,
 					`should not mention <think> tags for ${modelId} thinking=${thinkingLevel}`,
 				);
@@ -83,107 +97,20 @@ describe("assembleSystemPrompt — no `<think>` tag instructions", () => {
 	});
 });
 
-describe("assembleSystemPrompt — per-family guidance", () => {
-	it("OpenAI family gets the verbose execution-discipline block", () => {
-		const out = assembleSystemPrompt({
-			runtime: MOCK_RUNTIME,
-			personaFiles: [],
-			toolDescriptions: [],
-			modelId: "gpt-4o",
-			thinkingLevel: "off",
-		});
-		assert.match(out.text, /Execution discipline \(extra\)/);
-		assert.match(out.text, /never mental math/);
-	});
-
-	it("Google family gets path-absolutism + parallel-tool guidance", () => {
-		const out = assembleSystemPrompt({
-			runtime: MOCK_RUNTIME,
-			personaFiles: [],
-			toolDescriptions: [],
-			modelId: "gemini-2.5-pro",
-			thinkingLevel: "off",
-		});
-		assert.match(out.text, /Operational directives \(extra\)/);
-		assert.match(out.text, /ABSOLUTE file paths/);
-	});
-
-	it("Claude gets no per-family extras", () => {
-		const out = assembleSystemPrompt({
-			runtime: MOCK_RUNTIME,
-			personaFiles: [],
-			toolDescriptions: [],
-			modelId: "claude-opus-4-7",
-			thinkingLevel: "off",
-		});
-		assert.doesNotMatch(out.text, /Execution discipline \(extra\)/);
-		assert.doesNotMatch(out.text, /Operational directives \(extra\)/);
-	});
-
-	it("aggregator-prefixed model id resolves correctly", () => {
-		const out = assembleSystemPrompt({
-			runtime: MOCK_RUNTIME,
-			personaFiles: [],
-			toolDescriptions: [],
-			modelId: "openrouter/openai/gpt-4o",
-			thinkingLevel: "off",
-		});
-		assert.match(out.text, /Execution discipline \(extra\)/);
-	});
-});
-
-describe("assembleSystemPrompt — capability gates", () => {
-	it("omits all capability blocks when capabilities is empty / undefined", () => {
-		const out = assembleSystemPrompt({
-			runtime: MOCK_RUNTIME,
-			personaFiles: [],
-			toolDescriptions: [],
-		});
-		assert.doesNotMatch(out.text, /# Memory\n/);
-		assert.doesNotMatch(out.text, /# Skills\n/);
-		assert.doesNotMatch(out.text, /# Crew coordination/);
-	});
-
-	it("memory=true adds Memory guidance", () => {
-		const out = assembleSystemPrompt({
-			runtime: MOCK_RUNTIME,
-			personaFiles: [],
-			toolDescriptions: [],
-			capabilities: { memory: true },
-		});
-		assert.match(out.text, /# Memory/);
-	});
-
-	it("skills=true adds Skills guidance", () => {
-		const out = assembleSystemPrompt({
-			runtime: MOCK_RUNTIME,
-			personaFiles: [],
-			toolDescriptions: [],
-			capabilities: { skills: true },
-		});
-		assert.match(out.text, /# Skills/);
-	});
-
-	it("subAgents=true adds Crew coordination guidance", () => {
-		const out = assembleSystemPrompt({
-			runtime: MOCK_RUNTIME,
-			personaFiles: [],
-			toolDescriptions: [],
-			capabilities: { subAgents: true },
-		});
-		assert.match(out.text, /# Crew coordination/);
-	});
-
-	it("all capabilities=true adds all three blocks", () => {
+describe("assembleSystemPrompt — capabilities flag is accepted but ignored", () => {
+	// The `capabilities` arg still threads through (so callers don't break);
+	// the corresponding guidance blocks just aren't injected today. They
+	// stay in guidance.ts for future re-enable.
+	it("does NOT inject Memory/Skills/Crew blocks even when capabilities=true", () => {
 		const out = assembleSystemPrompt({
 			runtime: MOCK_RUNTIME,
 			personaFiles: [],
 			toolDescriptions: [],
 			capabilities: { memory: true, skills: true, subAgents: true },
 		});
-		assert.match(out.text, /# Memory/);
-		assert.match(out.text, /# Skills/);
-		assert.match(out.text, /# Crew coordination/);
+		assert.doesNotMatch(out.text, /# Memory/);
+		assert.doesNotMatch(out.text, /# Skills/);
+		assert.doesNotMatch(out.text, /# Crew coordination/);
 	});
 });
 

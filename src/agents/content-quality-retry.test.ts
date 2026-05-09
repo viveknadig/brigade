@@ -1,0 +1,172 @@
+import { strict as assert } from "node:assert";
+import { describe, it } from "node:test";
+
+import { detectContentIssue } from "./content-quality-retry.js";
+
+describe("detectContentIssue — base cases", () => {
+	it("returns null for non-assistant messages", () => {
+		assert.equal(detectContentIssue({ role: "user", content: [] }, true), null);
+		assert.equal(detectContentIssue({ role: "system", content: [] }, true), null);
+		assert.equal(detectContentIssue(null, true), null);
+		assert.equal(detectContentIssue(undefined, true), null);
+	});
+
+	it("returns 'empty' for assistant messages with no content blocks", () => {
+		assert.equal(detectContentIssue({ role: "assistant", content: [] }, true), "empty");
+		assert.equal(detectContentIssue({ role: "assistant", content: undefined }, true), "empty");
+	});
+
+	it("returns null for a healthy text reply", () => {
+		assert.equal(
+			detectContentIssue(
+				{ role: "assistant", content: [{ type: "text", text: "Here's the answer: 42." }] },
+				true,
+			),
+			null,
+		);
+	});
+});
+
+describe("detectContentIssue — reasoning-only", () => {
+	it("flags thinking blocks with no text + no tool call", () => {
+		assert.equal(
+			detectContentIssue(
+				{
+					role: "assistant",
+					content: [{ type: "thinking", thinking: "Let me reason about this..." }],
+				},
+				true,
+			),
+			"reasoning-only",
+		);
+	});
+
+	it("does NOT flag when thinking has empty text in addition", () => {
+		// An empty text block alongside thinking should still be reasoning-only
+		// because the user sees no visible reply.
+		assert.equal(
+			detectContentIssue(
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "..." },
+						{ type: "text", text: "   " },
+					],
+				},
+				true,
+			),
+			"reasoning-only",
+		);
+	});
+
+	it("does NOT flag thinking + visible text (healthy reply)", () => {
+		assert.equal(
+			detectContentIssue(
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "..." },
+						{ type: "text", text: "The answer is 42." },
+					],
+				},
+				true,
+			),
+			null,
+		);
+	});
+
+	it("does NOT flag thinking + tool call (healthy action)", () => {
+		assert.equal(
+			detectContentIssue(
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "..." },
+						{ type: "toolCall", name: "read", arguments: {} },
+					],
+				},
+				true,
+			),
+			null,
+		);
+	});
+});
+
+describe("detectContentIssue — planning-only", () => {
+	const planningContent = (text: string) => ({
+		role: "assistant",
+		content: [{ type: "text", text }],
+	});
+
+	it("flags 'I'll do X' patterns when tools are available", () => {
+		assert.equal(detectContentIssue(planningContent("I'll write the script for you."), true), "planning-only");
+		assert.equal(detectContentIssue(planningContent("Let me create the file."), true), "planning-only");
+		assert.equal(detectContentIssue(planningContent("I will implement this now."), true), "planning-only");
+		assert.equal(detectContentIssue(planningContent("Here's how I'll fix the bug."), true), "planning-only");
+	});
+
+	it("does NOT flag planning patterns when tools are NOT available", () => {
+		// Without tools, "I'll write the script" IS the deliverable.
+		assert.equal(detectContentIssue(planningContent("I'll write the script for you."), false), null);
+	});
+
+	it("does NOT flag when the planning phrase is mid-sentence (quoted user message)", () => {
+		assert.equal(
+			detectContentIssue(
+				planningContent('The user said "I\'ll fix it" but they meant "fix you" instead.'),
+				true,
+			),
+			null,
+		);
+	});
+
+	it("does NOT flag a healthy direct answer", () => {
+		assert.equal(detectContentIssue(planningContent("The answer is 42."), true), null);
+		assert.equal(detectContentIssue(planningContent("Here's the result: 42."), true), null);
+	});
+
+	it("does NOT flag when a tool call is present alongside a planning phrase", () => {
+		// Model said "I'll do X" AND actually did it via tool call → healthy.
+		assert.equal(
+			detectContentIssue(
+				{
+					role: "assistant",
+					content: [
+						{ type: "text", text: "I'll create the file now." },
+						{ type: "toolCall", name: "write", arguments: { path: "foo.ts" } },
+					],
+				},
+				true,
+			),
+			null,
+		);
+	});
+});
+
+describe("detectContentIssue — empty fallthrough", () => {
+	it("flags assistant message with only empty text blocks", () => {
+		assert.equal(
+			detectContentIssue(
+				{ role: "assistant", content: [{ type: "text", text: "" }, { type: "text", text: "   " }] },
+				true,
+			),
+			"empty",
+		);
+	});
+
+	it("does NOT flag empty text when a tool call is present", () => {
+		assert.equal(
+			detectContentIssue(
+				{
+					role: "assistant",
+					content: [
+						{ type: "text", text: "" },
+						{ type: "toolCall", name: "read", arguments: { path: "foo" } },
+					],
+				},
+				true,
+			),
+			null,
+		);
+	});
+});

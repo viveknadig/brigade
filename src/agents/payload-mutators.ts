@@ -22,6 +22,7 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 
 import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
+import { sanitizeMessages } from "./sanitize-surrogates.js";
 import { sanitizeToolUseResultPairing } from "../sessions/transcript-repair.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -284,6 +285,17 @@ export function buildBrigadeTransformContext(
       } catch {
         // safe fallback per Pi contract
       }
+    }
+    // Surrogate sanitization runs LAST so any text written by earlier
+    // passes (synthesised tool_result blocks, etc.) is also cleaned.
+    // Lone UTF-16 surrogate halves crash Anthropic / OpenAI intake with
+    // 400 "Invalid Unicode escape"; the most common source is bash tool
+    // output that was tail-truncated mid-codepoint. Two-pass strip; only
+    // unpaired halves removed, valid surrogate pairs preserved.
+    try {
+      working = sanitizeMessages(working);
+    } catch {
+      // safe fallback per Pi contract
     }
     return working;
   };

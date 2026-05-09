@@ -80,6 +80,16 @@ export interface RunWithModelFallbackResult<T> {
   attempts: FallbackAttempt[];
 }
 
+/**
+ * Cap on `LiveSessionModelSwitchError` retries within a single fallback run.
+ * Mirrors OpenClaw's `MAX_LIVE_SWITCH_RETRIES = 5` (`agent-command.ts:849`).
+ * Without this, a hook that throws a fresh switch error on every attempt
+ * would loop forever (each new candidate rejecting with another switch
+ * request). 5 is more than any reasonable user-driven /model swap cascade
+ * — beyond that something is wrong and we'd rather fail loud.
+ */
+const MAX_LIVE_SWITCH_RETRIES = 5;
+
 export async function runWithModelFallback<T>(
   args: RunWithModelFallbackArgs<T>,
 ): Promise<RunWithModelFallbackResult<T>> {
@@ -89,6 +99,9 @@ export async function runWithModelFallback<T>(
   // absorbed a probe in this run, further candidates on the same provider
   // skip ahead rather than re-probing.
   const exhaustedSlots = new Set<string>();
+  // Counter for the live-switch guard above. Resets per call to
+  // runWithModelFallback (each user prompt gets its own budget).
+  let liveSwitchRetries = 0;
 
   for (let i = 0; i < candidates.length; i++) {
     const candidate = candidates[i];
@@ -121,10 +134,29 @@ export async function runWithModelFallback<T>(
       // as a "failure". The previous attempt's actual outcome (whatever it
       // was) is discarded — the user asked for a different model, they
       // get the result of the new model.
+      //
+      // Max-retries guard mirrors OpenClaw's `MAX_LIVE_SWITCH_RETRIES = 5`
+      // (`agent-command.ts:849`). A buggy hook could otherwise chain
+      // switches forever (each new model immediately throws another
+      // LiveSessionModelSwitchError) — surface as a hard error after 5.
       if (isLiveSessionModelSwitchError(err)) {
+        if (liveSwitchRetries >= MAX_LIVE_SWITCH_RETRIES) {
+          log.error("live model switch retries exhausted", {
+            from: `${candidate.provider}/${candidate.model}`,
+            to: `${err.nextProvider}/${err.nextModel}`,
+            retries: liveSwitchRetries,
+            cap: MAX_LIVE_SWITCH_RETRIES,
+          });
+          throw new Error(
+            `Exceeded maximum live model switch retries (${MAX_LIVE_SWITCH_RETRIES})`,
+            { cause: err },
+          );
+        }
+        liveSwitchRetries++;
         log.info("live model switch requested mid-attempt", {
           from: `${candidate.provider}/${candidate.model}`,
           to: `${err.nextProvider}/${err.nextModel}`,
+          retry: liveSwitchRetries,
         });
         const switched: ModelCandidate = {
           provider: err.nextProvider,

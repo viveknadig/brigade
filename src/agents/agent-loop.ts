@@ -49,6 +49,7 @@ import {
 import { resolveSystemPromptOverride } from "../system-prompt/override.js";
 import { resolveRuntimeParams } from "../system-prompt/runtime-params.js";
 import { applyPersonaOverrideToSession } from "../system-prompt/pi-injection.js";
+import { bootstrapWorkspace } from "../workspace/bootstrap.js";
 import {
   evaluateBootstrapPhase,
   markSetupCompleted,
@@ -64,6 +65,10 @@ import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
 import { buildBrigadeTransformContext } from "./payload-mutators.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
+import { type BrigadeBeforeToolCallHook, makeUnknownToolGuard } from "./tool-guard.js";
+import { makeWorkspaceJailGuard } from "./workspace-jail.js";
+import { runWithContentQualityRetry, type ContentQualityIssue } from "./content-quality-retry.js";
+import { runWithThinkingFallback } from "./thinking-fallback.js";
 import { evaluateCompactionDecision } from "./smart-compaction.js";
 import { resolveToolSummary } from "./tool-summaries.js";
 import {
@@ -328,6 +333,39 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     throw new Error("Pi createAgentSession returned no session.");
   }
 
+  // Install the composed beforeToolCall guard. Two layers run in order:
+  //
+  //   1. UNKNOWN-TOOL GUARD (`makeUnknownToolGuard`) — name validation:
+  //      tool not in `enabledToolNames`, whitespace-wrapped names, empty
+  //      args for a tool that needs them. If this blocks, we stop here.
+  //
+  //   2. WORKSPACE-JAIL GUARD (`makeWorkspaceJailGuard`) — argument
+  //      validation for path-mutating tools (`write`, `edit`) plus a
+  //      blanket refusal for `bash` until Primitive #3 ships exec policy.
+  //      Resolves relative paths against the agent's WORKSPACE root (not
+  //      process cwd), so `write({path: "USER.md"})` lands at
+  //      `<workspace>/USER.md` — what BOOTSTRAP.md tells the model to do.
+  //      Without this, gpt-5.4 wrote USER.md to the cwd (the Brigade
+  //      source tree), creating an orphan file that never feeds back into
+  //      the persona loop.
+  //
+  // Pi turns either guard's `block: true` return into a synthetic
+  // tool_result the model sees inline, so the next turn can self-correct.
+  const sessionWithBeforeHook = session as AgentSession & {
+    agent?: {
+      beforeToolCall?: BrigadeBeforeToolCallHook;
+    };
+  };
+  if (sessionWithBeforeHook.agent) {
+    const nameGuard = makeUnknownToolGuard(enabledToolNames);
+    const jailGuard = makeWorkspaceJailGuard(workspaceDir);
+    sessionWithBeforeHook.agent.beforeToolCall = async (ctx, signal) => {
+      const named = await nameGuard(ctx, signal);
+      if (named?.block) return named;
+      return jailGuard(ctx, signal);
+    };
+  }
+
   // Compose stream-fn wrappers around Pi's auth-aware streamFn. Order
   // matters and is from-the-outside-in: the outermost wrapper sees events
   // last (closest to Pi's consumer), the innermost sees them first
@@ -358,6 +396,16 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       model: args.modelId,
     });
   }
+
+  // Seed the workspace before we read its state. Idempotent: only writes
+  // files that don't exist yet, so an established workspace is a no-op.
+  // Without this, a fresh `~/.brigade/` (e.g. after `rm -rf ~/.brigade`)
+  // would have no BOOTSTRAP.md / IDENTITY.md / AGENTS.md / etc., the
+  // assembler would have nothing to inject, and the model would default
+  // to its baseline ("I'm your coding assistant") instead of the
+  // BOOTSTRAP-driven greeting. Runtime A's `buildAgent` already does
+  // this at boot — runSingleTurn was missing the equivalent step.
+  await bootstrapWorkspace(workspaceDir);
 
   // Detect lifecycle phase BEFORE the turn. Two layers stack here:
   //   1. Workspace-level phase from workspace-state.json. Scopes to
@@ -412,6 +460,14 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     workspaceDir,
     cwd,
     modelLabel: `${args.provider}/${args.modelId}`,
+    // Raw model id (no provider prefix) so the assembler's
+    // `pickModelFamilyGuidance` can match `gpt-*` / `o[13]-*` / `gemini-*`
+    // / `claude-*` / `codex-*` and inject the per-family identity-override
+    // block (e.g. "your baseline says 'I'm ChatGPT' — OVERRIDDEN by the
+    // persona configuration above"). Without this, smaller / cheaper models
+    // happily reply with their training-data identity ("I'm your coding
+    // assistant") instead of following IDENTITY.md.
+    modelId: args.modelId,
     thinkingLevel: args.thinkingLevel ?? "off",
     bootstrapPhase: effectivePhase,
     toolDescriptions,
@@ -491,11 +547,61 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       }
     },
     attempt: async (_attemptIndex, _signal) => {
-      await (session as AgentSession).prompt(scrubbedMessage);
-      // Defensive settle wait. prompt() should already have settled the
-      // run, but if Pi adds queued steers or background compactions in a
-      // future minor, this catches the late activity.
-      await waitForStreamSettled(session as AgentSession);
+      // Compose order (outer → inner):
+      //   thinkingFallback → contentQualityRetry → prompt(scrubbedMessage)
+      //
+      // thinkingFallback OUTER: if the very first prompt fails with
+      // "thinking not supported", downgrade thinkingLevel and retry the
+      // SAME user message before contentQualityRetry ever sees it. The
+      // retry body inside thinkingFallback re-runs everything — including
+      // contentQualityRetry — so the second attempt still gets the
+      // "did the model actually act?" check.
+      //
+      // contentQualityRetry INNER: only fires after a successful prompt
+      // settles. If the model returned "I'll do X" without doing X, OR
+      // reasoning-only, OR empty, queue one steering re-prompt.
+      //
+      // Both wrappers are hard-capped at one retry. Combined ceiling is
+      // 4 prompts in the worst case (initial → thinking-downgrade →
+      // initial-of-retry → content-quality-steer-of-retry) — bounded.
+      await runWithThinkingFallback(
+        session as AgentSession,
+        async () => {
+          await runWithContentQualityRetry(
+            session as AgentSession,
+            async () => {
+              await (session as AgentSession).prompt(scrubbedMessage);
+              // Defensive settle wait. prompt() should already have settled
+              // the run, but if Pi adds queued steers or background
+              // compactions in a future minor, this catches the late activity.
+              await waitForStreamSettled(session as AgentSession);
+            },
+            {
+              onRetry: (reason: NonNullable<ContentQualityIssue>) => {
+                log.warn("content-quality retry triggered", {
+                  agentId,
+                  sessionId: resolved.sessionId,
+                  reason,
+                  provider: args.provider,
+                  model: args.modelId,
+                });
+              },
+            },
+          );
+        },
+        {
+          onDowngrade: (originalLevel: string, errorMessage: string) => {
+            log.warn("thinking level downgraded due to capability error", {
+              agentId,
+              sessionId: resolved.sessionId,
+              originalLevel,
+              errorMessage,
+              provider: args.provider,
+              model: args.modelId,
+            });
+          },
+        },
+      );
     },
   });
 
@@ -598,12 +704,25 @@ async function buildPersonaPrompt(args: {
   workspaceDir: string;
   cwd: string;
   modelLabel: string;
+  /** Raw model id (without provider prefix). Drives per-family guidance. */
+  modelId: string;
   thinkingLevel: string;
   bootstrapPhase: BootstrapPhase;
   // Tool surface to advertise in the system prompt. Caller resolves these
   // from the live Pi session (`getActiveToolNames`) so the model gets the
   // real list, not a guess.
   toolDescriptions?: Array<{ name: string; summary: string }>;
+  /**
+   * Capability gates for conditional guidance blocks. Off-by-default until
+   * the matching primitives ship (Memory=#4, Skills=#5, Sub-agents=#6).
+   * Pre-plumbed so flipping them on later is a one-line change here.
+   */
+  capabilities?: { memory?: boolean; skills?: boolean; subAgents?: boolean };
+  /**
+   * Per-turn-only suffix pinned BELOW the cache boundary so it never busts
+   * the cached prefix. Used by sub-agent task framing in Primitive #6.
+   */
+  ephemeralSuffix?: string;
 }): Promise<string> {
   const config = readConfigOrInit();
   const override = resolveSystemPromptOverride({ config, agentId: args.agentId });
@@ -627,6 +746,13 @@ async function buildPersonaPrompt(args: {
     heartbeatFile,
     toolDescriptions: args.toolDescriptions ?? [],
     bootstrapPhase: args.bootstrapPhase,
+    // Pass the raw model id + thinking level so the assembler's
+    // `pickModelFamilyGuidance` (OpenAI / Google identity-override blocks)
+    // and conditional-capability gates fire on the right matches.
+    modelId: args.modelId,
+    thinkingLevel: args.thinkingLevel,
+    capabilities: args.capabilities,
+    ephemeralSuffix: args.ephemeralSuffix,
   });
   return assembled.text;
 }
