@@ -1,7 +1,17 @@
 import { strict as assert } from "node:assert";
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 
+import { __resetAgentBusForTests } from "./agent-event-bus.js";
 import { openChatSession } from "./chat-session.js";
+
+// The agent event bus is a process-singleton. Even though chat-session
+// tests don't subscribe directly, runTurn paths that hit runSingleTurn
+// (via the pre-aborted-signal escape route) can leave residual listeners
+// from prior bus tests if they ran in the same process. Reset between
+// each chat-session test so we never run on dirty global state.
+afterEach(() => {
+	__resetAgentBusForTests();
+});
 
 // These tests exercise ONLY the slash-command + state-mutation path.
 // `runTurn` with a real (non-slash) message would call into runSingleTurn,

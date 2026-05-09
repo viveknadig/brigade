@@ -506,6 +506,13 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // up across the gateway's long-running process. Mirrors OpenClaw's
   // `src/infra/agent-events.ts` global registry pattern.
   const runId = randomUUID();
+  // Duck-typed Pi session subscription. We assert the SHAPE we want
+  // rather than coupling to a specific Pi version's exported type. If
+  // a future Pi changes `subscribe` to return `Promise<() => void>` or
+  // an object with `.unsubscribe()`, calling `rawDetach()` may throw —
+  // that throw is caught by `detachPiForwarder`'s internal try/catch
+  // (see below), so the bus listener still gets cleared and the worst
+  // case is a stale per-event log line, not a leak.
   const subscribableSession = session as unknown as {
     subscribe?: (cb: (piEvent: unknown) => void) => () => void;
   };

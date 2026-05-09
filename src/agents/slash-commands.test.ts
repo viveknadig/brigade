@@ -120,3 +120,69 @@ test("SLASH_COMMAND_HELP: all entries have non-empty fields", () => {
     assert.ok(entry.description.length > 0);
   }
 });
+
+// ── Edge cases identified in the Phase 3 final audit ─────────────────
+
+test("parseSlashCommand: /thinking with no args is an error", () => {
+  const r = parseSlashCommand("/thinking");
+  assert.equal(r.type, "error");
+  if (r.type === "error") {
+    assert.match(r.message, /thinking/i);
+  }
+});
+
+test("parseSlashCommand: /thinking with each valid level returns level", () => {
+  for (const level of ["off", "low", "medium", "high"]) {
+    const r = parseSlashCommand(`/thinking ${level}`);
+    assert.equal(r.type, "thinking", `'${level}' should be accepted`);
+    if (r.type === "thinking") assert.equal(r.level, level);
+  }
+});
+
+test("parseSlashCommand: /thinking with unknown level is an error", () => {
+  const r = parseSlashCommand("/thinking xhigh");
+  assert.equal(r.type, "error");
+});
+
+test("parseSlashCommand: command head is case-insensitive", () => {
+  const r = parseSlashCommand("/MODEL anthropic/claude-opus-4-7");
+  assert.equal(r.type, "model");
+  if (r.type === "model") {
+    assert.equal(r.provider, "anthropic");
+    assert.equal(r.modelId, "claude-opus-4-7");
+  }
+});
+
+test("parseSlashCommand: /reset with extra args is an error", () => {
+  const r = parseSlashCommand("/reset garbage");
+  assert.equal(r.type, "error");
+  if (r.type === "error") assert.match(r.message, /no arguments/);
+});
+
+test("parseSlashCommand: /model with multi-segment id (openrouter/anthropic/claude-...)", () => {
+  // Three-segment model id (provider via openrouter) should parse cleanly:
+  // first segment is provider, REST is the modelId verbatim.
+  const r = parseSlashCommand("/model openrouter/anthropic/claude-opus-4-7");
+  assert.equal(r.type, "model");
+  if (r.type === "model") {
+    assert.equal(r.provider, "openrouter");
+    assert.equal(r.modelId, "anthropic/claude-opus-4-7");
+  }
+});
+
+test("parseSlashCommand: /model with no args returns help (parser convention)", () => {
+  // The current parser convention: /model alone means "tell me the active
+  // model" — the help branch. Caller decides how to render. Lock this
+  // behaviour so a future refactor doesn't silently change it.
+  const r = parseSlashCommand("/model");
+  assert.equal(r.type, "help");
+});
+
+test("parseSlashCommand: tab-separated args parse the same as space-separated", () => {
+  const r = parseSlashCommand("/model\tanthropic/claude-opus-4-7");
+  assert.equal(r.type, "model");
+  if (r.type === "model") {
+    assert.equal(r.provider, "anthropic");
+    assert.equal(r.modelId, "claude-opus-4-7");
+  }
+});
