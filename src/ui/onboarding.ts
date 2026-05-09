@@ -104,44 +104,16 @@ export async function runOnboarding(
 	// Esc on provider picker exits onboarding entirely; Esc on later steps
 	// just rewinds to the previous step. This is what makes invalid keys
 	// recoverable instead of a one-shot abort.
+	//
+	// No "auto-select from env" shortcut — mirrors OpenClaw's wizard shape.
+	// Even when EXACTLY ONE provider has an env key set, the user goes
+	// through the picker → `ensureApiKey` → "Use existing X?" Yes/No prompt
+	// (with default = Yes). Skipping silently to "we picked for you" is a
+	// Brigade-specific behaviour the user explicitly rejected because it
+	// removes the explicit choice that OpenClaw always shows.
 	let step: "provider" | "key" | "model" = "provider";
 	let provider = "";
 	let modelId = "";
-
-	// Auto-select shortcut: when EXACTLY ONE provider has a key in the shell
-	// environment, the user's intent is unambiguous — skip the picker AND
-	// skip the env-key confirmation prompt. Validate the key online; on
-	// success, fast-path straight to the model picker. On failure, fall
-	// through to the normal interactive flow with the failure reason
-	// surfaced so the user knows what to fix.
-	//
-	// `--no-env-detect` opts out of this entirely (operator/CI escape hatch).
-	// Multi-key cases still go through the picker — the user has a real
-	// choice to make and we don't want to silently grab the alphabetically-
-	// first provider.
-	if (!opts.noEnvDetect) {
-		// Detect via Brigade's `readProviderEnvKey` (which honors per-provider
-		// fallbacks like ANTHROPIC_OAUTH_TOKEN) — Pi's `getEnvApiKey` only
-		// checks the primary env var.
-		const envProviders = PROVIDERS.filter((p) => !p.local && !p.noAuth && !!readProviderEnvKey(p));
-		if (envProviders.length === 1) {
-			const auto = envProviders[0]!;
-			const autoResult = await tryAutoSelectFromEnv(
-				tui,
-				authStorage,
-				modelRegistry,
-				auto.id,
-				opts.secretInputMode ?? "plaintext",
-			);
-			if (autoResult.ok) {
-				provider = auto.id;
-				step = "model";
-			}
-			// On failure, leave step === "provider" so the wizard renders
-			// normally. autoResult.message (if present) carries the reason
-			// the auto-path bailed (e.g. "key in env failed validation").
-		}
-	}
 
 	while (true) {
 		if (step === "provider") {
@@ -266,124 +238,6 @@ async function pickProvider(tui: TUI): Promise<string> {
 }
 
 /**
- * Auto-select shortcut for the single-env-key case. Caller (`runOnboarding`)
- * fires this BEFORE the wizard loop when exactly one curated provider has a
- * value in the shell environment, the assumption being: "if the user has
- * exactly one provider key exported, they meant for Brigade to use that one."
- *
- * Behaviour:
- *   - Read the env key (Pi's `getEnvApiKey` — same source the picker uses)
- *   - Validate it online (catches stale leftover exports before the user
- *     reaches chat with a dead key)
- *   - On success: persist to `~/.brigade/agents/<id>/agent/auth-profiles.json`
- *     in either plaintext (literal `key`) or ref (`keyRef`) shape — mirrors
- *     OpenClaw's `--secret-input-mode` storage. Show confirmation, return
- *     `{ ok: true }`.
- *   - On failure: render a stale-key notice, return `{ ok: false, message }`
- *     so the caller falls through to the normal interactive picker
- *
- * Idempotent w.r.t. auth-profiles.json — `upsertApiKeyProfile` /
- * `upsertApiKeyRefProfile` are the same writers the interactive path uses;
- * running auto-select repeatedly is safe.
- */
-async function tryAutoSelectFromEnv(
-	tui: TUI,
-	authStorage: AuthStorage,
-	modelRegistry: ModelRegistry,
-	providerId: string,
-	secretInputMode: "plaintext" | "ref" = "plaintext",
-): Promise<{ ok: boolean; message?: string }> {
-	const provider = findProvider(providerId);
-	if (!provider) return { ok: false };
-	const envValue = getEnvApiKey(providerId as KnownProvider);
-	if (!envValue) return { ok: false };
-
-	const envVar = provider.envVar ?? "the env var";
-	renderScreen(tui, `Auto-detected · ${provider.name}`);
-	tui.addChild(
-		new Text(
-			brand.dim(`  Found ${envVar} in your shell environment — using it.`),
-			0,
-			0,
-		),
-	);
-	tui.addChild(new Text("", 0, 0));
-
-	const loader = new CancellableLoader(
-		tui,
-		(s) => brand.amber(s),
-		(s) => brand.dim(s),
-		`Verifying ${provider.name}…`,
-	);
-	tui.addChild(loader);
-	tui.requestRender();
-
-	const check = await validateApiKeyOnline(providerId, envValue);
-	tui.removeChild(loader);
-
-	if (!check.ok) {
-		// Stale env value — surface the reason so the user knows their export
-		// is bad, then fall through to the normal interactive flow.
-		tui.addChild(
-			new Text(
-				`  ${brand.error("✗")} ${envVar} didn't validate: ${brand.dim(check.reason)}`,
-				0,
-				0,
-			),
-		);
-		tui.addChild(
-			new Text(
-				brand.dim(`  Falling back to the provider picker so you can choose another option.`),
-				0,
-				0,
-			),
-		);
-		tui.requestRender();
-		await delay(1200);
-		return { ok: false, message: check.reason };
-	}
-
-	// Same OpenClaw-shape persistence as the manual env-accept branch:
-	// plaintext writes literal `key`, ref writes `keyRef` pointing at the
-	// env var that ACTUALLY satisfied the read (handles envVarFallbacks).
-	// Both land in `~/.brigade/agents/<id>/agent/auth-profiles.json` under
-	// the same profileId. In ref mode we deliberately skip `authStorage.set`
-	// so Pi's `~/.brigade/auth.json` doesn't capture the literal — keeping
-	// the disk-leak surface minimal. Runtime reads via `loadBrigadeAuthStorage`
-	// → `resolveProfileKey` → `process.env[keyRef.id]`.
-	const envSource = resolveProviderEnvVarSource(provider);
-	if (secretInputMode === "ref" && envSource) {
-		upsertApiKeyRefProfile(DEFAULT_AGENT_ID, {
-			provider: providerId,
-			keyRef: { source: "env", provider: "default", id: envSource.name },
-		});
-		// Belt-and-suspenders — value already in process.env (that's where we
-		// read it). Ensure the in-process agent sees the same name we pinned.
-		process.env[envSource.name] = envSource.value;
-	} else {
-		upsertApiKeyProfile(DEFAULT_AGENT_ID, {
-			provider: providerId,
-			key: envValue,
-		});
-		authStorage.set(providerId, { type: "api_key", key: envValue });
-	}
-	// Refresh the registry so the model picker can see provider-specific
-	// catalog entries Pi populates after a key lands in env.
-	modelRegistry.refresh();
-
-	tui.addChild(
-		new Text(
-			`  ${brand.amber("✓")} ${provider.name} connected (${formatApiKeyPreview(envValue)}).`,
-			0,
-			0,
-		),
-	);
-	tui.requestRender();
-	await delay(700);
-	return { ok: true };
-}
-
-/**
  * Prompt for the API key, validate it (locally + online), persist on success.
  * Returns:
  *   - "ok"   → key is valid and saved (or already existed)
@@ -427,83 +281,29 @@ export async function ensureApiKey(
 	// pretend no credential exists. This is the enterprise / CI escape
 	// hatch — operators wanting TYPED-only auth flip the flag and Brigade
 	// never silently consults `$env:OPENROUTER_API_KEY` or its peers.
-	const stored = opts.noEnvDetect ? "" : await authStorage.getApiKey(providerId);
+	// Env-key detection — mirrors OpenClaw's `ensureApiKeyFromEnvOrPrompt`
+	// (provider-auth-input.ts:163-222): read process.env directly, prompt to
+	// confirm whenever found, fall through to typed-paste on No or no-env.
+	//
+	// CRITICAL: env-confirm fires WHENEVER a shell env var is present, even
+	// if a saved profile from a previous onboard already exists. That matches
+	// OpenClaw — the user gets to re-affirm the env value (default Yes) or
+	// switch to a freshly typed key. Skipping the prompt when "already saved"
+	// is a Brigade-specific shortcut the user explicitly rejected.
+	//
+	// `noEnvDetect` short-circuits env entirely (CI / typed-only operators).
 	const envKey = opts.noEnvDetect ? undefined : readProviderEnvKey(provider);
-	// Detect ref-stored profiles too — Pi's `authStorage.getApiKey` reads
-	// from ~/.brigade/auth.json (which is empty in ref mode by design); the
-	// canonical credential lives in auth-profiles.json with a `keyRef`. We
-	// resolve it the same way the runtime does (auth-bridge.ts:resolveProfileKey).
-	const refResolvedKey = !stored ? readKeyRefFromProfilesFile(providerId) : "";
-	const existing = stored || refResolvedKey || envKey || "";
-	if (existing) {
-		// `fromEnv` drives whether we show "saved credentials" (skip confirm)
-		// or "shell environment" (confirm with default=Yes). A ref-resolved
-		// key counts as "saved" — the operator already deliberately stored a
-		// keyRef profile pointing at this env var; we shouldn't make them
-		// re-confirm on every onboard. Saved (literal or ref) beats env.
-		const fromEnv =
-			!stored &&
-			!refResolvedKey &&
-			(!!getEnvApiKey(providerId as KnownProvider) || !!envKey);
-		if (!fromEnv) {
-			// Saved credential — passed validation when first stored. Fast accept.
-			renderScreen(tui, `Step 2 of 3 · ${provider.name}`);
-			tui.addChild(
-				new Text(
-					`  ${brand.amber("✓")} ${provider.name} is already connected (using ${brand.white("your saved credentials")}).`,
-					0,
-					0,
-				),
-			);
-			tui.requestRender();
-			await delay(600);
-			return "ok";
-		}
-
-		// Env-supplied key: confirm with the user before adopting it.
-		//
-		// We're here in the MULTI-key case (the single-env-key auto-select
-		// at the top of `runOnboarding` fires before this branch is reached
-		// when exactly one provider has a key set). The user explicitly
-		// picked THIS provider from a list that included multiple env-keyed
-		// providers — that's a deliberate choice. Default to YES so a quick
-		// Enter accepts the obvious next step. Pick "No" to paste a fresh
-		// key instead.
-		//
-		// Wording rationale: "shell environment" is portable across PowerShell,
-		// bash, zsh, fish, cmd, etc. The previous "(env, sk-…)" label was too
-		// cryptic — "env" could be read as brigade.json::env OR shell env, and
-		// users who had just run `Remove-Item -Recurse ~/.brigade` (or the bash
-		// equivalent) couldn't tell where the credential was coming from. Be
-		// explicit so they immediately know the key originated from THEIR shell,
-		// not from a stale brigade.json.
+	if (envKey) {
+		// Env-supplied key: confirm with the user before adopting it. Wording
+		// + shape mirrors OpenClaw's `Use existing OPENROUTER_API_KEY (env:
+		// OPENROUTER_API_KEY, sk-o…52b5)?` confirm prompt
+		// (provider-auth-input.ts:204-213). Single line, default = Yes.
+		// No explanatory paragraphs (OpenClaw doesn't show any).
 		const envVar = provider.envVar ?? "the env var";
 		renderScreen(tui, `Step 2 of 3 · ${provider.name}`);
 		tui.addChild(
 			new Text(
-				brand.dim(`  Brigade detected this key in your shell environment.`),
-				0,
-				0,
-			),
-		);
-		tui.addChild(
-			new Text(
-				brand.dim(`  Picking "Yes" persists it to ~/.brigade/brigade.json (so it survives shell restarts and machine moves).`),
-				0,
-				0,
-			),
-		);
-		tui.addChild(new Text("", 0, 0));
-		tui.addChild(
-			new Text(
-				`  ${brand.amber("?")} Use ${envVar} from your shell environment (${formatApiKeyPreview(existing)})?`,
-				0,
-				0,
-			),
-		);
-		tui.addChild(
-			new Text(
-				brand.dim(`  Pick "No" to paste a different ${provider.name} key instead.`),
+				`  ${brand.amber("?")} Use existing ${envVar} (env: ${envVar}, ${formatApiKeyPreview(envKey)})?`,
 				0,
 				0,
 			),
@@ -512,14 +312,14 @@ export async function ensureApiKey(
 
 		const confirmList = new SelectList(
 			[
-				{ value: "yes", label: "Yes, use the shell-env value" },
-				{ value: "no", label: "No, let me paste a different key" },
+				{ value: "yes", label: "Yes" },
+				{ value: "no", label: "No" },
 			],
 			2,
 			selectListTheme,
-			{ minPrimaryColumnWidth: 36, maxPrimaryColumnWidth: 48 },
+			{ minPrimaryColumnWidth: 6, maxPrimaryColumnWidth: 8 },
 		);
-		confirmList.setSelectedIndex(0); // user explicitly picked this provider — default Yes
+		confirmList.setSelectedIndex(0); // default Yes — same as OpenClaw's `initialValue: true`
 		tui.addChild(confirmList);
 		tui.setFocus(confirmList);
 		tui.requestRender();
@@ -541,7 +341,7 @@ export async function ensureApiKey(
 			// and let them paste their own. The typed-key loop below treats
 			// `lastError === null` as a clean first iteration, so no stale
 			// error text leaks in.
-			renderScreen(tui, `Step 2 of 3 · Connect ${provider.name}`);
+			renderScreen(tui, `Step 2 of 3 · ${provider.name}`);
 			// Fall through to typed-key loop without `lastError` set.
 			// (Variable declared just below the env block.)
 			return await promptTypedKey(tui, authStorage, provider, providerId, null);
@@ -564,7 +364,7 @@ export async function ensureApiKey(
 		tui.addChild(envLoader);
 		tui.requestRender();
 
-		const envCheck = await validateApiKeyOnline(providerId, existing);
+		const envCheck = await validateApiKeyOnline(providerId, envKey);
 		tui.removeChild(envLoader);
 
 		if (envCheck.ok) {
@@ -609,9 +409,9 @@ export async function ensureApiKey(
 			} else {
 				upsertApiKeyProfile(DEFAULT_AGENT_ID, {
 					provider: providerId,
-					key: existing,
+					key: envKey,
 				});
-				authStorage.set(providerId, { type: "api_key", key: existing });
+				authStorage.set(providerId, { type: "api_key", key: envKey });
 			}
 			const pinShape = mode === "ref" ? "your environment (kept as a reference)" : "your environment";
 			tui.addChild(
@@ -661,7 +461,7 @@ async function promptTypedKey(
 	let lastError: string | null = seedError;
 
 	while (true) {
-		renderScreen(tui, `Step 2 of 3 · Connect ${provider.name}`);
+		renderScreen(tui, `Step 2 of 3 · ${provider.name}`);
 
 		if (lastError) {
 			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
