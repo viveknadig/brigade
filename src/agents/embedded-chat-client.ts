@@ -26,8 +26,13 @@
  * WebSocket. Both can be passed to `runChat` interchangeably.
  */
 
-import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import { randomUUID } from "node:crypto";
 
+import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import type { Api, Model } from "@mariozechner/pi-ai";
+
+import { runBrigadeTurnLoop } from "./brigade-turn-loop.js";
+import { switchModelMidTurn as piSwitchModelMidTurn } from "./mid-turn-switch.js";
 import type {
 	ChatClient,
 	ChatThinkingLevel,
@@ -90,7 +95,10 @@ export function makeEmbeddedChatClient(opts: EmbeddedChatClientOptions): ChatCli
 
 		// ── Turn control ──────────────────────────────────────────────
 
-		async prompt(text, opts) {
+		async prompt(
+			text: string,
+			opts?: { signal?: AbortSignal; fallbacks?: Array<{ model: Model<Api> }> },
+		): Promise<void> {
 			// Pi's `prompt` doesn't accept an AbortSignal — the way to
 			// cancel mid-stream is `session.abort()`. We bridge by
 			// wiring a one-shot signal listener that calls abort when
@@ -107,7 +115,24 @@ export function makeEmbeddedChatClient(opts: EmbeddedChatClientOptions): ChatCli
 				opts.signal.addEventListener("abort", onAbort, { once: true });
 			}
 			try {
-				await session.prompt(text);
+				// `runBrigadeTurnLoop` owns the 6-layer wrapper composition
+				// (fallback → heartbeat → stream-timeout → length-continue →
+				// content-quality → thinking-fallback → session.prompt). Each
+				// layer emits a `turn-*` bus event on its lifecycle callback,
+				// so consumers (TUI, gateway WS broadcast) get a single
+				// subscription point for every per-turn status update.
+				//
+				// `runId` is generated per-prompt; lifecycle event subscribers
+				// can filter by runId to scope updates to a specific turn.
+				// (Pi's own events flow through `buildAgent`'s bus bridge
+				// with the per-buildAgent runId — see core/agent.ts.)
+				const runId = randomUUID();
+				await runBrigadeTurnLoop({
+					session,
+					runId,
+					message: text,
+					fallbacks: opts?.fallbacks ?? [],
+				});
 			} finally {
 				if (onAbort && opts?.signal) {
 					opts.signal.removeEventListener("abort", onAbort);
@@ -138,6 +163,14 @@ export function makeEmbeddedChatClient(opts: EmbeddedChatClientOptions): ChatCli
 
 		async setModel(model) {
 			await session.setModel(model);
+		},
+
+		async switchModelMidTurn(target, userMessageToReplay) {
+			// Delegate to the Pi-deep helper. It handles the abort →
+			// setModel → re-prompt sequence atomically; we just pass
+			// through the session reference held in this client's
+			// closure so the caller doesn't need raw Pi access.
+			return piSwitchModelMidTurn(session, target, userMessageToReplay);
 		},
 
 		setThinkingLevel(level) {

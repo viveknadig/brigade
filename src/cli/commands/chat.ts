@@ -201,15 +201,14 @@ export async function runChatCommand(opts: ChatCommandOptions = {}): Promise<Cha
 	// the UI is wired — the editor's onSubmit drives subsequent turns until
 	// /exit, Ctrl+D, or SIGINT (already wired above) tears it down.
 	// Wrap the long-lived Pi session in an EmbeddedChatClient so the TUI
-	// talks to a Brigade-native interface instead of Pi directly. Both
-	// `session` (raw, for the wrapper composition) and `client` (the
-	// public surface) are passed; Phase 5 collapses these by moving the
-	// wrappers into the client and dropping `session` from ChatTUIOptions.
+	// talks to a Brigade-native interface instead of Pi directly. Post-
+	// Phase-5c the TUI takes ONLY the client — the raw session lives
+	// inside the client's closure for the wrappers / mid-turn helpers
+	// that need Pi-deep access.
 	const client = makeEmbeddedChatClient({ session });
 
 	chatHandle = await runChat({
 		client,
-		session,
 		tui,
 		provider: providerStr,
 		modelId: modelIdStr,

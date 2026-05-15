@@ -48,15 +48,16 @@ import {
 } from "../protocol.js";
 import {
 	buildAgent,
-	runWithContentQualityRetry,
-	runWithFallback,
-	runWithHeartbeat,
-	runWithLengthContinuation,
-	runWithStreamTimeout,
-	runWithThinkingFallback,
-	switchModelMidTurn,
+	// `runWith*` and `switchModelMidTurn` are no longer imported here
+	// as of Phase 5c. Gateway turns route through `client.prompt(...)`
+	// + `client.switchModelMidTurn(...)` — both delegate to the
+	// Brigade-native helpers internally, so the gateway no longer
+	// needs raw Pi access. The lifecycle bus subscriber above
+	// translates the resulting events into `broadcast("log", ...)`
+	// frames for connect-mode TUI clients.
 } from "./agent.js";
 import { makeEmbeddedChatClient } from "../agents/embedded-chat-client.js";
+import { onAgentEvent } from "../agents/agent-event-bus.js";
 import { loadBrigadeAuthStorage } from "./auth-bridge.js";
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, loadConfig, saveConfig, type Config } from "./config.js";
 import { acquireGatewayLock, type GatewayLockHandle } from "./gateway-lock.js";
@@ -277,10 +278,11 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		cwd: getBrigadeWorkspaceDir(),
 	});
 
-	// Wrap the long-lived Pi session in a Brigade-native ChatClient. The
-	// gateway uses `client.X` for all read/write operations; the raw
-	// `session` is kept around only for the wrapper composition further
-	// below (Phase 5 will move that into the client and drop `session`).
+	// Wrap the long-lived Pi session in a Brigade-native ChatClient.
+	// Post-Phase-5c the gateway uses `client.X` for every read/write
+	// operation; the raw `session` is held only for the event-logger
+	// attachment below (which needs Pi's session.subscribe directly to
+	// stream events to disk). Everything else flows through `client`.
 	const client = makeEmbeddedChatClient({ session });
 
 	// Stream every Pi event to the JSONL log file. Logger silently degrades
@@ -407,6 +409,81 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		broadcast("state", buildSnapshot());
 	});
 
+	// Lifecycle bus subscriber (Phase 5b): translate `runBrigadeTurnLoop`
+	// events into broadcast("log", ...) frames so connect-mode TUI clients
+	// see the same status messages the inline composition used to emit.
+	const detachLifecycleBus = onAgentEvent((event) => {
+		switch (event.type) {
+			case "turn-heartbeat":
+				broadcast("log", {
+					level: "info",
+					message: `still working… ${Math.round(event.elapsedMs / 1000)}s elapsed`,
+					at: Date.now(),
+				});
+				break;
+			case "turn-stream-timeout":
+				broadcast("log", {
+					level: "warn",
+					message: `no response for ${Math.round(event.idleMs / 1000)}s — aborting`,
+					at: Date.now(),
+				});
+				break;
+			case "turn-length-continue":
+				broadcast("log", {
+					level: "info",
+					message: "reply was truncated — asking the model to continue",
+					at: Date.now(),
+				});
+				break;
+			case "turn-content-retry":
+				broadcast("log", {
+					level: "info",
+					message: `${event.reason} — re-prompting for a usable answer`,
+					at: Date.now(),
+				});
+				break;
+			case "turn-thinking-downgrade":
+				broadcast("log", {
+					level: "info",
+					message: `model doesn't support thinking — switching from ${event.from} to off and retrying`,
+					at: Date.now(),
+				});
+				break;
+			case "turn-fallback-attempt":
+				broadcast("log", {
+					level: "warn",
+					message: `primary failed (${event.reason}) — trying ${event.toModelId ?? "fallback"}`,
+					at: Date.now(),
+				});
+				break;
+			case "turn-fallback-exhausted":
+				broadcast("log", {
+					level: "error",
+					message: `all fallback models failed: ${event.reason}`,
+					at: Date.now(),
+				});
+				break;
+			case "turn-retry-attempt":
+				broadcast("log", {
+					level: event.errorClass === "context_overflow" ? "info" : "warn",
+					message: event.reason,
+					at: Date.now(),
+				});
+				break;
+			case "turn-compact-before-retry":
+				broadcast("log", {
+					level: "info",
+					message: "context overflow — compacting then retrying same model",
+					at: Date.now(),
+				});
+				break;
+			default:
+				// `pi`, `turn-start`, `turn-settled`, etc. — handled elsewhere
+				// or not surfaced as status logs.
+				break;
+		}
+	});
+
 	/* ──────────────── request handler ──────────────── */
 
 	/**
@@ -440,116 +517,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						? modelRegistry.find(fallbackProvider, fallbackModelId)
 						: undefined;
 
-				// Mirror the chat.ts composition so anything driven through the
-				// gateway gets the same loop semantics. Composition (outer→inner):
-				//   1. runWithFallback             — multi-model failover (outermost)
-				//   2. runWithHeartbeat            — periodic "still working…" log
-				//   3. runWithStreamTimeout        — abort on per-provider idle threshold
-				//   4. runWithLengthContinuation   — auto-continue truncated replies
-				//   5. runWithContentQualityRetry  — re-prompt empty/reasoning-only/planning-only
-				//   6. runWithThinkingFallback     — auto-downgrade thinking on rejection
-				//   7. session.prompt              — Pi's actual loop (innermost)
-				await runWithFallback(session, p.text, {
+				// Drive the turn through `client.prompt`, which routes to
+				// `runBrigadeTurnLoop` (the canonical Brigade safety stack:
+				// fallback → heartbeat → stream-timeout → length-continue →
+				// content-quality retry → thinking-fallback → session.prompt).
+				// Lifecycle status events fire on the agent-event bus; the
+				// subscriber below translates them into `broadcast("log", ...)`
+				// frames so connect-mode TUI clients see the same status
+				// messages they used to receive from the inline composition.
+				await client.prompt(p.text, {
 					fallbacks: fallbackModel ? [{ model: fallbackModel }] : [],
-					wrapAttempt: (promptFn) =>
-						runWithHeartbeat(
-							session,
-							() =>
-								runWithStreamTimeout(
-									session,
-									() =>
-										runWithLengthContinuation(
-											session,
-											() =>
-												runWithContentQualityRetry(
-													session,
-													() =>
-														runWithThinkingFallback(session, promptFn, {
-															onDowngrade: (originalLevel) => {
-																broadcast("log", {
-																	level: "info",
-																	message: `model doesn't support thinking — switching from ${originalLevel} to off and retrying`,
-																	at: Date.now(),
-																});
-															},
-														}),
-													{
-														onRetry: (reason) => {
-															broadcast("log", {
-																level: "info",
-																message: `${reason} — re-prompting for a usable answer`,
-																at: Date.now(),
-															});
-														},
-													},
-												),
-											{
-												onContinue: () => {
-													broadcast("log", {
-														level: "info",
-														message: "reply was truncated — asking the model to continue",
-														at: Date.now(),
-													});
-												},
-											},
-										),
-									{
-										idleMs: session.model ? pickStreamIdleMs(session.model) : 60_000,
-										onTimeout: (ms) => {
-											broadcast("log", {
-												level: "warn",
-												message: `no response for ${Math.round(ms / 1000)}s — aborting`,
-												at: Date.now(),
-											});
-										},
-									},
-								),
-							{
-								intervalMs: 30_000,
-								onHeartbeat: (ms) => {
-									broadcast("log", {
-										level: "info",
-										message: `still working… ${Math.round(ms / 1000)}s elapsed`,
-										at: Date.now(),
-									});
-								},
-							},
-						),
-					onFallback: (reason: string, next) => {
-						broadcast("log", {
-							level: "warn",
-							message: `primary failed (${reason}) — trying ${next.label ?? "fallback"}`,
-							at: Date.now(),
-						});
-					},
-					onFallbackExhausted: (reason: string) => {
-						broadcast("log", {
-							level: "error",
-							message: `all fallback models failed: ${reason}`,
-							at: Date.now(),
-						});
-					},
-					// Per-error-class retry visibility — without these the connect
-					// TUI sees the gateway go silent for 30s/60s/5min during a
-					// rate-limit retry and assumes the daemon is dead. Broadcasting
-					// each retry attempt + each context-overflow compaction lets
-					// the operator (chat OR connect) understand what's happening.
-					retryPolicy: {
-						onRetry: (info) => {
-							broadcast("log", {
-								level: info.class === "context_overflow" ? "info" : "warn",
-								message: `${info.reason}`,
-								at: Date.now(),
-							});
-						},
-						onCompactBeforeRetry: () => {
-							broadcast("log", {
-								level: "info",
-								message: "context overflow — compacting then retrying same model",
-								at: Date.now(),
-							});
-						},
-					},
 				});
 				broadcast("state", buildSnapshot());
 				return undefined as ResponseFor[M];
@@ -586,7 +563,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const p = params as RequestParams["switch-model-mid-turn"];
 				const target = modelRegistry.find(p.provider, p.modelId);
 				if (!target) throw new Error(`model ${p.provider}/${p.modelId} not found`);
-				await switchModelMidTurn(session, target, p.replayMessage);
+				await client.switchModelMidTurn(target, p.replayMessage);
 				model = target;
 				await saveConfig(persistDefaultModel(await loadConfig(), p.provider, p.modelId));
 				broadcast("state", buildSnapshot());
@@ -782,6 +759,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		async stop() {
 			clearInterval(tickTimer);
 			detachPi();
+			detachLifecycleBus();
 			detachLogger();
 			for (const ws of clients) {
 				try {

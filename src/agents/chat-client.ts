@@ -100,15 +100,27 @@ export interface ChatClient {
 	// ── Turn control ───────────────────────────────────────────────────
 
 	/**
-	 * Send a user message and run a turn. Resolves when the turn has
+	 * Send a user message and run a turn through Brigade's full safety
+	 * stack (multi-model fallback / heartbeat / stream-timeout /
+	 * length-continuation / content-quality retry / thinking fallback,
+	 * composed in `runBrigadeTurnLoop`). Resolves when the turn has
 	 * SETTLED (fully streamed and any tool calls completed). Streaming
-	 * events fire on the subscriber while this promise is pending.
+	 * events fire on the subscriber while this promise is pending;
+	 * lifecycle events (heartbeats, fallback attempts, content-retry)
+	 * fire on the global `agent-event-bus`.
 	 *
-	 * Same semantics as Pi's `AgentSession.prompt(text)` — callers
-	 * inspect `messages` / subscribe events to read the assistant
-	 * reply. `signal` aborts the turn at the next safe boundary.
+	 * `signal` aborts the turn at the next safe boundary. `fallbacks`
+	 * is an optional ordered list of candidate models to walk on hard
+	 * errors of the primary; empty / undefined = primary errors
+	 * propagate to the caller.
 	 */
-	prompt(text: string, opts?: { signal?: AbortSignal }): Promise<void>;
+	prompt(
+		text: string,
+		opts?: {
+			signal?: AbortSignal;
+			fallbacks?: Array<{ model: Model<Api> }>;
+		},
+	): Promise<void>;
 
 	/** Abort the in-flight turn (if any). No-op when idle. */
 	abort(): Promise<void>;
@@ -123,6 +135,16 @@ export interface ChatClient {
 	/** Switch the active model. Affects subsequent turns; does not abort
 	 *  the in-flight turn. */
 	setModel(model: Model<Api>): Promise<void>;
+
+	/** Mid-turn model swap. If a turn is currently streaming, abort it,
+	 *  switch model, and re-prompt with `userMessageToReplay`. Returns
+	 *  `true` if a swap actually happened (a turn was in flight) or
+	 *  `false` if the agent was idle (caller should use `setModel` +
+	 *  the next `prompt` instead).
+	 *
+	 *  Brigade-native, exposed here so the TUI / gateway slash-command
+	 *  handlers don't need the raw Pi session. */
+	switchModelMidTurn(target: Model<Api>, userMessageToReplay: string): Promise<boolean>;
 
 	/** Set the thinking level. Pi clamps to model capabilities. */
 	setThinkingLevel(level: ChatThinkingLevel): void;

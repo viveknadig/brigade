@@ -84,6 +84,74 @@ export type AgentBusEvent =
 			fromModelId: string;
 			toProvider: string;
 			toModelId: string;
+	  }
+	// ── Phase 5: per-turn loop lifecycle events ────────────────────────
+	// Emitted by `runBrigadeTurnLoop` (the wrapper composition that lives
+	// inside EmbeddedChatClient.prompt). Consumers (TUI, gateway WS
+	// broadcaster) subscribe to these for inline status rendering instead
+	// of receiving callbacks at every wrapper layer.
+	| {
+			/** Model fallback attempt: primary failed with `reason`, switching to `to`. */
+			type: "turn-fallback-attempt";
+			runId: string;
+			reason: string;
+			toProvider: string | undefined;
+			toModelId: string | undefined;
+	  }
+	| {
+			/** All fallback candidates exhausted with their final error. */
+			type: "turn-fallback-exhausted";
+			runId: string;
+			reason: string;
+	  }
+	| {
+			/** No streaming activity for `intervalMs`; surface "still working" UX. */
+			type: "turn-heartbeat";
+			runId: string;
+			elapsedMs: number;
+	  }
+	| {
+			/** Per-attempt idle-stream watchdog tripped after `idleMs`. */
+			type: "turn-stream-timeout";
+			runId: string;
+			idleMs: number;
+	  }
+	| {
+			/** Length-continuation kicked in: response was truncated mid-stream
+			 *  and the loop re-prompted the model to continue. */
+			type: "turn-length-continue";
+			runId: string;
+	  }
+	| {
+			/** Content-quality retry fired with reason: empty / reasoning-only /
+			 *  planning-only. The loop sent a steer-prompt asking the model to
+			 *  produce an actual visible answer / actually do the work. */
+			type: "turn-content-retry";
+			runId: string;
+			reason: "empty" | "reasoning-only" | "planning-only";
+	  }
+	| {
+			/** Thinking level downgraded (model rejected the configured level)
+			 *  from `from` to "off"; the loop retries the same user message. */
+			type: "turn-thinking-downgrade";
+			runId: string;
+			from: string;
+	  }
+	| {
+			/** Same-model retry triggered by transient error (rate_limit /
+			 *  overloaded / timeout / context_overflow). `class` is the
+			 *  classification; `reason` is the human-readable detail the
+			 *  gateway can log to subscribers. */
+			type: "turn-retry-attempt";
+			runId: string;
+			errorClass: string;
+			reason: string;
+	  }
+	| {
+			/** Context overflow detected; compacting transcript before next
+			 *  retry on the same model. */
+			type: "turn-compact-before-retry";
+			runId: string;
 	  };
 
 export type AgentEventListener = (event: AgentBusEvent) => void;

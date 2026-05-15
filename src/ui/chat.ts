@@ -18,6 +18,7 @@ import * as path from "node:path";
 import type { AgentSession, AgentSessionEvent, AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
 
 import type { ChatClient } from "../agents/chat-client.js";
+import { onAgentEvent } from "../agents/agent-event-bus.js";
 import {
 	CancellableLoader,
 	CombinedAutocompleteProvider,
@@ -39,16 +40,13 @@ import chalk from "chalk";
 // underscores into the chat output.
 import { Markdown } from "./markdown.js";
 
-import {
-	classifySensitiveStopReason,
-	runWithContentQualityRetry,
-	runWithFallback,
-	runWithHeartbeat,
-	runWithLengthContinuation,
-	runWithStreamTimeout,
-	runWithThinkingFallback,
-	switchModelMidTurn,
-} from "../core/agent.js";
+// `classifySensitiveStopReason` lives in `agents/stop-reason.ts` as of
+// Phase 5d. The rest of the wrapper exports (`runWithFallback`,
+// `runWithHeartbeat`, `runWithStreamTimeout`, `runWithLengthContinuation`,
+// `runWithContentQualityRetry`, `runWithThinkingFallback`,
+// `switchModelMidTurn`) are encapsulated inside `EmbeddedChatClient` /
+// `runBrigadeTurnLoop`; the TUI never reaches into them directly anymore.
+import { classifySensitiveStopReason } from "../agents/stop-reason.js";
 import { BRIGADE_DIR, loadConfig, saveConfig } from "../core/config.js";
 import { cleanProviderError, describeModelCapabilities, pickStreamIdleMs } from "../core/model-caps.js";
 import { buildLoginGuidanceMessage, friendlyError, translateAuthError } from "../core/auth-error.js";
@@ -65,15 +63,13 @@ type ThinkingLevelName = (typeof VALID_THINKING_LEVELS)[number];
 
 export interface ChatTUIOptions {
 	/** Brigade-side chat surface. The TUI reads/writes session state
-	 *  through this interface. Phase 4d will fully replace `session`
-	 *  with `client`; today both are required because the wrapper
-	 *  composition (runWithFallback / runWithThinkingFallback / etc.)
-	 *  still calls Pi-specific methods on the raw session. */
+	 *  through this interface — Pi `AgentSession` is no longer exposed
+	 *  here (Phase 5c). For in-process mode `client` is built by
+	 *  `makeEmbeddedChatClient({session: buildAgent(...)})` in the boot
+	 *  wrapper; for the gateway-client path it'll be a
+	 *  `GatewayChatClient` over WebSocket. Both implement the same
+	 *  interface — `runChat` doesn't care which mode it's in. */
 	client: ChatClient;
-	/** Raw Pi `AgentSession`. Only used by the wrapper composition;
-	 *  the TUI itself talks to `client`. Will be removed in Phase 5
-	 *  once the wrappers move into `EmbeddedChatClient`. */
-	session: AgentSession;
 	tui: TUI;
 	provider: string;
 	modelId: string;
@@ -94,7 +90,7 @@ export interface ChatHandle {
 }
 
 export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
-	const { client, session, tui, authStorage, modelRegistry } = opts;
+	const { client, tui, authStorage, modelRegistry } = opts;
 	let provider = opts.provider;
 	let modelId = opts.modelId;
 
@@ -772,6 +768,97 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 		}
 	});
 
+	// ── Lifecycle bus subscriber (Phase 5b) ────────────────────────────
+	// `runBrigadeTurnLoop` (inside `EmbeddedChatClient.prompt`) emits
+	// per-turn status events on the agent-event bus: heartbeat, stream
+	// timeout, length continuation, content-quality retry, thinking
+	// fallback, model fallback. Pre-migration these fired as inline
+	// callbacks; now they reach the TUI via the bus so a single
+	// subscription handles every wrapper layer.
+	const disposeLifecycleSubscription = onAgentEvent((event) => {
+		switch (event.type) {
+			case "turn-heartbeat": {
+				const sec = Math.round(event.elapsedMs / 1000);
+				insertBeforeEditor(
+					new Text(`  ${brand.dim(`still working… ${sec}s elapsed`)}`, 0, 0),
+				);
+				break;
+			}
+			case "turn-stream-timeout": {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim(`⏳ no response for ${Math.round(event.idleMs / 1000)}s — aborting…`)}`,
+						0,
+						0,
+					),
+				);
+				break;
+			}
+			case "turn-length-continue": {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim("↻ reply was truncated — asking the model to continue…")}`,
+						0,
+						0,
+					),
+				);
+				break;
+			}
+			case "turn-content-retry": {
+				const label =
+					event.reason === "empty"
+						? "no visible answer — re-prompting"
+						: event.reason === "reasoning-only"
+							? "model emitted only reasoning — asking for visible answer"
+							: "model described an action but didn't take it — asking it to actually do it";
+				insertBeforeEditor(new Text(`  ${brand.dim(`↻ ${label}…`)}`, 0, 0));
+				break;
+			}
+			case "turn-thinking-downgrade": {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim(`This model doesn't support thinking — switching from ${event.from} to off and retrying…`)}`,
+						0,
+						0,
+					),
+				);
+				break;
+			}
+			case "turn-fallback-attempt": {
+				const target = event.toModelId ?? "fallback";
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim(`↻ primary failed (${friendlyError(event.reason, cleanProviderError)}) — trying ${target}…`)}`,
+						0,
+						0,
+					),
+				);
+				break;
+			}
+			case "turn-fallback-exhausted": {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.error("✗ all fallback models failed:")} ${brand.error(friendlyError(event.reason, cleanProviderError))}`,
+						0,
+						0,
+					),
+				);
+				break;
+			}
+			default:
+				// Other event types (pi, turn-start/settled, etc.) handled
+				// elsewhere (or not relevant to TUI status rendering).
+				break;
+		}
+	});
+	process.once("exit", () => {
+		try {
+			disposeLifecycleSubscription();
+		} catch {
+			/* harmless */
+		}
+	});
+
 	// ── input handling ─────────────────────────────────────────────────
 	editor.onSubmit = async (value: string) => {
 		const trimmed = value.trim();
@@ -831,7 +918,7 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 					),
 				);
 				try {
-					const swapped = await switchModelMidTurn(session, target, replayMsg);
+					const swapped = await client.switchModelMidTurn(target, replayMsg);
 					if (!swapped) {
 						// Turn ended between our `isAgentRunning` check and switchModelMidTurn —
 						// the in-flight signal had already cleared. Fall back to a normal
@@ -1413,124 +1500,18 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 					? modelRegistry.find(fallbackProvider, fallbackModelId)
 					: undefined;
 
-			// Compose the loop wrappers from the inside out:
-			//   1. session.prompt()         — Pi's actual loop
-			//   2. runWithStreamTimeout()   — aborts if the loop goes silent for 60s
-			//   3. runWithFallback()        — on hard error, walks the fallback chain
-			// Order matters: timeout wraps the prompt INSIDE fallback, so each
-			// fallback attempt gets its own fresh 60s watcher.
-			await runWithFallback(session, trimmed, {
+			// Run the turn through the full Brigade safety stack. The
+			// wrapper composition (heartbeat → stream-timeout → length-
+			// continuation → content-quality retry → thinking-fallback →
+			// fallback → Pi's prompt) lives inside `EmbeddedChatClient.
+			// prompt` / `runBrigadeTurnLoop` post-Phase-5b. Status events
+			// fire on the agent-event bus; the subscriber above (lifecycle
+			// `onAgentEvent` block) translates them into the same inline
+			// "still working… 30s elapsed" / "↻ primary failed — trying
+			// fallback…" / "↻ truncated — asking the model to continue…"
+			// lines the user saw pre-migration.
+			await client.prompt(trimmed, {
 				fallbacks: fallbackModel ? [{ model: fallbackModel }] : [],
-				// Per-attempt wrappers. Composition (outer → inner):
-				//   1. runWithHeartbeat            — every 30s of silence, show "still
-				//                                    working… Ns elapsed" so the user
-				//                                    knows we're alive (esp. local 30B
-				//                                    models that take minutes per turn)
-				//   2. runWithStreamTimeout        — abort after per-provider idle threshold
-				//                                    (60s cloud / 5min Ollama)
-				//   3. runWithContentQualityRetry  — re-prompt with a steer if the model
-				//                                    returned empty / reasoning-only /
-				//                                    planning-only output
-				//   4. runWithThinkingFallback     — auto-downgrade thinking on rejection
-				//   5. session.prompt              — Pi's actual loop
-				wrapAttempt: (promptFn) =>
-					runWithHeartbeat(
-						session,
-						() =>
-							runWithStreamTimeout(
-								session,
-								() =>
-									runWithLengthContinuation(
-										session,
-										() =>
-											runWithContentQualityRetry(
-												session,
-												() =>
-													runWithThinkingFallback(session, promptFn, {
-														onDowngrade: (originalLevel) => {
-															insertBeforeEditor(
-																new Text(
-																	`  ${brand.dim(`This model doesn't support thinking — switching from ${originalLevel} to off and retrying…`)}`,
-																	0,
-																	0,
-																),
-															);
-														},
-													}),
-										{
-											onRetry: (reason) => {
-												const label =
-													reason === "empty"
-														? "no visible answer — re-prompting"
-														: reason === "reasoning-only"
-															? "model emitted only reasoning — asking for visible answer"
-															: "model described an action but didn't take it — asking it to actually do it";
-												insertBeforeEditor(
-													new Text(`  ${brand.dim(`↻ ${label}…`)}`, 0, 0),
-												);
-											},
-										},
-									),
-									{
-										onContinue: () => {
-											insertBeforeEditor(
-												new Text(
-													`  ${brand.dim("↻ reply was truncated — asking the model to continue…")}`,
-													0,
-													0,
-												),
-											);
-										},
-									},
-								),
-								{
-									// Per-provider timeout. Cloud non-reasoning: 60s; cloud
-									// reasoning: 180s; Ollama: 5min; custom: 3min.
-									idleMs: session.model ? pickStreamIdleMs(session.model) : 60_000,
-									onTimeout: (ms) => {
-										insertBeforeEditor(
-											new Text(
-												`  ${brand.dim(`⏳ no response for ${Math.round(ms / 1000)}s — aborting…`)}`,
-												0,
-												0,
-											),
-										);
-									},
-								},
-							),
-						{
-							intervalMs: 30_000,
-							onHeartbeat: (ms) => {
-								const sec = Math.round(ms / 1000);
-								insertBeforeEditor(
-									new Text(`  ${brand.dim(`still working… ${sec}s elapsed`)}`, 0, 0),
-								);
-							},
-						},
-					),
-				onFallback: (reason: string) => {
-					// `cfg.fallbackModelId` was the v0.1.3 flat shape; current config
-					// lives at `agents.defaults.model.fallbacks[0]` (read above into
-					// `fallbackModelId`). Without this the user saw "trying undefined…"
-					// every time the primary failed.
-					const target = fallbackModelId ?? "fallback";
-					insertBeforeEditor(
-						new Text(
-							`  ${brand.dim(`↻ primary failed (${friendlyError(reason, cleanProviderError)}) — trying ${target}…`)}`,
-							0,
-							0,
-						),
-					);
-				},
-				onFallbackExhausted: (reason: string) => {
-					insertBeforeEditor(
-						new Text(
-							`  ${brand.error("✗ all fallback models failed:")} ${brand.error(friendlyError(reason, cleanProviderError))}`,
-							0,
-							0,
-						),
-					);
-				},
 			});
 		} catch (err: unknown) {
 			// Provider errors arrive here when the request itself throws (vs being
