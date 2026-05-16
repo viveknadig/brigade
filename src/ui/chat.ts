@@ -609,12 +609,32 @@ export async function runChat(opts: ChatTUIOptions): Promise<ChatHandle> {
 					const mark = event.isError ? brand.error("✗") : brand.tool("✓");
 					// Append a short preview of what the tool produced so the user
 					// can see "✓ bash · 7 packages installed" rather than just
-					// "✓ bash". Errors stay flagged in the same line. Empty
-					// results (Pi's edit/write success cases) collapse to just
-					// the mark + name to keep the chat compact.
-					const summary = summarizeToolResult(event.result);
-					const preview = summary.hasContent ? ` ${brand.dim(`· ${summary.preview}`)}` : "";
-					indicator.setText(`  ${mark} ${brand.tool(event.toolName)}${preview}`);
+					// "✓ bash". Empty results (Pi's edit/write success cases)
+					// collapse to just the mark + name to keep the chat compact.
+					//
+					// ERROR results (jail / exec-approvals refusals, tool
+					// exceptions) preserve newlines + use a larger budget so the
+					// "brigade exec allow ..." instruction line survives intact.
+					// Without this, the operator only sees "✗ bash · Tool 'bash'
+					// was blocked: …" truncated mid-sentence and has to ask the
+					// model what to do.
+					const summary = summarizeToolResult(event.result, {
+						preserveNewlines: event.isError,
+					});
+					if (event.isError && summary.multiline) {
+						// Re-render the indicator as a status header, then append
+						// the full reason as a dimmed block below so the call-to-
+						// action (`brigade exec allow ...`) is visible verbatim.
+						indicator.setText(`  ${mark} ${brand.tool(event.toolName)}`);
+						const indentedBody = summary.preview
+							.split("\n")
+							.map((line) => `      ${brand.dim(line)}`)
+							.join("\n");
+						insertBeforeEditor(new Text(indentedBody, 0, 0));
+					} else {
+						const preview = summary.hasContent ? ` ${brand.dim(`· ${summary.preview}`)}` : "";
+						indicator.setText(`  ${mark} ${brand.tool(event.toolName)}${preview}`);
+					}
 					tui.requestRender();
 					pendingTools.delete(event.toolCallId);
 				}

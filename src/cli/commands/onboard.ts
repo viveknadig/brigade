@@ -146,7 +146,11 @@ export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promi
 			chalk.dim(
 				`\n✓ onboarded — provider: ${chalk.bold(result.provider)} · model: ${chalk.bold(result.modelId)}\n` +
 					`Next: run ${chalk.bold("brigade gateway")} (then ${chalk.bold("brigade connect")} in a second terminal),\n` +
-					`      or ${chalk.bold("brigade")} for the in-process TUI.\n`,
+					`      or ${chalk.bold("brigade")} for the in-process TUI.\n` +
+					`Shell access: ${chalk.bold("bash is gated")} — agents must ask before running commands.\n` +
+					`              Approve with ${chalk.bold('brigade exec allow "<cmd>"')} ` +
+					`(${chalk.bold("brigade exec list")} to see what's approved).\n` +
+					`              Read/grep/find/ls are open — they never need approval.\n`,
 			),
 		);
 		return 0;

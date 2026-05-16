@@ -32,6 +32,7 @@ import {
 import { BRIGADE_DIR, loadConfig } from "../../core/config.js";
 import { loadBrigadeAuthStorage } from "../../core/auth-bridge.js";
 import { getTodayLogPath } from "../../core/event-logger.js";
+import { readApprovalsSummary } from "../../core/exec-approvals.js";
 import { probeGateway, readPidFile, isProcessAlive } from "../../core/gateway-probe.js";
 import { findProvider, PROVIDERS } from "../../providers/catalog.js";
 
@@ -63,6 +64,7 @@ export async function runDoctorCommand(opts: DoctorCommandOptions = {}): Promise
 	checks.push(checkConfiguredProvider(await safeLoadConfig()));
 	checks.push(checkWorkspace());
 	checks.push(checkLogDirWritable());
+	checks.push(checkExecApprovals());
 	checks.push(await checkGateway(opts));
 
 	if (opts.json) {
@@ -311,6 +313,51 @@ function checkWorkspace(): CheckResult {
 		? fs.readdirSync(sessionsDir).filter((n) => n.endsWith(".jsonl")).length
 		: 0;
 	return { name: "workspace", status: "ok", message: `7/7 persona files, ${sessionCount} session(s)` };
+}
+
+function checkExecApprovals(): CheckResult {
+	const s = readApprovalsSummary();
+	// Schema-version mismatch is reported via `s.error` (the loader threw,
+	// readApprovalsSummary caught + surfaced). Render it as `fail` so the
+	// operator sees clearly that the gate WILL refuse every bash call until
+	// they take action.
+	if (s.error) {
+		return {
+			name: "exec approvals",
+			status: "fail",
+			message: `${s.filePath} — ${s.error}`,
+			hint: "the gate refuses every bash call while the file is unreadable — repair or move it aside",
+		};
+	}
+	if (!s.fileExists) {
+		// "ok" because an empty allowlist is a SECURE default in v1 — bash
+		// is refused until the operator approves. We just want the operator
+		// to know the gate exists and how to feed it.
+		return {
+			name: "exec approvals",
+			status: "ok",
+			message: "no approvals yet — bash is refused until you approve a command",
+			hint: 'run `brigade exec allow "ls -la"` (or your common safe commands) to feed the allowlist',
+		};
+	}
+	const total = s.commandCount + s.patternCount;
+	if (total === 0) {
+		return {
+			name: "exec approvals",
+			status: "ok",
+			message: `allowlist file exists at ${s.filePath} but is empty`,
+			hint: 'run `brigade exec allow "<cmd>"` to add an exact approval, or `brigade exec allow-pattern <regex>` for a family',
+		};
+	}
+	const parts: string[] = [];
+	if (s.commandCount > 0) parts.push(`${s.commandCount} command${s.commandCount === 1 ? "" : "s"}`);
+	if (s.patternCount > 0) parts.push(`${s.patternCount} pattern${s.patternCount === 1 ? "" : "s"}`);
+	return {
+		name: "exec approvals",
+		status: "ok",
+		message: `${parts.join(", ")} approved (${s.filePath})`,
+		hint: "list with `brigade exec list`, classify a command with `brigade exec deny-test <cmd>`",
+	};
 }
 
 function checkLogDirWritable(): CheckResult {

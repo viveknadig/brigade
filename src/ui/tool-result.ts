@@ -7,27 +7,56 @@
  * MCP-style tools). We don't want to dump JSON into the chat; we want
  * something legible after the `✓ tool_name` line.
  *
+ * Two render modes:
+ *   - SUCCESS — collapse to a 120-char one-line preview ("✓ bash · 7
+ *     packages installed"). Tool output is usually long and bulky; the
+ *     model already sees the full result, the operator just needs the
+ *     gist.
+ *   - ERROR (`{ isError: true }` from Pi, or `opts.preserveNewlines`) —
+ *     keep newlines + raise the cap to ~800 chars. Refusals from the
+ *     workspace jail / exec-approvals gate carry multi-line instructions
+ *     ("blocked: command 'ls' is not on the allowlist. Operator must
+ *     run\n  brigade exec allow ...\n…"). A 120-char single-line preview
+ *     would chop the magic `brigade exec allow` incantation in half and
+ *     leave the operator guessing. The model already self-corrects from
+ *     the FULL reason (Pi pipes that into the synthetic tool_result it
+ *     sees), so the operator deserves the same fidelity.
+ *
  * Mirrors openclaw's interactive-mode tool-result rendering shape (which
  * uses Pi-TUI's MarkdownComponent.append for streamed output). Brigade's
  * shorter format trades depth for compactness — a one-line preview keeps
- * the chat scannable.
+ * the chat scannable, but ERROR results break that rule because their
+ * call-to-action lives in the body.
  */
 export interface ToolResultSummary {
-	/** Single-line preview, never longer than `maxLength` chars */
+	/** Preview text. For errors, may contain newlines; for success, single line. */
 	preview: string;
 	/** Whether the result was non-empty (false → caller may hide entirely) */
 	hasContent: boolean;
+	/** True when the preview is multi-line (caller should render with line breaks). */
+	multiline: boolean;
 }
 
 const DEFAULT_MAX_LENGTH = 120;
+const ERROR_MAX_LENGTH = 800;
+
+export interface SummarizeOpts {
+	maxLength?: number;
+	/**
+	 * When true, preserve newlines + use the error budget. Set by the TUI
+	 * for `isError` tool results. Defaults to false (success render).
+	 */
+	preserveNewlines?: boolean;
+}
 
 export function summarizeToolResult(
 	result: unknown,
-	opts: { maxLength?: number } = {},
+	opts: SummarizeOpts = {},
 ): ToolResultSummary {
-	const maxLength = opts.maxLength ?? DEFAULT_MAX_LENGTH;
+	const isError = opts.preserveNewlines === true;
+	const maxLength = opts.maxLength ?? (isError ? ERROR_MAX_LENGTH : DEFAULT_MAX_LENGTH);
 
-	if (result == null) return { preview: "", hasContent: false };
+	if (result == null) return { preview: "", hasContent: false, multiline: false };
 
 	let text: string;
 	if (typeof result === "string") {
@@ -65,13 +94,28 @@ export function summarizeToolResult(
 		text = String(result);
 	}
 
-	// Collapse whitespace so a multi-line bash output renders on one line.
-	// Tabs → space, CR/LF → space, runs of whitespace → single space.
+	if (isError) {
+		// Trim leading/trailing whitespace but preserve internal newlines
+		// + indentation so the "brigade exec allow ..." line stays
+		// visually aligned in the rendered block.
+		const trimmed = text.replace(/^\s+|\s+$/g, "");
+		if (!trimmed) return { preview: "", hasContent: false, multiline: false };
+		const sliced = trimmed.length <= maxLength ? trimmed : `${trimmed.slice(0, maxLength - 1)}…`;
+		return {
+			preview: sliced,
+			hasContent: true,
+			multiline: sliced.includes("\n"),
+		};
+	}
+
+	// Success path: collapse whitespace so a multi-line bash output renders
+	// on one line. Tabs → space, CR/LF → space, runs of whitespace → single
+	// space. Same shape as before.
 	const collapsed = text.replace(/\s+/g, " ").trim();
-	if (!collapsed) return { preview: "", hasContent: false };
+	if (!collapsed) return { preview: "", hasContent: false, multiline: false };
 
 	if (collapsed.length <= maxLength) {
-		return { preview: collapsed, hasContent: true };
+		return { preview: collapsed, hasContent: true, multiline: false };
 	}
-	return { preview: `${collapsed.slice(0, maxLength - 1)}…`, hasContent: true };
+	return { preview: `${collapsed.slice(0, maxLength - 1)}…`, hasContent: true, multiline: false };
 }

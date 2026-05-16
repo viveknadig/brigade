@@ -525,9 +525,22 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 					const mark = event.isError ? brand.error("✗") : brand.tool("✓");
 					// Append a short preview of what the tool produced so the
 					// connect view matches `brigade chat` ("✓ bash · output").
-					const summary = summarizeToolResult(event.result);
-					const preview = summary.hasContent ? ` ${brand.dim(`· ${summary.preview}`)}` : "";
-					indicator.setText(`  ${mark} ${brand.tool(event.toolName)}${preview}`);
+					// Errors preserve newlines + use a bigger budget so the
+					// gate's "brigade exec allow ..." call-to-action survives.
+					const summary = summarizeToolResult(event.result, {
+						preserveNewlines: event.isError,
+					});
+					if (event.isError && summary.multiline) {
+						indicator.setText(`  ${mark} ${brand.tool(event.toolName)}`);
+						const indentedBody = summary.preview
+							.split("\n")
+							.map((line) => `      ${brand.dim(line)}`)
+							.join("\n");
+						insertBeforeEditor(new Text(indentedBody, 0, 0));
+					} else {
+						const preview = summary.hasContent ? ` ${brand.dim(`· ${summary.preview}`)}` : "";
+						indicator.setText(`  ${mark} ${brand.tool(event.toolName)}${preview}`);
+					}
 					tui.requestRender();
 					pendingTools.delete(event.toolCallId);
 				}

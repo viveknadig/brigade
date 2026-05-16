@@ -56,7 +56,8 @@ import * as path from "node:path";
 
 import type { BeforeToolCallContext, BeforeToolCallResult } from "@mariozechner/pi-agent-core";
 
-import { decideApproval } from "../core/exec-approvals.js";
+import { BrigadeApprovalFileVersionError, decideApproval } from "../core/exec-approvals.js";
+import { emitAgentEvent } from "./agent-event-bus.js";
 import type { BrigadeBeforeToolCallHook } from "./tool-guard.js";
 
 /**
@@ -67,10 +68,16 @@ const PATH_MUTATING_TOOLS = new Set(["write", "edit"]);
 
 /**
  * Tools whose invocation is gated through the exec-approvals allowlist.
- * v1 has only `bash`; the gate is general enough to take on additional
- * shell-shaped tools (`sh`, `pwsh`, `cmd`) when/if Brigade exposes them.
+ * Includes the canonical `bash` name plus the OpenClaw / OpenAI / generic
+ * aliases providers sometimes emit (`exec`, `shell`, `sh`). Adding a name
+ * here AUTOMATICALLY makes Brigade refuse it unless allowlisted — no other
+ * wiring needed.
+ *
+ * Pi today registers the tool as `bash`. The extra names are belt-and-
+ * braces: if a future Pi minor or a provider plugin emits `exec`, the
+ * gate doesn't silently let it through.
  */
-const EXEC_GATED_TOOLS = new Set(["bash"]);
+const EXEC_GATED_TOOLS = new Set(["bash", "exec", "shell", "sh"]);
 
 /**
  * Unicode whitespace codepoints that some providers occasionally emit
@@ -207,17 +214,37 @@ function actualPiResolvedPath(rawPath: string, processCwd: string): string {
 }
 
 /**
+ * Optional context the guard threads into bus events. Lifted from the
+ * agent-loop turn at wire-up time — the guard receives a closure that
+ * carries the current runId/agentId so consumers (TUI, gateway WS
+ * broadcaster) can correlate the refusal with the turn it fired inside.
+ *
+ * Both fields are optional: when omitted (e.g. in unit tests) the guard
+ * still emits the event with empty-string ids, which is fine because the
+ * test usually asserts on `toolName` + `reason` and ignores the ids.
+ */
+export interface WorkspaceJailContext {
+	runId?: string;
+	agentId?: string;
+}
+
+/**
  * Build a `beforeToolCall` hook that enforces the three policies above.
  *
  * @param workspaceRoot — agent persona dir; mutating tools stay inside.
  * @param processCwd — cwd Pi was given when the session was created.
  *   Pi resolves relative tool paths against THIS, not workspaceRoot.
  *   Defaults to `process.cwd()` if omitted.
+ * @param ctxRef — optional ref carrying the current turn's runId/agentId.
+ *   The agent-loop sets `ctxRef.value = {runId, agentId}` at turn start
+ *   and clears it at turn end; the guard captures the closure and reads
+ *   live each call. Bus events get accurate correlation IDs without
+ *   re-wiring the guard between turns.
  *
  * Compose with `makeUnknownToolGuard` at the call site:
  *
  *   const nameGuard = makeUnknownToolGuard(enabledToolNames);
- *   const jailGuard = makeWorkspaceJailGuard(workspaceRoot, processCwd);
+ *   const jailGuard = makeWorkspaceJailGuard(workspaceRoot, processCwd, ctxRef);
  *   session.agent.beforeToolCall = async (ctx, signal) => {
  *     return (await nameGuard(ctx, signal)) ?? (await jailGuard(ctx, signal));
  *   };
@@ -225,15 +252,32 @@ function actualPiResolvedPath(rawPath: string, processCwd: string): string {
 export function makeWorkspaceJailGuard(
 	workspaceRoot: string,
 	processCwd: string = process.cwd(),
+	ctxRef: { value: WorkspaceJailContext } = { value: {} },
 ): BrigadeBeforeToolCallHook {
 	const root = path.resolve(workspaceRoot);
 	const cwd = path.resolve(processCwd);
+	const emitBlocked = (toolName: string, reason: string): void => {
+		const c = ctxRef.value;
+		emitAgentEvent({
+			type: "tool-blocked",
+			runId: c.runId ?? "",
+			agentId: c.agentId ?? "",
+			toolName,
+			reason,
+		});
+	};
 	return async (ctx: BeforeToolCallContext): Promise<BeforeToolCallResult | undefined> => {
 		const rawName = (ctx as { toolCall?: { name?: unknown }; name?: unknown })?.toolCall?.name
 			?? (ctx as { name?: unknown })?.name
 			?? "";
 		const name = typeof rawName === "string" ? rawName.trim() : "";
 		if (!name) return undefined;
+		// Case-insensitive match against EXEC_GATED_TOOLS so a provider that
+		// registers the bash tool as "Bash" / "BASH" / "Shell" doesn't slip
+		// past the gate. Defence in depth — the unknown-tool guard normally
+		// catches it first because `enabledToolNames` is lowercase, but the
+		// gate must not rely on a sibling guard to do its job.
+		const nameLower = name.toLowerCase();
 
 		const args = (ctx as { toolCall?: { arguments?: unknown }; args?: unknown; arguments?: unknown })
 			?.toolCall?.arguments
@@ -241,7 +285,7 @@ export function makeWorkspaceJailGuard(
 			?? (ctx as { arguments?: unknown })?.arguments
 			?? {};
 
-		if (EXEC_GATED_TOOLS.has(name)) {
+		if (EXEC_GATED_TOOLS.has(nameLower)) {
 			// Pull the command out of the tool args. Pi's `bash` tool accepts
 			// `command` (the OpenClaw/Anthropic convention); some providers
 			// emit `cmd` or `script` instead — fall back through them.
@@ -251,38 +295,145 @@ export function makeWorkspaceJailGuard(
 						?? (args as { cmd?: unknown }).cmd
 						?? (args as { script?: unknown }).script)
 					: undefined);
+
+			// Surface non-string command arguments distinctly from
+			// literal-empty commands. Without this branch the gate's
+			// "prompt" message says `(empty command)` even for cases
+			// where the model emitted `command: ["ls", "-la"]` or
+			// `command: null` — confusing the operator into thinking
+			// the model produced an empty string when it actually
+			// produced a malformed argument shape. The safer outcome
+			// (refuse with a clear typed message) tells the model
+			// exactly what to fix.
+			if (cmdRaw !== undefined && typeof cmdRaw !== "string") {
+				const shape = Array.isArray(cmdRaw) ? "array" : typeof cmdRaw === "object" && cmdRaw !== null ? "object" : typeof cmdRaw;
+				const article = /^[aeiou]/i.test(shape) ? "an" : "a";
+				const reason =
+					`Tool "${name}" was blocked: its \`command\` argument was ${article} ${shape}, ` +
+					`not a string. Brigade's bash gate expects a single shell command string ` +
+					`(e.g. \`{command: "ls -la"}\`). Re-emit the tool call with the command as ` +
+					`one string and retry.`;
+				emitBlocked(name, reason);
+				return { block: true, reason };
+			}
+
 			const cmd = typeof cmdRaw === "string" ? cmdRaw : "";
-			const decision = decideApproval(cmd);
+
+			// Workdir refusal — Pi's bash schema accepts a `workdir` (alias:
+			// `cwd`) override. An operator who allowlisted `ls -la` did NOT
+			// approve running it from /etc — the directory matters. v1
+			// refuses any workdir override regardless of value OR type;
+			// Pi's default cwd (the agent's processCwd) is the only allowed
+			// execution location. Phase 2 may relax this to "must be inside
+			// processCwd", but for v1 the simplest secure default is "no
+			// directory shopping". Refused BEFORE checking decideApproval
+			// so a workdir attack on an allowlisted command is still caught.
+			//
+			// Non-string workdir (number / object / null) is ALSO refused —
+			// otherwise a model emitting `{workdir: 42}` slips past the
+			// typeof check and lets Pi pick its own resolution (which may
+			// be process.cwd() or may surface an error mid-stream).
+			if (args && typeof args === "object") {
+				const hasWorkdir = Object.prototype.hasOwnProperty.call(args, "workdir");
+				const hasCwd = Object.prototype.hasOwnProperty.call(args, "cwd");
+				const workdirRaw = hasWorkdir
+					? (args as { workdir?: unknown }).workdir
+					: hasCwd
+						? (args as { cwd?: unknown }).cwd
+						: undefined;
+				const workdirKey = hasWorkdir ? "workdir" : hasCwd ? "cwd" : null;
+				if (workdirKey !== null && workdirRaw !== undefined && workdirRaw !== null) {
+					// Skip the empty-string case (operator explicitly clearing
+					// the override is harmless — same as not passing it at all).
+					const isEmptyString = typeof workdirRaw === "string" && workdirRaw.trim().length === 0;
+					if (!isEmptyString) {
+						const displayValue = typeof workdirRaw === "string"
+							? `"${workdirRaw}"`
+							: `(${Array.isArray(workdirRaw) ? "array" : typeof workdirRaw})`;
+						const reason =
+							`Tool "${name}" was blocked: \`${workdirKey}\` override ${displayValue} is not ` +
+							`allowed. v1 refuses any \`workdir\` / \`cwd\` argument on shell tools — ` +
+							`the command runs from the agent's process cwd ("${cwd}"). If you need ` +
+							`to act on files inside a subdirectory, prefer absolute paths in the ` +
+							`command itself (e.g. \`ls -la /full/path\`) or change the agent's cwd.`;
+						emitBlocked(name, reason);
+						return { block: true, reason };
+					}
+				}
+				// `env` refusal — Pi's bash schema accepts an `env` override.
+				// Allowlisting `git status` should NOT also allowlist running
+				// it with arbitrary env vars (e.g. `GIT_SSH_COMMAND=/tmp/evil`
+				// hijacks ssh; `LD_PRELOAD=…` hijacks dynamic linking). v1
+				// refuses any non-empty env override; the model emits the
+				// command as one string. Same shape as workdir refusal.
+				const envRaw = (args as { env?: unknown }).env;
+				if (envRaw !== undefined && envRaw !== null) {
+					// Non-object env → reject for typecheck violation.
+					// Empty object env (`{env: {}}`) is harmless — pass through.
+					if (typeof envRaw !== "object" || Array.isArray(envRaw) || Object.keys(envRaw as object).length > 0) {
+						const reason =
+							`Tool "${name}" was blocked: \`env\` override is not allowed. v1 refuses ` +
+							`any \`env\` argument on shell tools — environment variables can hijack ` +
+							`allowlisted commands (e.g. GIT_SSH_COMMAND to replace ssh, LD_PRELOAD to ` +
+							`hijack dynamic linking). If you need a specific env, prefix the command ` +
+							`itself (e.g. \`FOO=bar npm test\`) AND approve THAT exact string.`;
+						emitBlocked(name, reason);
+						return { block: true, reason };
+					}
+				}
+			}
+
+			// decideApproval may throw `BrigadeApprovalFileVersionError` if
+			// the on-disk allowlist file declares a future schema version
+			// the gate can't reason about. Refuse the tool call with a
+			// passthrough of the error's remediation instructions rather
+			// than letting Pi see a thrown exception.
+			let decision: ReturnType<typeof decideApproval>;
+			try {
+				decision = decideApproval(cmd);
+			} catch (err) {
+				if (err instanceof BrigadeApprovalFileVersionError) {
+					const reason =
+						`Tool "${name}" was blocked: the exec-approvals file declares a schema ` +
+						`version this Brigade build doesn't understand. ${err.message}`;
+					emitBlocked(name, reason);
+					return { block: true, reason };
+				}
+				throw err;
+			}
 			if (decision === "allow") {
 				return undefined;
 			}
 			if (decision === "deny") {
-				return {
-					block: true,
-					reason:
-						`Tool "${name}" was blocked: command "${cmd.slice(0, 120)}" ` +
-						`matches a hard-deny pattern (e.g. rm -rf /, dd to raw disk, ` +
-						`fork bomb). This pattern is permanently refused and cannot be ` +
-						`allowlisted — pick a safer command.`,
-				};
+				const reason =
+					`Tool "${name}" was blocked: command "${cmd.slice(0, 120)}" ` +
+					`matches a hard-deny pattern (e.g. rm -rf /, dd to raw disk, ` +
+					`fork bomb). This pattern is permanently refused and cannot be ` +
+					`allowlisted — pick a safer command.`;
+				emitBlocked(name, reason);
+				return { block: true, reason };
 			}
 			// "prompt" — operator hasn't allowlisted this command yet. v1
 			// has no mid-turn TUI prompt UI, so we refuse and tell the
 			// model exactly how the operator can approve it.
 			const preview = cmd.slice(0, 200) || "(empty command)";
-			return {
-				block: true,
-				reason:
-					`Tool "${name}" was blocked: command "${preview}" is not on the ` +
-					`exec-approvals allowlist. The operator must run\n` +
-					`  brigade exec allow ${JSON.stringify(cmd || "<command>")}\n` +
-					`(or \`brigade exec allow-pattern <regex>\` for a family of commands) ` +
-					`before this command can execute. Until then, prefer ` +
-					`"read", "grep", "find", or "ls" — those tools never need approval.`,
-			};
+			const reason =
+				`Tool "${name}" was blocked: command "${preview}" is not on the ` +
+				`exec-approvals allowlist. The operator must run\n` +
+				`  brigade exec allow ${JSON.stringify(cmd || "<command>")}\n` +
+				`(or \`brigade exec allow-pattern <regex>\` for a family of commands) ` +
+				`before this command can execute. Until then, prefer ` +
+				`"read", "grep", "find", or "ls" — those tools never need approval.`;
+			emitBlocked(name, reason);
+			return { block: true, reason };
 		}
 
-		if (!PATH_MUTATING_TOOLS.has(name)) return undefined;
+		// Case-insensitive match for the same reason as EXEC_GATED_TOOLS above:
+		// a provider that registers `Write`/`Edit` (capitalized) must NOT
+		// bypass the path jail. The unknown-tool guard would normally catch
+		// the casing mismatch first, but the jail can't rely on a sibling
+		// guard to enforce its own policy.
+		if (!PATH_MUTATING_TOOLS.has(nameLower)) return undefined;
 
 		if (!args || typeof args !== "object") return undefined;
 		const candidate = (args as { path?: unknown }).path;
@@ -292,12 +443,11 @@ export function makeWorkspaceJailGuard(
 		// path.relative on Windows in non-obvious ways and is never a
 		// legitimate workspace path.
 		if (isUncPath(candidate)) {
-			return {
-				block: true,
-				reason:
-					`Tool "${name}" was blocked: UNC / network paths (\\\\server\\share or //host/path) ` +
-					`are not allowed. Persona files belong inside the workspace at "${root}".`,
-			};
+			const reason =
+				`Tool "${name}" was blocked: UNC / network paths (\\\\server\\share or //host/path) ` +
+				`are not allowed. Persona files belong inside the workspace at "${root}".`;
+			emitBlocked(name, reason);
+			return { block: true, reason };
 		}
 
 		// Compute the path Pi will ACTUALLY use. Pi resolves non-absolute
@@ -311,16 +461,15 @@ export function makeWorkspaceJailGuard(
 		const piResolvedOk = isPathInsideWorkspace(piResolved, root);
 		if (!piResolvedOk) {
 			const suggestedAbsolute = path.join(root, path.basename(candidate));
-			return {
-				block: true,
-				reason:
-					`Tool "${name}" was blocked: path "${candidate}" resolves to "${piResolved}" ` +
-					`which is outside the workspace "${root}". Persona files (USER.md, ` +
-					`IDENTITY.md, SOUL.md, AGENTS.md, TOOLS.md, BOOTSTRAP.md, HEARTBEAT.md, ` +
-					`MEMORY.md) belong inside the workspace. Retry with the absolute path ` +
-					`"${suggestedAbsolute}" so it lands inside the workspace regardless of ` +
-					`the agent's current working directory.`,
-			};
+			const reason =
+				`Tool "${name}" was blocked: path "${candidate}" resolves to "${piResolved}" ` +
+				`which is outside the workspace "${root}". Persona files (USER.md, ` +
+				`IDENTITY.md, SOUL.md, AGENTS.md, TOOLS.md, BOOTSTRAP.md, HEARTBEAT.md, ` +
+				`MEMORY.md) belong inside the workspace. Retry with the absolute path ` +
+				`"${suggestedAbsolute}" so it lands inside the workspace regardless of ` +
+				`the agent's current working directory.`;
+			emitBlocked(name, reason);
+			return { block: true, reason };
 		}
 
 		// Final realpath check — catches the symlink-alias-escape case
@@ -328,14 +477,13 @@ export function makeWorkspaceJailGuard(
 		// canonical (realpath-resolved) path is outside.
 		const aliasOk = await isPathInsideWorkspaceWithAlias(piResolved, root);
 		if (!aliasOk) {
-			return {
-				block: true,
-				reason:
-					`Tool "${name}" was blocked: path "${candidate}" lexically resolves inside ` +
-					`the workspace but its canonical (realpath) location is outside "${root}". ` +
-					`This usually means the path passes through a symlink that escapes the ` +
-					`workspace boundary. Pick a path that doesn't traverse a symlink.`,
-			};
+			const reason =
+				`Tool "${name}" was blocked: path "${candidate}" lexically resolves inside ` +
+				`the workspace but its canonical (realpath) location is outside "${root}". ` +
+				`This usually means the path passes through a symlink that escapes the ` +
+				`workspace boundary. Pick a path that doesn't traverse a symlink.`;
+			emitBlocked(name, reason);
+			return { block: true, reason };
 		}
 		return undefined;
 	};

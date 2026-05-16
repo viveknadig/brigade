@@ -369,11 +369,17 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       beforeToolCall?: BrigadeBeforeToolCallHook;
     };
   };
+  // Mutable closure-bag for the workspace jail: the agent-loop sets
+  // `jailCtxRef.value = {runId, agentId}` once it has those (just before
+  // the prompt() call) and clears it in the finally block. The jail
+  // reads .value live each call, so bus events carry accurate ids
+  // without re-wiring the guard between turns.
+  const jailCtxRef: { value: { runId?: string; agentId?: string } } = { value: {} };
   if (sessionWithBeforeHook.agent) {
     const nameGuard = makeUnknownToolGuard(enabledToolNames);
     // Pass cwd so the jail validates the path Pi will ACTUALLY resolve
     // to (Pi resolves relative paths against this cwd, not the workspace).
-    const jailGuard = makeWorkspaceJailGuard(workspaceDir, cwd);
+    const jailGuard = makeWorkspaceJailGuard(workspaceDir, cwd, jailCtxRef);
     sessionWithBeforeHook.agent.beforeToolCall = async (ctx, signal) => {
       const named = await nameGuard(ctx, signal);
       if (named?.block) return named;
@@ -517,6 +523,11 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // up across the gateway's long-running process. Mirrors OpenClaw's
   // `src/infra/agent-events.ts` global registry pattern.
   const runId = randomUUID();
+  // Publish runId+agentId to the workspace-jail closure-bag so any
+  // `tool-blocked` events emitted during this turn carry accurate
+  // correlation ids. Cleared in finally so a subsequent turn (which
+  // reuses the same session) doesn't leak stale ids.
+  jailCtxRef.value = { runId, agentId };
   // Duck-typed Pi session subscription. We assert the SHAPE we want
   // rather than coupling to a specific Pi version's exported type. If
   // a future Pi changes `subscribe` to return `Promise<() => void>` or
@@ -780,6 +791,11 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // gets cleaned up here. Idempotent — the success path's explicit
     // detach above is a no-op once this fires.
     detachPiForwarder();
+    // Clear the jail context bag so the NEXT turn (which reuses the
+    // session) doesn't see this turn's runId on a refusal that fired
+    // outside a prompt() call (e.g. a steer-triggered tool retry that
+    // races the turn boundary).
+    jailCtxRef.value = {};
   }
 }
 

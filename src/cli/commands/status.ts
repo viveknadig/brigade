@@ -26,6 +26,7 @@ import type { Command } from "commander";
 import { DEFAULT_AGENT_ID, resolveAuthProfilesPath, resolveSessionsDir } from "../../config/paths.js";
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, loadConfig } from "../../core/config.js";
 import { getLastLoggedError, getTodayLogPath } from "../../core/event-logger.js";
+import { readApprovalsSummary } from "../../core/exec-approvals.js";
 import { probeGateway } from "../../core/gateway-probe.js";
 
 export interface StatusCommandOptions {
@@ -44,6 +45,13 @@ interface StatusReport {
 	authProfileProviders: string[];
 	sessionsDir: string;
 	sessionCount: number;
+	execApprovals: {
+		filePath: string;
+		fileExists: boolean;
+		commandCount: number;
+		patternCount: number;
+		error?: string;
+	};
 	gateway: {
 		url: string;
 		reachable: boolean;
@@ -78,6 +86,8 @@ async function collectStatusReport(opts: StatusCommandOptions): Promise<StatusRe
 	const sessionsDir = resolveSessionsDir(DEFAULT_AGENT_ID);
 	const sessionCount = countSessionFiles(sessionsDir);
 
+	const execApprovals = readApprovalsSummary();
+
 	const probe = await probeGateway({ host: opts.host, port: opts.port });
 
 	return {
@@ -90,6 +100,7 @@ async function collectStatusReport(opts: StatusCommandOptions): Promise<StatusRe
 		authProfileProviders,
 		sessionsDir,
 		sessionCount,
+		execApprovals,
 		gateway: {
 			url: probe.url,
 			reachable: probe.reachable,
@@ -150,6 +161,34 @@ function formatStatusText(r: StatusReport): string {
 	lines.push(chalk.dim("Sessions"));
 	lines.push(`  count:         ${r.sessionCount}`);
 	lines.push(`  dir:           ${path.relative(r.brigadeDir, r.sessionsDir) || r.sessionsDir}`);
+	lines.push("");
+	lines.push(chalk.dim("Exec gating"));
+	if (r.execApprovals.error) {
+		// Schema-version mismatch or unreadable file. Surface RED so the
+		// operator can't miss it — the gate refuses every bash call while
+		// the file is in this state.
+		lines.push(`  approvals:     ${chalk.red("ERROR")} ${chalk.dim("(gate refuses every bash call)")}`);
+		lines.push(`  reason:        ${chalk.red(r.execApprovals.error)}`);
+		lines.push(`  file:          ${path.relative(r.brigadeDir, r.execApprovals.filePath) || r.execApprovals.filePath}`);
+	} else if (!r.execApprovals.fileExists) {
+		lines.push(`  approvals:     ${chalk.yellow("none yet")} ${chalk.dim("(bash refused until approved)")}`);
+		lines.push(`  hint:          ${chalk.dim('run `brigade exec allow "<cmd>"` to approve a command')}`);
+	} else {
+		const total = r.execApprovals.commandCount + r.execApprovals.patternCount;
+		if (total === 0) {
+			lines.push(`  approvals:     ${chalk.yellow("0 (file exists but empty)")}`);
+		} else {
+			const parts: string[] = [];
+			if (r.execApprovals.commandCount > 0) {
+				parts.push(`${r.execApprovals.commandCount} command${r.execApprovals.commandCount === 1 ? "" : "s"}`);
+			}
+			if (r.execApprovals.patternCount > 0) {
+				parts.push(`${r.execApprovals.patternCount} pattern${r.execApprovals.patternCount === 1 ? "" : "s"}`);
+			}
+			lines.push(`  approvals:     ${parts.join(", ")}`);
+		}
+		lines.push(`  file:          ${path.relative(r.brigadeDir, r.execApprovals.filePath) || r.execApprovals.filePath}`);
+	}
 	lines.push("");
 	lines.push(chalk.dim("Gateway"));
 	if (r.gateway.reachable) {

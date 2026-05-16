@@ -99,8 +99,12 @@ describe("decideApproval — allowlist", () => {
 		assert.equal(mod.decideApproval("git push"), "prompt");
 	});
 
-	it("hard-deny beats allowlist (rm -rf / cannot be approved)", () => {
-		mod.recordApproval("rm -rf /", "exact");
+	it("hard-deny REFUSES at recordApproval — never lands on disk for exact kind", () => {
+		assert.throws(
+			() => mod.recordApproval("rm -rf /", "exact"),
+			(err: unknown) => err instanceof mod.BrigadeApprovalRefusedError,
+		);
+		// And the gate still says deny (file shouldn't contain it).
 		assert.equal(mod.decideApproval("rm -rf /"), "deny");
 	});
 
@@ -132,5 +136,390 @@ describe("recordApproval — persistence", () => {
 		mod.recordApproval("   ", "exact");
 		mod.recordApproval("", "exact");
 		assert.equal(mod.decideApproval("   "), "prompt");
+	});
+
+	it("writes the file with operator-only perms (0o600) on POSIX", function (t) {
+		if (process.platform === "win32") {
+			t.skip("chmod fidelity is partial on NTFS — POSIX-only assertion");
+			return;
+		}
+		mod.recordApproval("ls", "exact");
+		const stat = fs.statSync(mod.getApprovalsFilePath());
+		// Mode low bits = 0o600 (owner rw, no group, no world)
+		assert.equal(stat.mode & 0o777, 0o600);
+	});
+});
+
+describe("decideApproval — mtime cache invalidation (second-shell flow)", () => {
+	it("reloads from disk when another process writes the file", () => {
+		// Simulate "long-lived TUI process" reading the gate before any
+		// approval exists.
+		assert.equal(mod.decideApproval("ls -la"), "prompt");
+		// Now another process writes the file directly (this is the
+		// `brigade exec allow` flow run from a second shell). We mimic
+		// that by writing the JSON manually with a bumped mtime, since
+		// we're inside one process and want to bypass the in-memory cache.
+		const filePath = mod.getApprovalsFilePath();
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(
+			filePath,
+			JSON.stringify({ version: 1, commands: ["ls -la"], patterns: [] }, null, 2),
+			"utf8",
+		);
+		// Bump mtime by 100ms to ensure stat detects the change even on
+		// filesystems with coarse mtime resolution.
+		const future = new Date(Date.now() + 100);
+		fs.utimesSync(filePath, future, future);
+		// The original TUI's cache is now stale. The next decideApproval
+		// MUST see the new mtime and reload.
+		assert.equal(
+			mod.decideApproval("ls -la"),
+			"allow",
+			"mtime change must invalidate the cache",
+		);
+	});
+
+	it("loads from disk when the file is created out-of-band (cache miss path)", () => {
+		// Cache starts empty; first call after beforeEach has no file.
+		assert.equal(mod.decideApproval("ls"), "prompt");
+		// Another process plants the file. The first decideApproval already
+		// loaded into cache (with mtimeMs = -1 for missing). Next call
+		// stats → mtime is now real → mismatch → reload.
+		const filePath = mod.getApprovalsFilePath();
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(
+			filePath,
+			JSON.stringify({ version: 1, commands: ["ls"], patterns: [] }, null, 2),
+			"utf8",
+		);
+		assert.equal(mod.decideApproval("ls"), "allow");
+	});
+});
+
+describe("readApprovalsSummary", () => {
+	it("reports fileExists=false when nothing has been written", () => {
+		const s = mod.readApprovalsSummary();
+		assert.equal(s.fileExists, false);
+		assert.equal(s.commandCount, 0);
+		assert.equal(s.patternCount, 0);
+		assert.match(s.filePath, /exec-approvals\.json$/);
+	});
+
+	it("counts commands + patterns after writes", () => {
+		mod.recordApproval("ls", "exact");
+		mod.recordApproval("git status", "exact");
+		mod.recordApproval("^npm ", "pattern");
+		const s = mod.readApprovalsSummary();
+		assert.equal(s.fileExists, true);
+		assert.equal(s.commandCount, 2);
+		assert.equal(s.patternCount, 1);
+	});
+});
+
+describe("isHardDenied", () => {
+	it("returns true for canonical POSIX foot-guns", () => {
+		assert.equal(mod.isHardDenied("rm -rf /"), true);
+		assert.equal(mod.isHardDenied("dd if=foo of=/dev/sda"), true);
+		assert.equal(mod.isHardDenied(":(){ :|:& };:"), true);
+	});
+
+	it("returns true for Windows foot-guns (cmd.exe family)", () => {
+		assert.equal(mod.isHardDenied("rd /s /q C:\\"), true);
+		assert.equal(mod.isHardDenied("rd /S /Q C:\\"), true);
+		assert.equal(mod.isHardDenied("del /f /s /q C:\\*"), true);
+		assert.equal(mod.isHardDenied("DEL /F /S /Q C:\\"), true);
+		// Quoted path variants (round-4 audit gap fix).
+		assert.equal(mod.isHardDenied('rd /s /q "C:\\Users"'), true);
+		assert.equal(mod.isHardDenied("rd /s /q 'C:\\'"), true);
+	});
+
+	it("returns false for safe single-file del variants (the round-4 audit del-false-positive regression)", () => {
+		// `del /q C:\file` is a SAFE single-file quiet-delete — must NOT be
+		// hard-denied. The previous regex matched any `del /<letter>` then
+		// drive root, which over-rejected.
+		assert.equal(mod.isHardDenied("del /q C:\\file.txt"), false);
+		assert.equal(mod.isHardDenied("del /p C:\\file.txt"), false);
+		assert.equal(mod.isHardDenied("del /a C:\\file.txt"), false);
+		// But /s variants STILL match — they delete recursively.
+		assert.equal(mod.isHardDenied("del /s C:\\folder"), true);
+		assert.equal(mod.isHardDenied("del /q /s C:\\*"), true);
+	});
+
+	it("returns true for Windows foot-guns (PowerShell family)", () => {
+		assert.equal(mod.isHardDenied("Remove-Item -Recurse -Force C:\\"), true);
+		assert.equal(mod.isHardDenied("Remove-Item -Force -Recurse C:\\"), true);
+		assert.equal(mod.isHardDenied("remove-item -recurse -force c:\\"), true);
+		assert.equal(mod.isHardDenied("Format-Volume -DriveLetter C"), true);
+		assert.equal(mod.isHardDenied("Clear-Disk -Number 0 -RemoveData"), true);
+		// PowerShell alias `ri` and short flag `-r` (round-4 audit gap fix).
+		assert.equal(mod.isHardDenied("ri -Recurse -Force C:\\"), true);
+		assert.equal(mod.isHardDenied("ri -r -Force C:\\"), true);
+		// Quoted destinations.
+		assert.equal(mod.isHardDenied('Remove-Item -Recurse -Force "C:\\Users"'), true);
+	});
+
+	it("returns false for safe commands across platforms", () => {
+		assert.equal(mod.isHardDenied("ls"), false);
+		assert.equal(mod.isHardDenied("rm -rf node_modules"), false);
+		assert.equal(mod.isHardDenied("Remove-Item .\\temp.txt"), false); // no -Recurse
+		assert.equal(mod.isHardDenied("rd subdir"), false); // no /s flag
+		assert.equal(mod.isHardDenied("ri .\\temp"), false); // alias without destructive flags
+		assert.equal(mod.isHardDenied(""), false);
+	});
+});
+
+describe("decideApproval — whitespace normalization (exact match)", () => {
+	it("matches allowlisted command despite extra internal whitespace from the model", () => {
+		mod.recordApproval("ls -la", "exact");
+		assert.equal(mod.decideApproval("ls  -la"), "allow");
+		assert.equal(mod.decideApproval("ls   -la"), "allow");
+		assert.equal(mod.decideApproval("  ls -la  "), "allow");
+		assert.equal(mod.decideApproval("ls\t-la"), "allow"); // tab also normalised
+	});
+
+	it("does NOT match different commands that happen to whitespace-collapse the same", () => {
+		mod.recordApproval("ls -la", "exact");
+		assert.equal(mod.decideApproval("ls -lah"), "prompt");
+		assert.equal(mod.decideApproval("ls"), "prompt");
+	});
+});
+
+describe("patternMatchesHardDeny", () => {
+	it("returns true for patterns that match a hard-deny probe", () => {
+		assert.equal(mod.patternMatchesHardDeny(".*"), true);
+		assert.equal(mod.patternMatchesHardDeny("rm -rf /"), true);
+		assert.equal(mod.patternMatchesHardDeny("^Remove-Item"), true); // matches Remove-Item -Recurse...
+	});
+
+	it("returns false for patterns that don't match any probe", () => {
+		assert.equal(mod.patternMatchesHardDeny("^git (status|diff|log)"), false);
+		assert.equal(mod.patternMatchesHardDeny("^ls"), false);
+		assert.equal(mod.patternMatchesHardDeny("^npm test$"), false);
+	});
+
+	it("returns false for malformed regex (caller handles invalid syntax up-front)", () => {
+		assert.equal(mod.patternMatchesHardDeny("[unclosed"), false);
+	});
+});
+
+describe("loadApprovals — malformed file tolerance", () => {
+	it("returns empty allowlist when file is unparseable JSON", () => {
+		fs.writeFileSync(mod.getApprovalsFilePath(), "{not json", "utf8");
+		assert.equal(mod.decideApproval("ls"), "prompt");
+	});
+
+	it("returns empty allowlist when file is empty", () => {
+		fs.writeFileSync(mod.getApprovalsFilePath(), "", "utf8");
+		assert.equal(mod.decideApproval("ls"), "prompt");
+	});
+
+	it("returns empty allowlist when file is whitespace only", () => {
+		fs.writeFileSync(mod.getApprovalsFilePath(), "   \n\n  ", "utf8");
+		assert.equal(mod.decideApproval("ls"), "prompt");
+	});
+
+	it("tolerates top-level JSON array (shape violation)", () => {
+		fs.writeFileSync(mod.getApprovalsFilePath(), "[]", "utf8");
+		assert.equal(mod.decideApproval("ls"), "prompt");
+	});
+
+	it("tolerates top-level JSON null", () => {
+		fs.writeFileSync(mod.getApprovalsFilePath(), "null", "utf8");
+		assert.equal(mod.decideApproval("ls"), "prompt");
+	});
+
+	it("tolerates commands that aren't arrays", () => {
+		fs.writeFileSync(
+			mod.getApprovalsFilePath(),
+			JSON.stringify({ version: 1, commands: "ls", patterns: {} }),
+			"utf8",
+		);
+		assert.equal(mod.decideApproval("ls"), "prompt");
+	});
+});
+
+describe("loadApprovals — schema version gate", () => {
+	it("decideApproval throws BrigadeApprovalFileVersionError on v2 file", () => {
+		fs.writeFileSync(
+			mod.getApprovalsFilePath(),
+			JSON.stringify({ version: 2, commands: ["ls"] }),
+			"utf8",
+		);
+		assert.throws(
+			() => mod.decideApproval("ls"),
+			(err: unknown) => err instanceof mod.BrigadeApprovalFileVersionError,
+		);
+	});
+
+	it("recordApproval throws on v99 file (caller can't append silently)", () => {
+		fs.writeFileSync(
+			mod.getApprovalsFilePath(),
+			JSON.stringify({ version: 99, commands: [] }),
+			"utf8",
+		);
+		assert.throws(
+			() => mod.recordApproval("ls", "exact"),
+			(err: unknown) => err instanceof mod.BrigadeApprovalFileVersionError,
+		);
+	});
+
+	it("readApprovalsSummary reports version-mismatch via error field, doesn't throw", () => {
+		fs.writeFileSync(
+			mod.getApprovalsFilePath(),
+			JSON.stringify({ version: 2, commands: [] }),
+			"utf8",
+		);
+		const s = mod.readApprovalsSummary();
+		assert.equal(s.fileExists, true);
+		assert.equal(s.commandCount, 0);
+		assert.match(s.error ?? "", /schema version/);
+	});
+
+	it("missing version field is treated as v1 (back-compat for old files)", () => {
+		fs.writeFileSync(
+			mod.getApprovalsFilePath(),
+			JSON.stringify({ commands: ["ls"], patterns: [] }),
+			"utf8",
+		);
+		assert.equal(mod.decideApproval("ls"), "allow");
+	});
+});
+
+describe("recordApproval + removeApproval — concurrent-write safety", () => {
+	it("recordApproval merges with sibling-process additions (no entries lost)", () => {
+		// Sibling process writes "x" to disk while THIS process knows nothing.
+		fs.writeFileSync(
+			mod.getApprovalsFilePath(),
+			JSON.stringify({ version: 1, commands: ["x"], patterns: [] }),
+			"utf8",
+		);
+		// We bump mtime to invalidate any cached snapshot from an earlier test.
+		const future = new Date(Date.now() + 100);
+		fs.utimesSync(mod.getApprovalsFilePath(), future, future);
+		// THIS process adds "y". Without merge-from-disk, "x" would be lost.
+		mod.recordApproval("y", "exact");
+		// Read raw — both entries MUST be there.
+		const parsed = JSON.parse(fs.readFileSync(mod.getApprovalsFilePath(), "utf8")) as {
+			commands: string[];
+		};
+		assert.deepEqual(parsed.commands.sort(), ["x", "y"]);
+	});
+
+	it("removeApproval merges with sibling-process additions before deleting", () => {
+		// Sibling writes "x", "y", "z" — three entries.
+		fs.writeFileSync(
+			mod.getApprovalsFilePath(),
+			JSON.stringify({ version: 1, commands: ["x", "y", "z"], patterns: [] }),
+			"utf8",
+		);
+		const future = new Date(Date.now() + 100);
+		fs.utimesSync(mod.getApprovalsFilePath(), future, future);
+		// THIS process removes "y" — must drop ONLY "y", keep the others
+		// (last writer doesn't clobber x and z).
+		const result = mod.removeApproval("y");
+		assert.equal(result.removedCommands, 1);
+		const parsed = JSON.parse(fs.readFileSync(mod.getApprovalsFilePath(), "utf8")) as {
+			commands: string[];
+		};
+		assert.deepEqual(parsed.commands.sort(), ["x", "z"]);
+	});
+
+	it("removeApproval is a no-op when value isn't in either list", () => {
+		mod.recordApproval("ls", "exact");
+		const result = mod.removeApproval("not-there");
+		assert.equal(result.removedCommands, 0);
+		assert.equal(result.removedPatterns, 0);
+		// File still has "ls".
+		const parsed = JSON.parse(fs.readFileSync(mod.getApprovalsFilePath(), "utf8")) as {
+			commands: string[];
+		};
+		assert.deepEqual(parsed.commands, ["ls"]);
+	});
+
+	it("removeApproval preserves 0o600 perms (regression test for the CLI's old umask leak)", function (t) {
+		if (process.platform === "win32") {
+			t.skip("chmod fidelity is partial on NTFS — POSIX-only assertion");
+			return;
+		}
+		mod.recordApproval("ls", "exact");
+		mod.recordApproval("git status", "exact");
+		mod.removeApproval("ls");
+		const stat = fs.statSync(mod.getApprovalsFilePath());
+		assert.equal(stat.mode & 0o777, 0o600);
+	});
+});
+
+describe("recordApproval — symlink guard", () => {
+	it("refuses to write through a symlink at the file path", function (t) {
+		// Skip on Windows hosts without Dev Mode (symlink creation requires admin
+		// or developer mode; many CI runners lack it).
+		const filePath = mod.getApprovalsFilePath();
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		const fakeTarget = path.join(path.dirname(filePath), "decoy.json");
+		fs.writeFileSync(fakeTarget, "{}", "utf8");
+		try {
+			fs.symlinkSync(fakeTarget, filePath);
+		} catch (err) {
+			t.skip(`symlink creation not permitted on this host: ${(err as Error).message}`);
+			return;
+		}
+		try {
+			assert.throws(
+				() => mod.recordApproval("ls", "exact"),
+				(err: unknown) => err instanceof mod.BrigadeApprovalRefusedError && /symlink/i.test((err as Error).message),
+			);
+			// Decoy file untouched.
+			assert.equal(fs.readFileSync(fakeTarget, "utf8"), "{}");
+		} finally {
+			try {
+				fs.unlinkSync(filePath);
+			} catch {
+				/* ignore */
+			}
+		}
+	});
+});
+
+describe("recordApproval — large input tolerance", () => {
+	it("accepts a 1MB exact command without OOM", () => {
+		const big = "echo " + "a".repeat(1_000_000);
+		mod.recordApproval(big, "exact");
+		assert.equal(mod.decideApproval(big), "allow");
+	});
+});
+
+describe("decideApproval — hard-deny wins over a matching pattern", () => {
+	it("an operator-supplied pattern that DOES match a hard-denied command can't override hard-deny", () => {
+		// Plant a pattern by writing directly to disk (bypassing recordApproval's
+		// pattern-hard-deny pre-check, which would refuse this pattern). This
+		// simulates the case where an older Brigade version (without the pre-
+		// check) had stored such a pattern OR an operator hand-edited the file.
+		fs.writeFileSync(
+			mod.getApprovalsFilePath(),
+			JSON.stringify({ version: 1, commands: [], patterns: [".*"] }),
+			"utf8",
+		);
+		// Hard-deny check runs FIRST in decideApproval.
+		assert.equal(mod.decideApproval("rm -rf /"), "deny");
+		assert.equal(mod.decideApproval("Remove-Item -Recurse -Force C:\\"), "deny");
+		// And safe commands STILL get "allow" from the permissive pattern.
+		assert.equal(mod.decideApproval("ls"), "allow");
+	});
+
+	it("recordApproval REFUSES to persist a permissive pattern that matches hard-deny probes", () => {
+		assert.throws(
+			() => mod.recordApproval(".*", "pattern"),
+			(err: unknown) => err instanceof mod.BrigadeApprovalRefusedError,
+		);
+		assert.throws(
+			() => mod.recordApproval("^Remove-Item", "pattern"),
+			(err: unknown) => err instanceof mod.BrigadeApprovalRefusedError,
+		);
+	});
+
+	it("recordApproval ALLOWS a pattern that doesn't match any hard-deny probe", () => {
+		mod.recordApproval("^git (status|diff|log)", "pattern");
+		assert.equal(mod.decideApproval("git status"), "allow");
+		assert.equal(mod.decideApproval("git log --oneline"), "allow");
 	});
 });

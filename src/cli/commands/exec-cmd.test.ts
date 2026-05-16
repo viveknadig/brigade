@@ -161,6 +161,26 @@ describe("brigade exec allow-pattern", () => {
 		assert.equal(code, 1);
 		assert.match(err(), /pattern is empty/);
 	});
+
+	it("refuses patterns that match a hard-deny probe (e.g. '.*')", async () => {
+		const code = await execCmd.runExecAllowPattern(".*");
+		assert.equal(code, 1);
+		assert.match(err(), /matches at least one hard-deny command/);
+	});
+
+	it("warns when pattern is unanchored (no '^' prefix) — but still approves", async () => {
+		const code = await execCmd.runExecAllowPattern("git status");
+		assert.equal(code, 0);
+		assert.match(out(), /allowed \(pattern\)/);
+		// The dim note about anchoring should appear on stdout.
+		assert.match(out(), /does not start with `\^`/);
+	});
+
+	it("does NOT warn when pattern starts with '^'", async () => {
+		const code = await execCmd.runExecAllowPattern("^git status$");
+		assert.equal(code, 0);
+		assert.doesNotMatch(out(), /does not start with/);
+	});
 });
 
 describe("brigade exec remove", () => {
