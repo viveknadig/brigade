@@ -1,44 +1,89 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
+import { assembleSystemPrompt } from "./assembler.js";
 import {
-	pickModelFamilyGuidance,
-	SAFETY_GUARDRAILS_GUIDANCE,
-	EXECUTION_BIAS_GUIDANCE,
-	TOOL_CALL_STYLE_GUIDANCE,
-	TOOL_USE_ENFORCEMENT_GUIDANCE,
 	MEMORY_GUIDANCE,
+	pickModelFamilyGuidance,
+	REASONING_FORMAT_GUIDANCE,
+	shouldUseReasoningFormat,
 	SKILLS_GUIDANCE,
 	SUB_AGENTS_GUIDANCE,
 } from "./guidance.js";
+import type { RuntimeParams } from "./runtime-params.js";
 
-describe("guidance constants — non-empty + load-bearing language", () => {
-	it("Safety baseline contains anti-self-preservation clause", () => {
-		assert.match(SAFETY_GUARDRAILS_GUIDANCE, /no independent goals/i);
-		assert.match(SAFETY_GUARDRAILS_GUIDANCE, /human oversight/i);
-		assert.match(SAFETY_GUARDRAILS_GUIDANCE, /never bypass/i);
+const MOCK_RUNTIME: RuntimeParams = {
+	agentId: "main",
+	workspaceDir: "/tmp/.brigade/workspace",
+	cwd: "/tmp/.brigade/workspace",
+	hostName: "host",
+	platform: "linux",
+	arch: "x64",
+	nodeVersion: "v22.12.0",
+	shell: "/bin/bash",
+	modelLabel: "anthropic/claude-opus-4-7",
+	channelLabel: "cli",
+	thinkingLevel: "off",
+	timezone: "UTC",
+	nowIso: "2026-05-08T00:00:00.000Z",
+	repoRoot: undefined,
+};
+
+describe("guidance constants — bodies still load-bearing", () => {
+	// These five constants are CURRENTLY EMITTED into the system prompt
+	// (REASONING_FORMAT) or queued for upcoming primitives (MEMORY, SKILLS,
+	// SUB_AGENTS). Assert their key invariants here so a future refactor
+	// doesn't accidentally strip the load-bearing language.
+
+	it("REASONING_FORMAT_GUIDANCE keeps the <think> tag contract", () => {
+		assert.match(REASONING_FORMAT_GUIDANCE, /<think>/);
+		assert.match(REASONING_FORMAT_GUIDANCE, /Do not output analysis outside/i);
 	});
-	it("Execution bias forbids commentary-only turns", () => {
-		assert.match(EXECUTION_BIAS_GUIDANCE, /commentary-only/i);
-	});
-	it("Tool-call style allows narration for sensitive actions", () => {
-		assert.match(TOOL_CALL_STYLE_GUIDANCE, /sensitive actions/i);
-	});
-	it("Tool-use enforcement contains the SAY-AND-DO contract", () => {
-		assert.match(TOOL_USE_ENFORCEMENT_GUIDANCE, /MUST call the tool in the same response/i);
-		assert.match(TOOL_USE_ENFORCEMENT_GUIDANCE, /promise of future action/i);
-	});
-	it("Memory guidance teaches declarative-not-imperative", () => {
+
+	it("MEMORY_GUIDANCE teaches declarative-not-imperative (Primitive #4)", () => {
 		assert.match(MEMORY_GUIDANCE, /DECLARATIVE FACTS/);
 		assert.match(MEMORY_GUIDANCE, /not instructions/i);
 	});
-	it("Skills guidance covers scan-before-reply + patch-while-using", () => {
+
+	it("SKILLS_GUIDANCE covers scan-before-reply + patch-while-using (Primitive #5)", () => {
 		assert.match(SKILLS_GUIDANCE, /Before replying/i);
 		assert.match(SKILLS_GUIDANCE, /patch it before finishing/i);
 	});
-	it("Sub-agents guidance describes delegation boundaries", () => {
+
+	it("SUB_AGENTS_GUIDANCE describes delegation boundaries (Primitive #6)", () => {
 		assert.match(SUB_AGENTS_GUIDANCE, /independent/i);
 		assert.match(SUB_AGENTS_GUIDANCE, /Don't delegate trivial work/i);
+	});
+
+	it("SUB_AGENTS_GUIDANCE does NOT use 'crew' framing (locked positioning)", () => {
+		// Saved feedback: Brigade is positioned as "personal AI" not "team
+		// tool" in v1; "crew" framing reads as the latter.
+		assert.doesNotMatch(SUB_AGENTS_GUIDANCE, /\bcrew\b/i);
+	});
+});
+
+describe("shouldUseReasoningFormat", () => {
+	it("returns false when thinkingLevel is off / undefined", () => {
+		assert.equal(shouldUseReasoningFormat("gpt-4o", "off"), false);
+		assert.equal(shouldUseReasoningFormat("gpt-4o", undefined), false);
+	});
+
+	it("returns false for Claude (native extended thinking)", () => {
+		assert.equal(shouldUseReasoningFormat("claude-opus-4-7", "high"), false);
+		assert.equal(shouldUseReasoningFormat("anthropic/claude-3-5-sonnet", "high"), false);
+		assert.equal(shouldUseReasoningFormat("openrouter/anthropic/claude-3", "high"), false);
+	});
+
+	it("returns false for OpenAI reasoning models (o1, o3)", () => {
+		assert.equal(shouldUseReasoningFormat("o1", "high"), false);
+		assert.equal(shouldUseReasoningFormat("o3-mini", "high"), false);
+		assert.equal(shouldUseReasoningFormat("openai/o1-preview", "high"), false);
+	});
+
+	it("returns true for gpt-* / gemini-* / mistral / llama with thinking on", () => {
+		assert.equal(shouldUseReasoningFormat("gpt-4o", "high"), true);
+		assert.equal(shouldUseReasoningFormat("gemini-2.5-pro", "high"), true);
+		assert.equal(shouldUseReasoningFormat("mistral-large-2", "high"), true);
 	});
 });
 
@@ -52,38 +97,111 @@ describe("pickModelFamilyGuidance", () => {
 		assert.ok(pickModelFamilyGuidance("openai/gpt-4o"));
 		assert.ok(pickModelFamilyGuidance("openrouter/openai/gpt-4o"));
 	});
-	it("OpenAI block contains identity-override clause + grounded-data list", () => {
+
+	it("OpenAI block contains identity-override clause + grounded-data hint", () => {
 		const text = pickModelFamilyGuidance("gpt-4o");
 		assert.ok(text);
-		assert.match(text!, /OVERRIDDEN by the persona/i);
-		assert.match(text!, /never mental math/i);
-		assert.match(text!, /Resolve prerequisites first/i);
+		assert.match(text!, /baseline training tells you to identify as "ChatGPT"/i);
+		assert.match(text!, /draw your identity from the persona files/i);
+		assert.match(text!, /answer from memory when a tool gives grounded data/i);
 	});
+
 	it("returns Google block for gemini-* / gemma-*", () => {
 		assert.ok(pickModelFamilyGuidance("gemini-2.5-pro"));
 		assert.ok(pickModelFamilyGuidance("gemma-7b"));
 		assert.ok(pickModelFamilyGuidance("google/gemini-2.5-flash"));
 		assert.ok(pickModelFamilyGuidance("openrouter/google/gemini-2.5-pro"));
 	});
-	it("Google block contains absolute-paths clause + parallel-tool clause", () => {
+
+	it("Google block contains identity-override clause + brevity clause", () => {
 		const text = pickModelFamilyGuidance("gemini-2.5-pro");
 		assert.ok(text);
-		assert.match(text!, /ABSOLUTE file paths/);
-		assert.match(text!, /single response rather than sequentially/i);
+		assert.match(text!, /baseline training tells you to identify as "Gemini/i);
+		assert.match(text!, /draw your identity from the persona files/i);
+		assert.match(text!, /Keep prose brief/i);
 	});
+
 	it("returns null for Claude (no extras needed)", () => {
 		assert.equal(pickModelFamilyGuidance("claude-opus-4-7"), null);
 		assert.equal(pickModelFamilyGuidance("anthropic/claude-3-5-sonnet"), null);
 		assert.equal(pickModelFamilyGuidance("openrouter/anthropic/claude-3"), null);
 	});
+
 	it("returns null for unknown / niche models", () => {
 		assert.equal(pickModelFamilyGuidance("mistral-large-2"), null);
 		assert.equal(pickModelFamilyGuidance("llama-3.1-70b"), null);
 	});
+
 	it("trims whitespace + handles empty input", () => {
 		assert.equal(pickModelFamilyGuidance(""), null);
 		assert.equal(pickModelFamilyGuidance("   "), null);
 		assert.equal(pickModelFamilyGuidance(undefined), null);
 		assert.ok(pickModelFamilyGuidance(" gpt-4o "));
+	});
+});
+
+describe("guidance — wired into assembled prompt (not vapourware)", () => {
+	// Earlier audits found that pickModelFamilyGuidance was exported but
+	// never CALLED by the assembler — the per-family identity-override
+	// block was vapourware. These tests assert against the FULL ASSEMBLED
+	// PROMPT to confirm the block actually lands.
+
+	it("OpenAI family block appears in the assembled prompt for gpt-* models", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			modelId: "gpt-4o",
+			thinkingLevel: "off",
+			personaFiles: [],
+			toolDescriptions: [],
+		});
+		assert.match(out.text, /# Identity override \(OpenAI family\)/);
+		assert.match(out.text, /I am ChatGPT/i); // explicit forbidden-string literal
+	});
+
+	it("Google family block appears in the assembled prompt for gemini-* models", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			modelId: "gemini-2.5-pro",
+			thinkingLevel: "off",
+			personaFiles: [],
+			toolDescriptions: [],
+		});
+		assert.match(out.text, /# Identity override \(Google family\)/);
+		assert.match(out.text, /I am Gemini/i);
+	});
+
+	it("Claude family adds NO extra block (clean prompt)", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			modelId: "claude-opus-4-7",
+			thinkingLevel: "off",
+			personaFiles: [],
+			toolDescriptions: [],
+		});
+		// Identity-override block is absent for Claude.
+		assert.doesNotMatch(out.text, /# Identity override/i);
+	});
+
+	it("Reasoning format block appears when thinking is on AND model supports it", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			modelId: "gpt-4o",
+			thinkingLevel: "high",
+			personaFiles: [],
+			toolDescriptions: [],
+		});
+		assert.match(out.text, /Reasoning format/i);
+		assert.match(out.text, /<think>/);
+	});
+
+	it("Reasoning format block is suppressed for Claude (native thinking)", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			modelId: "claude-opus-4-7",
+			thinkingLevel: "high",
+			personaFiles: [],
+			toolDescriptions: [],
+		});
+		assert.doesNotMatch(out.text, /# Reasoning format/i);
 	});
 });

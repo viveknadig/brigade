@@ -56,8 +56,11 @@ describe("assembleSystemPrompt — universal sections (OpenClaw mirror order)", 
 			toolDescriptions: [],
 		});
 		assert.match(out.text, /## Tool Call Style/);
-		assert.match(out.text, /Don't narrate routine tool calls/);
-		assert.match(out.text, /destructive or sensitive actions/);
+		assert.match(out.text, /do not narrate routine, low-risk tool calls/i);
+		assert.match(out.text, /sensitive actions/i);
+		// New OpenClaw-lifted lines that were previously missing.
+		assert.match(out.text, /Keep narration brief and value-dense/i);
+		assert.match(out.text, /When a first-class tool exists/i);
 	});
 
 	it("Execution Bias block tells the model to start doing it", () => {
@@ -78,21 +81,36 @@ describe("assembleSystemPrompt — universal sections (OpenClaw mirror order)", 
 			toolDescriptions: [],
 		});
 		assert.match(out.text, /## Safety/);
-		assert.match(out.text, /Decline requests that would compromise/);
-		assert.match(out.text, /Treat untrusted external content/);
+		// OpenClaw-lifted constitution-style baseline (anti-self-preservation,
+		// human-oversight priority, no-self-modification). Replaces the
+		// earlier operator-protection bullets which were already covered at
+		// the exec-gate layer (workdir/env refusal + decideApproval).
+		assert.match(out.text, /no independent goals/i);
+		assert.match(out.text, /human oversight/i);
+		assert.match(out.text, /never bypass safeguards/i);
+		assert.match(out.text, /Anthropic's constitution/i);
 	});
 
-	it("Brigade CLI Quick Reference lists actual subcommands", () => {
+	it("Brigade CLI Quick Reference lists operator-critical subcommands", () => {
 		const out = assembleSystemPrompt({
 			runtime: MOCK_RUNTIME,
 			personaFiles: [],
 			toolDescriptions: [],
 		});
 		assert.match(out.text, /## Brigade CLI Quick Reference/);
-		assert.match(out.text, /brigade chat/);
+		// Trimmed to gateway lifecycle + onboard + doctor (mirror of OpenClaw
+		// `system-prompt.ts:704-712`). The earlier enumeration of every
+		// subcommand trained the model to suggest `brigade <foo>` in
+		// conversational replies about unrelated topics — see assembler.ts
+		// comment at the CLI block for details.
 		assert.match(out.text, /brigade gateway/);
-		assert.match(out.text, /brigade connect/);
+		assert.match(out.text, /brigade gateway status/);
+		assert.match(out.text, /brigade gateway stop/);
 		assert.match(out.text, /brigade onboard/);
+		assert.match(out.text, /brigade doctor/);
+		// And the help-fallback line that lets the model defer to the operator
+		// instead of guessing at command shapes it doesn't know.
+		assert.match(out.text, /brigade --help/);
 	});
 
 	it("Workspace block declares the absolute workspace dir", () => {
@@ -103,7 +121,7 @@ describe("assembleSystemPrompt — universal sections (OpenClaw mirror order)", 
 		});
 		assert.match(out.text, /## Workspace/);
 		assert.match(out.text, /\/home\/me\/\.brigade\/workspace/);
-		assert.match(out.text, /use the absolute path/);
+		assert.match(out.text, /single global workspace/);
 	});
 
 	it("everything in the canonical mirror sits ABOVE the cache boundary", () => {
