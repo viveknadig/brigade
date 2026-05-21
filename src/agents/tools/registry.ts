@@ -17,6 +17,8 @@
  * narrower scope (no plugins, no channels, no MCP).
  */
 
+import { FileMemoryStore } from "../memory/storage.js";
+import { makeReadMemoryTool, makeRecallMemoryTool } from "./memory-tools.js";
 import type { AnyBrigadeTool } from "./types.js";
 
 /**
@@ -54,32 +56,28 @@ export interface CreateBrigadeToolsOptions {
  * tests can construct a deterministic registry without touching the
  * filesystem.
  */
-export function createBrigadeTools(
-	_opts: CreateBrigadeToolsOptions,
-): AnyBrigadeTool[] {
-	// Primitive #3 v1: empty list. Pi's 5 built-ins are the v1 tool
-	// surface and they're already enabled via the `tools: string[]`
-	// allowlist in `agent-loop.ts:enabledToolNames`. Brigade-native
-	// tools land here in subsequent primitives.
+export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeTool[] {
+	// Primitive #4 (Memory): two READ tools backed by a filesystem-rooted
+	// BrigadeStorage. Writing memory is NOT a tool — the agent appends to
+	// `memory/<today>.md` with its ordinary `write`/`edit` tool (cwd is
+	// the workspace dir). Mirrors OpenClaw's memory_search + memory_get.
 	//
-	// When adding a tool:
-	//   1. Build it in `src/agents/tools/<name>-tool.ts` exposing a
-	//      `make<Name>Tool(opts: CreateBrigadeToolsOptions) →
-	//      BrigadeTool<TParams, TDetails>` factory.
-	//   2. Append `make<Name>Tool(opts)` to the array below.
-	//   3. Add a TUI render handler in `tool-renderer.ts` (Phase 6 will
-	//      formalise this; for now the existing TUI tool_result render
-	//      handles the `content` text block uniformly).
-	//   4. Add `<name>` to the system-prompt `## Tooling` block via the
-	//      assembler's `toolDescriptions` array.
-	return [];
+	// The store is constructed per-turn from the workspace dir; it's
+	// stateless (filesystem-backed), so there's no lifecycle to manage.
+	// Phase 2 swaps `FileMemoryStore` for a DB-backed `BrigadeStorage`
+	// here without touching the tools or the prompt.
+	const memoryStore = new FileMemoryStore(opts.workspaceDir);
+	return [
+		makeRecallMemoryTool(memoryStore),
+		makeReadMemoryTool(memoryStore),
+	];
 }
 
 /**
- * Names of Brigade-native tools shipped today. Empty list — Primitive
- * #3 v1 ships the framework only. Used by the system-prompt assembler
- * to advertise tools by name in the `## Tooling` section.
+ * Names of Brigade-native tools shipped today. Used by the system-prompt
+ * assembler to advertise tools by name in the `## Tooling` section AND by
+ * `agent-loop.ts` to flip on the memory-capability prompt block.
  */
 export function listBrigadeToolNames(): string[] {
-	return [];
+	return ["recall_memory", "read_memory"];
 }

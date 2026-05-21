@@ -52,7 +52,13 @@ import {
 } from "../agents/payload-mutators.js";
 import { smartCompactToolResults } from "../agents/smart-compaction.js";
 import { refreshSessionSystemPrompt, seedDefaultPrompts } from "./system-prompt.js";
+import { getBrigadeWorkspaceDir } from "./config.js";
 import { emitAgentEvent } from "../agents/agent-event-bus.js";
+import {
+	assembleBrigadeToolset,
+	composeBrigadeBeforeToolCall,
+	type GuardContextRef,
+} from "../agents/session-wiring.js";
 import { DEFAULT_AGENT_ID } from "../config/paths.js";
 import { randomUUID } from "node:crypto";
 
@@ -141,6 +147,19 @@ export async function buildAgent(opts: BuildAgentOptions): Promise<AgentSession>
 	// Users can change this at runtime via /thinking <level>.
 	const thinkingLevel = pickInitialThinkingLevel(opts.model);
 
+	// Assemble Brigade's FULL tool surface — the 7 built-ins PLUS the
+	// Brigade-native tools (memory: recall_memory / read_memory). Shared with
+	// `runSingleTurn` via `assembleBrigadeToolset` so the TUI, gateway, and
+	// single-turn CLI all expose the identical set. Previously buildAgent
+	// omitted `tools` (Pi defaulted to 4) and never passed `customTools`, so
+	// the interactive surfaces had no memory tools and a narrower tool list.
+	const workspaceDir = getBrigadeWorkspaceDir();
+	const toolset = assembleBrigadeToolset({
+		workspaceDir,
+		agentId: DEFAULT_AGENT_ID,
+		cwd: opts.cwd,
+	});
+
 	const { session } = await createAgentSession({
 		cwd: opts.cwd,
 		agentDir: BRIGADE_DIR, // ~/.brigade — isolates Brigade from any other Pi install
@@ -149,7 +168,8 @@ export async function buildAgent(opts: BuildAgentOptions): Promise<AgentSession>
 		model: opts.model,
 		sessionManager,
 		thinkingLevel,
-		// tools: omitted → Pi enables read/bash/edit/write by default; grep is available too
+		tools: toolset.enabledToolNames,
+		customTools: toolset.customTools,
 	});
 
 	// Bridge Pi's per-session event stream into Brigade's process-wide
@@ -210,65 +230,46 @@ export async function buildAgent(opts: BuildAgentOptions): Promise<AgentSession>
 		await refreshSessionSystemPrompt(session as any, opts.cwd);
 	}
 
-	// Wire loop hooks. These are public properties on the Pi Agent class; setting
-	// them after createAgentSession() is the supported integration point —
-	// `createAgentSession` itself doesn't surface them as options, so we layer
-	// them here. The hook setters wrap the user's hook in a guard so we never
-	// pass a thrown error from a hook back to the loop unhandled.
+	// Compose Brigade's canonical beforeToolCall chain via the SHARED helper
+	// (`composeBrigadeBeforeToolCall`) so the long-lived interactive session
+	// gets the IDENTICAL guard stack as the single-turn path:
 	//
-	// beforeToolCall composition (always-on first, user-supplied second):
-	//   1. unknownToolGuard — refuse hallucinated names, whitespace-wrapped
-	//      names, and empty-args calls to tools that need params. Built fresh
-	//      per session against the actual tool registry so adding/removing
-	//      tools at runtime stays consistent.
-	//   2. user's hook — additional policy (approval workflows, audit, etc.)
-	//      Runs ONLY if the guard passed (no point asking the user to approve
-	//      a call that's about to be refused for being malformed).
-	const allowedToolNames = (session.agent.state.tools ?? [])
-		.map((t: { name?: string }) => t.name ?? "")
-		.filter((n: string) => n.length > 0);
-	const guardHook = makeUnknownToolGuard(allowedToolNames);
-	const userBeforeHook = opts.beforeToolCall;
-	session.agent.beforeToolCall = async (ctx, signal) => {
+	//   xAI-decode → unknown-tool guard → loop detector → exec-gate → userHook
+	//
+	// Previously buildAgent wired only the unknown-tool guard inline — no
+	// loop detector, NO exec-gate. That meant bash ran UNGATED in the TUI and
+	// gateway (the exec-approvals allowlist never fired). Routing through the
+	// shared composer closes that gap.
+	//
+	// `gateCtxRef` carries correlation ids for `tool-blocked` bus events. For
+	// a long-lived session we key the loop detector on a stable per-session
+	// id so loops are detected across turns; runId/agentId stay constant for
+	// the session's lifetime (Runtime A holds one Pi session per process).
+	const gateCtxRef: GuardContextRef = {
+		value: {
+			runId: buildAgentRunId,
+			agentId: DEFAULT_AGENT_ID,
+			sessionKey: (session as { id?: string }).id ?? `agent:${DEFAULT_AGENT_ID}:main`,
+		},
+	};
+	const decodeArgs = (ctx: unknown): void => {
 		// xAI / Grok occasionally HTML-encodes string values inside tool args
-		// (`&quot;` instead of `"`, `&#x2F;` instead of `/`). Pi parses the JSON
-		// fine but the args object then has unusable strings. Decode in-place
-		// BEFORE the guard runs and BEFORE the tool executes — once decoded
-		// the rest of the loop sees clean values.
-		//
-		// Mutates ctx.toolCall.arguments in place, which is what Pi reads when
-		// dispatching to the tool. Provider check is live (session.model) so a
-		// mid-session /model into / out of xAI takes effect immediately.
+		// (`&quot;` instead of `"`). Decode in-place before the guards read
+		// them. Provider check is live so a mid-session /model toggle applies.
 		if (isXaiModel(session.model)) {
-			const tc = (ctx as any)?.toolCall;
+			const tc = (ctx as { toolCall?: { arguments?: unknown } })?.toolCall;
 			if (tc && tc.arguments && typeof tc.arguments === "object") {
-				tc.arguments = decodeXaiToolCallArgs(tc.arguments);
+				tc.arguments = decodeXaiToolCallArgs(tc.arguments as Record<string, unknown>);
 			}
 		}
-
-		// Guard next. If it returns a block, short-circuit — the user's hook
-		// never sees malformed calls.
-		try {
-			const guardResult = await guardHook(ctx, signal);
-			if (guardResult && (guardResult as any).block) return guardResult;
-		} catch (err) {
-			return {
-				block: true,
-				reason: `tool guard error: ${err instanceof Error ? err.message : String(err)}`,
-			};
-		}
-		if (!userBeforeHook) return undefined;
-		try {
-			return await userBeforeHook(ctx, signal);
-		} catch (err) {
-			// A throwing hook is treated as "block" — safer than letting an
-			// unrelated bug allow a destructive tool through.
-			return {
-				block: true,
-				reason: `policy hook error: ${err instanceof Error ? err.message : String(err)}`,
-			};
-		}
 	};
+	session.agent.beforeToolCall = composeBrigadeBeforeToolCall({
+		enabledToolNames: toolset.enabledToolNames,
+		gateCtxRef,
+		displayCwd: opts.cwd,
+		decodeArgs,
+		userBeforeHook: opts.beforeToolCall as never,
+	}) as never;
 	if (opts.afterToolCall) {
 		const userHook = opts.afterToolCall;
 		session.agent.afterToolCall = async (ctx, signal) => {

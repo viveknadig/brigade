@@ -223,20 +223,41 @@ describe("assembleSystemPrompt — persona file canonical sort", () => {
 	});
 });
 
-describe("assembleSystemPrompt — capabilities flag is accepted but ignored", () => {
-	// The `capabilities` arg still threads through (so callers don't break);
-	// the corresponding guidance blocks just aren't injected today. Memory /
-	// Skills / Sub-agents land alongside Primitives #4-6.
-	it("does NOT inject Memory/Skills/Sub-agents blocks even when capabilities=true", () => {
+describe("assembleSystemPrompt — capability-gated sections", () => {
+	// Primitive #4 wires the Memory block. Skills (#5) + Sub-agents (#6)
+	// are still defined-but-unwired (their primitives haven't shipped), so
+	// their flags are accepted but produce no section yet.
+
+	it("injects the ## Memory block when capabilities.memory is true", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+			capabilities: { memory: true },
+		});
+		assert.match(out.text, /## Memory/);
+		assert.match(out.text, /recall_memory/);
+		assert.match(out.text, /memory\/<YYYY-MM-DD>\.md/);
+	});
+
+	it("does NOT inject ## Memory when capabilities.memory is absent/false", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+		});
+		assert.doesNotMatch(out.text, /## Memory/);
+	});
+
+	it("Skills / Sub-agents blocks are still unwired (Primitives #5/#6)", () => {
 		const out = assembleSystemPrompt({
 			runtime: MOCK_RUNTIME,
 			personaFiles: [],
 			toolDescriptions: [],
 			capabilities: { memory: true, skills: true, subAgents: true },
 		});
-		assert.doesNotMatch(out.text, /# Memory/);
 		assert.doesNotMatch(out.text, /# Skills/);
-		assert.doesNotMatch(out.text, /# Crew coordination/);
+		assert.doesNotMatch(out.text, /# Sub-agents/);
 	});
 });
 

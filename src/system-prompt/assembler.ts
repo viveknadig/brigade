@@ -4,6 +4,7 @@ import { applyBudget, DEFAULT_BUDGET, type BudgetResult } from "./bootstrap-budg
 import { sanitizeForPromptLiteral } from "./sanitize.js";
 import { formatRuntimeLine, type RuntimeParams } from "./runtime-params.js";
 import {
+  MEMORY_GUIDANCE,
   pickModelFamilyGuidance,
   REASONING_FORMAT_GUIDANCE,
   shouldUseReasoningFormat,
@@ -69,9 +70,11 @@ export interface AssembleArgs {
   // Native-reasoning models (Claude w/ extended thinking, o1/o3) skip
   // the block regardless of level.
   thinkingLevel?: string;
-  // Capability gates for conditional guidance — Memory/Skills/Sub-agents
-  // arrive alongside Primitives #4-6. Until then the gates stay false and
-  // the cached prefix stays small. (No-op today; reserved for #4-#6.)
+  // Capability gates for conditional guidance. `memory` is WIRED
+  // (Primitive #4) — when true the assembler emits the `## Memory`
+  // section. `skills` (#5) and `subAgents` (#6) are accepted but still
+  // produce no section until their primitives ship. Gates stay false by
+  // default so the cached prefix stays small.
   capabilities?: {
     memory?: boolean;
     skills?: boolean;
@@ -299,6 +302,19 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     "Treat this directory as the single global workspace for file operations unless explicitly instructed otherwise.",
   );
   lines.push("");
+
+  // 7b. ## Memory (conditional on the memory capability).
+  // Primitive #4. Emitted only when the session has the memory tools
+  // (recall_memory / read_memory) wired — gated on `capabilities.memory`.
+  // Mirrors OpenClaw's `memory-core` "## Memory Recall" prompt section
+  // (`extensions/memory-core/src/prompt-section.ts`): the model is told
+  // to search memory BEFORE answering and how durable facts are stored.
+  // MEMORY.md itself is injected separately as a persona file in
+  // `# Project Context` below — this section is the behavioural wrapper.
+  if (args.capabilities?.memory) {
+    lines.push(MEMORY_GUIDANCE);
+    lines.push("");
+  }
 
   // 8. ## Reasoning Format.
   // OpenClaw `system-prompt.ts:858-860, 558-569`. ONLY emitted when

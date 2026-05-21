@@ -29,6 +29,7 @@ import {
 	resolveAuthProfilesPath,
 	resolveSessionsDir,
 } from "../../config/paths.js";
+import { FileMemoryStore } from "../../agents/memory/storage.js";
 import { BRIGADE_DIR, loadConfig } from "../../core/config.js";
 import { loadBrigadeAuthStorage } from "../../core/auth-bridge.js";
 import { getTodayLogPath } from "../../core/event-logger.js";
@@ -63,6 +64,7 @@ export async function runDoctorCommand(opts: DoctorCommandOptions = {}): Promise
 	checks.push(checkAuthProfiles());
 	checks.push(checkConfiguredProvider(await safeLoadConfig()));
 	checks.push(checkWorkspace());
+	checks.push(await checkMemory());
 	checks.push(checkLogDirWritable());
 	checks.push(checkExecApprovals());
 	checks.push(await checkGateway(opts));
@@ -313,6 +315,36 @@ function checkWorkspace(): CheckResult {
 		? fs.readdirSync(sessionsDir).filter((n) => n.endsWith(".jsonl")).length
 		: 0;
 	return { name: "workspace", status: "ok", message: `7/7 persona files, ${sessionCount} session(s)` };
+}
+
+async function checkMemory(): Promise<CheckResult> {
+	const workspaceDir = resolveAgentWorkspaceDir(DEFAULT_AGENT_ID);
+	const store = new FileMemoryStore(workspaceDir);
+	let summary: Awaited<ReturnType<FileMemoryStore["status"]>>;
+	try {
+		summary = await store.status();
+	} catch (err) {
+		return {
+			name: "memory",
+			status: "warn",
+			message: `could not read memory: ${(err as Error).message}`,
+		};
+	}
+	if (summary.fileCount === 0) {
+		// "ok" — an empty memory corpus is the normal fresh state. The agent
+		// populates it as it learns durable facts.
+		return {
+			name: "memory",
+			status: "ok",
+			message: "no memory yet — MEMORY.md + memory/ notes fill in as the agent learns",
+		};
+	}
+	const kb = (summary.totalBytes / 1024).toFixed(1);
+	return {
+		name: "memory",
+		status: "ok",
+		message: `${summary.fileCount} file${summary.fileCount === 1 ? "" : "s"}, ${kb} KB (MEMORY.md + memory/*.md)`,
+	};
 }
 
 function checkExecApprovals(): CheckResult {

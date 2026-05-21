@@ -8,5 +8,8 @@
 			"name": "Brigade",
 			"path": "."
 		}
-	]
+	],
+	"settings": {
+		"liveServer.settings.multiRootWorkspaceName": "pilot"
+	}
 }

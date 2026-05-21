@@ -23,6 +23,7 @@ import * as path from "node:path";
 import chalk from "chalk";
 import type { Command } from "commander";
 
+import { FileMemoryStore } from "../../agents/memory/storage.js";
 import { DEFAULT_AGENT_ID, resolveAuthProfilesPath, resolveSessionsDir } from "../../config/paths.js";
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, loadConfig } from "../../core/config.js";
 import { getLastLoggedError, getTodayLogPath } from "../../core/event-logger.js";
@@ -45,6 +46,10 @@ interface StatusReport {
 	authProfileProviders: string[];
 	sessionsDir: string;
 	sessionCount: number;
+	memory: {
+		fileCount: number;
+		totalBytes: number;
+	};
 	execApprovals: {
 		filePath: string;
 		fileExists: boolean;
@@ -86,6 +91,10 @@ async function collectStatusReport(opts: StatusCommandOptions): Promise<StatusRe
 	const sessionsDir = resolveSessionsDir(DEFAULT_AGENT_ID);
 	const sessionCount = countSessionFiles(sessionsDir);
 
+	const memoryStatus = await new FileMemoryStore(getBrigadeWorkspaceDir())
+		.status()
+		.catch(() => ({ fileCount: 0, totalBytes: 0 }));
+
 	const execApprovals = readApprovalsSummary();
 
 	const probe = await probeGateway({ host: opts.host, port: opts.port });
@@ -100,6 +109,7 @@ async function collectStatusReport(opts: StatusCommandOptions): Promise<StatusRe
 		authProfileProviders,
 		sessionsDir,
 		sessionCount,
+		memory: { fileCount: memoryStatus.fileCount, totalBytes: memoryStatus.totalBytes },
 		execApprovals,
 		gateway: {
 			url: probe.url,
@@ -161,6 +171,14 @@ function formatStatusText(r: StatusReport): string {
 	lines.push(chalk.dim("Sessions"));
 	lines.push(`  count:         ${r.sessionCount}`);
 	lines.push(`  dir:           ${path.relative(r.brigadeDir, r.sessionsDir) || r.sessionsDir}`);
+	lines.push("");
+	lines.push(chalk.dim("Memory"));
+	if (r.memory.fileCount === 0) {
+		lines.push(`  stored:        ${chalk.dim("none yet (fills in as the agent learns)")}`);
+	} else {
+		const kb = (r.memory.totalBytes / 1024).toFixed(1);
+		lines.push(`  stored:        ${r.memory.fileCount} file${r.memory.fileCount === 1 ? "" : "s"}, ${kb} KB`);
+	}
 	lines.push("");
 	lines.push(chalk.dim("Exec gating"));
 	if (r.execApprovals.error) {

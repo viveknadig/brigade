@@ -1,26 +1,65 @@
 import { strict as assert } from "node:assert";
-import { describe, it } from "node:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { after, before, describe, it } from "node:test";
 
-import {
-	createBrigadeTools,
-	listBrigadeToolNames,
-} from "./registry.js";
+import { createBrigadeTools, listBrigadeToolNames } from "./registry.js";
 
-describe("createBrigadeTools — Primitive #3 v1 (framework only)", () => {
-	it("returns an empty array (no Brigade-native tools ship in #3)", () => {
+// createBrigadeTools constructs a FileMemoryStore rooted at workspaceDir.
+// Point it at a tempdir so the tools are real but isolated.
+let tmpWorkspace: string;
+
+before(() => {
+	tmpWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-registry-"));
+});
+
+after(() => {
+	try {
+		fs.rmSync(tmpWorkspace, { recursive: true, force: true });
+	} catch {
+		/* ignore */
+	}
+});
+
+describe("createBrigadeTools — Primitive #4 (memory)", () => {
+	it("returns the two memory read tools (recall_memory + read_memory)", () => {
 		const tools = createBrigadeTools({
-			workspaceDir: "/home/me/.brigade/workspace",
+			workspaceDir: tmpWorkspace,
 			agentId: "main",
-			cwd: "/some/cwd",
+			cwd: tmpWorkspace,
 		});
-		assert.equal(tools.length, 0);
-		assert.ok(Array.isArray(tools));
+		assert.equal(tools.length, 2);
+		const names = tools.map((t) => t.name).sort();
+		assert.deepEqual(names, ["read_memory", "recall_memory"]);
 	});
 
-	it("does not throw on common option shapes", () => {
-		// Tool-author tests will replace this when they add tools; here we
-		// just verify the factory contract — accept the options bag, return
-		// an array. No side-effects, no thrown errors.
+	it("each tool has the required AgentTool shape", () => {
+		const tools = createBrigadeTools({
+			workspaceDir: tmpWorkspace,
+			agentId: "main",
+			cwd: tmpWorkspace,
+		});
+		for (const tool of tools) {
+			assert.equal(typeof tool.name, "string");
+			assert.equal(typeof tool.label, "string");
+			assert.equal(typeof tool.description, "string");
+			assert.ok(tool.parameters, "parameters schema present");
+			assert.equal(typeof tool.execute, "function");
+		}
+	});
+
+	it("does NOT include a write tool (writing goes through the file tool — OpenClaw model)", () => {
+		const tools = createBrigadeTools({
+			workspaceDir: tmpWorkspace,
+			agentId: "main",
+			cwd: tmpWorkspace,
+		});
+		const names = tools.map((t) => t.name);
+		assert.ok(!names.includes("write_memory"), "no write_memory tool in v1");
+	});
+
+	it("does not throw on common option shapes (Windows + POSIX paths)", () => {
 		assert.doesNotThrow(() =>
 			createBrigadeTools({
 				workspaceDir: "C:\\Users\\me\\.brigade\\workspace",
@@ -32,8 +71,8 @@ describe("createBrigadeTools — Primitive #3 v1 (framework only)", () => {
 });
 
 describe("listBrigadeToolNames", () => {
-	it("returns an empty array (no Brigade-native tools ship in #3)", () => {
-		assert.deepEqual(listBrigadeToolNames(), []);
+	it("returns the memory tool names", () => {
+		assert.deepEqual(listBrigadeToolNames().sort(), ["read_memory", "recall_memory"]);
 	});
 
 	it("returns a fresh array on each call (callers may mutate)", () => {
@@ -41,6 +80,10 @@ describe("listBrigadeToolNames", () => {
 		const b = listBrigadeToolNames();
 		assert.notEqual(a, b, "different array instances");
 		a.push("test-pollution");
-		assert.deepEqual(listBrigadeToolNames(), [], "subsequent calls unaffected");
+		assert.deepEqual(
+			listBrigadeToolNames().sort(),
+			["read_memory", "recall_memory"],
+			"subsequent calls unaffected",
+		);
 	});
 });

@@ -80,13 +80,11 @@ export function shouldUseReasoningFormat(
  * NOT YET WIRED — Primitive #4 (Memory) lands the call site in the
  * assembler, gated on `args.capabilities.memory`.
  */
-export const MEMORY_GUIDANCE = `# Memory
+export const MEMORY_GUIDANCE = `## Memory
 
-You have persistent memory across sessions. Save durable facts using the memory tool: user preferences, environment details, project conventions, recurring corrections.
+You have persistent memory across sessions, stored in MEMORY.md (always visible to you above) plus dated notes under memory/. Before answering anything that depends on past context — the user's preferences, project conventions, environment details, or something you may have noted earlier — call recall_memory to search first, then read_memory to pull the full text around a hit.
 
-Prioritise what reduces future user steering — the most valuable memory is one that prevents the user from having to correct or remind you again.
-
-Don't save task progress, session outcomes, completed-work logs, or temporary state. Memory is for facts that will still matter later, not breadcrumbs of this conversation.
+To SAVE a durable fact, store it in today's note at \`memory/<YYYY-MM-DD>.md\` (the date is in the Runtime line below). There is no separate save tool — memory is just files. CRITICAL: the \`write\` tool OVERWRITES the whole file, so to ADD a fact to a note that already has content, FIRST read it (read_memory or read), THEN write the existing content plus your new line — or use the \`edit\` tool to insert your line without rewriting. Only use a bare \`write\` when the file doesn't exist yet. Skipping the read-first step silently destroys earlier facts saved the same day. Save what reduces future steering: user preferences, environment details, project conventions, recurring corrections. Don't save task progress, session outcomes, or temporary state — memory is for facts that still matter later, not breadcrumbs of this conversation.
 
 Write memories as DECLARATIVE FACTS, not instructions. "User prefers concise replies" ✓ — "Always reply concisely" ✗. "Project uses pytest with -n auto" ✓ — "Run tests with pytest -n auto" ✗. Imperative phrasing gets re-read as a directive on future turns and overrides the user's current request.`;
 
@@ -150,16 +148,23 @@ export function pickModelFamilyGuidance(modelId: string | undefined): string | n
 	if (!modelId || typeof modelId !== "string") return null;
 	const id = modelId.trim().toLowerCase();
 	if (id.length === 0) return null;
-	// OpenAI family — strongest tendency to plan without acting + identify as ChatGPT.
-	if (/(?:^|\/)(?:gpt|codex|o[13])(?:[-_]|$)/.test(id)) {
+	// OpenAI family — strongest tendency to plan without acting + identify as
+	// ChatGPT. The trailing class also accepts a digit / colon so Ollama-style
+	// ids (`gpt-oss:20b`) match, not just cloud `gpt-4o`.
+	if (/(?:^|\/)(?:gpt|codex|o[13])(?:\d|[-_.:]|$)/.test(id)) {
 		return OPENAI_FAMILY_GUIDANCE;
 	}
-	// Google family — identifies as Gemini; benefits from absolute paths + parallel-tool guidance.
-	if (/(?:^|\/)(?:gemini|gemma)(?:[-_]|$)/.test(id)) {
+	// Google family — identifies as Gemini/Gemma; benefits from absolute paths
+	// + parallel-tool guidance. The trailing class accepts a DIGIT so Ollama
+	// tags like `gemma4:e2b` / `gemma2:9b` / `gemma3:27b` match (the old
+	// `(?:[-_]|$)` only matched cloud `gemma-7b` / `gemini-2.5-pro` and SILENTLY
+	// MISSED every Ollama gemma — which is why `gemma4:e2b` kept replying
+	// "I am Gemma 4 from Google DeepMind").
+	if (/(?:^|\/)(?:gemini|gemma)(?:\d|[-_.:]|$)/.test(id)) {
 		return GOOGLE_FAMILY_GUIDANCE;
 	}
 	// Anthropic family — already follows the patterns the system prompt teaches.
-	if (/(?:^|\/)claude(?:[-_]|$)/.test(id)) return null;
+	if (/(?:^|\/)claude(?:\d|[-_.:]|$)/.test(id)) return null;
 	// Unknown / niche — fall through to no extra guidance.
 	return null;
 }

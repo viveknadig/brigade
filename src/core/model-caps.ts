@@ -33,8 +33,43 @@ import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
  *   - Users who want more reasoning can `/thinking high` at runtime.
  */
 export function pickInitialThinkingLevel(model: Model<any>): ThinkingLevel {
-	if (!model.reasoning) return "off";
-	return "low";
+	// Primary signal: the catalog's `reasoning` flag (mirrors OpenClaw's
+	// `resolveThinkingDefaultForModel` — reasoning → "low", else "off").
+	if (model.reasoning) return "low";
+	// Robustness fallback: aggregators (OpenRouter, Vercel AI Gateway, etc.)
+	// frequently ship model metadata WITHOUT the reasoning flag set, even for
+	// models that REQUIRE a non-zero thinking budget and reject "off"
+	// (budget=0 → HTTP 400 → empty turn). gemini-2.5-pro via OpenRouter is the
+	// canonical case. Detect those known reasoning-only families by id so
+	// they still default to "low" instead of the rejected "off".
+	if (isLikelyReasoningModelId(modelIdOf(model))) return "low";
+	return "off";
+}
+
+/** Best-effort extraction of a comparable model id across Pi model shapes. */
+function modelIdOf(model: Model<any>): string {
+	const m = model as unknown as { id?: unknown; modelId?: unknown };
+	const raw = (typeof m.id === "string" && m.id) || (typeof m.modelId === "string" && m.modelId) || "";
+	return raw.trim().toLowerCase();
+}
+
+/**
+ * Conservative id-pattern detector for reasoning-only models that reject a
+ * zero thinking budget. Kept tight on purpose — only families we KNOW
+ * require thinking-on, so we never send "low" to a plain non-reasoning model
+ * (which some providers would bill for or reject). Aggregator-prefix
+ * tolerant (`openrouter/google/gemini-2.5-pro`).
+ */
+export function isLikelyReasoningModelId(modelId: string): boolean {
+	const id = (modelId ?? "").trim().toLowerCase();
+	if (!id) return false;
+	// Gemini 2.5 / 3.x Pro + Flash-thinking — reject budget=0.
+	if (/(?:^|\/)gemini-(?:2\.5|3)(?:[-.]|$)/.test(id)) return true;
+	// OpenAI o-series reasoning models.
+	if (/(?:^|\/)o[13](?:[-_]|$)/.test(id)) return true;
+	// DeepSeek R1 reasoning family.
+	if (/(?:^|\/)deepseek-r1(?:[-_:]|$)/.test(id)) return true;
+	return false;
 }
 
 /**

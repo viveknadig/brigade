@@ -65,12 +65,14 @@ import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
 import { buildBrigadeTransformContext } from "./payload-mutators.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
-import { type BrigadeBeforeToolCallHook, makeUnknownToolGuard } from "./tool-guard.js";
-import { makeExecGate } from "./exec-gate.js";
-import { makeToolLoopDetector } from "./tool-loop-detector.js";
+import type { BrigadeBeforeToolCallHook } from "./tool-guard.js";
 import { runWithContentQualityRetry, type ContentQualityIssue } from "./content-quality-retry.js";
 import { runWithThinkingFallback } from "./thinking-fallback.js";
-import { createBrigadeTools } from "./tools/registry.js";
+import {
+  assembleBrigadeToolset,
+  composeBrigadeBeforeToolCall,
+  type GuardContextRef,
+} from "./session-wiring.js";
 import { emitAgentEvent } from "./agent-event-bus.js";
 import { randomUUID } from "node:crypto";
 import { evaluateCompactionDecision } from "./smart-compaction.js";
@@ -316,28 +318,17 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     },
   );
 
-  // Pi's `tools` field is an ALLOWLIST OF NAMES (string[]), not Tool
-  // objects — `customTools` is the slot for Tool objects. The earlier
-  // smoke run hit exactly this bug: we passed Tool objects into `tools`,
-  // Pi treated each Tool object as a tool-name string, none matched any
-  // real tool, and the model correctly said "I have no file access."
-  //
-  // Naming the seven coding tools explicitly (vs omitting `tools` entirely
-  // and letting Pi default to its 4 base tools) gives us the full surface
-  // including grep / find / ls — closer to what OpenClaw exposes. The cwd
-  // is the agent run's cwd, NOT the agent state dir, so tools operate on
-  // the user's actual workspace.
-  const enabledToolNames: string[] = ["read", "write", "edit", "bash", "grep", "find", "ls"];
-
-  // Brigade-native custom tools (Primitive #3 framework). Empty in v1 —
-  // Pi's 5 built-ins above are the v1 surface. Tools land here in
-  // Primitives #4-6 (memory, skills, sub-agents) as one-liner additions
-  // inside `createBrigadeTools` without touching this callsite.
-  const brigadeCustomTools = createBrigadeTools({
-    workspaceDir,
-    agentId,
-    cwd,
-  });
+  // Assemble Brigade's full tool surface via the SHARED helper — the SAME
+  // one `buildAgent` (TUI + gateway) uses, so every surface exposes an
+  // identical set (7 built-ins + memory tools). Pi's `tools` field is an
+  // allowlist of NAMES; `customTools` is the slot for the Brigade-native
+  // Tool objects. The unknown-tool guard's allowlist must include the
+  // custom names too (else `recall_memory` is refused as unknown), which
+  // `enabledToolNames` already covers.
+  const toolset = assembleBrigadeToolset({ workspaceDir, agentId, cwd });
+  const brigadeCustomTools = toolset.customTools;
+  const enabledToolNames = toolset.enabledToolNames;
+  const promptCapabilities = toolset.capabilities;
 
   const { session } = await createAgentSession({
     cwd,
@@ -391,32 +382,19 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       beforeToolCall?: BrigadeBeforeToolCallHook;
     };
   };
-  // Mutable closure-bag shared by the exec-gate and the loop detector.
-  // The agent-loop sets `gateCtxRef.value = {runId, agentId, sessionKey}`
-  // once it has those (just before the prompt() call) and clears it in
-  // the finally block. Both guards read .value live each call, so
-  // `tool-blocked` bus events carry accurate correlation ids without
-  // re-wiring the guards between turns.
-  const gateCtxRef: {
-    value: { runId?: string; agentId?: string; sessionKey?: string };
-  } = { value: {} };
+  // Mutable closure-bag the shared guard chain reads for `tool-blocked`
+  // bus-event correlation. The agent-loop sets
+  // `gateCtxRef.value = {runId, agentId, sessionKey}` once it has those
+  // (just before the prompt() call) and clears it in the finally block.
+  const gateCtxRef: GuardContextRef = { value: {} };
   if (sessionWithBeforeHook.agent) {
-    const nameGuard = makeUnknownToolGuard(enabledToolNames);
-    // Loop detector goes BEFORE the exec-gate so a stuck model doesn't
-    // even consult the approval allowlist — saves the operator from
-    // seeing 20 identical refusal messages when one will do. Detects
-    // both repeated allowlisted calls (e.g. read({path:"X"}) ad
-    // infinitum) and repeated refused calls (e.g. bash on the same
-    // unapproved command).
-    const loopDetector = makeToolLoopDetector({ ctxRef: gateCtxRef });
-    const execGate = makeExecGate({ ctxRef: gateCtxRef, displayCwd: cwd });
-    sessionWithBeforeHook.agent.beforeToolCall = async (ctx, signal) => {
-      const named = await nameGuard(ctx, signal);
-      if (named?.block) return named;
-      const loop = await loopDetector(ctx, signal);
-      if (loop?.block) return loop;
-      return execGate(ctx, signal);
-    };
+    // SHARED guard chain — identical to the one buildAgent installs:
+    //   unknown-tool guard → loop detector → exec-gate.
+    sessionWithBeforeHook.agent.beforeToolCall = composeBrigadeBeforeToolCall({
+      enabledToolNames,
+      gateCtxRef,
+      displayCwd: cwd,
+    });
   }
 
   // Compose stream-fn wrappers around Pi's auth-aware streamFn. Order
@@ -524,6 +502,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     thinkingLevel: args.thinkingLevel ?? "off",
     bootstrapPhase: effectivePhase,
     toolDescriptions,
+    capabilities: promptCapabilities,
   });
   if (personaPrompt) {
     applyPersonaOverrideToSession(session as AgentSession, personaPrompt);

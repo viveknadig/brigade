@@ -27,6 +27,7 @@ import {
   loadWorkspaceContextFiles,
 } from "../system-prompt/workspace-loader.js";
 import { bootstrapWorkspace } from "../workspace/bootstrap.js";
+import { resolveToolSummary } from "../agents/tool-summaries.js";
 import { DEFAULT_AGENT_ID, resolveAgentWorkspaceDir } from "../config/paths.js";
 
 // The cache marker the lifted code referenced. F:\Brigade's existing
@@ -114,14 +115,34 @@ export async function refreshSessionSystemPrompt(
     modelLabel: `${provider}/${modelId}`,
     thinkingLevel,
   });
+  // Derive tool descriptions + capability gates from the session's LIVE
+  // tool set so the `## Tooling` and `## Memory` sections reflect what's
+  // actually wired (recall_memory / read_memory, etc.). The previous shim
+  // hard-coded `toolDescriptions: []` and only honoured an explicit
+  // `opts.capabilities`, so the interactive path advertised no tools and
+  // never emitted the memory section. Reading from the session keeps every
+  // refresh (initial + per-turn) accurate without threading data through.
+  const liveToolNames = (
+    (session as unknown as { agent?: { state?: { tools?: Array<{ name?: string }> } } }).agent
+      ?.state?.tools ?? []
+  )
+    .map((t) => (typeof t?.name === "string" ? t.name : ""))
+    .filter((n): n is string => n.length > 0);
+  const toolDescriptions = liveToolNames.map((name) => ({
+    name,
+    summary: resolveToolSummary(name) ?? "",
+  }));
+  const capabilities = opts.capabilities ?? {
+    memory: liveToolNames.includes("recall_memory"),
+  };
   const assembled = assembleSystemPrompt({
     runtime,
     personaFiles,
     heartbeatFile,
-    toolDescriptions: [],
+    toolDescriptions,
     modelId,
     thinkingLevel,
-    capabilities: opts.capabilities,
+    capabilities,
     ephemeralSuffix: opts.ephemeralSuffix,
   });
   applyPersonaOverrideToSession(session, assembled.text);

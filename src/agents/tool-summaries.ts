@@ -20,6 +20,11 @@ export const BRIGADE_TOOL_SUMMARIES: Record<string, string> = {
   grep: "Search file contents for a regex pattern (ripgrep-backed).",
   find: "Find files by name or glob pattern.",
   ls: "List the contents of a directory.",
+  // Primitive #4 (Memory). Recall = search; read = bounded excerpt.
+  // Writing memory uses the `write` tool (memory/<today>.md), not a
+  // dedicated tool — mirrors OpenClaw.
+  recall_memory: "Search your durable memory (MEMORY.md + memory/*.md) before answering.",
+  read_memory: "Read a bounded excerpt of a memory file found via recall_memory.",
   // Reserved for future Brigade additions — keep them documented even when
   // not yet wired so a single source-of-truth covers any tool name Pi
   // might surface via getActiveToolNames().
