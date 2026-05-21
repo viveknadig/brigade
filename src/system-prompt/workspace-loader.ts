@@ -7,15 +7,17 @@ import { sanitizeForPromptLiteral } from "./sanitize.js";
 
 // Persona files brigade expects to find in <agentDir>/workspace/. Order
 // matters — it determines the sequence inside the assembled prompt's
-// `# Project Context` section. HEARTBEAT.md is intentionally absent: it
+// `# Project Context` section. This mirrors OpenClaw's
+// `loadWorkspaceBootstrapFiles` order (AGENTS → SOUL → TOOLS → IDENTITY →
+// USER → BOOTSTRAP → MEMORY). HEARTBEAT.md is intentionally absent: it
 // belongs in the *dynamic suffix* (below the cache boundary) and is loaded
 // via loadHeartbeatFile.
 const STABLE_FILE_ORDER = [
   "AGENTS.md",
   "SOUL.md",
+  "TOOLS.md",
   "IDENTITY.md",
   "USER.md",
-  "TOOLS.md",
   "BOOTSTRAP.md",
   "MEMORY.md",
 ] as const;

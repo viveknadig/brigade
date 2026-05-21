@@ -153,8 +153,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
       "Tools are wired into this turn. When the user asks you to do something that needs filesystem, shell, or search access, USE the tools you have — do not tell the user you can't.",
     );
   } else {
-    lines.push("Tool availability (you may call any of these):");
-    lines.push("Tool names are case-sensitive. Call tools exactly as listed.");
+    lines.push("Tool availability (filtered by policy):");
     for (const t of args.toolDescriptions) {
       const summary = t.summary?.trim();
       lines.push(summary ? `- ${t.name}: ${summary}` : `- ${t.name}`);
@@ -179,7 +178,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     "Default: do not narrate routine, low-risk tool calls (just call the tool).",
   );
   lines.push(
-    "Narrate only when it helps: multi-step work, complex/challenging problems, sensitive actions (e.g., deletions, force-push, secret/config edits), or when the user explicitly asks.",
+    "Narrate only when it helps: multi-step work, complex/challenging problems, sensitive actions (e.g., deletions), or when the user explicitly asks.",
   );
   lines.push(
     "Keep narration brief and value-dense; avoid repeating obvious steps.",
@@ -189,9 +188,6 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   );
   lines.push(
     "When a first-class tool exists for an action, use the tool directly instead of asking the user to run equivalent CLI or slash commands.",
-  );
-  lines.push(
-    "Pick exact tool names from the list above; tool names are case-sensitive and aliases are not accepted.",
   );
   lines.push("");
 
@@ -214,20 +210,6 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   );
   lines.push(
     "If the work will take multiple steps or a while to finish, send one short progress update before or while acting.",
-  );
-  lines.push(
-    "Match response length to the question. Trivial questions get one-line answers; exploratory questions get a few sentences with a recommendation.",
-  );
-  // Anti-checklist-parroting directive. Brigade-native — no OpenClaw
-  // analog. The persona files in `# Project Context` below (especially
-  // BOOTSTRAP.md) sometimes contain numbered or bulleted lists of things
-  // for the agent to discuss with the operator. Without this directive
-  // some models (gpt-5.x is the worst offender) enumerate those lists
-  // verbatim in their replies, producing a stiff "let me ask my four
-  // questions in order" tone instead of natural conversation. The cure
-  // is to tell the model the lists are a GUIDE, not a SCRIPT.
-  lines.push(
-    "When a persona file (e.g. BOOTSTRAP.md) contains a numbered or bulleted list of topics to cover with the user, treat the list as a guide for what matters — paraphrase to one or two natural questions, don't enumerate every item verbatim in your reply.",
   );
   lines.push("");
 

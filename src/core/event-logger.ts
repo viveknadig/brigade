@@ -172,8 +172,17 @@ function serializeForLog(event: AgentSessionEvent): Record<string, unknown> {
 			};
 		}
 		case "message_end":
-			// Final message — full content kept for replay/debugging.
-			return { ...base, role: ev.message?.role, content: ev.message?.content, stopReason: ev.message?.stopReason };
+			// Final message — full content kept for replay/debugging. Pi puts a
+			// provider/transport failure here as stopReason "error"/"aborted" +
+			// `errorMessage`; capture it so a failed turn is diagnosable from the
+			// log instead of showing as a mysterious empty message.
+			return {
+				...base,
+				role: ev.message?.role,
+				content: ev.message?.content,
+				stopReason: ev.message?.stopReason,
+				errorMessage: ev.message?.errorMessage,
+			};
 		case "tool_execution_start":
 			return { ...base, toolCallId: ev.toolCallId, toolName: ev.toolName, args: ev.args };
 		case "tool_execution_end":

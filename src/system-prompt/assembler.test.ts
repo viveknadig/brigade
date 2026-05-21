@@ -71,7 +71,10 @@ describe("assembleSystemPrompt — universal sections (OpenClaw mirror order)", 
 		});
 		assert.match(out.text, /## Execution Bias/);
 		assert.match(out.text, /start doing it/);
-		assert.match(out.text, /Match response length to the question/);
+		// OpenClaw-mirror: Execution Bias is the 4 universal lines only — no
+		// Brigade-specific response-length / anti-checklist editorializing.
+		assert.match(out.text, /Commentary-only turns are incomplete/);
+		assert.doesNotMatch(out.text, /Match response length to the question/);
 	});
 
 	it("Safety block keeps the three durable rules", () => {
@@ -322,8 +325,9 @@ describe("assembleSystemPrompt — tool listing", () => {
 				{ name: "bash", summary: "Run a shell command" },
 			],
 		});
-		assert.match(out.text, /Tool availability/);
-		assert.match(out.text, /Tool names are case-sensitive/);
+		// OpenClaw-mirror opener; case-sensitivity is enforced by the
+		// unknown-tool guard at the tool layer, not narrated in the prompt.
+		assert.match(out.text, /Tool availability \(filtered by policy\):/);
 		assert.match(out.text, /- read: Read a file/);
 		assert.match(out.text, /- bash: Run a shell command/);
 	});

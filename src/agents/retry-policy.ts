@@ -13,7 +13,7 @@
 //   overloaded         yes        3        2s+jitter    yes             503 / 529
 //   timeout            yes        3        1s+jitter    yes             econn*, deadline
 //   unknown            yes        2        1s+jitter    yes             collapse-into-retry
-//   billing            yes(1)     1        none         no              probe once at expiry
+//   billing            no         0        n/a          rotate-model    402 → failover chain / surface (mirrors openclaw)
 //   format             no         0        n/a          n/a             same body re-fails
 //   model_not_found    no         0        n/a          rotate-model    fallback chain
 //   auth               no         0        n/a          yes             try other profile
@@ -86,14 +86,21 @@ export function getRetryPolicy(reason: RetryReason): RetryPolicy {
         consumesProbeSlot: true,
       };
     case "billing":
+      // Mirror OpenClaw: billing (402 insufficient credits) is a FAILOVER
+      // reason, never a same-model retry. The same model on the same account
+      // has the same credits — re-poking it just wastes a round-trip. So fail
+      // fast at the policy layer (no same-model retry) and let the model
+      // fallback chain try a different (provider, model); if none is
+      // configured, the error surfaces immediately. Same shape as
+      // model_not_found ("fallback chain", not "probe again").
       return {
         reason,
-        transient: true,
-        maxRetries: 1,
+        transient: false,
+        maxRetries: 0,
         baseBackoffMs: 0,
         rotateAuthProfile: false,
-        rotateModel: false,
-        consumesProbeSlot: true,
+        rotateModel: true,
+        consumesProbeSlot: false,
       };
     case "format":
       return {

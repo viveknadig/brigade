@@ -35,7 +35,7 @@
  * enough for the gpt-5 / gemini-2.5 / mistral cohort that the gate
  * actually fires for.
  */
-export const REASONING_FORMAT_GUIDANCE = `# Reasoning format
+export const REASONING_FORMAT_GUIDANCE = `## Reasoning Format
 
 Put internal reasoning inside \`<think>...</think>\` tags. Do not output analysis outside \`<think>\`.
 

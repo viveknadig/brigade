@@ -62,6 +62,7 @@ import {
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { runWithRetry } from "./retry-policy.js";
 import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
+import { cleanProviderError } from "../core/model-caps.js";
 import { buildBrigadeTransformContext } from "./payload-mutators.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
@@ -708,6 +709,10 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
               // the run, but if Pi adds queued steers or background
               // compactions in a future minor, this catches the late activity.
               await waitForStreamSettled(session as AgentSession);
+              // Surface a provider-error stop BEFORE content-quality inspects
+              // the (empty) content — otherwise it's mistaken for an "empty"
+              // reply and we re-prompt a model that's hard-erroring.
+              assertNoProviderErrorStop(session as AgentSession);
             },
             {
               onRetry: (reason: NonNullable<ContentQualityIssue>) => {
@@ -778,6 +783,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
           "Please continue your previous response from where you left off. Don't repeat what you've already said.",
         );
         await waitForStreamSettled(session as AgentSession);
+        assertNoProviderErrorStop(session as AgentSession);
       },
     });
   }
@@ -1118,6 +1124,50 @@ async function waitForStreamSettled(session: AgentSession): Promise<void> {
       `(isStreaming=${session.isStreaming} isCompacting=${session.isCompacting}). ` +
       `Likely a hung provider connection — abort the run and retry.`,
   );
+}
+
+// Surface a provider/transport failure that Pi reports as DATA rather than a
+// thrown exception.
+//
+// Mirrors OpenClaw's embedded-runner contract: there, `runEmbeddedAttempt`
+// returns the settled `lastAssistant` message and a failover layer inspects
+// its `stopReason`/`errorMessage` to decide retry → rotate → fallback-model →
+// surface (see openclaw assistant-failover + failover-policy). Pi emits the
+// same shape: a SETTLED assistant message with `stopReason: "error"` and an
+// `errorMessage` — not an exception, and not an intentionally-empty reply.
+//
+// Brigade reaches the same outcome through its existing throw-based machinery:
+// we convert that error-as-data into a thrown error carrying the cleaned
+// provider message, so it flows into `error-classifier` → `runWithRetry`
+// (transient like rate_limit/overloaded/timeout → retried) and, in the
+// resilient path, `runWithModelFallback` (→ failover to the next model);
+// a permanent failure (model_not_found / auth) is surfaced to the caller
+// instead of being mistaken for a content-quality "empty" and returning blank.
+// `"aborted"` is user-initiated (Ctrl-C / disconnect) and is left alone.
+function assertNoProviderErrorStop(session: AgentSession): void {
+  const messages = session.messages as Array<{
+    role?: string;
+    stopReason?: string;
+    errorMessage?: string;
+  }>;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m.role !== "assistant") continue;
+    if (m.stopReason === "error") {
+      const raw = m.errorMessage?.trim();
+      // cleanProviderError peels the provider's JSON error blob down to its
+      // human-readable message (Brigade's equivalent of OpenClaw's
+      // formatAssistantErrorText) so the classifier matches on real text and
+      // the user sees a readable line, not a raw payload.
+      throw new Error(
+        raw
+          ? cleanProviderError(raw)
+          : "the model returned an error with no detail (the provider request failed before producing any output)",
+      );
+    }
+    // Most recent assistant message settled normally — nothing to surface.
+    return;
+  }
 }
 
 function extractLastAssistantText(session: AgentSession): string {
