@@ -64,6 +64,7 @@ import { runWithRetry } from "./retry-policy.js";
 import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
 import { cleanProviderError } from "../core/model-caps.js";
 import { resolveModelNeverMiss } from "./model-resolution.js";
+import { buildAutoRecallBlock } from "./memory/auto-recall.js";
 import { buildBrigadeTransformContext } from "./payload-mutators.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
@@ -529,6 +530,14 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     bootstrapPhase: effectivePhase,
     toolDescriptions,
     capabilities: promptCapabilities,
+    // Auto-recall: lexically surface the top relevant structured facts for THIS
+    // user message as an ephemeral (per-turn, below-cache-boundary) suffix, so
+    // the model has them without calling recall_memory. Sync + free. This is a
+    // PASSIVE injection — it does NOT bump accessCount (only the explicit
+    // recall_memory tool reinforces decay). Only present when memory is enabled.
+    ephemeralSuffix: promptCapabilities?.memory
+      ? buildAutoRecallBlock(workspaceDir, args.message)
+      : undefined,
   });
   if (personaPrompt) {
     applyPersonaOverrideToSession(session as AgentSession, personaPrompt);

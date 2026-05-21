@@ -23,15 +23,15 @@ after(() => {
 });
 
 describe("createBrigadeTools — Primitive #4 (memory)", () => {
-	it("returns the two memory read tools (recall_memory + read_memory)", () => {
+	it("returns the three memory tools (recall_memory + read_memory + write_memory)", () => {
 		const tools = createBrigadeTools({
 			workspaceDir: tmpWorkspace,
 			agentId: "main",
 			cwd: tmpWorkspace,
 		});
-		assert.equal(tools.length, 2);
+		assert.equal(tools.length, 3);
 		const names = tools.map((t) => t.name).sort();
-		assert.deepEqual(names, ["read_memory", "recall_memory"]);
+		assert.deepEqual(names, ["read_memory", "recall_memory", "write_memory"]);
 	});
 
 	it("each tool has the required AgentTool shape", () => {
@@ -49,14 +49,14 @@ describe("createBrigadeTools — Primitive #4 (memory)", () => {
 		}
 	});
 
-	it("does NOT include a write tool (writing goes through the file tool — OpenClaw model)", () => {
+	it("includes the structured write_memory tool (Boop model)", () => {
 		const tools = createBrigadeTools({
 			workspaceDir: tmpWorkspace,
 			agentId: "main",
 			cwd: tmpWorkspace,
 		});
 		const names = tools.map((t) => t.name);
-		assert.ok(!names.includes("write_memory"), "no write_memory tool in v1");
+		assert.ok(names.includes("write_memory"), "write_memory tool present");
 	});
 
 	it("does not throw on common option shapes (Windows + POSIX paths)", () => {
@@ -72,7 +72,7 @@ describe("createBrigadeTools — Primitive #4 (memory)", () => {
 
 describe("listBrigadeToolNames", () => {
 	it("returns the memory tool names", () => {
-		assert.deepEqual(listBrigadeToolNames().sort(), ["read_memory", "recall_memory"]);
+		assert.deepEqual(listBrigadeToolNames().sort(), ["read_memory", "recall_memory", "write_memory"]);
 	});
 
 	it("returns a fresh array on each call (callers may mutate)", () => {
@@ -82,7 +82,7 @@ describe("listBrigadeToolNames", () => {
 		a.push("test-pollution");
 		assert.deepEqual(
 			listBrigadeToolNames().sort(),
-			["read_memory", "recall_memory"],
+			["read_memory", "recall_memory", "write_memory"],
 			"subsequent calls unaffected",
 		);
 	});

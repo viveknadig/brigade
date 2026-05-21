@@ -63,8 +63,10 @@ import { runResilientTurn } from "../agents/agent-loop.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
 import { switchModelMidTurn as piSwitchModelMidTurn } from "../agents/mid-turn-switch.js";
 import { onAgentEvent } from "../agents/agent-event-bus.js";
-import { DEFAULT_AGENT_ID } from "../config/paths.js";
+import { DEFAULT_AGENT_ID, resolveAgentDir, resolveAgentWorkspaceDir } from "../config/paths.js";
 import { defaultSessionKey } from "../sessions/session-store.js";
+import { makeExtractionLlm, runExtractionSweep } from "../agents/memory/extract.js";
+import { runDecayGc } from "../agents/memory/decay.js";
 import { loadBrigadeAuthStorage } from "./auth-bridge.js";
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, loadConfig, saveConfig, type Config } from "./config.js";
 import { acquireGatewayLock, type GatewayLockHandle } from "./gateway-lock.js";
@@ -299,6 +301,73 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// JSONL event logger for the active turn. Set when a turn starts, called
 	// (idempotently) when it settles.
 	let currentTurnCleanup: (() => void) | null = null;
+
+	// ── Background memory extraction (off the hot path) ──
+	// After a turn settles we DEBOUNCE a batched sweep: during quiet time it
+	// distills the NEW transcript turns into structured facts in ONE extra
+	// model call, so the per-turn path stays at a single call. This is the
+	// scalable shape (OpenClaw-style off-hot-path + batching) over Boop's
+	// extraction algorithm — see agents/memory/extract.ts. Kill-switch:
+	// BRIGADE_DISABLE_MEMORY_EXTRACT=1.
+	const memoryExtractEnabled = process.env.BRIGADE_DISABLE_MEMORY_EXTRACT !== "1";
+	const EXTRACT_DEBOUNCE_MS = 45_000;
+	let extractTimer: ReturnType<typeof setTimeout> | null = null;
+	let pendingExtract: { sessionId: string; messages: unknown[] } | null = null;
+	let extracting = false;
+
+	const armExtractTimer = (): void => {
+		if (extractTimer) clearTimeout(extractTimer);
+		extractTimer = setTimeout(() => void runExtractionNow(), EXTRACT_DEBOUNCE_MS);
+		extractTimer.unref?.();
+	};
+
+	const runExtractionNow = async (): Promise<void> => {
+		if (!pendingExtract) return;
+		// Defer while a turn is active OR another sweep is in flight — never
+		// compete with the user-facing call or run two extractions at once.
+		// CRITICAL: re-arm rather than DROP the pending batch (otherwise a sweep
+		// that fires mid-turn would silently lose the turns it was meant to
+		// distill, with nothing to retrigger it until the next prompt).
+		if (isAgentRunning || extracting) {
+			armExtractTimer();
+			return;
+		}
+		const pending = pendingExtract;
+		pendingExtract = null;
+		extracting = true;
+		try {
+			const workspaceDir = resolveAgentWorkspaceDir(agentId);
+			const llm = makeExtractionLlm({
+				workspaceDir,
+				agentDir: resolveAgentDir(agentId),
+				authStorage,
+				modelRegistry,
+				model,
+			});
+			await runExtractionSweep({
+				workspaceDir,
+				sessionId: pending.sessionId,
+				messages: pending.messages,
+				llm,
+			});
+			// Cheap, no-model-call decay GC in the same quiet window — ages out
+			// neglected facts so the structured store self-prunes.
+			runDecayGc(workspaceDir);
+		} catch (err) {
+			// Best-effort — extraction never affects the user-facing turn.
+			opts.consoleStream?.info?.(
+				`memory extraction error: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		} finally {
+			extracting = false;
+		}
+	};
+
+	const scheduleExtraction = (result: { sessionId: string; messages: unknown[] }): void => {
+		if (!memoryExtractEnabled) return;
+		pendingExtract = { sessionId: result.sessionId, messages: result.messages };
+		armExtractTimer();
+	};
 
 	// Cumulative usage totals for the state snapshot. Pi reports per-turn
 	// usage on turn_end; we accumulate across turns.
@@ -642,7 +711,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					// the session when it settles. `onSessionReady` hands us the
 					// session for its lifetime so abort/steer/switch-model-mid-turn
 					// have something to act on; we tear the wiring down in finally.
-					await runResilientTurn({
+					const result = await runResilientTurn({
 						agentId,
 						provider,
 						modelId,
@@ -657,6 +726,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 							currentTurnCleanup = attachTurnSession(session);
 						},
 					});
+					// Queue a debounced, batched memory-extraction sweep over the
+					// settled transcript (off the hot path; see scheduleExtraction).
+					scheduleExtraction({ sessionId: result.sessionId, messages: result.messages });
 				} finally {
 					if (currentTurnCleanup) {
 						currentTurnCleanup();
@@ -957,6 +1029,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		host,
 		async stop() {
 			clearInterval(tickTimer);
+			if (extractTimer) clearTimeout(extractTimer);
 			// Tear down any in-flight turn's Pi subscription + JSONL logger.
 			// Between turns there's nothing attached, so this is a no-op then.
 			if (currentTurnCleanup) {

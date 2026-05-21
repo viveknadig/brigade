@@ -5,7 +5,8 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { FileMemoryStore } from "../memory/storage.js";
-import { makeReadMemoryTool, makeRecallMemoryTool } from "./memory-tools.js";
+import { FactStore } from "../memory/records.js";
+import { makeReadMemoryTool, makeRecallMemoryTool, makeWriteMemoryTool } from "./memory-tools.js";
 
 let workspace: string;
 let store: FileMemoryStore;
@@ -29,6 +30,34 @@ function writeMemory(rel: string, content: string): void {
 	fs.mkdirSync(path.dirname(full), { recursive: true });
 	fs.writeFileSync(full, content, "utf8");
 }
+
+describe("write_memory tool + recall integration", () => {
+	it("persists a structured fact that recall_memory then finds", async () => {
+		const factStore = new FactStore(workspace);
+		const write = makeWriteMemoryTool(factStore);
+		const w = await write.execute("c1", {
+			content: "User prefers spaces over tabs.",
+			segment: "preference",
+		} as never);
+		assert.match((w.content[0] as { text: string }).text, /Remembered \[preference/);
+
+		// recall (markdown store + fact store) surfaces the written fact.
+		const recall = makeRecallMemoryTool(store, factStore);
+		const r = await recall.execute("c2", { query: "tabs spaces" } as never);
+		assert.match((r.content[0] as { text: string }).text, /spaces over tabs/);
+		assert.equal(r.details.facts.length, 1);
+		assert.equal(r.details.facts[0]?.segment, "preference");
+	});
+
+	it("recall marks the fact accessed (decay reinforcement)", async () => {
+		const factStore = new FactStore(workspace);
+		const write = makeWriteMemoryTool(factStore);
+		await write.execute("c1", { content: "Deploys happen on Fridays.", segment: "project" } as never);
+		const recall = makeRecallMemoryTool(store, factStore);
+		await recall.execute("c2", { query: "deploys Fridays" } as never);
+		assert.equal(factStore.list()[0]?.accessCount, 1);
+	});
+});
 
 describe("recall_memory tool", () => {
 	it("has the expected name + shape", () => {

@@ -2,12 +2,12 @@
  * Brigade tool registry.
  *
  * Factory that builds the array of Brigade-native custom tools passed to
- * Pi's `createAgentSession({customTools})` slot. Today it returns the two
- * Primitive #4 memory read tools — `recall_memory` (lexical search across
- * memory files) and `read_memory` (fetch a specific file) — alongside Pi's
- * built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`).
- * The remaining Brigade-native tools (`write_memory`, `spawn_agent`) ship
- * with their primitives (#4 write path, #6 sub-agents).
+ * Pi's `createAgentSession({customTools})` slot. Today it returns the three
+ * Primitive #4 memory tools — `recall_memory` (lexical search across markdown
+ * notes + the structured fact store), `read_memory` (fetch a specific note),
+ * and `write_memory` (persist a structured fact) — alongside Pi's built-in
+ * tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`). `spawn_agent`
+ * ships with Primitive #6 (sub-agents).
  *
  * The factory is plumbed through `session-wiring.ts` (the single
  * tool-assembly seam) so adding a tool later is a one-line change in
@@ -19,7 +19,8 @@
  */
 
 import { FileMemoryStore } from "../memory/storage.js";
-import { makeReadMemoryTool, makeRecallMemoryTool } from "./memory-tools.js";
+import { FactStore } from "../memory/records.js";
+import { makeReadMemoryTool, makeRecallMemoryTool, makeWriteMemoryTool } from "./memory-tools.js";
 import type { AnyBrigadeTool } from "./types.js";
 
 /**
@@ -46,31 +47,30 @@ export interface CreateBrigadeToolsOptions {
 }
 
 /**
- * Build Brigade's custom tool array. Returns an empty array today;
- * tools are added in Primitives #4 (memory), #5 (skills), #6
- * (sub-agents). Callers should pass the result directly to Pi's
- * `customTools` option — Pi merges it with the `tools` allowlist
- * (Pi's built-ins selected by name) to form the full tool surface
- * visible to the model.
+ * Build Brigade's custom tool array — the THREE Primitive #4 memory tools
+ * today (recall_memory, read_memory, write_memory); skills (#5) and
+ * sub-agents (#6) add more later. Callers pass the result to Pi's
+ * `customTools` option — Pi merges it with the `tools` allowlist (built-ins
+ * by name) to form the full tool surface.
  *
- * The function takes options eagerly rather than late-binding so
- * tests can construct a deterministic registry without touching the
- * filesystem.
+ * The function takes options eagerly rather than late-binding so tests can
+ * construct a deterministic registry without touching the filesystem.
  */
 export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeTool[] {
-	// Primitive #4 (Memory): two READ tools backed by a filesystem-rooted
-	// BrigadeStorage. Writing memory is NOT a tool — the agent appends to
-	// `memory/<today>.md` with its ordinary `write`/`edit` tool (cwd is
-	// the workspace dir). Mirrors OpenClaw's memory_search + memory_get.
-	//
-	// The store is constructed per-turn from the workspace dir; it's
-	// stateless (filesystem-backed), so there's no lifecycle to manage.
-	// Phase 2 swaps `FileMemoryStore` for a DB-backed `BrigadeStorage`
-	// here without touching the tools or the prompt.
+	// Primitive #4 (Memory): markdown notes via `FileMemoryStore` (recall/read)
+	// + structured facts via `FactStore` (recall/write). Stores are constructed
+	// per-turn from the workspace dir; they're stateless (filesystem-backed), so
+	// there's no lifecycle to manage. Phase 2 swaps `FileMemoryStore` for a
+	// DB-backed `BrigadeStorage` here without touching the tools or the prompt.
 	const memoryStore = new FileMemoryStore(opts.workspaceDir);
+	const factStore = new FactStore(opts.workspaceDir);
 	return [
-		makeRecallMemoryTool(memoryStore),
+		// recall searches BOTH markdown notes (memoryStore) and structured
+		// facts (factStore), reinforcing recalled facts against decay.
+		makeRecallMemoryTool(memoryStore, factStore),
 		makeReadMemoryTool(memoryStore),
+		// write_memory persists distilled structured facts (Boop model).
+		makeWriteMemoryTool(factStore),
 	];
 }
 
@@ -80,5 +80,5 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
  * `agent-loop.ts` to flip on the memory-capability prompt block.
  */
 export function listBrigadeToolNames(): string[] {
-	return ["recall_memory", "read_memory"];
+	return ["recall_memory", "read_memory", "write_memory"];
 }

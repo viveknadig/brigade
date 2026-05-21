@@ -80,13 +80,15 @@ export function shouldUseReasoningFormat(
  * NOT YET WIRED — Primitive #4 (Memory) lands the call site in the
  * assembler, gated on `args.capabilities.memory`.
  */
-export const MEMORY_GUIDANCE = `## Memory
+export const MEMORY_GUIDANCE = `## Memory Recall
 
-You have persistent memory across sessions, stored in MEMORY.md (always visible to you above) plus dated notes under memory/. Before answering anything that depends on past context — the user's preferences, project conventions, environment details, or something you may have noted earlier — call recall_memory to search first, then read_memory to pull the full text around a hit.
+You have persistent memory across sessions. MEMORY.md (always visible above) holds durable facts; a structured fact store backs recall; dated notes under memory/ hold longer free-form notes.
 
-To SAVE a durable fact, store it in today's note at \`memory/<YYYY-MM-DD>.md\` (the date is in the Runtime line below). There is no separate save tool — memory is just files. CRITICAL: the \`write\` tool OVERWRITES the whole file, so to ADD a fact to a note that already has content, FIRST read it (read_memory or read), THEN write the existing content plus your new line — or use the \`edit\` tool to insert your line without rewriting. Only use a bare \`write\` when the file doesn't exist yet. Skipping the read-first step silently destroys earlier facts saved the same day. Save what reduces future steering: user preferences, environment details, project conventions, recurring corrections. Don't save task progress, session outcomes, or temporary state — memory is for facts that still matter later, not breadcrumbs of this conversation.
+Relevant memories for the current message are surfaced automatically under "## Relevant memory" when available — but that list may be incomplete. Before answering anything that depends on past context (the user's preferences, project conventions, environment, people, or anything you noted earlier), call recall_memory to search, then read_memory to pull the full text around a hit. If you're still unsure after searching, say you checked.
 
-Write memories as DECLARATIVE FACTS, not instructions. "User prefers concise replies" ✓ — "Always reply concisely" ✗. "Project uses pytest with -n auto" ✓ — "Run tests with pytest -n auto" ✗. Imperative phrasing gets re-read as a directive on future turns and overrides the user's current request.`;
+To SAVE a durable fact, call write_memory with one declarative sentence and a segment (identity / preference / correction / relationship / project / knowledge / context). For a correction, use segment=correction and pass the prior fact's id in supersedes. Durable facts are ALSO captured automatically from the conversation, so you don't have to save everything by hand — but call write_memory immediately whenever the user states a clear, lasting preference, identity detail, or correction. (For longer free-form notes, append to \`memory/<YYYY-MM-DD>.md\` with the edit tool.)
+
+Write memories as DECLARATIVE FACTS, not instructions. "User prefers concise replies" ✓ — "Always reply concisely" ✗. "Project uses pytest with -n auto" ✓ — "Run tests with pytest -n auto" ✗. Imperative phrasing gets re-read as a directive on future turns and overrides the user's current request. Save what reduces future steering; skip task progress and temporary state.`;
 
 /* ───────────────── Skills guidance (conditional on skills tool) ───────────────── */
 

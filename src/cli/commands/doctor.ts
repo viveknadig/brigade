@@ -30,6 +30,7 @@ import {
 	resolveSessionsDir,
 } from "../../config/paths.js";
 import { FileMemoryStore } from "../../agents/memory/storage.js";
+import { FactStore } from "../../agents/memory/records.js";
 import { BRIGADE_DIR, loadConfig } from "../../core/config.js";
 import { loadBrigadeAuthStorage } from "../../core/auth-bridge.js";
 import { getTodayLogPath } from "../../core/event-logger.js";
@@ -330,20 +331,28 @@ async function checkMemory(): Promise<CheckResult> {
 			message: `could not read memory: ${(err as Error).message}`,
 		};
 	}
-	if (summary.fileCount === 0) {
+	// Structured fact count — lets `doctor` show whether extraction/write_memory
+	// is actually populating facts.jsonl (useful when verifying memory manually).
+	let factCount = 0;
+	try {
+		factCount = new FactStore(workspaceDir).list().length;
+	} catch {
+		/* no fact store yet */
+	}
+	if (summary.fileCount === 0 && factCount === 0) {
 		// "ok" — an empty memory corpus is the normal fresh state. The agent
 		// populates it as it learns durable facts.
 		return {
 			name: "memory",
 			status: "ok",
-			message: "no memory yet — MEMORY.md + memory/ notes fill in as the agent learns",
+			message: "no memory yet — facts + MEMORY.md + memory/ notes fill in as the agent learns",
 		};
 	}
 	const kb = (summary.totalBytes / 1024).toFixed(1);
 	return {
 		name: "memory",
 		status: "ok",
-		message: `${summary.fileCount} file${summary.fileCount === 1 ? "" : "s"}, ${kb} KB (MEMORY.md + memory/*.md)`,
+		message: `${factCount} fact${factCount === 1 ? "" : "s"} · ${summary.fileCount} note file${summary.fileCount === 1 ? "" : "s"}, ${kb} KB`,
 	};
 }
 

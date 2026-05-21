@@ -1,21 +1,19 @@
 /**
- * Brigade memory tools — Primitive #4. Two READ tools, exactly mirroring
- * OpenClaw's `memory_search` + `memory_get` (`extensions/memory-core/
- * src/tools.ts`):
+ * Brigade memory tools — Primitive #4. Three tools:
  *
- *   - `recall_memory` — lexical search across MEMORY.md + memory/*.md,
- *     returns scored snippets. The "search before you answer" tool.
- *   - `read_memory`   — bounded excerpt read of one memory file.
+ *   - `recall_memory` — lexical search across MEMORY.md + memory/*.md daily
+ *     notes (markdown, via BrigadeStorage) AND the structured fact store
+ *     (memory/facts.jsonl, via FactStore). Mirrors OpenClaw's `memory_search`.
+ *   - `read_memory`   — bounded excerpt read of one memory file (`memory_get`).
+ *   - `write_memory`  — persist a structured durable fact (Boop's
+ *     `write_memory`): one sentence + segment + importance. Recall hits bump
+ *     the fact's accessCount (decay reinforcement); the post-turn extraction
+ *     subagent writes through the same store.
  *
- * There is NO write tool, by design — the agent appends durable facts to
- * `memory/<today>.md` using its ordinary `write` / `edit` tool (Pi's
- * session cwd is the workspace dir, so a relative path lands in the right
- * place). This is precisely OpenClaw's model; Brigade's locked skill spec
- * lists a `write_memory` tool but the operator chose to mirror OpenClaw
- * for v1 and revisit a dedicated write tool later.
- *
- * Both tools delegate to a `BrigadeStorage` instance, so Phase 2's
- * DB-backed store drops in without touching the tool code.
+ * Markdown reads/searches go through `BrigadeStorage` (Phase-2 DB-swap seam);
+ * structured facts go through `FactStore`. Daily-note free-form writes still
+ * use the ordinary `write`/`edit` tool against the workspace cwd — `write_memory`
+ * is for distilled, taggable facts.
  */
 
 import { Type } from "typebox";
@@ -27,6 +25,7 @@ import {
 	type MemoryReadResult,
 	type MemorySearchResult,
 } from "../memory/storage.js";
+import { type FactStore, MEMORY_SEGMENTS, type MemorySegment } from "../memory/records.js";
 import { readNumberParam, readStringParam, textResult } from "./common.js";
 import type { BrigadeTool } from "./types.js";
 
@@ -45,28 +44,40 @@ const RecallMemoryParams = Type.Object({
 	),
 });
 
+interface RecalledFact {
+	memoryId: string;
+	content: string;
+	segment: string;
+	importance: number;
+	score: number;
+}
+
 interface RecallMemoryDetails {
 	query: string;
 	resultCount: number;
 	results: MemorySearchResult[];
+	facts: RecalledFact[];
 }
 
 /**
- * Build the `recall_memory` tool bound to a storage instance.
+ * Build the `recall_memory` tool. Searches markdown memory (BrigadeStorage)
+ * and, when a FactStore is supplied, the structured fact store too — merging
+ * both into one ranked result set and reinforcing recalled facts.
  */
 export function makeRecallMemoryTool(
 	store: BrigadeStorage,
+	factStore?: FactStore,
 ): BrigadeTool<typeof RecallMemoryParams, RecallMemoryDetails> {
 	return {
 		name: "recall_memory",
 		label: "recall memory",
 		displaySummary: "searching memory",
 		description:
-			"Search your durable memory (MEMORY.md + memory/*.md daily notes) for relevant " +
-			"facts before answering. Use this whenever the user refers to past context, " +
-			"their preferences, project conventions, or anything you might have noted earlier. " +
-			"Returns scored snippets with the file + line range each came from; follow up with " +
-			"read_memory to pull the full surrounding text.",
+			"Search your durable memory — structured facts plus MEMORY.md and memory/*.md daily " +
+			"notes — for relevant context before answering. Use this whenever the user refers to " +
+			"past context, their preferences, project conventions, or anything you might have noted " +
+			"earlier. Returns matching facts and scored note snippets (with file + line range); " +
+			"follow up with read_memory to pull the full surrounding text of a note.",
 		parameters: RecallMemoryParams,
 		async execute(_toolCallId, params): Promise<AgentToolResult<RecallMemoryDetails>> {
 			const query = readStringParam(params as Record<string, unknown>, "query", {
@@ -78,26 +89,52 @@ export function makeRecallMemoryTool(
 				label: "maxResults",
 			});
 			const results = await store.search(query, maxResults ? { maxResults } : {});
+			// Structured facts (memory/facts.jsonl). Searching marks hits accessed
+			// so frequently-recalled facts resist decay.
+			const factHits = (factStore?.search(query, maxResults ? { limit: maxResults } : {}) ?? []).map(
+				(r) => ({
+					memoryId: r.memoryId,
+					content: r.content,
+					segment: r.segment,
+					importance: r.importance,
+					score: r.score,
+				}),
+			);
 			const details: RecallMemoryDetails = {
 				query,
-				resultCount: results.length,
+				resultCount: results.length + factHits.length,
 				results,
+				facts: factHits,
 			};
-			if (results.length === 0) {
+			if (results.length === 0 && factHits.length === 0) {
 				return textResult(
 					`No memory matched "${query}". Nothing has been noted about this yet — ` +
-						`if it's worth remembering, write it to memory/<today>.md.`,
+						`if it's worth remembering, use write_memory (or jot it in memory/<today>.md).`,
 					details,
 				);
 			}
-			const rendered = results
-				.map((r, i) => {
-					const loc = `${r.relPath}:${r.startLine}-${r.endLine}`;
-					return `[${i + 1}] ${loc} (score ${r.score.toFixed(1)})\n${r.snippet}`;
-				})
-				.join("\n\n");
+			const sections: string[] = [];
+			if (factHits.length > 0) {
+				sections.push(
+					"Facts:\n" +
+						factHits
+							.map((f) => `- [${f.segment}] ${f.content} (importance ${f.importance.toFixed(2)})`)
+							.join("\n"),
+				);
+			}
+			if (results.length > 0) {
+				sections.push(
+					"Notes:\n" +
+						results
+							.map((r, i) => {
+								const loc = `${r.relPath}:${r.startLine}-${r.endLine}`;
+								return `[${i + 1}] ${loc} (score ${r.score.toFixed(1)})\n${r.snippet}`;
+							})
+							.join("\n\n"),
+				);
+			}
 			return textResult(
-				`Found ${results.length} memory snippet${results.length === 1 ? "" : "s"} for "${query}":\n\n${rendered}`,
+				`Found ${details.resultCount} memory match${details.resultCount === 1 ? "" : "es"} for "${query}":\n\n${sections.join("\n\n")}`,
 				details,
 			);
 		},
@@ -176,6 +213,83 @@ export function makeReadMemoryTool(
 				}
 				throw err;
 			}
+		},
+	};
+}
+
+/* ───────────────────────── write_memory ───────────────────────── */
+
+const WriteMemoryParams = Type.Object({
+	content: Type.String({
+		description:
+			"One clear declarative sentence to remember durably. " +
+			'E.g. "The user prefers spaces over tabs." Keep it self-contained.',
+	}),
+	segment: Type.Union(
+		MEMORY_SEGMENTS.map((s) => Type.Literal(s)),
+		{
+			description:
+				"What kind of fact: identity (who they are) · preference (how they like things) · " +
+				"correction (fixing a prior belief — set supersedes) · relationship (people) · " +
+				"project (work/conventions) · knowledge (durable facts) · context (ongoing state).",
+		},
+	),
+	importance: Type.Optional(
+		Type.Number({ description: "0..1 importance. Omit to use the segment's default." }),
+	),
+	supersedes: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "memoryIds this fact replaces (use for corrections/updates).",
+		}),
+	),
+});
+
+interface WriteMemoryDetails {
+	memoryId: string;
+	segment: string;
+	importance: number;
+}
+
+/**
+ * Build the `write_memory` tool bound to a FactStore. Mirrors Boop's
+ * `write_memory` — persist a single distilled fact tagged by segment, with
+ * tier/importance/decay derived from that segment.
+ */
+export function makeWriteMemoryTool(
+	factStore: FactStore,
+): BrigadeTool<typeof WriteMemoryParams, WriteMemoryDetails> {
+	return {
+		name: "write_memory",
+		label: "write memory",
+		displaySummary: "saving to memory",
+		description:
+			"Persist a durable fact to long-term memory. Prefer aggressive writing — memory is " +
+			"cheap, forgetting is expensive. Save the user's identity, preferences, corrections, " +
+			"project conventions, relationships, and ongoing context. Skip transient things " +
+			'("I\'m tired right now"). One clear sentence per fact. For a correction, set ' +
+			"segment=correction and pass the prior fact's id in supersedes.",
+		parameters: WriteMemoryParams,
+		async execute(_toolCallId, params): Promise<AgentToolResult<WriteMemoryDetails>> {
+			const p = params as Record<string, unknown>;
+			const content = readStringParam(p, "content", { required: true, label: "content" });
+			const segment = readStringParam(p, "segment", {
+				required: true,
+				label: "segment",
+			}) as MemorySegment;
+			const importance = readNumberParam(p, "importance", { label: "importance" });
+			const supersedes = Array.isArray(p.supersedes)
+				? (p.supersedes as unknown[]).filter((x): x is string => typeof x === "string")
+				: undefined;
+			const rec = factStore.write({
+				content,
+				segment,
+				...(importance !== undefined ? { importance } : {}),
+				...(supersedes && supersedes.length > 0 ? { supersedes } : {}),
+			});
+			return textResult(
+				`Remembered [${rec.segment}, importance ${rec.importance.toFixed(2)}]: ${rec.content}`,
+				{ memoryId: rec.memoryId, segment: rec.segment, importance: rec.importance },
+			);
 		},
 	};
 }
