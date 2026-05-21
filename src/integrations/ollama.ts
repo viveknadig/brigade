@@ -194,3 +194,39 @@ export async function writeOllamaToModelsJson(
 
 	await fs.writeFile(modelsJsonPath, JSON.stringify(existing, null, 2), "utf8");
 }
+
+/**
+ * Runtime re-discovery for local Ollama — the Brigade equivalent of OpenClaw's
+ * Ollama discovery hook (it enumerates `/api/tags` into the provider config so
+ * any pulled model resolves without a manual catalog edit).
+ *
+ * Called when the model registry MISSES an `ollama/<model>` id: the user has
+ * almost certainly `ollama pull`ed a model since onboarding. We re-query the
+ * local daemon, merge the full catalog into models.json (capability inference
+ * + zero cost + the OpenAI-compatible provider routing), and report whether the
+ * requested model now exists. Best-effort: never throws — on any failure
+ * (daemon down, no models) it returns `false` and the caller surfaces the
+ * normal "not registered" guidance.
+ *
+ * The caller is responsible for `modelRegistry.refresh()` + re-`find()` after
+ * this resolves true, so Pi picks up the freshly-written entries.
+ */
+export async function rediscoverOllamaModel(
+	modelsJsonPath: string,
+	modelId: string,
+	baseUrl: string = DEFAULT_BASE_URL,
+): Promise<boolean> {
+	let discovered: OllamaModelSummary[];
+	try {
+		discovered = await discoverOllamaModels(baseUrl);
+	} catch {
+		// Daemon unreachable / no models — let the caller surface the standard
+		// guidance (run `ollama pull`, check the daemon is up).
+		return false;
+	}
+	if (discovered.length === 0) return false;
+	await writeOllamaToModelsJson(modelsJsonPath, baseUrl, discovered);
+	// Match on id OR name — `/api/tags` reports both, and the user may have
+	// typed either form when picking the model.
+	return discovered.some((m) => m.id === modelId || m.name === modelId);
+}

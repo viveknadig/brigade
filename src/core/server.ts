@@ -60,6 +60,7 @@ import {
 // session is surfaced for the turn's lifetime via `onSessionReady` so the
 // gateway can steer / abort / switch-model mid-stream.
 import { runResilientTurn } from "../agents/agent-loop.js";
+import { resolveModelNeverMiss } from "../agents/model-resolution.js";
 import { switchModelMidTurn as piSwitchModelMidTurn } from "../agents/mid-turn-switch.js";
 import { onAgentEvent } from "../agents/agent-event-bus.js";
 import { DEFAULT_AGENT_ID } from "../config/paths.js";
@@ -215,7 +216,15 @@ export async function startServer(opts: ServerOptions = {}): Promise<ServerHandl
 		if (!provider || !modelId) {
 			throw new Error("server: no saved config — run setup first");
 		}
-		let model = modelRegistry.find(provider, modelId);
+		let model =
+			modelRegistry.find(provider, modelId) ??
+			((await resolveModelNeverMiss({
+				modelRegistry,
+				provider,
+				modelId,
+				modelsFile: `${BRIGADE_DIR}/models.json`,
+				authStorage,
+			})) as Model<string> | undefined);
 		if (!model) {
 			throw new Error(`server: model ${provider}/${modelId} not in registry`);
 		}
@@ -260,7 +269,8 @@ interface BootContinueArgs {
 }
 
 async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
-	const { opts, port, host, startupStartedAt, lockHandle, modelRegistry, bootLog } = args;
+	const { opts, port, host, startupStartedAt, lockHandle, modelRegistry, authStorage, bootLog } = args;
+	const modelsFile = `${BRIGADE_DIR}/models.json`;
 
 	// Gateway-held turn parameters. There is NO long-lived Pi session: each
 	// inbound `prompt` builds a fresh session per turn (see the `prompt`
@@ -613,8 +623,13 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					const wizardNow = (cfgNow.agents as { defaults?: { provider?: string; model?: { fallbacks?: string[] } } } | undefined)?.defaults;
 					const fallbackProvider = wizardNow?.provider;
 					const fallbackModelId = wizardNow?.model?.fallbacks?.[0];
+					// Include the configured fallback unconditionally — the per-turn
+					// path (runResilientTurn → runSingleTurn) runs the never-miss
+					// resolver on it, so we no longer pre-filter with a static
+					// `find` (which would silently drop a valid-but-uncatalogued
+					// fallback like a fresh OpenRouter model).
 					const fallbacks =
-						fallbackProvider && fallbackModelId && modelRegistry.find(fallbackProvider, fallbackModelId)
+						fallbackProvider && fallbackModelId
 							? [{ provider: fallbackProvider, modelId: fallbackModelId }]
 							: [];
 
@@ -670,7 +685,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			}
 			case "set-model": {
 				const p = params as RequestParams["set-model"];
-				const target = modelRegistry.find(p.provider, p.modelId);
+				const target =
+					modelRegistry.find(p.provider, p.modelId) ??
+					((await resolveModelNeverMiss({
+						modelRegistry,
+						provider: p.provider,
+						modelId: p.modelId,
+						modelsFile,
+						authStorage,
+					})) as Model<string> | undefined);
 				if (!target) throw new Error(`model ${p.provider}/${p.modelId} not found`);
 				// No live session to mutate — update the gateway's current
 				// selection so the NEXT turn builds with this model. Re-pick a
@@ -688,7 +711,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			}
 			case "switch-model-mid-turn": {
 				const p = params as RequestParams["switch-model-mid-turn"];
-				const target = modelRegistry.find(p.provider, p.modelId);
+				const target =
+					modelRegistry.find(p.provider, p.modelId) ??
+					((await resolveModelNeverMiss({
+						modelRegistry,
+						provider: p.provider,
+						modelId: p.modelId,
+						modelsFile,
+						authStorage,
+					})) as Model<string> | undefined);
 				if (!target) throw new Error(`model ${p.provider}/${p.modelId} not found`);
 				// A live mid-turn switch (abort → swap → replay) only applies
 				// when a turn is actually running. If one is, perform it on the

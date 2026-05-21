@@ -41,8 +41,17 @@ export function resolveAuthStatePath(agentId: string): string {
   return path.join(resolveAuthDir(agentId), "auth-state.json");
 }
 
-export function resolveModelsPath(agentId: string): string {
-  return path.join(resolveAuthDir(agentId), "models.json");
+export function resolveModelsPath(_agentId: string): string {
+  // models.json is the per-USER provider catalog (Ollama, custom
+  // OpenAI-compatible endpoints, etc.) — NOT per-agent. It lives at the
+  // state-dir root alongside brigade.json, which is the canonical path
+  // onboarding writes to AND the gateway reads at boot. The per-turn runtime
+  // (runSingleTurn) MUST read the same file: previously this returned the
+  // per-agent auth dir, so the gateway accepted a model at boot (reading
+  // ~/.brigade/models.json) but the turn failed "Model not registered"
+  // (reading an empty ~/.brigade/agents/<id>/agent/models.json). Auth
+  // profiles stay per-agent; the provider catalog is shared per-user.
+  return path.join(resolveStateDir(), "models.json");
 }
 
 // Sessions are Pi SDK JSONL transcripts: one file per session.

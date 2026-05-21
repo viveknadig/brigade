@@ -63,6 +63,7 @@ import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { runWithRetry } from "./retry-policy.js";
 import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
 import { cleanProviderError } from "../core/model-caps.js";
+import { resolveModelNeverMiss } from "./model-resolution.js";
 import { buildBrigadeTransformContext } from "./payload-mutators.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
@@ -220,7 +221,20 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
         "update brigade's agent-loop to match the new Pi API.",
     );
   }
-  const model = registryAsFinder.find(args.provider, args.modelId);
+  let model = registryAsFinder.find(args.provider, args.modelId);
+  // Never-miss resolution (OpenClaw mirror). On a static miss, discover or
+  // synthesize a usable Model: Ollama re-queries /api/tags; cloud providers hit
+  // their /models endpoint for accurate metadata and synthesize from a
+  // catalogued template (inheriting api/baseUrl/auth). See model-resolution.ts.
+  if (!model) {
+    model = await resolveModelNeverMiss({
+      modelRegistry,
+      provider: args.provider,
+      modelId: args.modelId,
+      modelsFile,
+      authStorage,
+    });
+  }
   if (!model) {
     throw new Error(
       `Model not registered: provider=${args.provider} model=${args.modelId}.\n` +
