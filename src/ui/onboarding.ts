@@ -33,6 +33,7 @@ import {
 import { validateApiKeyOnline } from "../providers/validate-key.js";
 import { renderBrandHeader } from "./brand.js";
 import { brand, selectListTheme } from "./theme.js";
+import { SearchableSelectList } from "./searchable-select.js";
 
 export interface OnboardingResult {
 	provider: string;
@@ -698,9 +699,20 @@ async function pickModel(tui: TUI, modelRegistry: ModelRegistry, providerId: str
 		return (mb.contextWindow ?? 0) - (ma.contextWindow ?? 0);
 	});
 
-	const list = new SelectList(items, Math.min(items.length, 12), selectListTheme, {
+	// Searchable picker — providers like OpenRouter expose 270+ models, so a
+	// type-to-filter box on top of the list is the difference between usable
+	// and unusable. Fuzzy-matches across id + description (so "opus" finds
+	// claude-opus-*, "gpt mini" finds gpt-*-mini). Falls back to a plain
+	// scrollable list when the query is empty.
+	const list = new SearchableSelectList(items, 12, selectListTheme, {
 		minPrimaryColumnWidth: 26,
 		maxPrimaryColumnWidth: 38,
+		formatHeader: (q, matchCount, total) =>
+			brand.dim(
+				q.length > 0
+					? `  search: ${q}▌  (${matchCount}/${total} match${matchCount === 1 ? "" : "es"})`
+					: `  ${total} models · type to filter · ↑↓ move · Enter select · Esc back`,
+			),
 	});
 	tui.addChild(list);
 	tui.setFocus(list);

@@ -14,6 +14,7 @@
   "files": [
     "brigade.mjs",
     "scripts/run-brigade.mjs",
+    "scripts/build-done.mjs",
     "dist/**/*",
     "templates/**/*",
     "README.md",
@@ -21,6 +22,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "postbuild": "node scripts/build-done.mjs",
     "build:watch": "tsc -p tsconfig.build.json --watch",
     "clean": "node -e \"import('node:fs').then(fs => fs.rmSync('dist', { recursive: true, force: true }))\"",
     "prepack": "npm run build",
