@@ -37,11 +37,20 @@ function makeFakeChannel(overrides: Partial<ChannelAdapter> = {}): {
 }
 
 describe("channelSessionKey", () => {
-	it("scopes per agent + channel + conversation", () => {
-		assert.equal(channelSessionKey("main", "whatsapp", "123@s.whatsapp.net"), "agent:main:whatsapp:123@s.whatsapp.net");
+	it("scopes per agent + channel + conversation with a readable prefix", () => {
+		const key = channelSessionKey("main", "whatsapp", "123@s.whatsapp.net");
+		assert.match(key, /^agent:main:whatsapp:123@s\.whatsapp\.net\.[0-9a-f]{8}$/);
 	});
-	it("sanitizes whitespace + reserved separators", () => {
-		assert.equal(channelSessionKey("main", "slack", "C 01:thread"), "agent:main:slack:C_01_thread");
+	it("sanitizes whitespace + reserved separators in the readable prefix", () => {
+		const key = channelSessionKey("main", "slack", "C 01:thread");
+		assert.match(key, /^agent:main:slack:C_01_thread\.[0-9a-f]{8}$/);
+	});
+	it("never collides distinct ids that sanitize to the same prefix", () => {
+		// "a:b" and "a b" both sanitize to "a_b" — the raw-id hash keeps them apart.
+		assert.notEqual(channelSessionKey("main", "x", "a:b"), channelSessionKey("main", "x", "a b"));
+	});
+	it("is stable for the same id", () => {
+		assert.equal(channelSessionKey("main", "x", "c1"), channelSessionKey("main", "x", "c1"));
 	});
 });
 
@@ -66,7 +75,9 @@ describe("startChannels", () => {
 		});
 		const msg: InboundMessage = { channel: "fake", conversationId: "c1", from: "u1", text: "ping" };
 		await f.ctx().onInbound(msg);
-		assert.deepEqual(calls, [{ text: "ping", sessionKey: "agent:main:fake:c1" }]);
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0]?.text, "ping");
+		assert.match(calls[0]?.sessionKey ?? "", /^agent:main:fake:c1\.[0-9a-f]{8}$/);
 		assert.deepEqual(f.sent, [{ conversationId: "c1", text: "pong" }]);
 		await mgr.stop();
 	});

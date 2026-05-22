@@ -55,8 +55,7 @@ export interface ChannelManager {
 /**
  * Start every configured channel adapter. Returns a handle whose `stop()` tears
  * them all down. Channels that aren't configured (missing keys/settings) are
- * skipped silently — the same shape as OpenClaw, where only configured accounts
- * spin up a listener.
+ * skipped silently — only configured channels spin up a listener.
  */
 export async function startChannels(args: StartChannelsArgs): Promise<ChannelManager> {
 	const env = args.env ?? process.env;

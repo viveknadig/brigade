@@ -64,7 +64,7 @@ export function createWhatsAppAdapter(): ChannelAdapter {
 				},
 				onConnected: () => ctx.log("WhatsApp ready"),
 				onLoggedOut: () =>
-					ctx.log("WhatsApp logged out — delete the channel auth dir and restart to re-link"),
+					ctx.log(`WhatsApp was unlinked. Delete ${authDir} and restart to scan a new QR code.`),
 				onMessage: (msg) => {
 					void ctx.onInbound({
 						channel: CHANNEL_ID,

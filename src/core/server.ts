@@ -314,6 +314,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// (see below), torn down in handle.stop(). Null when no channel is configured.
 	let channelManager: ChannelManager | undefined;
 
+	// Set true once handle.stop() begins, so background work (memory extraction
+	// debounce) doesn't re-arm timers or run sweeps against a torn-down server.
+	let serverStopped = false;
+
 	// ── Background memory extraction (off the hot path) ──
 	// After a turn settles we DEBOUNCE a batched sweep: during quiet time it
 	// distills the NEW transcript turns into structured facts in ONE extra
@@ -329,28 +333,35 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	const memoryExtractEnabled = process.env.BRIGADE_DISABLE_MEMORY_EXTRACT !== "1";
 	const EXTRACT_DEBOUNCE_MS = 45_000;
 	let extractTimer: ReturnType<typeof setTimeout> | null = null;
-	let pendingExtract: { sessionId: string; messages: unknown[] } | null = null;
+	// Keyed by sessionId so turns from DIFFERENT conversations (e.g. a WhatsApp
+	// chat and the TUI) that settle inside the same debounce window each keep
+	// their own pending batch — a single slot would let one overwrite another
+	// and silently drop its turns. Re-setting the same sessionId just refreshes
+	// that conversation's batch with the latest transcript.
+	const pendingExtracts = new Map<string, unknown[]>();
 	let extracting = false;
 
 	const armExtractTimer = (): void => {
+		if (serverStopped) return; // never re-arm after shutdown
 		if (extractTimer) clearTimeout(extractTimer);
 		extractTimer = setTimeout(() => void runExtractionNow(), EXTRACT_DEBOUNCE_MS);
 		extractTimer.unref?.();
 	};
 
 	const runExtractionNow = async (): Promise<void> => {
-		if (!pendingExtract) return;
+		if (pendingExtracts.size === 0 || serverStopped) return;
 		// Defer while a turn is active OR another sweep is in flight — never
 		// compete with the user-facing call or run two extractions at once.
-		// CRITICAL: re-arm rather than DROP the pending batch (otherwise a sweep
+		// CRITICAL: re-arm rather than DROP the pending batches (otherwise a sweep
 		// that fires mid-turn would silently lose the turns it was meant to
 		// distill, with nothing to retrigger it until the next prompt).
 		if (isAgentRunning || extracting) {
 			armExtractTimer();
 			return;
 		}
-		const pending = pendingExtract;
-		pendingExtract = null;
+		// Drain every pending conversation's batch this window.
+		const batches = [...pendingExtracts.entries()];
+		pendingExtracts.clear();
 		extracting = true;
 		try {
 			const workspaceDir = resolveAgentWorkspaceDir(agentId);
@@ -361,14 +372,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				modelRegistry,
 				model,
 			});
-			await runExtractionSweep({
-				workspaceDir,
-				sessionId: pending.sessionId,
-				messages: pending.messages,
-				llm,
-			});
+			for (const [sessionId, messages] of batches) {
+				await runExtractionSweep({ workspaceDir, sessionId, messages, llm });
+			}
 			// Cheap, no-model-call decay GC in the same quiet window — ages out
-			// neglected facts so the structured store self-prunes.
+			// neglected facts so the structured store self-prunes. Runs once per
+			// drain regardless of how many conversations were swept.
 			runDecayGc(workspaceDir);
 			// Lean semantic consolidation (1 LLM call) — THROTTLED to ~once/30min:
 			// archives contradicted/duplicate facts that lexical write-time dedup
@@ -400,8 +409,8 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	};
 
 	const scheduleExtraction = (result: { sessionId: string; messages: unknown[] }): void => {
-		if (!memoryExtractEnabled) return;
-		pendingExtract = { sessionId: result.sessionId, messages: result.messages };
+		if (!memoryExtractEnabled || serverStopped) return;
+		pendingExtracts.set(result.sessionId, result.messages);
 		armExtractTimer();
 	};
 
@@ -1118,21 +1127,27 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		port,
 		host,
 		async stop() {
+			serverStopped = true; // freeze background memory work
 			clearInterval(tickTimer);
 			if (extractTimer) clearTimeout(extractTimer);
+			pendingExtracts.clear();
 			// Stop channels first so no new inbound turn is enqueued during teardown.
 			if (channelManager) {
 				await channelManager.stop().catch(() => {});
 				channelManager = undefined;
 			}
+			// Best-effort abort of a turn that's still streaming, then WAIT for the
+			// turn queue to drain so an in-flight (or just-queued) turn's finally —
+			// cleanup, broadcast, scheduleExtraction — can't run against a
+			// torn-down server after stop() returns.
+			if (inFlightSession) await inFlightSession.abort().catch(() => {});
+			await turnChain.catch(() => {});
 			// Tear down any in-flight turn's Pi subscription + JSONL logger.
 			// Between turns there's nothing attached, so this is a no-op then.
 			if (currentTurnCleanup) {
 				currentTurnCleanup();
 				currentTurnCleanup = null;
 			}
-			// Best-effort abort of a turn that's still streaming at shutdown.
-			if (inFlightSession) await inFlightSession.abort().catch(() => {});
 			detachLifecycleBus();
 			for (const ws of clients) {
 				try {

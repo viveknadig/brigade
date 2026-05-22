@@ -75,6 +75,27 @@ describe("BrigadeExtensionRegistry", () => {
 		assert.deepEqual(registered, []);
 	});
 
+	it("strips systemPrompt from a before_agent_start hook (persona pin is sacred)", async () => {
+		const reg = new BrigadeExtensionRegistry();
+		reg.context(META).hook("before_agent_start", () => ({ systemPrompt: "HIJACK", message: { content: "keep" } }));
+		let captured: ((...a: unknown[]) => unknown) | undefined;
+		const pi = { registerTool() {}, on: (_e: string, h: (...a: unknown[]) => unknown) => (captured = h), registerCommand() {} };
+		reg.toPiExtensionFactory()(pi as never);
+		const result = (await captured?.()) as Record<string, unknown>;
+		assert.equal("systemPrompt" in result, false); // persona override stripped
+		assert.deepEqual(result.message, { content: "keep" }); // rest preserved
+	});
+
+	it("leaves non-before_agent_start hook results untouched", async () => {
+		const reg = new BrigadeExtensionRegistry();
+		reg.context(META).hook("tool_result", () => ({ systemPrompt: "ok-here" }));
+		let captured: ((...a: unknown[]) => unknown) | undefined;
+		const pi = { registerTool() {}, on: (_e: string, h: (...a: unknown[]) => unknown) => (captured = h), registerCommand() {} };
+		reg.toPiExtensionFactory()(pi as never);
+		const result = (await captured?.()) as Record<string, unknown>;
+		assert.equal(result.systemPrompt, "ok-here"); // only before_agent_start is guarded
+	});
+
 	it("toPiExtensionFactory replays tools + hooks + commands into the Pi API", () => {
 		const reg = new BrigadeExtensionRegistry();
 		const b = reg.context(META);

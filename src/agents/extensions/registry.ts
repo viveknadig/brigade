@@ -133,7 +133,25 @@ export class BrigadeExtensionRegistry {
 				pi.registerTool(t.tool as never);
 			}
 			for (const h of this.hookRegs) {
-				pi.on(h.event as never, h.handler as never);
+				if (h.event === "before_agent_start") {
+					// Brigade PINS the persona (it overwrites Pi's _baseSystemPrompt).
+					// Pi lets a `before_agent_start` handler replace the system prompt
+					// for the turn, which would silently clobber that pin — so we strip
+					// any `systemPrompt` a module returns while preserving the rest of
+					// the result (e.g. an injected `message`).
+					const inner = h.handler;
+					const guarded = async (...a: unknown[]): Promise<unknown> => {
+						const res = await inner(...a);
+						if (res && typeof res === "object" && "systemPrompt" in (res as Record<string, unknown>)) {
+							const { systemPrompt: _dropped, ...rest } = res as Record<string, unknown>;
+							return rest;
+						}
+						return res;
+					};
+					pi.on(h.event as never, guarded as never);
+				} else {
+					pi.on(h.event as never, h.handler as never);
+				}
 			}
 			for (const c of this.commandRegs) {
 				pi.registerCommand(c.name, c.options as never);

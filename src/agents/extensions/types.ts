@@ -14,12 +14,9 @@
  * writing a module that implements the contract + calls `b.tts(...)` / `b.channel(...)`
  * — existing code never changes. Implementations land per phase; the seam doesn't move.
  *
- * Mirrors OpenClaw's plugin-API register surface (full parity) but realized as
- * Pi extensions + light registries instead of an 80K-LOC engine. See the memory
- * note `project_brigade_extensibility_plan`.
+ * Provides a full plugin-API register surface, but realized as Pi extensions +
+ * light capability registries instead of a bespoke engine.
  */
-
-import type { TSchema } from "typebox";
 
 import type { BrigadeConfig } from "../../config/io.js";
 import type { AnyBrigadeTool } from "../tools/types.js";
@@ -134,7 +131,7 @@ export interface HookRegistration {
 }
 
 /** A recorded tool registration + its enablement gate. */
-export interface ToolRegistration<TParams extends TSchema = TSchema, TDetails = unknown> {
+export interface ToolRegistration {
 	tool: AnyBrigadeTool;
 	/** Toolset grouping (minimal/coding/messaging/full); informs profile gating. */
 	toolset?: string;
@@ -161,6 +158,12 @@ export interface BrigadeExtensionContext {
 
 	/* agent-level → replayed into Pi's ExtensionAPI per session */
 	tool(tool: AnyBrigadeTool, opts?: { toolset?: string; eligible?: () => boolean }): void;
+	/**
+	 * Subscribe to a Pi lifecycle event (replayed via `pi.on`). NOTE: a
+	 * `before_agent_start` handler may NOT replace the system prompt — Brigade
+	 * pins the persona, so any `systemPrompt` returned from that event is
+	 * stripped before Pi sees it (the rest of the result is kept).
+	 */
 	hook(event: string, handler: (...args: unknown[]) => unknown): void;
 	command(name: string, options: unknown): void;
 	modelProvider(name: string, config: unknown): void;
