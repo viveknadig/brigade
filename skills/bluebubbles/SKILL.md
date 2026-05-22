@@ -1,14 +1,14 @@
 ---
 name: bluebubbles
 description: Use when you need to send or manage iMessages via BlueBubbles (recommended iMessage integration). Calls go through the generic message tool with channel="bluebubbles".
-metadata: { "openclaw": { "emoji": "🫧", "requires": { "config": ["channels.bluebubbles"] } } }
+metadata: { "brigade": { "emoji": "🫧", "requires": { "config": ["channels.bluebubbles"] } } }
 ---
 
 # BlueBubbles Actions
 
 ## Overview
 
-BlueBubbles is OpenClaw’s recommended iMessage integration. Use the `message` tool with `channel: "bluebubbles"` to send messages and manage iMessage conversations: send texts and attachments, react (tapbacks), edit/unsend, reply in threads, and manage group participants/names/icons.
+BlueBubbles is Brigade’s recommended iMessage integration. Use the `message` tool with `channel: "bluebubbles"` to send messages and manage iMessage conversations: send texts and attachments, react (tapbacks), edit/unsend, reply in threads, and manage group participants/names/icons.
 
 ## Inputs to collect
 
@@ -28,7 +28,7 @@ If the user is vague ("text my mom"), ask for the recipient handle or chat guid 
   "action": "send",
   "channel": "bluebubbles",
   "target": "+15551234567",
-  "message": "hello from OpenClaw"
+  "message": "hello from Brigade"
 }
 ```
 
@@ -122,7 +122,7 @@ Use `message` for the user-facing text. Do not rely on `caption` as a distinct B
 
 - Requires gateway config `channels.bluebubbles` (serverUrl/password/webhookPath).
 - Prefer `chat_guid` targets when you have them (especially for group chats).
-- For media + text, treat `message` as canonical. OpenClaw can accept `caption` as an alias, but BlueBubbles/iMessage does not offer a reliable native attachment-caption concept.
+- For media + text, treat `message` as canonical. Brigade can accept `caption` as an alias, but BlueBubbles/iMessage does not offer a reliable native attachment-caption concept.
 - In practice, media with text may arrive as the attachment plus a separate text message rather than one captioned bubble. Do not promise exact attachment-caption rendering.
 - If you must use the channel-specific file action, the canonical action name is `upload-file`; `sendAttachment` is a legacy alias.
 - BlueBubbles supports rich actions, but some are macOS-version dependent (for example, edit may be broken on macOS 26 Tahoe).
