@@ -59,7 +59,9 @@ import {
 // `runEmbeddedAttempt` and no session lives between turns. The in-flight
 // session is surfaced for the turn's lifetime via `onSessionReady` so the
 // gateway can steer / abort / switch-model mid-stream.
-import { runResilientTurn } from "../agents/agent-loop.js";
+import { runResilientTurn, type RunSingleTurnResult } from "../agents/agent-loop.js";
+import { BUNDLED_MODULES, loadModules } from "../agents/extensions/index.js";
+import { type ChannelManager, startChannels } from "../agents/channels/manager.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
 import { switchModelMidTurn as piSwitchModelMidTurn } from "../agents/mid-turn-switch.js";
 import { onAgentEvent } from "../agents/agent-event-bus.js";
@@ -307,6 +309,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// JSONL event logger for the active turn. Set when a turn starts, called
 	// (idempotently) when it settles.
 	let currentTurnCleanup: (() => void) | null = null;
+
+	// Channel manager (WhatsApp/Slack/…): started after the WS listener is up
+	// (see below), torn down in handle.stop(). Null when no channel is configured.
+	let channelManager: ChannelManager | undefined;
 
 	// ── Background memory extraction (off the hot path) ──
 	// After a turn settles we DEBOUNCE a batched sweep: during quiet time it
@@ -681,6 +687,83 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		}
 	});
 
+	/* ──────────────── serialized turn executor ──────────────── */
+
+	// Every agent turn — whether from a TUI `prompt` RPC or an inbound channel
+	// message — runs through this single FIFO queue. There is exactly one brain
+	// in this phase: turns never overlap, so the per-turn session plumbing
+	// (inFlightSession / broadcast snapshot / extraction debounce) stays
+	// single-writer. Phase 2 (multi-user) will shard the queue per crew; the
+	// `runGatewayTurn` seam is what they'll plug into.
+	let turnChain: Promise<unknown> = Promise.resolve();
+	const runQueued = <T>(fn: () => Promise<T>): Promise<T> => {
+		// Chain onto the previous turn regardless of how it settled, so one
+		// turn's failure never wedges the queue.
+		const run = turnChain.then(fn, fn);
+		turnChain = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		return run;
+	};
+
+	/**
+	 * Run one agent turn end-to-end and return its result. Builds a FRESH Pi
+	 * session via the canonical per-turn path (`runResilientTurn`), resumes the
+	 * transcript identified by `sessionKey`, runs the full Brigade safety stack,
+	 * schedules the off-hot-path memory sweep, and tears the per-turn wiring down
+	 * when it settles. Always invoked inside `runQueued` so only one runs at once.
+	 */
+	const runGatewayTurn = (turn: { text: string; sessionKey: string }): Promise<RunSingleTurnResult> =>
+		runQueued(async () => {
+			isAgentRunning = true;
+			broadcast("state", buildSnapshot());
+			try {
+				// Resolve fallback model fresh per turn — the user may have edited
+				// config (or rotated keys) between turns. F:\Brigade's shape:
+				// `agents.defaults.model.fallbacks[]` (string array).
+				const cfgNow = await loadConfig();
+				const wizardNow = (
+					cfgNow.agents as { defaults?: { provider?: string; model?: { fallbacks?: string[] } } } | undefined
+				)?.defaults;
+				const fallbackProvider = wizardNow?.provider;
+				const fallbackModelId = wizardNow?.model?.fallbacks?.[0];
+				// Include the configured fallback unconditionally — the per-turn path
+				// runs the never-miss resolver on it, so we don't pre-filter with a
+				// static `find` (which would drop a valid-but-uncatalogued fallback).
+				const fallbacks =
+					fallbackProvider && fallbackModelId ? [{ provider: fallbackProvider, modelId: fallbackModelId }] : [];
+
+				const result = await runResilientTurn({
+					agentId,
+					provider,
+					modelId,
+					message: turn.text,
+					sessionKey: turn.sessionKey,
+					thinkingLevel: thinkingLevel as "off" | "low" | "medium" | "high",
+					fallbacks,
+					onSessionReady: (session) => {
+						// A fallback candidate builds a fresh session; tear down the
+						// previous candidate's wiring before attaching the new one.
+						if (currentTurnCleanup) currentTurnCleanup();
+						currentTurnCleanup = attachTurnSession(session);
+					},
+				});
+				// Queue a debounced, batched memory-extraction sweep over the settled
+				// transcript (off the hot path; see scheduleExtraction).
+				scheduleExtraction({ sessionId: result.sessionId, messages: result.messages });
+				return result;
+			} finally {
+				if (currentTurnCleanup) {
+					currentTurnCleanup();
+					currentTurnCleanup = null;
+				}
+				inFlightSession = null;
+				isAgentRunning = false;
+				broadcast("state", buildSnapshot());
+			}
+		});
+
 	/* ──────────────── request handler ──────────────── */
 
 	/**
@@ -702,72 +785,13 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		switch (method) {
 			case "prompt": {
 				const p = params as RequestParams["prompt"];
-				// One turn at a time. The per-turn model resumes a single
-				// shared transcript by sessionKey, so two overlapping prompts
-				// would interleave appends to the same JSONL. Reject the second.
-				//
-				// Claim the turn SYNCHRONOUSLY — set `isAgentRunning` immediately
-				// after the guard check, before the first `await`. Otherwise two
-				// prompts arriving in the same tick both pass the check (the
-				// `await loadConfig()` below yields the event loop between them)
-				// and both start. The flag is owned here, top to bottom (NOT by
-				// Pi's per-run agent_end — see the per-turn subscription note).
+				// One turn at a time. Fast-reject if a turn is already streaming so
+				// the interactive client gets immediate feedback rather than a
+				// silently-queued duplicate. Correctness (no overlap) is guaranteed
+				// by `runGatewayTurn`'s serialized queue regardless — this check is
+				// just UX. The TUI prompt drives the gateway's main session key.
 				if (isAgentRunning) throw new Error("a turn is already in progress");
-				isAgentRunning = true;
-				broadcast("state", buildSnapshot());
-				try {
-					// Resolve fallback model fresh per turn — the user may have
-					// edited config (or rotated keys) between turns. F:\Brigade's
-					// new shape: `agents.defaults.model.fallbacks[]` (string array).
-					const cfgNow = await loadConfig();
-					const wizardNow = (cfgNow.agents as { defaults?: { provider?: string; model?: { fallbacks?: string[] } } } | undefined)?.defaults;
-					const fallbackProvider = wizardNow?.provider;
-					const fallbackModelId = wizardNow?.model?.fallbacks?.[0];
-					// Include the configured fallback unconditionally — the per-turn
-					// path (runResilientTurn → runSingleTurn) runs the never-miss
-					// resolver on it, so we no longer pre-filter with a static
-					// `find` (which would silently drop a valid-but-uncatalogued
-					// fallback like a fresh OpenRouter model).
-					const fallbacks =
-						fallbackProvider && fallbackModelId
-							? [{ provider: fallbackProvider, modelId: fallbackModelId }]
-							: [];
-
-					// Build a FRESH session for this turn via the single canonical
-					// per-turn path. `runResilientTurn` resolves auth + model,
-					// resumes the JSONL transcript by sessionKey, runs the full
-					// Brigade safety stack (retry → thinking-fallback → content
-					// quality → stream wrappers → multi-model fallback), and drops
-					// the session when it settles. `onSessionReady` hands us the
-					// session for its lifetime so abort/steer/switch-model-mid-turn
-					// have something to act on; we tear the wiring down in finally.
-					const result = await runResilientTurn({
-						agentId,
-						provider,
-						modelId,
-						message: p.text,
-						sessionKey,
-						thinkingLevel: thinkingLevel as "off" | "low" | "medium" | "high",
-						fallbacks,
-						onSessionReady: (session) => {
-							// A fallback candidate builds a fresh session; tear
-							// down the previous candidate's wiring before attaching.
-							if (currentTurnCleanup) currentTurnCleanup();
-							currentTurnCleanup = attachTurnSession(session);
-						},
-					});
-					// Queue a debounced, batched memory-extraction sweep over the
-					// settled transcript (off the hot path; see scheduleExtraction).
-					scheduleExtraction({ sessionId: result.sessionId, messages: result.messages });
-				} finally {
-					if (currentTurnCleanup) {
-						currentTurnCleanup();
-						currentTurnCleanup = null;
-					}
-					inFlightSession = null;
-					isAgentRunning = false;
-					broadcast("state", buildSnapshot());
-				}
+				await runGatewayTurn({ text: p.text, sessionKey });
 				return undefined as ResponseFor[M];
 			}
 			case "abort": {
@@ -1044,6 +1068,42 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// `log file: <path>` line (`src/gateway/server-startup-log.ts:33`).
 	bootLog(`log file: ${getTodayLogPath()}`);
 
+	// Phase 11 — channels. Load the extension registry for its product-level
+	// channel adapters and start any that are configured. Inbound messages run
+	// through the SAME serialized turn queue as TUI prompts (`runGatewayTurn`),
+	// so a channel turn never overlaps a TUI turn. A channel that isn't
+	// configured (or fails to start) is skipped — never fatal to the gateway.
+	try {
+		const cfgForChannels = await loadConfig();
+		const workspaceDir = resolveAgentWorkspaceDir(agentId);
+		const registry = await loadModules({
+			modules: BUNDLED_MODULES,
+			meta: { agentId, workspaceDir, cwd: workspaceDir, config: cfgForChannels as never },
+		});
+		if (registry.channels.length > 0) {
+			channelManager = await startChannels({
+				adapters: registry.channels,
+				config: cfgForChannels as never,
+				agentId,
+				runTurn: (turn) => runGatewayTurn(turn),
+				onPairing: (channelId, info) => {
+					const line =
+						info.kind === "qr"
+							? `[${channelId}] scan the QR code shown in the gateway logs to link your account`
+							: `[${channelId}] pairing code: ${info.value}`;
+					bootLog(line);
+					broadcast("log", { level: "info", message: line, at: Date.now() });
+				},
+			});
+			if (channelManager.started.length > 0) {
+				bootLog(`channels: ${channelManager.started.join(", ")}`);
+			}
+		}
+	} catch (err) {
+		// Channels are best-effort — a failure here must not stop the gateway.
+		bootLog(`channels failed to start: ${err instanceof Error ? err.message : String(err)}`);
+	}
+
 	// Write the PID file AFTER the listen succeeded so a failed-to-bind boot
 	// doesn't leave a stale pointer to a process that never accepted any
 	// connections. `brigade gateway stop` reads this to find the daemon.
@@ -1060,6 +1120,11 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		async stop() {
 			clearInterval(tickTimer);
 			if (extractTimer) clearTimeout(extractTimer);
+			// Stop channels first so no new inbound turn is enqueued during teardown.
+			if (channelManager) {
+				await channelManager.stop().catch(() => {});
+				channelManager = undefined;
+			}
 			// Tear down any in-flight turn's Pi subscription + JSONL logger.
 			// Between turns there's nothing attached, so this is a no-op then.
 			if (currentTurnCleanup) {
