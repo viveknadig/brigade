@@ -40,7 +40,8 @@ import {
   defaultSessionKey,
   resolveOrCreateSession,
 } from "../sessions/session-store.js";
-import { readConfigOrInit } from "../config/io.js";
+import { readConfigOrInit, type BrigadeConfig } from "../config/io.js";
+import { discoverEligibleSkills } from "./skills/index.js";
 import { assembleSystemPrompt } from "../system-prompt/assembler.js";
 import {
   loadHeartbeatFile,
@@ -355,7 +356,26 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   const toolset = assembleBrigadeToolset({ workspaceDir, agentId, cwd });
   const brigadeCustomTools = toolset.customTools;
   const enabledToolNames = toolset.enabledToolNames;
-  const promptCapabilities = toolset.capabilities;
+
+  // Primitive #5 (Skills): discover the skills eligible for this turn — a
+  // cheap synchronous scan of the bundled + workspace roots, OS/binary/env
+  // filtered. The rendered <available_skills> block (if any) is injected into
+  // the assembled persona prompt below; the model loads a skill's body on
+  // demand via the existing `read` tool. `capabilities.skills` gates the
+  // `## Skills` guidance section so it only appears when a skill is available.
+  // Read the config ONCE per turn and thread it to both skill discovery and
+  // the persona assembler — avoids a duplicate brigade.json read and any
+  // chance the two reads disagree if the file is rewritten mid-turn.
+  const turnConfig = readConfigOrInit();
+  const skillDiscovery = discoverEligibleSkills({ workspaceDir, config: turnConfig });
+  const promptCapabilities = {
+    ...toolset.capabilities,
+    // Gate on the RENDERED block, not the eligible count: a skill set that's
+    // entirely model-invocation-disabled yields an empty block, and emitting
+    // the "scan the skills listed below" guidance with no list beneath it is
+    // misleading. promptBlock is undefined exactly when there's nothing to show.
+    skills: skillDiscovery.promptBlock !== undefined,
+  };
 
   const { session } = await createAgentSession({
     cwd,
@@ -367,7 +387,11 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     tools: enabledToolNames,
     customTools: brigadeCustomTools,
     sessionManager,
-    resourceLoader: new DefaultResourceLoader({ cwd, agentDir }),
+    // `noSkills`: Brigade owns skill discovery + rendering (see skills/) and
+    // injects the block into the assembled persona prompt. Pi's own skills
+    // injection would be clobbered by the persona pin anyway, and leaving it
+    // on would make Pi scan `<cwd>/.pi/skills` — outside Brigade's state.
+    resourceLoader: new DefaultResourceLoader({ cwd, agentDir, noSkills: true }),
     transformContext,
   } as never);
 
@@ -530,6 +554,11 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     bootstrapPhase: effectivePhase,
     toolDescriptions,
     capabilities: promptCapabilities,
+    // Pre-rendered <available_skills> XML for the eligible skills (Primitive
+    // #5). Lands in the cached prefix under `## Skills`; the model reads a
+    // skill's body on demand via the read tool.
+    skillsPromptBlock: skillDiscovery.promptBlock,
+    config: turnConfig,
     // Auto-recall: lexically surface the top relevant structured facts for THIS
     // user message as an ephemeral (per-turn, below-cache-boundary) suffix, so
     // the model has them without calling recall_memory. Sync + free. This is a
@@ -921,12 +950,19 @@ async function buildPersonaPrompt(args: {
    */
   capabilities?: { memory?: boolean; skills?: boolean; subAgents?: boolean };
   /**
+   * Pre-rendered `<available_skills>` block (Primitive #5). Emitted in the
+   * cached prefix under `## Skills` when `capabilities.skills` is true.
+   */
+  skillsPromptBlock?: string;
+  /**
    * Per-turn-only suffix pinned BELOW the cache boundary so it never busts
    * the cached prefix. Used by sub-agent task framing in Primitive #6.
    */
   ephemeralSuffix?: string;
+  /** The turn's config (read once upstream). Falls back to a read when omitted. */
+  config?: BrigadeConfig;
 }): Promise<string> {
-  const config = readConfigOrInit();
+  const config = args.config ?? readConfigOrInit();
   const override = resolveSystemPromptOverride({ config, agentId: args.agentId });
   if (override) return override;
 
@@ -954,6 +990,7 @@ async function buildPersonaPrompt(args: {
     modelId: args.modelId,
     thinkingLevel: args.thinkingLevel,
     capabilities: args.capabilities,
+    skillsPromptBlock: args.skillsPromptBlock,
     ephemeralSuffix: args.ephemeralSuffix,
   });
   return assembled.text;

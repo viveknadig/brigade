@@ -252,14 +252,49 @@ describe("assembleSystemPrompt — capability-gated sections", () => {
 		assert.doesNotMatch(out.text, /## Memory/);
 	});
 
-	it("Skills / Sub-agents blocks are still unwired (Primitives #5/#6)", () => {
+	it("injects the ## Skills block + rendered list when capabilities.skills is true", () => {
 		const out = assembleSystemPrompt({
 			runtime: MOCK_RUNTIME,
 			personaFiles: [],
 			toolDescriptions: [],
-			capabilities: { memory: true, skills: true, subAgents: true },
+			capabilities: { skills: true },
+			skillsPromptBlock: "<available_skills>\n  <skill><name>demo</name></skill>\n</available_skills>",
 		});
-		assert.doesNotMatch(out.text, /# Skills/);
+		assert.match(out.text, /## Skills/);
+		assert.match(out.text, /Before replying to anything non-trivial/);
+		assert.match(out.text, /<available_skills>/);
+		assert.match(out.text, /<name>demo<\/name>/);
+	});
+
+	it("emits ## Skills guidance even with no rendered block, but omits the empty block", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+			capabilities: { skills: true },
+		});
+		assert.match(out.text, /## Skills/);
+		assert.doesNotMatch(out.text, /<available_skills>/);
+	});
+
+	it("does NOT inject ## Skills when capabilities.skills is absent/false", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+			skillsPromptBlock: "<available_skills>x</available_skills>",
+		});
+		assert.doesNotMatch(out.text, /## Skills/);
+		assert.doesNotMatch(out.text, /<available_skills>/);
+	});
+
+	it("Sub-agents block is still unwired (Primitive #6)", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+			capabilities: { subAgents: true },
+		});
 		assert.doesNotMatch(out.text, /# Sub-agents/);
 	});
 });

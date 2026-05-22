@@ -121,6 +121,10 @@ const SKILL_ENTRY_SCHEMA = Type.Object({
 });
 
 const SKILLS_SCHEMA = Type.Object({
+	// Global on/off for the skills subsystem (default: on when omitted).
+	enabled: Type.Optional(Type.Boolean()),
+	// Extra skill search roots beyond the bundled + workspace dirs.
+	paths: Type.Optional(Type.Array(Type.String())),
 	entries: Type.Optional(Type.Record(Type.String(), SKILL_ENTRY_SCHEMA)),
 });
 

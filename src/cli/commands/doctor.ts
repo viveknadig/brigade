@@ -31,6 +31,8 @@ import {
 } from "../../config/paths.js";
 import { FileMemoryStore } from "../../agents/memory/storage.js";
 import { FactStore } from "../../agents/memory/records.js";
+import { discoverEligibleSkills } from "../../agents/skills/index.js";
+import { readConfigOrInit } from "../../config/io.js";
 import { BRIGADE_DIR, loadConfig } from "../../core/config.js";
 import { loadBrigadeAuthStorage } from "../../core/auth-bridge.js";
 import { getTodayLogPath } from "../../core/event-logger.js";
@@ -66,6 +68,7 @@ export async function runDoctorCommand(opts: DoctorCommandOptions = {}): Promise
 	checks.push(checkConfiguredProvider(await safeLoadConfig()));
 	checks.push(checkWorkspace());
 	checks.push(await checkMemory());
+	checks.push(checkSkills());
 	checks.push(checkLogDirWritable());
 	checks.push(checkExecApprovals());
 	checks.push(await checkGateway(opts));
@@ -353,6 +356,36 @@ async function checkMemory(): Promise<CheckResult> {
 		name: "memory",
 		status: "ok",
 		message: `${factCount} fact${factCount === 1 ? "" : "s"} · ${summary.fileCount} note file${summary.fileCount === 1 ? "" : "s"}, ${kb} KB`,
+	};
+}
+
+function checkSkills(): CheckResult {
+	const workspaceDir = resolveAgentWorkspaceDir(DEFAULT_AGENT_ID);
+	let result: ReturnType<typeof discoverEligibleSkills>;
+	try {
+		result = discoverEligibleSkills({ workspaceDir, config: readConfigOrInit() });
+	} catch (err) {
+		return {
+			name: "skills",
+			status: "warn",
+			message: `could not scan skills: ${(err as Error).message}`,
+		};
+	}
+	const count = result.skills.length;
+	if (count === 0) {
+		// "ok" — no skills is the normal fresh state. Drop a folder to add one.
+		return {
+			name: "skills",
+			status: "ok",
+			message: "no skills yet — drop a folder in workspace/skills/<name>/SKILL.md",
+		};
+	}
+	const hidden = result.totalDiscovered - count;
+	const suffix = hidden > 0 ? ` (${hidden} not eligible here)` : "";
+	return {
+		name: "skills",
+		status: "ok",
+		message: `${count} skill${count === 1 ? "" : "s"} available${suffix}`,
 	};
 }
 

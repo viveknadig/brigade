@@ -17,6 +17,7 @@
     "scripts/build-done.mjs",
     "dist/**/*",
     "templates/**/*",
+    "skills/**/*",
     "README.md",
     "LICENSE"
   ],

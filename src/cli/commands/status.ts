@@ -25,6 +25,8 @@ import type { Command } from "commander";
 
 import { FileMemoryStore } from "../../agents/memory/storage.js";
 import { FactStore } from "../../agents/memory/records.js";
+import { discoverEligibleSkills } from "../../agents/skills/index.js";
+import { readConfigOrInit } from "../../config/io.js";
 import { DEFAULT_AGENT_ID, resolveAuthProfilesPath, resolveSessionsDir } from "../../config/paths.js";
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, loadConfig } from "../../core/config.js";
 import { getLastLoggedError, getTodayLogPath } from "../../core/event-logger.js";
@@ -51,6 +53,9 @@ interface StatusReport {
 		fileCount: number;
 		totalBytes: number;
 		factCount: number;
+	};
+	skills: {
+		count: number;
 	};
 	execApprovals: {
 		filePath: string;
@@ -103,6 +108,16 @@ async function collectStatusReport(opts: StatusCommandOptions): Promise<StatusRe
 		/* no fact store yet */
 	}
 
+	let skillCount = 0;
+	try {
+		skillCount = discoverEligibleSkills({
+			workspaceDir: getBrigadeWorkspaceDir(),
+			config: readConfigOrInit(),
+		}).skills.length;
+	} catch {
+		/* no skills yet */
+	}
+
 	const execApprovals = readApprovalsSummary();
 
 	const probe = await probeGateway({ host: opts.host, port: opts.port });
@@ -118,6 +133,7 @@ async function collectStatusReport(opts: StatusCommandOptions): Promise<StatusRe
 		sessionsDir,
 		sessionCount,
 		memory: { fileCount: memoryStatus.fileCount, totalBytes: memoryStatus.totalBytes, factCount },
+		skills: { count: skillCount },
 		execApprovals,
 		gateway: {
 			url: probe.url,
@@ -187,6 +203,13 @@ function formatStatusText(r: StatusReport): string {
 		const kb = (r.memory.totalBytes / 1024).toFixed(1);
 		lines.push(`  notes:         ${r.memory.fileCount} file${r.memory.fileCount === 1 ? "" : "s"}, ${kb} KB`);
 		lines.push(`  facts:         ${r.memory.factCount} active`);
+	}
+	lines.push("");
+	lines.push(chalk.dim("Skills"));
+	if (r.skills.count === 0) {
+		lines.push(`  available:     ${chalk.dim("none yet (drop a folder in workspace/skills/)")}`);
+	} else {
+		lines.push(`  available:     ${r.skills.count} skill${r.skills.count === 1 ? "" : "s"}`);
 	}
 	lines.push("");
 	lines.push(chalk.dim("Exec gating"));

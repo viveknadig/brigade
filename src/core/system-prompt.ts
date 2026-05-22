@@ -28,6 +28,8 @@ import {
 } from "../system-prompt/workspace-loader.js";
 import { bootstrapWorkspace } from "../workspace/bootstrap.js";
 import { resolveToolSummary } from "../agents/tool-summaries.js";
+import { discoverEligibleSkills } from "../agents/skills/index.js";
+import { readConfigOrInit } from "../config/io.js";
 import { DEFAULT_AGENT_ID, resolveAgentWorkspaceDir } from "../config/paths.js";
 
 // The cache marker the lifted code referenced. F:\Brigade's existing
@@ -138,8 +140,15 @@ export async function refreshSessionSystemPrompt(
     name,
     summary: resolveToolSummary(name) ?? "",
   }));
+  // Skills (Primitive #5) — discover the eligible set so the `## Skills`
+  // section + `<available_skills>` block stay consistent with the live
+  // runSingleTurn path. Cheap synchronous scan.
+  const skillDiscovery = discoverEligibleSkills({ workspaceDir, config: readConfigOrInit() });
   const capabilities = opts.capabilities ?? {
     memory: liveToolNames.includes("recall_memory"),
+    // Gate on the rendered block (see agent-loop) so guidance never references
+    // an absent list when every eligible skill is model-invocation-disabled.
+    skills: skillDiscovery.promptBlock !== undefined,
   };
   const assembled = assembleSystemPrompt({
     runtime,
@@ -149,6 +158,7 @@ export async function refreshSessionSystemPrompt(
     modelId,
     thinkingLevel,
     capabilities,
+    skillsPromptBlock: skillDiscovery.promptBlock,
     ephemeralSuffix: opts.ephemeralSuffix,
   });
   applyPersonaOverrideToSession(session, assembled.text);

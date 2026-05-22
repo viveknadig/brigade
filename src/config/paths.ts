@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // All filesystem paths the brigade runtime touches resolve through this module.
 // Override via BRIGADE_STATE_DIR / BRIGADE_CONFIG_PATH so tests + alt installs
@@ -81,6 +82,28 @@ export function resolveAgentWorkspaceDir(_agentId: string, override?: string): s
     return path.join(resolveStateDir(), `workspace-${profile}`);
   }
   return path.join(resolveStateDir(), "workspace");
+}
+
+// User-authored skills live under the shared workspace (NOT per-agent),
+// exactly like persona files and memory/facts.jsonl — drop a folder
+// `<workspace>/skills/<name>/SKILL.md` and it's discovered. Honours the same
+// `override` / BRIGADE_PROFILE divergence as the workspace itself.
+export function resolveSkillsDir(agentId: string, override?: string): string {
+  return path.join(resolveAgentWorkspaceDir(agentId, override), "skills");
+}
+
+// Bundled starter skills ship inside the package at `<packageRoot>/skills`.
+// This module sits at `<root>/src/config/paths.ts` in dev and
+// `<root>/dist/config/paths.js` once compiled — both are two levels under the
+// package root, so `..", ".."` resolves the root in either layout. The npm
+// tarball includes `skills/` (package.json "files"), so an installed copy
+// finds them at `<pkg>/skills`. Override via BRIGADE_BUNDLED_SKILLS_DIR
+// (tests point this at a fixture; set to an empty/missing dir to disable).
+export function resolveBundledSkillsDir(): string {
+  const override = process.env.BRIGADE_BUNDLED_SKILLS_DIR?.trim();
+  if (override && override.length > 0) return path.resolve(override);
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  return path.resolve(moduleDir, "..", "..", "skills");
 }
 
 export function resolveTasksDir(): string {

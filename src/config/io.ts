@@ -38,6 +38,7 @@ export interface BrigadeConfig {
   tools?: BrigadeToolsConfig;
   auth?: BrigadeAuthConfig;
   plugins?: BrigadePluginsConfig;
+  skills?: BrigadeSkillsConfig;
   wizard?: BrigadeWizardMetaConfig;
   meta?: BrigadeConfigMeta;
   [key: string]: unknown;
@@ -128,6 +129,22 @@ export interface BrigadePluginsConfig {
 }
 
 export interface BrigadePluginEntry {
+  enabled?: boolean;
+  [key: string]: unknown;
+}
+
+// Skills (Primitive #5). `enabled` globally toggles the subsystem (default on);
+// `paths` adds extra skill search roots beyond the bundled + workspace dirs;
+// `entries[<name>].enabled = false` disables one skill by name. Mirrors the
+// plugins shape so the two read the same way.
+export interface BrigadeSkillsConfig {
+  enabled?: boolean;
+  paths?: string[];
+  entries?: Record<string, BrigadeSkillEntry>;
+  [key: string]: unknown;
+}
+
+export interface BrigadeSkillEntry {
   enabled?: boolean;
   [key: string]: unknown;
 }

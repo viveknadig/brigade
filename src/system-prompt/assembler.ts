@@ -7,6 +7,7 @@ import {
   MEMORY_GUIDANCE,
   pickModelFamilyGuidance,
   REASONING_FORMAT_GUIDANCE,
+  SKILLS_GUIDANCE,
   shouldUseReasoningFormat,
 } from "./guidance.js";
 import type { ContextFile } from "./types.js";
@@ -14,15 +15,13 @@ import type { BootstrapPhase } from "../workspace/state.js";
 
 // Top-level assembler.
 //
-// Section order mirrors OpenClaw's `src/agents/system-prompt.ts` —
-// `buildAgentSystemPrompt` (line 380) — for every UNIVERSAL section that
-// applies to Brigade today. Sections that depend on OpenClaw-specific
-// architecture are deferred:
+// Section order mirrors the reference layered-prompt design for every
+// UNIVERSAL section that applies to Brigade today. Memory (Primitive #4) and
+// Skills (Primitive #5) are now wired (## Memory / ## Skills below). Sections
+// that depend on not-yet-shipped architecture are still deferred:
 //
-//   - Skills (Primitive #5)
-//   - Memory (Primitive #4)
 //   - Group Chat / Subagent Context (Primitive #6)
-//   - Self-Update via gateway-RPC agent tools (Primitive #3)
+//   - Self-Update via gateway-RPC agent tools
 //   - Sandbox (host-trust v1; sandbox is v3+ on the locked stack)
 //   - Authorized Senders (Phase 2 multi-user)
 //   - Output Directives / Messaging / Voice / Reactions / Silent Replies (Phase 3 channels)
@@ -80,6 +79,11 @@ export interface AssembleArgs {
     skills?: boolean;
     subAgents?: boolean;
   };
+  // Pre-rendered `<available_skills>` XML (Primitive #5). Discovered + filtered
+  // + rendered upstream (agents/skills) and passed in; the assembler just
+  // places it under `## Skills` when `capabilities.skills` is true. Lives in
+  // the cached prefix — the skill list is stable within a session.
+  skillsPromptBlock?: string;
 }
 
 export interface ToolDescription {
@@ -296,6 +300,23 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   if (args.capabilities?.memory) {
     lines.push(MEMORY_GUIDANCE);
     lines.push("");
+  }
+
+  // 7c. ## Skills (conditional on the skills capability).
+  // Primitive #5. Emitted only when at least one eligible skill was discovered
+  // (`capabilities.skills`). SKILLS_GUIDANCE is the behavioural wrapper (scan
+  // before replying, load the matching skill, patch it if wrong); the
+  // pre-rendered `<available_skills>` block that follows is the actual list of
+  // names + descriptions + read-tool locations. Brigade owns this render
+  // (rather than Pi's auto-injection) because the persona pin replaces Pi's
+  // prompt-build hook, so the assembled prompt carries the skills section.
+  if (args.capabilities?.skills) {
+    lines.push(SKILLS_GUIDANCE);
+    lines.push("");
+    if (args.skillsPromptBlock && args.skillsPromptBlock.trim().length > 0) {
+      lines.push(args.skillsPromptBlock.trim());
+      lines.push("");
+    }
   }
 
   // 8. ## Reasoning Format.

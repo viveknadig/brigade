@@ -2,21 +2,19 @@
  * System-prompt guidance constants.
  *
  * Two always-on blocks live HERE (the rest moved inline to assembler.ts
- * so they're easier to keep in sync with OpenClaw's exact text):
+ * so they're easier to keep in sync with the reference prompt text):
  *
  *   - `REASONING_FORMAT_GUIDANCE` — `<think>` tag rules, conditional on
  *     model + thinking-level via `shouldUseReasoningFormat`.
  *   - `OPENAI_FAMILY_GUIDANCE` / `GOOGLE_FAMILY_GUIDANCE` — per-model-
  *     family identity-override blocks, picked via `pickModelFamilyGuidance`.
- *     These are Brigade-better than OpenClaw (which has no equivalent);
  *     gpt-5 / gemini-2.5 routinely identify as "ChatGPT" / "Gemini" until
  *     overridden, which is a real multi-provider failure mode.
  *
- * Three conditional blocks remain DEFINED-BUT-UNWIRED, waiting for the
- * matching primitives to ship (Memory = #4, Skills = #5, Sub-agents = #6).
- * Each is wired into the assembler via the `capabilities` AssembleArgs
- * field the moment its primitive lands — the bodies stay close to the
- * model's mental model of the feature so they don't drift apart.
+ * MEMORY_GUIDANCE (#4) and SKILLS_GUIDANCE (#5) are now wired into the
+ * assembler via the `capabilities` AssembleArgs field. SUB_AGENTS_GUIDANCE
+ * (#6) remains DEFINED-BUT-UNWIRED until that primitive ships — its body
+ * stays close to the model's mental model of the feature so it doesn't drift.
  *
  * Naming rule: zero references to other agent projects. Patterns are
  * lifted (memory discipline, family overrides) but every identifier and
@@ -77,8 +75,7 @@ export function shouldUseReasoningFormat(
  * not-imperative phrasing rule (which prevents memory from being re-read
  * as a directive on a future turn).
  *
- * NOT YET WIRED — Primitive #4 (Memory) lands the call site in the
- * assembler, gated on `args.capabilities.memory`.
+ * Wired in the assembler, gated on `args.capabilities.memory`.
  */
 export const MEMORY_GUIDANCE = `## Memory Recall
 
@@ -93,15 +90,15 @@ Write memories as DECLARATIVE FACTS, not instructions. "User prefers concise rep
 /* ───────────────── Skills guidance (conditional on skills tool) ───────────────── */
 
 /**
- * Injected when the session has skills capability (Primitive #5).
- * Teaches the model to scan available skills BEFORE replying and load the
- * most relevant one.
- *
- * NOT YET WIRED — Primitive #5 lands the call site.
+ * Injected when at least one eligible skill was discovered (Primitive #5),
+ * gated on `capabilities.skills` in the assembler. The behavioural wrapper:
+ * teaches the model to scan the `<available_skills>` list that follows BEFORE
+ * replying and load the most relevant one. The section header is `## Skills`
+ * to match the other assembler sections (`## Memory`, `## Reasoning Format`).
  */
-export const SKILLS_GUIDANCE = `# Skills
+export const SKILLS_GUIDANCE = `## Skills
 
-Before replying to anything non-trivial, scan the available skills. If one applies — even partially — load it and follow its instructions. Skills contain specialised knowledge: API endpoints, proven workflows, the user's preferred conventions.
+Before replying to anything non-trivial, scan the available skills listed below. If one applies — even partially — read its file (the path in its <location>) and follow its instructions. Skills contain specialised knowledge: API endpoints, proven workflows, the user's preferred conventions.
 
 Err on the side of loading. It's better to have context you don't need than to miss critical steps. Skills also encode HOW the user wants tasks done in this environment, not just what to do.
 
@@ -141,10 +138,9 @@ If a sub-agent returns an error or unclear result, decide whether to retry it on
  * Aggregator-prefix tolerant: `openrouter/openai/gpt-4o` is treated as
  * OpenAI family; `together/google/gemini-2.5-pro` as Google family.
  *
- * Wired by `assembler.ts` right after the Safety section. OpenClaw has
- * no equivalent — this is a genuine Brigade-better dimension because
- * gpt-5 and gemini-2.5 routinely identify as "ChatGPT" / "Gemini" until
- * told otherwise.
+ * Wired by `assembler.ts` right after the Safety section — a genuine
+ * Brigade-native dimension because gpt-5 and gemini-2.5 routinely identify
+ * as "ChatGPT" / "Gemini" until told otherwise.
  */
 export function pickModelFamilyGuidance(modelId: string | undefined): string | null {
 	if (!modelId || typeof modelId !== "string") return null;
