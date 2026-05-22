@@ -25,7 +25,7 @@ export function buildProgram(): Command {
   const program = new Command();
   program
     .name("brigade")
-    .description("Brigade — your personal AI crew")
+    .description("🦁 Brigade — your personal AI crew")
     .version(formatVersion(), "-v, --version", "show brigade version");
 
   // exitOverride lets runMain decide how to surface help/no-args, instead of

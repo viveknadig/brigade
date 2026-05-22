@@ -126,7 +126,7 @@ function toFullwidth(s: string): string {
 	return out;
 }
 
-const TAGLINE = chalk.hex(BRIGADE_HIGHLIGHT)(toFullwidth("your personal AI crew  ·  by spinabot"));
+const TAGLINE = chalk.hex(BRIGADE_HIGHLIGHT)(toFullwidth("🦁  your personal AI crew  ·  by spinabot"));
 
 // Three spaces between the video block and the wordmark. The video is now
 // 56 cells wide (the char-based render) and the wordmark is ~146 cells once
@@ -240,7 +240,9 @@ function visibleWidth(s: string): number {
 			(cp >= 0x3400 && cp <= 0x4dbf) || // CJK Ext A
 			(cp >= 0x4e00 && cp <= 0x9fff) || // CJK Unified
 			(cp >= 0xa000 && cp <= 0xa4cf) || // Yi
-			(cp >= 0xac00 && cp <= 0xd7a3); // Hangul Syllables
+			(cp >= 0xac00 && cp <= 0xd7a3) || // Hangul Syllables
+			(cp >= 0x1f300 && cp <= 0x1faff) || // emoji (incl. the 🦁 mascot)
+			(cp >= 0x2600 && cp <= 0x27bf); // misc symbols / dingbats
 		cells += wide ? 2 : 1;
 	}
 	return cells;

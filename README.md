@@ -1,4 +1,4 @@
-# Brigade
+# 🦁 Brigade
 
 > AI crew framework — terminal-first personal assistant.
 

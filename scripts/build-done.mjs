@@ -70,7 +70,7 @@ try {
 	const sha = head ? ` ${chalk.dim(`· ${head.slice(0, 7)}`)}` : "";
 	const count = files > 0 ? ` (${files} files)` : "";
 	process.stdout.write(
-		`\n${gold.bold("✓ Build complete")}${chalk.dim(` — dist/ ready${count}.`)}${sha}\n` +
+		`\n${gold.bold("🦁 Build complete")}${chalk.dim(` — dist/ ready${count}.`)}${sha}\n` +
 			`${chalk.dim("  Run:")} ${gold("brigade")}${chalk.dim(" chat · ")}${gold("brigade gateway")}${chalk.dim(" daemon · ")}${gold("brigade onboard")}${chalk.dim(" setup")}\n\n`,
 	);
 } catch {
