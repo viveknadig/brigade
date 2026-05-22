@@ -67,6 +67,12 @@ import { DEFAULT_AGENT_ID, resolveAgentDir, resolveAgentWorkspaceDir } from "../
 import { defaultSessionKey } from "../sessions/session-store.js";
 import { makeExtractionLlm, runExtractionSweep } from "../agents/memory/extract.js";
 import { runDecayGc } from "../agents/memory/decay.js";
+import {
+	makeConsolidationLlm,
+	markConsolidationRun,
+	runConsolidation,
+	shouldRunConsolidation,
+} from "../agents/memory/consolidate.js";
 import { loadBrigadeAuthStorage } from "./auth-bridge.js";
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, loadConfig, saveConfig, type Config } from "./config.js";
 import { acquireGatewayLock, type GatewayLockHandle } from "./gateway-lock.js";
@@ -353,6 +359,25 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// Cheap, no-model-call decay GC in the same quiet window — ages out
 			// neglected facts so the structured store self-prunes.
 			runDecayGc(workspaceDir);
+			// Lean semantic consolidation (1 LLM call) — THROTTLED to ~once/30min:
+			// archives contradicted/duplicate facts that lexical write-time dedup
+			// can't see. Off the hot path, rare, batched. Best-effort. The window
+			// is tunable via BRIGADE_CONSOLIDATE_INTERVAL_MS (set 0 to run it on
+			// every sweep — useful for manually verifying consolidation).
+			const envInterval = Number(process.env.BRIGADE_CONSOLIDATE_INTERVAL_MS);
+			const consolidateInterval =
+				Number.isFinite(envInterval) && envInterval >= 0 ? envInterval : undefined;
+			if (shouldRunConsolidation(workspaceDir, consolidateInterval)) {
+				const consolidateLlm = makeConsolidationLlm({
+					workspaceDir,
+					agentDir: resolveAgentDir(agentId),
+					authStorage,
+					modelRegistry,
+					model,
+				});
+				await runConsolidation({ workspaceDir, llm: consolidateLlm });
+				markConsolidationRun(workspaceDir);
+			}
 		} catch (err) {
 			// Best-effort — extraction never affects the user-facing turn.
 			opts.consoleStream?.info?.(

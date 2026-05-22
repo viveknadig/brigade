@@ -93,6 +93,34 @@ export const FACTS_RELATIVE_PATH = path.join("memory", "facts.jsonl");
  */
 export const MAX_FACT_CONTENT_CHARS = 1000;
 
+/**
+ * Jaccard-similarity threshold above which two facts are treated as the same
+ * at write time (dedup). Deliberately HIGH (0.85) so only near-identical
+ * restatements collapse — distinct facts that merely share words (e.g. two
+ * different facts about the same topic) are kept separate. Mirrors Boop's
+ * dreaming dedupe similarity.
+ */
+export const DEDUP_SIMILARITY = 0.85;
+
+/** Lowercased alphanumeric token SET of a fact's content (for dedup). */
+function tokenSet(content: string): Set<string> {
+	return new Set(
+		content
+			.toLowerCase()
+			.split(/[^a-z0-9]+/)
+			.filter((t) => t.length > 0),
+	);
+}
+
+/** Jaccard similarity |A∩B| / |A∪B| of two token sets (0 when both empty). */
+function jaccard(a: Set<string>, b: Set<string>): number {
+	if (a.size === 0 && b.size === 0) return 0;
+	let inter = 0;
+	for (const t of a) if (b.has(t)) inter += 1;
+	const union = a.size + b.size - inter;
+	return union === 0 ? 0 : inter / union;
+}
+
 /** `mem_<base36 time>_<rand>` — Boop's id shape, time-sortable. */
 export function makeMemoryId(): string {
 	return `mem_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -197,6 +225,29 @@ export class FactStore {
 		};
 
 		const all = this.readAll();
+
+		// Write-time dedup (no LLM). A near-identical ACTIVE fact already exists
+		// (e.g. the model called write_memory AND the post-turn extraction sweep
+		// distilled the same fact) → don't add a parallel copy. Instead reinforce
+		// the existing one: keep the higher importance, refresh access, inherit a
+		// sourceTurn if it lacked one. Skipped for explicit corrections/updates
+		// (they carry `supersedes` and intentionally replace prior beliefs). This
+		// is the cheap layer; semantic contradictions are handled by consolidation.
+		if (!record.supersedes) {
+			const incoming = tokenSet(record.content);
+			const dup = all.find(
+				(r) => r.lifecycle === "active" && jaccard(incoming, tokenSet(r.content)) >= DEDUP_SIMILARITY,
+			);
+			if (dup) {
+				dup.importance = Math.max(dup.importance, record.importance);
+				dup.lastAccessedAt = now;
+				dup.accessCount += 1;
+				if (!dup.sourceTurn && record.sourceTurn) dup.sourceTurn = record.sourceTurn;
+				this.writeAll(all);
+				return dup;
+			}
+		}
+
 		// Archive superseded records (corrections/updates overwrite prior beliefs).
 		if (record.supersedes) {
 			const dead = new Set(record.supersedes);

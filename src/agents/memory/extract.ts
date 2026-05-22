@@ -258,14 +258,18 @@ export interface MakeExtractionLlmArgs {
 }
 
 /**
- * Build a production `ExtractionLlm`: an isolated, tool-less subagent with the
- * EXTRACTION_PROMPT pinned, run against a throwaway transcript (deleted after)
- * so it never pollutes the real session. Reuses the resolved model/auth so it
- * costs one extra call per SWEEP (not per turn).
+ * Build an ISOLATED, tool-less subagent runner: a one-shot LLM call with
+ * `systemPrompt` pinned, run against a throwaway transcript (deleted after) so
+ * it never pollutes the real session. Reuses the resolved model/auth (inherits
+ * Pi's auth-aware streamFn — never replaced). Shared by the extraction sweep
+ * and the consolidation sweep; both cost one extra call per SWEEP, not per turn.
  */
-export function makeExtractionLlm(args: MakeExtractionLlmArgs): ExtractionLlm {
-	return async (conversationText: string): Promise<string> => {
-		const tmpTranscript = path.join(args.agentDir, "sessions", `.extract-${randomUUID()}.jsonl`);
+export function makeIsolatedLlm(
+	systemPrompt: string,
+	args: MakeExtractionLlmArgs,
+): (input: string) => Promise<string> {
+	return async (input: string): Promise<string> => {
+		const tmpTranscript = path.join(args.agentDir, "sessions", `.subagent-${randomUUID()}.jsonl`);
 		const sessionManager = SessionManager.open(tmpTranscript);
 		try {
 			const { session } = await createAgentSession({
@@ -283,8 +287,8 @@ export function makeExtractionLlm(args: MakeExtractionLlmArgs): ExtractionLlm {
 				resourceLoader: new DefaultResourceLoader({ cwd: args.workspaceDir, agentDir: args.agentDir }),
 			} as never);
 			if (!session) return "";
-			applyPersonaOverrideToSession(session as AgentSession, EXTRACTION_PROMPT);
-			await (session as AgentSession).prompt(conversationText);
+			applyPersonaOverrideToSession(session as AgentSession, systemPrompt);
+			await (session as AgentSession).prompt(input);
 			return lastAssistantText(session as AgentSession);
 		} finally {
 			try {
@@ -294,6 +298,13 @@ export function makeExtractionLlm(args: MakeExtractionLlmArgs): ExtractionLlm {
 			}
 		}
 	};
+}
+
+/**
+ * The extraction distiller — `makeIsolatedLlm` with the EXTRACTION_PROMPT pinned.
+ */
+export function makeExtractionLlm(args: MakeExtractionLlmArgs): ExtractionLlm {
+	return makeIsolatedLlm(EXTRACTION_PROMPT, args);
 }
 
 function lastAssistantText(session: AgentSession): string {

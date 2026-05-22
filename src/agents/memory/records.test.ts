@@ -34,6 +34,45 @@ describe("FactStore — write + list", () => {
 		assert.equal(store.list({ segment: "identity" })[0]?.content, "User is on Windows.");
 	});
 
+	it("dedups a near-identical active fact (reinforces instead of duplicating)", () => {
+		const store = new FactStore(dir);
+		const a = store.write({ content: "The user prefers concise, no-fluff answers.", segment: "preference", importance: 0.9 });
+		// Extraction later distills the SAME fact at a lower importance.
+		const b = store.write({
+			content: "The user prefers concise, no-fluff answers.",
+			segment: "preference",
+			importance: 0.7,
+			sourceTurn: "t1",
+		});
+		// Same record returned — no parallel copy.
+		assert.equal(b.memoryId, a.memoryId);
+		assert.equal(store.list().length, 1);
+		// Kept the HIGHER importance, reinforced, inherited the sourceTurn.
+		assert.equal(store.list()[0]?.importance, 0.9);
+		assert.equal(store.list()[0]?.accessCount, 1);
+		assert.equal(store.list()[0]?.sourceTurn, "t1");
+	});
+
+	it("does NOT dedup distinct facts that merely share words", () => {
+		const store = new FactStore(dir);
+		store.write({ content: "The user is on Windows and uses PowerShell.", segment: "context" });
+		store.write({ content: "The user prefers dark mode in their editor.", segment: "preference" });
+		assert.equal(store.list().length, 2);
+	});
+
+	it("never dedups a correction (supersedes is intentional)", () => {
+		const store = new FactStore(dir);
+		const old = store.write({ content: "The user is on Windows.", segment: "context" });
+		// A correction with the SAME-ish words must still be its own record + archive the old.
+		store.write({
+			content: "The user is on Windows no longer — they are on macOS.",
+			segment: "correction",
+			supersedes: [old.memoryId],
+		});
+		assert.equal(store.list().length, 1); // only the correction is active
+		assert.equal(store.list()[0]?.segment, "correction");
+	});
+
 	it("clamps an out-of-range importance override", () => {
 		const store = new FactStore(dir);
 		const hi = store.write({ content: "x", segment: "context", importance: 5 });
