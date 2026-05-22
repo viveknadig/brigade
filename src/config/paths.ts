@@ -138,6 +138,13 @@ export function resolveCacheDir(): string {
   return path.join(resolveStateDir(), "cache");
 }
 
+// Per-channel state root, e.g. `~/.brigade/channels/whatsapp`. Channels keep
+// their own auth/creds here so `rm -rf ~/.brigade` wipes them with everything
+// else and a single channel can be reset by deleting just its subdir.
+export function resolveChannelStateDir(channelId: string): string {
+  return path.join(resolveStateDir(), "channels", channelId);
+}
+
 export function resolveConfigAuditLogPath(): string {
   return path.join(resolveLogsDir(), "config-audit.jsonl");
 }

@@ -1,0 +1,46 @@
+import { strict as assert } from "node:assert";
+import { describe, it } from "node:test";
+
+import type { BrigadeConfig } from "../../../config/io.js";
+import { BrigadeExtensionRegistry } from "../../extensions/registry.js";
+import { createWhatsAppAdapter } from "./adapter.js";
+import { whatsAppModule } from "./module.js";
+
+const META = { agentId: "main", workspaceDir: "/ws", cwd: "/cwd", config: {} as BrigadeConfig };
+
+describe("WhatsApp adapter", () => {
+	it("identifies as the whatsapp channel", () => {
+		const a = createWhatsAppAdapter();
+		assert.equal(a.id, "whatsapp");
+		assert.equal(a.label, "WhatsApp");
+	});
+
+	it("is configured only when channels.whatsapp.enabled is true", () => {
+		const a = createWhatsAppAdapter();
+		assert.equal(a.isConfigured({} as BrigadeConfig), false);
+		assert.equal(a.isConfigured({ channels: { whatsapp: {} } } as unknown as BrigadeConfig), false);
+		assert.equal(a.isConfigured({ channels: { whatsapp: { enabled: false } } } as unknown as BrigadeConfig), false);
+		assert.equal(a.isConfigured({ channels: { whatsapp: { enabled: true } } } as unknown as BrigadeConfig), true);
+	});
+
+	it("refuses sendText before start()", async () => {
+		const a = createWhatsAppAdapter();
+		await assert.rejects(() => a.sendText("123@s.whatsapp.net", "hi"), /not started/);
+	});
+
+	it("stop() before start() is a harmless no-op", async () => {
+		const a = createWhatsAppAdapter();
+		await a.stop(); // must not throw even though nothing was connected
+	});
+});
+
+describe("whatsAppModule", () => {
+	it("registers exactly one whatsapp channel through the seam", () => {
+		const reg = new BrigadeExtensionRegistry();
+		whatsAppModule.register(reg.context(META));
+		assert.equal(reg.channels.length, 1);
+		assert.equal(reg.channels[0]?.id, "whatsapp");
+		// product-only: registers no tools/hooks into the Pi factory
+		assert.deepEqual(reg.toolNames(), []);
+	});
+});

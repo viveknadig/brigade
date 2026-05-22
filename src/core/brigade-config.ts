@@ -130,6 +130,21 @@ const SKILLS_SCHEMA = Type.Object({
 
 const CHANNELS_SCHEMA = Type.Record(Type.String(), Type.Record(Type.String(), Type.Unknown()));
 
+// Extension subsystem (Pi-native tools/hooks/commands + Brigade product
+// channels/voice/media). Mirrors the plugins/skills gating shape: a global
+// on/off, a deny-list, and per-module entries. The extension loader reads
+// this; channels additionally honor their own `channels.<id>` settings.
+const EXTENSION_ENTRY_SCHEMA = Type.Object({
+	enabled: Type.Optional(Type.Boolean()),
+	config: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+});
+
+const EXTENSIONS_SCHEMA = Type.Object({
+	enabled: Type.Optional(Type.Boolean()),
+	disabled: Type.Optional(Type.Array(Type.String())),
+	entries: Type.Optional(Type.Record(Type.String(), EXTENSION_ENTRY_SCHEMA)),
+});
+
 const GATEWAY_AUTH_SCHEMA = Type.Object({
 	mode: Type.Optional(
 		Type.Union([Type.Literal("none"), Type.Literal("token"), Type.Literal("password")]),
@@ -214,6 +229,7 @@ export const BrigadeConfigSchema = Type.Object({
 	plugins: Type.Optional(PLUGINS_SCHEMA),
 	skills: Type.Optional(SKILLS_SCHEMA),
 	channels: Type.Optional(CHANNELS_SCHEMA),
+	extensions: Type.Optional(EXTENSIONS_SCHEMA),
 	gateway: Type.Optional(GATEWAY_SCHEMA),
 	settings: Type.Optional(SETTINGS_SCHEMA),
 });

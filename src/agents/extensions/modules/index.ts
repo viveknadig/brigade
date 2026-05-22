@@ -7,6 +7,7 @@
  * are discovered separately by the loader (same gating).
  */
 
+import { whatsAppModule } from "../../channels/whatsapp/module.js";
 import type { BrigadeModule } from "../types.js";
 
-export const BUNDLED_MODULES: BrigadeModule[] = [];
+export const BUNDLED_MODULES: BrigadeModule[] = [whatsAppModule];
