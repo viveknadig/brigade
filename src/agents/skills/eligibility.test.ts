@@ -45,10 +45,63 @@ describe("parseEligibility", () => {
 		const meta = parseEligibility("# c\nname: x\n\ndescription: y\nrandom: 1");
 		assert.deepEqual(meta, { os: [], requiresBins: [], requiresAnyBins: [], requiresEnv: [] });
 	});
-	it("treats an empty value as absent", () => {
-		const meta = parseEligibility("os:\nrequires-bins:  ");
+	it("treats a truly empty key (no inline value, no block items) as absent", () => {
+		const meta = parseEligibility("os:\nname: x\nrequires-bins:\ndescription: y");
 		assert.deepEqual(meta.os, []);
 		assert.deepEqual(meta.requiresBins, []);
+	});
+
+	it("parses YAML block-sequence form (what a formatter leaves behind)", () => {
+		const meta = parseEligibility(
+			"name: gh\nos:\n  - darwin\n  - linux\nrequires-bins:\n  - gh\n  - jq\ndescription: y",
+		);
+		assert.deepEqual(meta.os, ["darwin", "linux"]);
+		assert.deepEqual(meta.requiresBins, ["gh", "jq"]);
+	});
+
+	it("block-sequence stops at the next key (doesn't bleed across keys)", () => {
+		const meta = parseEligibility("requires-bins:\n  - gh\nrequires-env:\n  - TOKEN");
+		assert.deepEqual(meta.requiresBins, ["gh"]);
+		assert.deepEqual(meta.requiresEnv, ["TOKEN"]);
+		assert.deepEqual(meta.os, []);
+	});
+
+	it("inline flow-sequence form `[a, b]` still parses", () => {
+		const meta = parseEligibility('os: [macos, "linux"]');
+		assert.deepEqual(meta.os, ["darwin", "linux"]);
+	});
+
+	it("reads the nested metadata.brigade block (ported form, incl. trailing commas)", () => {
+		const fm = [
+			"name: sherpa",
+			"metadata:",
+			'  { "brigade": { "os": ["darwin","linux","win32"],',
+			'      "requires": { "env": ["RUNTIME_DIR","MODEL_DIR"], },',
+			'      "install": [ {"id":"a"}, {"id":"b"}, ], }, }',
+		].join("\n");
+		const meta = parseEligibility(fm);
+		assert.deepEqual(meta.os, ["darwin", "linux", "win32"]);
+		assert.deepEqual(meta.requiresEnv, ["RUNTIME_DIR", "MODEL_DIR"]);
+	});
+
+	it("metadata.brigade.requires.bins / anyBins parse", () => {
+		const fm = 'metadata:\n  { "brigade": { "requires": { "bins": ["gh"], "anyBins": ["rg","grep"] } } }';
+		const meta = parseEligibility(fm);
+		assert.deepEqual(meta.requiresBins, ["gh"]);
+		assert.deepEqual(meta.requiresAnyBins, ["rg", "grep"]);
+	});
+
+	it("flat keys fill in fields the metadata block doesn't set", () => {
+		// metadata.brigade sets only os; flat requires-bins supplies the rest.
+		const fm = 'metadata:\n  { "brigade": { "os": ["linux"] } }\nrequires-bins: jq';
+		const meta = parseEligibility(fm);
+		assert.deepEqual(meta.os, ["linux"]);
+		assert.deepEqual(meta.requiresBins, ["jq"]);
+	});
+
+	it("malformed frontmatter → no constraints (eligible), never throws", () => {
+		const meta = parseEligibility("os: [unterminated\n  : : :");
+		assert.deepEqual(meta, { os: [], requiresBins: [], requiresAnyBins: [], requiresEnv: [] });
 	});
 });
 
