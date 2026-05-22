@@ -42,6 +42,7 @@ import {
 } from "../sessions/session-store.js";
 import { readConfigOrInit, type BrigadeConfig } from "../config/io.js";
 import { discoverEligibleSkills } from "./skills/index.js";
+import { BUNDLED_MODULES, loadModules } from "./extensions/index.js";
 import { assembleSystemPrompt } from "../system-prompt/assembler.js";
 import {
   loadHeartbeatFile,
@@ -377,6 +378,33 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     skills: skillDiscovery.promptBlock !== undefined,
   };
 
+  // Extension layer: load Brigade modules (bundled now; user `~/.brigade/extensions`
+  // later) into a registry. Agent-level registrations (tools/hooks/commands) are
+  // replayed into THIS Pi session via an ExtensionFactory; product-level ones
+  // (channels/voice/…) are consumed by the gateway. We pass our own resource
+  // loader, so createAgentSession won't reload it — we MUST reload() ourselves or
+  // getExtensions() stays empty. The loader runs ONLY our factory: every other
+  // resource type is opted out because Brigade owns skills/prompts/themes/context
+  // itself and the persona pin owns the system prompt.
+  const extensionRegistry = await loadModules({
+    modules: BUNDLED_MODULES,
+    meta: { agentId, workspaceDir, cwd, config: turnConfig },
+  });
+  const brigadeResourceLoader = new DefaultResourceLoader({
+    cwd,
+    agentDir,
+    noSkills: true, // Brigade discovers + renders skills itself (see skills/)
+    noExtensions: true, // skip FILE extension discovery (cwd/.pi/extensions); our factory still runs
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+    extensionFactories: [extensionRegistry.toPiExtensionFactory()],
+  } as never);
+  await (brigadeResourceLoader as unknown as { reload: () => Promise<void> }).reload();
+  // Extension tool names join the allowlist so the unknown-tool guard + Pi's
+  // `tools` activation gate accept them alongside the built-ins + memory tools.
+  const allEnabledToolNames = [...new Set([...enabledToolNames, ...extensionRegistry.toolNames()])];
+
   const { session } = await createAgentSession({
     cwd,
     agentDir,
@@ -384,14 +412,10 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     modelRegistry,
     model: model as never,
     thinkingLevel: args.thinkingLevel ?? "off",
-    tools: enabledToolNames,
+    tools: allEnabledToolNames,
     customTools: brigadeCustomTools,
     sessionManager,
-    // `noSkills`: Brigade owns skill discovery + rendering (see skills/) and
-    // injects the block into the assembled persona prompt. Pi's own skills
-    // injection would be clobbered by the persona pin anyway, and leaving it
-    // on would make Pi scan `<cwd>/.pi/skills` — outside Brigade's state.
-    resourceLoader: new DefaultResourceLoader({ cwd, agentDir, noSkills: true }),
+    resourceLoader: brigadeResourceLoader,
     transformContext,
   } as never);
 
@@ -442,7 +466,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // SHARED guard chain — identical to the one buildAgent installs:
     //   unknown-tool guard → loop detector → exec-gate.
     sessionWithBeforeHook.agent.beforeToolCall = composeBrigadeBeforeToolCall({
-      enabledToolNames,
+      enabledToolNames: allEnabledToolNames,
       gateCtxRef,
       displayCwd: cwd,
     });
@@ -525,7 +549,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   const activeToolNames = (
     typeof sessionWithTools.getActiveToolNames === "function"
       ? sessionWithTools.getActiveToolNames()
-      : enabledToolNames
+      : allEnabledToolNames
   ).slice();
   const toolDescriptions = activeToolNames.map((name) => ({
     name,

@@ -67,8 +67,8 @@
     "node": ">=22.12"
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.70.6",
-    "@mariozechner/pi-tui": "^0.70.6",
+    "@mariozechner/pi-coding-agent": "0.73.1",
+    "@mariozechner/pi-tui": "0.73.1",
     "cfonts": "^3.3.1",
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
