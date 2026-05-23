@@ -645,23 +645,53 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 						if (jid === "status@broadcast" || jid.endsWith("@status") || jid.endsWith("@broadcast")) return;
 						const isGroup = jid.endsWith("@g.us");
 						const msgId = m.key.id;
-						// `fromMe` handling: WhatsApp mirrors our own outbound sends back
-						// through `messages.upsert` (the platform's "you sent X" event).
-						// A blanket `if (fromMe) return` would silence those echoes — good —
-						// but it would ALSO silence the operator legitimately DMing
-						// themselves from a linked device (self-chat mode), which is a
-						// real-world use case (notes to self, testing). Drop only the
-						// echoes we recognize (id we just sent), let everything else
-						// (including unrecognized fromMe = self-chat DM) flow through.
+						// `fromMe` handling. WhatsApp surfaces TWO distinct flavours of
+						// `fromMe: true` messages through the same `messages.upsert`
+						// event, and they must be handled completely differently:
+						//
+						//   (a) ECHO of an outbound Brigade just sent — `msgId` is in
+						//       `outboundDedupe` (we remembered it on send). Always
+						//       drop; it's not user input.
+						//
+						//   (b) OPERATOR TYPED ON A LINKED DEVICE (their phone, web,
+						//       another linked Brigade) — `msgId` is fresh. This branches:
+						//
+						//       (b1) DM to a CONTACT (chat jid ≠ operator's own phone):
+						//            the operator messaging Mom from their phone. Brigade
+						//            MUST NOT engage with this — otherwise we'd send
+						//            Mom a pairing-challenge card from the operator's
+						//            own account. Drop silently. Matches OpenClaw's
+						//            access-control.ts:136-144 "Skipping outbound DM".
+						//
+						//       (b2) SELF-CHAT (chat jid == operator's own phone): the
+						//            "notes-to-self" use case. Flow through as normal
+						//            inbound; the bot responds.
+						//
+						//       (b3) GROUP: fall through so policy.ts can apply the
+						//            standard group rules (mention required even for
+						//            the operator). policy.ts blocks operator-without-
+						//            mention with reason `group:self-without-mention`.
 						if (m.key.fromMe) {
-							if (!msgId || outboundDedupe.peek(outboundKey(jid, msgId))) {
-								// Either no id (can't dedupe — defensive drop) or a known
-								// echo of our own send to this conversation. Either way:
-								// not user input.
-								return;
+							// (a) — known echo of our own outbound.
+							if (!msgId || outboundDedupe.peek(outboundKey(jid, msgId))) return;
+							// (b1) — operator messaged a contact from a linked device.
+							// Detect by comparing the chat jid's canonical phone to the
+							// linked self id. Resolution gates on having BOTH — without
+							// either, we conservatively drop (better to miss a self-
+							// chat than to spam a contact with a pairing card).
+							if (!isGroup) {
+								const selfPhone = canonicalWhatsAppId(sock?.user?.id);
+								const chatPhone = await resolveJidToE164(sock, jid, args.authDir);
+								const isSelfChat = !!(selfPhone && chatPhone && selfPhone === chatPhone);
+								if (!isSelfChat) {
+									args.log("dropped operator outbound DM (fromMe, not self-chat)", {
+										jid,
+										msgId,
+									});
+									return;
+								}
 							}
-							// Unrecognized fromMe = the operator typed this on a linked
-							// device. Fall through to normal handling.
+							// (b2) self-chat, or (b3) group: fall through.
 						}
 						// Drop duplicates of the same message — WhatsApp re-delivers the
 						// same `msg.key.id` after a reconnect; without this guard the agent

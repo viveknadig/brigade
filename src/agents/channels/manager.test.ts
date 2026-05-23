@@ -646,24 +646,146 @@ describe("startChannels", () => {
 	});
 
 	it("sends the pairing CHALLENGE REPLY for a fresh inbound (live, post-connect)", async () => {
-		const f = makeFakeChannel({
-			connectedAt: () => Date.now() - 5_000, // connected 5s ago
-		});
-		const mgr = await startChannels({
-			adapters: [f.adapter],
-			config: { channels: { fake: { dmPolicy: "pairing" } } } as unknown as BrigadeConfig,
-			agentId: "main",
-			runTurn: async () => ({ reply: "should-not-run" }),
-		});
-		await f.ctx().onInbound({
-			channel: "fake",
-			conversationId: "c1",
-			messageId: "m-live",
-			from: "+15551234567",
-			text: "hi just now",
-			messageTimestampMs: Date.now(), // live
-		});
-		assert.equal(f.sent.length, 1, "fresh stranger must receive a pairing code reply");
-		await mgr.stop();
+		// Isolate the pairing store so this test starts with an empty
+		// pending list — otherwise prior tests' entries could leak in and
+		// make this stranger's first message look like a re-challenge.
+		const tmp = mkdtempSync(join(tmpdir(), "brigade-pair-fresh-"));
+		const prev = process.env.BRIGADE_STATE_DIR;
+		process.env.BRIGADE_STATE_DIR = tmp;
+		try {
+			const f = makeFakeChannel({
+				connectedAt: () => Date.now() - 5_000, // connected 5s ago
+			});
+			const mgr = await startChannels({
+				adapters: [f.adapter],
+				config: { channels: { fake: { dmPolicy: "pairing" } } } as unknown as BrigadeConfig,
+				agentId: "main",
+				runTurn: async () => ({ reply: "should-not-run" }),
+			});
+			await f.ctx().onInbound({
+				channel: "fake",
+				conversationId: "c1",
+				messageId: "m-live",
+				from: "+15557776666",
+				text: "hi just now",
+				messageTimestampMs: Date.now(), // live
+			});
+			assert.equal(f.sent.length, 1, "fresh stranger must receive a pairing code reply");
+			await mgr.stop();
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
+			else process.env.BRIGADE_STATE_DIR = prev;
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it("`allowlist` mode IGNORES the persisted pairing store — only config.allowFrom counts", async () => {
+		// Reference behaviour: `allowlist` is the strict mode where the
+		// operator hand-curates the list. A pairing-store entry (which is
+		// written by `brigade pairing approve` OR `brigade channels allow
+		// add`) must NOT auto-bypass it. Operators choose `allowlist` when
+		// they want zero leakage; the persisted store is `pairing`-mode-only.
+		const tmp = mkdtempSync(join(tmpdir(), "brigade-allowlist-store-"));
+		const prev = process.env.BRIGADE_STATE_DIR;
+		process.env.BRIGADE_STATE_DIR = tmp;
+		try {
+			// Seed the persisted store with an entry. In allowlist mode this
+			// MUST NOT count.
+			addAllowFrom("fake", "+15551112222");
+			const f = makeFakeChannel();
+			let turnRan = false;
+			const mgr = await startChannels({
+				adapters: [f.adapter],
+				// Allowlist mode + EMPTY config.allowFrom → strictly nobody can DM.
+				config: { channels: { fake: { dmPolicy: "allowlist", allowFrom: [] } } } as unknown as BrigadeConfig,
+				agentId: "main",
+				runTurn: async () => {
+					turnRan = true;
+					return { reply: "x" };
+				},
+			});
+			await f.ctx().onInbound({
+				channel: "fake",
+				conversationId: "c1",
+				from: "+15551112222", // present in store, NOT in config.allowFrom
+				text: "hi",
+			});
+			assert.equal(turnRan, false, "store entry must not auto-allow in allowlist mode");
+			assert.equal(f.sent.length, 0);
+			await mgr.stop();
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
+			else process.env.BRIGADE_STATE_DIR = prev;
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it("`pairing` mode DOES consult the persisted store (operator's `pairing approve` takes effect)", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "brigade-pairing-store-"));
+		const prev = process.env.BRIGADE_STATE_DIR;
+		process.env.BRIGADE_STATE_DIR = tmp;
+		try {
+			addAllowFrom("fake", "+15551112222"); // simulate prior `pairing approve`
+			const f = makeFakeChannel();
+			const mgr = await startChannels({
+				adapters: [f.adapter],
+				config: { channels: { fake: { dmPolicy: "pairing" } } } as unknown as BrigadeConfig,
+				agentId: "main",
+				runTurn: async () => ({ reply: "hello back" }),
+			});
+			await f.ctx().onInbound({
+				channel: "fake",
+				conversationId: "c1",
+				from: "+15551112222",
+				text: "hi",
+			});
+			assert.deepEqual(f.sent, [{ conversationId: "c1", text: "hello back" }]);
+			await mgr.stop();
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
+			else process.env.BRIGADE_STATE_DIR = prev;
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it("sends the pairing CHALLENGE only ONCE per stranger — subsequent messages do NOT re-send", async () => {
+		// This is the bug from the user's WhatsApp screenshot: every reply
+		// from an unapproved stranger triggered a new identical "your one-
+		// time code" card, turning their normal chat into a wall of duplicate
+		// challenge cards. Fix mirrors OpenClaw's `issuePairingChallenge` —
+		// only emit the reply when the upsert reports a newly-created entry.
+		// Isolate the pairing store to a tempdir so we don't see entries
+		// left over from earlier tests in this file.
+		const tmp = mkdtempSync(join(tmpdir(), "brigade-pair-once-"));
+		const prev = process.env.BRIGADE_STATE_DIR;
+		process.env.BRIGADE_STATE_DIR = tmp;
+		try {
+			const f = makeFakeChannel({
+				connectedAt: () => Date.now() - 1_000,
+			});
+			const mgr = await startChannels({
+				adapters: [f.adapter],
+				config: { channels: { fake: { dmPolicy: "pairing" } } } as unknown as BrigadeConfig,
+				agentId: "main",
+				runTurn: async () => ({ reply: "ignored — pairing should gate" }),
+			});
+			// 5 messages from the same stranger.
+			for (let i = 0; i < 5; i += 1) {
+				await f.ctx().onInbound({
+					channel: "fake",
+					conversationId: "c-stranger",
+					messageId: `m-${i}`,
+					from: "+15558889999", // distinct from other tests in this file
+					text: `msg ${i}`,
+					messageTimestampMs: Date.now(),
+				});
+			}
+			assert.equal(f.sent.length, 1, "exactly ONE challenge reply across 5 messages");
+			await mgr.stop();
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
+			else process.env.BRIGADE_STATE_DIR = prev;
+			rmSync(tmp, { recursive: true, force: true });
+		}
 	});
 });

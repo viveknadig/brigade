@@ -36,19 +36,37 @@ function eq(a: string, b: string): boolean {
 }
 
 /**
+ * Whether `senderId` is approved by an allow-from list. A bare `*` entry in
+ * the list is a wildcard — matches every sender (useful for open-to-all
+ * deployments where the operator wants the agent reachable by anyone but
+ * still wants the OTHER policy controls). Otherwise the sender must appear
+ * verbatim. Mirrors the upstream `isSenderAllowed` shape: wildcard check
+ * happens BEFORE the per-entry comparison so an empty / partial list with
+ * `*` still matches.
+ */
+function isOnAllowList(senderId: string, allowFrom: ReadonlyArray<string>): boolean {
+	for (const entry of allowFrom) if (entry === "*") return true;
+	return allowFrom.includes(senderId);
+}
+
+/**
  * Decide what to do with one inbound message based on the channel's DM policy
  * and the current allow-from list. The caller is responsible for ISSUING the
  * code on a `challenge` decision (so the evaluator stays pure).
  */
 export function evaluateAccess(args: EvaluateAccessArgs): AccessDecision {
-	// Self-chat is always allowed — the operator messaging their own linked
-	// number must work even before any allow-from entries are recorded.
-	if (args.selfId && eq(args.selfId, args.senderId)) {
-		return { kind: "allow", reason: "self" };
-	}
+	const isSelf = !!(args.selfId && eq(args.selfId, args.senderId));
 	// Group branch — completely separate gate from DMs. A `pairing` group policy
 	// is intentionally degraded to "allowlist" semantics: spamming pairing codes
 	// at strangers in a group is worse than just being silent.
+	//
+	// CRITICAL: the operator's OWN messages in a group must follow the same
+	// mention rules as anyone else. Without this, every time the operator
+	// types in a group chat (where their account is the linked self), the
+	// bot would answer — turning every group conversation into a Brigade
+	// interview. Self-bypass is DM-only; in groups, even the operator must
+	// either be on the group allow-from list AND mention the bot, or the
+	// message is silently dropped.
 	if (args.isGroup) {
 		const policy = args.groupPolicy ?? args.policy;
 		const allow = args.groupAllowFrom ?? args.allowFrom;
@@ -61,11 +79,29 @@ export function evaluateAccess(args: EvaluateAccessArgs): AccessDecision {
 				: { kind: "block", reason: "group:open-without-mention" };
 		}
 		// `allowlist` or `pairing` (degraded): only approved senders, only when
-		// the bot is addressed.
-		if (!allow.includes(args.senderId)) return { kind: "block", reason: "group:not-allowlisted" };
+		// the bot is addressed. Operator (self) is treated as implicitly
+		// allow-listed here — they don't need to add themselves — but they
+		// STILL need to mention the bot to be heard. A `*` in the list is
+		// a wildcard and matches everyone (still mention-gated below).
+		const senderAllowed = isSelf || isOnAllowList(args.senderId, allow);
+		if (!senderAllowed) return { kind: "block", reason: "group:not-allowlisted" };
 		return args.mentioned
-			? { kind: "allow", reason: "group:allow-from+mention" }
-			: { kind: "block", reason: "group:allow-from-without-mention" };
+			? {
+					kind: "allow",
+					reason: isSelf ? "group:self+mention" : "group:allow-from+mention",
+				}
+			: {
+					kind: "block",
+					reason: isSelf
+						? "group:self-without-mention"
+						: "group:allow-from-without-mention",
+				};
+	}
+	// DM branch — self-chat (operator DMing their own linked number) is
+	// ALWAYS allowed, regardless of allow-from / pairing state. The owner
+	// must be able to talk to their own bot from day one.
+	if (isSelf) {
+		return { kind: "allow", reason: "self" };
 	}
 	switch (args.policy) {
 		case "open":
@@ -73,11 +109,11 @@ export function evaluateAccess(args: EvaluateAccessArgs): AccessDecision {
 		case "disabled":
 			return { kind: "block", reason: "policy:disabled" };
 		case "allowlist":
-			return args.allowFrom.includes(args.senderId)
+			return isOnAllowList(args.senderId, args.allowFrom)
 				? { kind: "allow", reason: "allow-from" }
 				: { kind: "block", reason: "not-allowlisted" };
 		case "pairing":
-			if (args.allowFrom.includes(args.senderId)) return { kind: "allow", reason: "allow-from" };
+			if (isOnAllowList(args.senderId, args.allowFrom)) return { kind: "allow", reason: "allow-from" };
 			// Caller will mint/refresh the code via the store and send a reply.
 			return { kind: "challenge", code: "", reason: "needs-pairing" };
 	}

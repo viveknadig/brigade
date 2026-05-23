@@ -39,11 +39,82 @@ afterEach(() => {
 /* ──────────────────────────── policy ──────────────────────────── */
 
 describe("evaluateAccess", () => {
-	it("self always allowed regardless of policy", () => {
+	it("self always allowed in DMs regardless of DM policy", () => {
 		for (const policy of ["pairing", "allowlist", "open", "disabled"] as const) {
 			const r = evaluateAccess({ policy, senderId: "self@x", selfId: "self@x", allowFrom: [] });
-			assert.equal(r.kind, "allow");
+			assert.equal(r.kind, "allow", `policy=${policy} should allow self in a DM`);
 		}
+	});
+
+	/* ── self-in-GROUP: must follow mention rules (not auto-allowed) ── */
+
+	it("self in a GROUP with no mention is BLOCKED (operator typing in a group must not summon Brigade)", () => {
+		// The bug: previously self bypassed everything. Now the operator's
+		// own messages in a group room follow the same allow-from + mention
+		// rules — otherwise every line the operator types in a group chat
+		// triggers a turn.
+		const r = evaluateAccess({
+			policy: "pairing",
+			groupPolicy: "allowlist",
+			senderId: "+15551234567",
+			selfId: "+15551234567",
+			isGroup: true,
+			mentioned: false,
+			allowFrom: [],
+			groupAllowFrom: [],
+		});
+		assert.equal(r.kind, "block");
+		assert.match(String(r.reason), /^group:self-without-mention$/);
+	});
+
+	it("self in a GROUP WITH a mention is allowed (operator opted in by tagging the bot)", () => {
+		const r = evaluateAccess({
+			policy: "pairing",
+			groupPolicy: "allowlist",
+			senderId: "+15551234567",
+			selfId: "+15551234567",
+			isGroup: true,
+			mentioned: true,
+			allowFrom: [],
+			groupAllowFrom: [],
+		});
+		assert.equal(r.kind, "allow");
+		assert.match(String(r.reason), /^group:self\+mention$/);
+	});
+
+	it("self in a group is implicitly allow-listed (no need to add own number to groupAllowFrom)", () => {
+		// Operator's own number doesn't need to be on the explicit
+		// groupAllowFrom list for them to "qualify" — they're implicitly
+		// allowed by virtue of being self. They still need to mention the
+		// bot to actually be heard, but they shouldn't get a
+		// "not-allowlisted" block for being THE owner.
+		const r = evaluateAccess({
+			policy: "pairing",
+			groupPolicy: "allowlist",
+			senderId: "+15551234567",
+			selfId: "+15551234567",
+			isGroup: true,
+			mentioned: false,
+			allowFrom: [],
+			groupAllowFrom: ["+19998887777"], // someone else, not the operator
+		});
+		// Result: block, but the REASON is "without-mention", not "not-allowlisted".
+		assert.equal(r.kind, "block");
+		assert.match(String(r.reason), /^group:self-without-mention$/);
+	});
+
+	it("self in a `open` group still requires a mention (matches general open-group rule)", () => {
+		const r = evaluateAccess({
+			policy: "open",
+			groupPolicy: "open",
+			senderId: "+15551234567",
+			selfId: "+15551234567",
+			isGroup: true,
+			mentioned: false,
+			allowFrom: [],
+		});
+		assert.equal(r.kind, "block");
+		assert.match(String(r.reason), /^group:open-without-mention$/);
 	});
 
 	it("`open` policy allows any sender", () => {
@@ -62,6 +133,60 @@ describe("evaluateAccess", () => {
 	it("`pairing` allows listed senders and challenges everyone else", () => {
 		assert.equal(evaluateAccess({ policy: "pairing", senderId: "x", allowFrom: ["x"] }).kind, "allow");
 		assert.equal(evaluateAccess({ policy: "pairing", senderId: "y", allowFrom: ["x"] }).kind, "challenge");
+	});
+
+	/* ── wildcard `*` support (mirrors upstream isSenderAllowed) ── */
+
+	it("`*` wildcard in allowFrom matches every sender in `allowlist` mode", () => {
+		assert.equal(evaluateAccess({ policy: "allowlist", senderId: "anyone", allowFrom: ["*"] }).kind, "allow");
+		assert.equal(evaluateAccess({ policy: "allowlist", senderId: "+15551234567", allowFrom: ["*"] }).kind, "allow");
+	});
+
+	it("`*` wildcard in `pairing` mode short-circuits the challenge (no codes for anyone)", () => {
+		const r = evaluateAccess({ policy: "pairing", senderId: "+15551234567", allowFrom: ["*"] });
+		assert.equal(r.kind, "allow", "wildcard means no pairing challenge needed");
+		assert.match(String(r.reason), /^allow-from$/);
+	});
+
+	it("`*` wildcard works alongside explicit entries (no special ordering required)", () => {
+		assert.equal(
+			evaluateAccess({ policy: "allowlist", senderId: "newcomer", allowFrom: ["alice", "*"] }).kind,
+			"allow",
+		);
+	});
+
+	it("a literal '*' sender id is NOT auto-allowed unless the list itself contains `*`", () => {
+		// Defence-in-depth: the wildcard semantics are LIST-side, not sender-
+		// side. A peer with a literal id of "*" still has to be explicitly
+		// listed (and wouldn't be — provider ids never look like this).
+		assert.equal(
+			evaluateAccess({ policy: "allowlist", senderId: "*", allowFrom: ["alice"] }).kind,
+			"block",
+		);
+	});
+
+	it("`*` wildcard in groupAllowFrom matches every group sender (still mention-gated)", () => {
+		const withMention = evaluateAccess({
+			policy: "pairing",
+			groupPolicy: "allowlist",
+			senderId: "stranger",
+			isGroup: true,
+			mentioned: true,
+			allowFrom: [],
+			groupAllowFrom: ["*"],
+		});
+		assert.equal(withMention.kind, "allow");
+		const noMention = evaluateAccess({
+			policy: "pairing",
+			groupPolicy: "allowlist",
+			senderId: "stranger",
+			isGroup: true,
+			mentioned: false,
+			allowFrom: [],
+			groupAllowFrom: ["*"],
+		});
+		assert.equal(noMention.kind, "block", "wildcard doesn't bypass the mention requirement");
+		assert.match(String(noMention.reason), /^group:allow-from-without-mention$/);
 	});
 });
 

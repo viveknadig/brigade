@@ -467,8 +467,18 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 					const dmPolicy = resolveDmPolicy(args.config, adapter.id);
 					const groupPolicy = resolveGroupPolicy(args.config, adapter.id);
 					const cfgEntry = channelAccessCfg(args.config, adapter.id);
+					// Allow-from sources merge: config (declarative `allowFrom`) +
+					// persisted store (where `pairing approve` and `allow add`
+					// write). Reference behaviour: `allowlist` mode IGNORES the
+					// persisted store — only the declarative `allowFrom` from
+					// config counts. The reasoning: `allowlist` is the strict
+					// "operator hand-curates this list" mode; a pairing approval
+					// shouldn't auto-bypass it. `pairing` mode is the opt-in
+					// "anyone can request, operator approves" mode and merges
+					// both. (`open` / `disabled` skip the list entirely below.)
+					const storeAllow = dmPolicy === "allowlist" ? [] : readAllowFrom(adapter.id);
 					const allowFrom = [
-						...new Set([...readAllowFrom(adapter.id), ...configIds(cfgEntry.allowFrom)]),
+						...new Set([...storeAllow, ...configIds(cfgEntry.allowFrom)]),
 					];
 					const groupAllowFrom = [
 						...new Set([...readGroupAllowFrom(adapter.id), ...configIds(cfgEntry.groupAllowFrom)]),
@@ -528,14 +538,18 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 							channel: adapter.id,
 							sender: challengeSenderId,
 							isNew,
-							skipReply: isHistorical,
+							skipReply: isHistorical || !isNew,
 						});
-						if (isHistorical) {
-							// Recorded the request silently. Operator can approve via
-							// `brigade pairing approve <code>` and the stranger will
-							// see normal replies once they DM again.
-							return;
-						}
+						// Reply ONLY on first sight. If the stranger already has a
+						// pending code (isNew=false) every subsequent message would
+						// otherwise re-send the same challenge card — turning a
+						// stranger's normal chat into a wall of identical "your
+						// one-time code" replies. Same shape as OpenClaw's
+						// `issuePairingChallenge` (bails when `!created`). The
+						// upsertPairingRequest above already RECORDED the request
+						// so the operator can still approve via the CLI; we're just
+						// not spamming the stranger with duplicates.
+						if (isHistorical || !isNew) return;
 						await adapter.sendText(
 							msg.conversationId,
 							buildChallengeReply({ code, senderId: challengeSenderId, channelLabel: adapter.label }),
