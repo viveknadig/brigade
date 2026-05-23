@@ -211,6 +211,34 @@ export class BrigadeExtensionRegistry {
 		return resolveActiveWebProvider(this.webSearchProviders, cfg, env, "search");
 	}
 
+	/**
+	 * Look up a web-search provider by id, respecting the operator's
+	 * allow/deny lists. Returns null when the id is unknown OR is gated
+	 * out by config. Used for per-call `provider` overrides on
+	 * `web_search`.
+	 */
+	lookupWebSearchProviderById(
+		id: string,
+		cfg: BrigadeConfig,
+	): import("./types.js").WebSearchProvider | null {
+		const target = id.trim().toLowerCase();
+		if (!target) return null;
+		const slot = (cfg as {
+			tools?: { web?: { search?: { allow?: string[]; deny?: string[] } } };
+		}).tools?.web?.search;
+		const allow = slot?.allow;
+		const deny = slot?.deny;
+		const allowSet = allow && allow.length > 0 ? new Set(allow.map((s) => s.trim().toLowerCase())) : null;
+		const denySet = deny && deny.length > 0 ? new Set(deny.map((s) => s.trim().toLowerCase())) : null;
+		for (const p of this.webSearchProviders) {
+			if (p.id.toLowerCase() !== target) continue;
+			if (allowSet && !allowSet.has(target)) return null;
+			if (denySet && denySet.has(target)) return null;
+			return p;
+		}
+		return null;
+	}
+
 	resolveActiveWebFetchProvider(
 		cfg: BrigadeConfig,
 		env?: NodeJS.ProcessEnv,
@@ -414,14 +442,24 @@ function resolveActiveWebProvider<
 	kind: "search" | "fetch",
 ): T | null {
 	if (candidates.length === 0) return null;
-	const cfgRoot = cfg as { tools?: { web?: { search?: { provider?: string }; fetch?: { provider?: string } } } };
-	const pinnedId = cfgRoot.tools?.web?.[kind]?.provider?.trim();
+	const cfgRoot = cfg as {
+		tools?: {
+			web?: {
+				search?: { provider?: string; allow?: string[]; deny?: string[] };
+				fetch?: { provider?: string; allow?: string[]; deny?: string[] };
+			};
+		};
+	};
+	const slot = cfgRoot.tools?.web?.[kind];
+	const pinnedId = slot?.provider?.trim();
+	const allowed = filterByAllowDeny(candidates, slot?.allow, slot?.deny);
+	if (allowed.length === 0) return null;
 	if (pinnedId) {
 		// Explicit pin: honor it verbatim. If the operator pinned a provider
-		// that isn't yet configured, return null so the tool surfaces an
-		// actionable "this provider needs an API key" error rather than
-		// silently choosing a different one.
-		const pinned = candidates.find((c) => c.id === pinnedId);
+		// that isn't yet configured (or is excluded via deny), return null
+		// so the tool surfaces an actionable error rather than silently
+		// choosing a different one.
+		const pinned = allowed.find((c) => c.id === pinnedId);
 		if (!pinned) return null;
 		const isConfigured = (() => {
 			try {
@@ -432,7 +470,7 @@ function resolveActiveWebProvider<
 		})();
 		return isConfigured ? pinned : null;
 	}
-	const sorted = [...candidates].sort(
+	const sorted = [...allowed].sort(
 		(a, b) => (a.autoDetectOrder ?? 100) - (b.autoDetectOrder ?? 100) || a.id.localeCompare(b.id),
 	);
 	for (const c of sorted) {
@@ -447,4 +485,28 @@ function resolveActiveWebProvider<
 		if (c.requiresCredential === false) return c;
 	}
 	return null;
+}
+
+/**
+ * Apply operator allow / deny lists to the candidate set.
+ *
+ *   - `allow` (when non-empty): only providers whose id is listed survive.
+ *   - `deny` (always): listed providers are dropped.
+ *
+ * Allow runs before deny — if a provider is both allowed and denied, deny
+ * wins (fail-closed). An empty/missing allow list means "all allowed".
+ */
+function filterByAllowDeny<T extends { id: string }>(
+	candidates: ReadonlyArray<T>,
+	allow: string[] | undefined,
+	deny: string[] | undefined,
+): T[] {
+	const allowSet = allow && allow.length > 0 ? new Set(allow.map((s) => s.trim().toLowerCase())) : null;
+	const denySet = deny && deny.length > 0 ? new Set(deny.map((s) => s.trim().toLowerCase())) : null;
+	return candidates.filter((c) => {
+		const id = c.id.toLowerCase();
+		if (allowSet && !allowSet.has(id)) return false;
+		if (denySet && denySet.has(id)) return false;
+		return true;
+	});
 }

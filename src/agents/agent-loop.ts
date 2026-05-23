@@ -539,9 +539,37 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
         provider: activeSearchProvider,
         providerCtx: webProviderCtx,
         cacheTtlMinutes: searchCacheTtlMinutes,
+        // Per-call provider override: the agent can pass `provider: "<id>"`
+        // in a single web_search call to route through a different backend
+        // without changing operator config. The lookup respects the same
+        // allow/deny config the default resolver does.
+        lookupProviderById: (id) =>
+          extensionRegistry.lookupWebSearchProviderById(id, turnConfig as never),
       })
     : null;
-  const webTools = [fetchUrlTool, ...(webSearchTool ? [webSearchTool] : [])];
+  // Browser tool — opt-in via the operator dropping `playwright` into the
+  // workspace's node_modules. We try a require.resolve at this point;
+  // if it works we surface the tool, otherwise the agent won't see it.
+  // Lazy because Playwright is heavy and most turns don't need it.
+  const browserTool = await (async () => {
+    if (process.env.BRIGADE_DISABLE_BROWSER_TOOL === "1") return null;
+    try {
+      // `await import` would force-load Chromium binding at startup; resolve
+      // the manifest path instead so we only confirm presence.
+      const { createRequire } = await import("node:module");
+      const requireFn = createRequire(import.meta.url);
+      requireFn.resolve("playwright");
+      const { makeBrowserTool } = await import("./tools/browser.js");
+      return makeBrowserTool({});
+    } catch {
+      return null;
+    }
+  })();
+  const webTools = [
+    fetchUrlTool,
+    ...(webSearchTool ? [webSearchTool] : []),
+    ...(browserTool ? [browserTool] : []),
+  ];
   const webToolNames = webTools.map((t) => t.name);
   brigadeCustomTools.push(...webTools);
   // Gate the system-prompt ## Web section on whether ANY web tool actually

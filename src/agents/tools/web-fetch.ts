@@ -276,6 +276,14 @@ async function fetchRawAndExtract(args: {
 		},
 		timeoutMs: args.timeoutMs,
 		signal: args.signal,
+		// Transient-failure backoff for the built-in fetcher. 3 attempts,
+		// 500 ms base. Honors Retry-After when set by the upstream.
+		retry: {
+			maxAttempts: 3,
+			baseDelayMs: 500,
+			onRetry: ({ attempt, delayMs, reason }) =>
+				log.debug("fetch_url retry", { attempt, delayMs, reason }),
+		},
 	});
 
 	const status = response.status;

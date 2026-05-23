@@ -22,6 +22,8 @@ import { isIP, isIPv4, isIPv6 } from "node:net";
 import { promises as dnsPromises } from "node:dns";
 
 import { DEFAULT_TIMEOUT_SECONDS } from "../../agents/tools/web-shared.js";
+import { fetchWithRetry } from "../../agents/tools/web-retry.js";
+import { buildPinnedDispatcherForHostname } from "./dns-pinning.js";
 
 /** Default redirect cap — matches the upstream reference. */
 export const DEFAULT_MAX_REDIRECTS = 3;
@@ -233,6 +235,13 @@ export interface GuardedFetchOptions {
 	timeoutMs?: number;
 	/** Signal from the caller (e.g. agent turn cancel). Combined with the timeout signal. */
 	signal?: AbortSignal;
+	/** When set, retry transient failures (429 / 5xx / network) with exp-backoff. */
+	retry?: {
+		maxAttempts?: number;
+		baseDelayMs?: number;
+		maxDelayMs?: number;
+		onRetry?: (info: { attempt: number; delayMs: number; reason: string }) => void;
+	};
 }
 
 /** Headers stripped on cross-origin redirects to prevent credential leakage. */
@@ -277,13 +286,49 @@ export async function guardedFetch(
 			const ssrfReason = await classifyUrlForSsrf(currentUrl);
 			if (ssrfReason) throw new SsrfBlockedError(currentUrl, ssrfReason);
 
-			const response = await fetch(currentUrl, {
-				method: currentMethod,
-				headers: currentHeaders,
-				body: currentBody ?? undefined,
-				redirect: "manual",
-				signal,
-			});
+			// DNS pinning: pre-resolve the hostname ourselves, pick the first
+			// SSRF-safe address, and force undici to connect to THAT exact
+			// IP via a per-call dispatcher. Stops the rebinding TOCTOU where
+			// DNS flips between our `classifyUrlForSsrf` check and the socket
+			// connect. When the hostname is already an IP literal, we skip
+			// pinning (no DNS, nothing to rebind).
+			let pinnedDispatcher: import("undici").Dispatcher | undefined;
+			const parsedNow = new URL(currentUrl);
+			if (isIP(parsedNow.hostname) === 0) {
+				try {
+					const pinned = await buildPinnedDispatcherForHostname({
+						hostname: parsedNow.hostname,
+						classifyAddress: (addr, family) =>
+							family === 6 ? classifyIPv6(addr) : classifyIPv4(addr),
+					});
+					if (!pinned) {
+						throw new SsrfBlockedError(currentUrl, "all resolved IPs failed SSRF check");
+					}
+					pinnedDispatcher = pinned.dispatcher;
+				} catch (err) {
+					if (err instanceof SsrfBlockedError) throw err;
+					// DNS resolution failed — let the plain fetch surface the
+					// natural network error so the model sees "could not resolve".
+					pinnedDispatcher = undefined;
+				}
+			}
+
+			// When the caller opts in, retry transient 429/5xx with exp-backoff.
+			// We retry the SAME hop (no re-classify of redirect chain) — the
+			// SSRF check already passed at this URL.
+			const doFetch = (): Promise<Response> =>
+				fetch(currentUrl, {
+					method: currentMethod,
+					headers: currentHeaders,
+					body: currentBody ?? undefined,
+					redirect: "manual",
+					signal,
+					// Undici's `dispatcher` is accepted by Node's built-in fetch.
+					...(pinnedDispatcher ? { dispatcher: pinnedDispatcher } : {}),
+				} as RequestInit);
+			const response = opts.retry
+				? await fetchWithRetry(doFetch, { ...opts.retry, signal })
+				: await doFetch();
 
 			// Non-redirect: we're done. Caller handles the status.
 			if (response.status < 300 || response.status >= 400 || response.status === 304) {

@@ -36,15 +36,36 @@ import {
 } from "./web-provider-helpers.js";
 
 const BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search";
+const BRAVE_LLM_CONTEXT_ENDPOINT = "https://api.search.brave.com/res/v1/llm/context";
+
+type BraveMode = "web" | "llm-context";
 
 interface BraveSearchConfig {
 	apiKey?: string;
+	/**
+	 * `web` (default): structured ranked results. `llm-context`: Brave's
+	 * pre-extracted snippets endpoint optimized for grounded LLM input.
+	 * llm-context returns multi-snippet result rows + a `sources[]`
+	 * array; useful when the agent is doing one-shot RAG.
+	 */
+	mode?: BraveMode;
 	country?: string;
 	search_lang?: string;
 	ui_lang?: string;
 	freshness?: string;
 	dateAfter?: string;
 	dateBefore?: string;
+}
+
+interface BraveLlmContextEntry {
+	url?: string;
+	title?: string;
+	snippets?: unknown;
+}
+
+interface BraveLlmContextResponse {
+	grounding?: { generic?: BraveLlmContextEntry[] };
+	sources?: Array<{ url?: string; hostname?: string; date?: string }>;
 }
 
 /**
@@ -162,9 +183,11 @@ function createBraveSearchProvider(): WebSearchProvider {
 						25,
 					);
 
-					const url = new URL(BRAVE_SEARCH_ENDPOINT);
+					const mode: BraveMode = cfgSlot.mode === "llm-context" ? "llm-context" : "web";
+					const endpoint = mode === "llm-context" ? BRAVE_LLM_CONTEXT_ENDPOINT : BRAVE_SEARCH_ENDPOINT;
+					const url = new URL(endpoint);
 					url.searchParams.set("q", query);
-					url.searchParams.set("count", String(count));
+					if (mode === "web") url.searchParams.set("count", String(count));
 					// Validate locale/country codes against Brave's documented
 					// set before forwarding. Invalid values are dropped silently
 					// so the request still goes through with safe defaults.
@@ -173,11 +196,14 @@ function createBraveSearchProvider(): WebSearchProvider {
 					const uiLang = normalizeBraveUiLang(cfgSlot.ui_lang);
 					if (country) url.searchParams.set("country", country);
 					if (searchLang) url.searchParams.set("search_lang", searchLang);
-					if (uiLang) url.searchParams.set("ui_lang", uiLang);
-					const freshness = normalizeFreshnessPreset(cfgSlot.freshness);
+					// `ui_lang` + `freshness` + date range are web-mode only.
+					if (mode === "web" && uiLang) url.searchParams.set("ui_lang", uiLang);
+					const freshness = mode === "web"
+						? normalizeFreshnessPreset(cfgSlot.freshness)
+						: undefined;
 					if (freshness) {
 						url.searchParams.set("freshness", freshness);
-					} else {
+					} else if (mode === "web") {
 						// Validate dates against YYYY-MM-DD format + parseable.
 						const after = isValidIsoDate(cfgSlot.dateAfter) ? cfgSlot.dateAfter : undefined;
 						const before = isValidIsoDate(cfgSlot.dateBefore) ? cfgSlot.dateBefore : undefined;
@@ -211,6 +237,54 @@ function createBraveSearchProvider(): WebSearchProvider {
 							const safe = body.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 200);
 							throw new Error(`brave: HTTP ${response.status} — ${safe}`);
 						}
+						if (mode === "llm-context") {
+							const data = (() => {
+								try {
+									return JSON.parse(body) as BraveLlmContextResponse;
+								} catch {
+									throw new Error("brave: invalid JSON from upstream (llm-context)");
+								}
+							})();
+							const entries = Array.isArray(data.grounding?.generic)
+								? data.grounding!.generic!
+								: [];
+							const results = entries
+								.map((entry) => {
+									const title = (entry.title ?? "").trim();
+									const u = (entry.url ?? "").trim();
+									if (!title || !u) return null;
+									const snippetList = Array.isArray(entry.snippets)
+										? entry.snippets.filter((s): s is string => typeof s === "string" && s.length > 0)
+										: [];
+									// Concatenate snippets so the agent gets all of
+									// Brave's pre-extracted context in one row. Wrap
+									// the merged string through the envelope.
+									const merged = snippetList.join("\n\n").trim();
+									return wrapSearchHit({
+										title,
+										url: u,
+										snippet: merged.length > 0 ? merged : undefined,
+										siteName: resolveSiteName(u),
+									});
+								})
+								.filter((h): h is NonNullable<typeof h> => h !== null);
+							return {
+								provider: "brave",
+								mode,
+								results,
+								// Surface Brave's `sources[]` block separately — useful
+								// for downstream citation rendering.
+								sources: data.sources,
+								_cacheKey: makeProviderCacheKey([
+									"brave",
+									mode,
+									query,
+									country,
+									searchLang,
+								]),
+							};
+						}
+
 						const data = (() => {
 							try {
 								return JSON.parse(body) as BraveSearchResponse;
@@ -235,9 +309,11 @@ function createBraveSearchProvider(): WebSearchProvider {
 							.filter((h): h is NonNullable<typeof h> => h !== null);
 						return {
 							provider: "brave",
+							mode,
 							results,
 							_cacheKey: makeProviderCacheKey([
 								"brave",
+								mode,
 								query,
 								count,
 								country,

@@ -28,10 +28,26 @@ import {
 	wrapSearchHit,
 } from "./web-provider-helpers.js";
 
-const PERPLEXITY_ENDPOINT = "https://api.perplexity.ai/search";
+// re-import to keep helper visibility in runSonarChat below the top-level
+// import block (some bundlers need this when the function is declared at
+// module scope).
+void resolveSiteName;
+
+const PERPLEXITY_SEARCH_ENDPOINT = "https://api.perplexity.ai/search";
+const PERPLEXITY_CHAT_ENDPOINT = "https://api.perplexity.ai/chat/completions";
+
+type PerplexityTransport = "search" | "sonar";
 
 interface PerplexityConfig {
 	apiKey?: string;
+	/**
+	 * `search` (default): native Perplexity Search API — structured ranked
+	 * hits with title/url/snippet/date. `sonar`: chat/completions API
+	 * that returns an AI-synthesized answer + citations.
+	 */
+	transport?: PerplexityTransport;
+	/** Sonar model id (only used when transport === "sonar"). */
+	sonarModel?: string;
 	country?: string;
 	searchRecencyFilter?: "day" | "week" | "month" | "year";
 	searchDomainFilter?: string[];
@@ -117,6 +133,17 @@ function createPerplexitySearchProvider(): WebSearchProvider {
 						Math.max(Number((args as { count?: unknown }).count ?? 10) | 0, 1),
 						10,
 					);
+					const transport: PerplexityTransport = cfgSlot.transport === "sonar" ? "sonar" : "search";
+					if (transport === "sonar") {
+						return await runSonarChat({
+							query,
+							maxResults: max_results,
+							apiKey,
+							cfgSlot,
+							timeoutMs,
+							signal,
+						});
+					}
 					const body: Record<string, unknown> = { query, max_results };
 					if (cfgSlot.country) body.country = cfgSlot.country;
 					if (cfgSlot.searchRecencyFilter) body.search_recency_filter = cfgSlot.searchRecencyFilter;
@@ -146,7 +173,7 @@ function createPerplexitySearchProvider(): WebSearchProvider {
 					timer.unref?.();
 					const combined = mergeSignals([signal, controller.signal]);
 					try {
-						const response = await fetch(PERPLEXITY_ENDPOINT, {
+						const response = await fetch(PERPLEXITY_SEARCH_ENDPOINT, {
 							method: "POST",
 							headers: {
 								"content-type": "application/json",
@@ -194,6 +221,122 @@ function createPerplexitySearchProvider(): WebSearchProvider {
 			};
 		},
 	};
+}
+
+/**
+ * Run a Perplexity Sonar chat completion. Treats the question as a single
+ * user turn and asks the model to answer with citations. Returns the
+ * answer (envelope-wrapped) plus a flattened `citations[]` derived from
+ * BOTH the top-level `citations` array AND `choices[].message.annotations`
+ * (Perplexity emits citations in both spots depending on model version).
+ */
+async function runSonarChat(params: {
+	query: string;
+	maxResults: number;
+	apiKey: string;
+	cfgSlot: Partial<PerplexityConfig>;
+	timeoutMs: number;
+	signal?: AbortSignal;
+}): Promise<Record<string, unknown>> {
+	const { query, maxResults, apiKey, cfgSlot, timeoutMs } = params;
+	const model = cfgSlot.sonarModel?.trim() || "sonar";
+	const body: Record<string, unknown> = {
+		model,
+		messages: [
+			{
+				role: "system",
+				content:
+					"You are a research assistant. Answer the user's question concisely, citing each claim with the source URL. Return only the answer text.",
+			},
+			{ role: "user", content: query },
+		],
+	};
+	if (cfgSlot.searchRecencyFilter) body.search_recency_filter = cfgSlot.searchRecencyFilter;
+	if (cfgSlot.searchDomainFilter?.length) {
+		body.search_domain_filter = cfgSlot.searchDomainFilter.slice(0, 20);
+	}
+	if (cfgSlot.country) body.country = cfgSlot.country;
+
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(new Error("timeout")), timeoutMs);
+	timer.unref?.();
+	const combined = mergeSignals([params.signal, controller.signal]);
+	try {
+		const response = await fetch(PERPLEXITY_CHAT_ENDPOINT, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: `Bearer ${apiKey}`,
+				"http-referer": "https://github.com/Bhasvanth-Dev9380/brigade",
+				"x-title": "Brigade",
+			},
+			body: JSON.stringify(body),
+			signal: combined,
+		});
+		const { text: rawBody } = await readResponseText(response.body, 2_000_000);
+		if (response.status !== 200) {
+			const safe = rawBody.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 200);
+			throw new Error(`perplexity sonar: HTTP ${response.status} — ${safe}`);
+		}
+		const data = (() => {
+			try {
+				return JSON.parse(rawBody) as Record<string, unknown>;
+			} catch {
+				throw new Error("perplexity sonar: invalid JSON from upstream");
+			}
+		})();
+		const choices = Array.isArray(data.choices) ? (data.choices as Array<Record<string, unknown>>) : [];
+		const message = choices[0]?.message as Record<string, unknown> | undefined;
+		const answerText = typeof message?.content === "string" ? message.content.trim() : "";
+
+		// Citations come from EITHER the top-level `citations[]` (Perplexity
+		// classic shape) OR `choices[0].message.annotations[]` with type
+		// `url_citation`. Merge both, dedupe by URL, cap at maxResults.
+		const citations = new Set<string>();
+		const topCites = Array.isArray(data.citations) ? data.citations : [];
+		for (const c of topCites) {
+			if (typeof c === "string" && c.trim()) citations.add(c.trim());
+		}
+		const annotations = Array.isArray(message?.annotations)
+			? (message!.annotations as Array<Record<string, unknown>>)
+			: [];
+		for (const ann of annotations) {
+			if (ann?.type === "url_citation") {
+				const inner = ann.url_citation as Record<string, unknown> | undefined;
+				const candidate = typeof ann.url === "string"
+					? ann.url
+					: typeof inner?.url === "string"
+						? inner.url
+						: "";
+				if (candidate) citations.add(candidate);
+			}
+		}
+		const citationList = Array.from(citations).slice(0, maxResults);
+
+		// Sonar doesn't return per-hit titles; surface the citation URLs as
+		// minimal result rows so the schema matches the search transport.
+		// Title falls back to hostname; snippet wraps the URL itself.
+		const results = citationList
+			.map((u) => {
+				try {
+					const host = new URL(u).hostname;
+					return wrapSearchHit({ title: host, url: u, siteName: host });
+				} catch {
+					return null;
+				}
+			})
+			.filter((h): h is NonNullable<typeof h> => h !== null);
+
+		return {
+			provider: "perplexity",
+			mode: "sonar",
+			results,
+			answer: answerText, // gets wrapped downstream by web-search.ts normalizer
+			citations: citationList,
+		};
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 function mergeSignals(signals: ReadonlyArray<AbortSignal | undefined>): AbortSignal | undefined {
