@@ -421,7 +421,35 @@ export interface WebProviderContext {
 	readonly providerConfig?: Record<string, unknown>;
 	/** Runtime hints carried in from the resolver — currently just timeoutMs. */
 	readonly runtime?: { timeoutMs?: number; maxBytes?: number };
+	/**
+	 * Resolved runtime metadata captured by the provider's optional
+	 * `resolveRuntimeMetadata()` hook (transport choice, model selection,
+	 * detected feature flags). Opaque per-provider — `createTool` reads it.
+	 */
+	readonly runtimeMetadata?: Record<string, unknown>;
 }
+
+/**
+ * Optional setup hook signature for a provider. The CLI's onboarding flow
+ * calls this when the operator picks a provider that ships its own wizard
+ * (Brave OAuth, Tavily API-key fetch, etc.). Returns a structured
+ * outcome the CLI renders + persists to `brigade.json`. Providers without
+ * a wizard omit the method — the CLI falls back to a generic env-var prompt.
+ */
+export interface WebProviderSetupContext {
+	readonly config: BrigadeConfig;
+	readonly env: NodeJS.ProcessEnv;
+	/** Mutate to persist secrets / config. The CLI flushes after success. */
+	readonly setSecret: (path: string, value: string) => void;
+	readonly setConfig: (path: string, value: unknown) => void;
+	/** Operator-facing prompt — pass-through to the CLI's TTY. */
+	readonly prompt: (question: string, opts?: { mask?: boolean }) => Promise<string>;
+	readonly print: (line: string) => void;
+}
+export type WebProviderSetupOutcome =
+	| { status: "configured"; summary?: string }
+	| { status: "skipped"; summary?: string }
+	| { status: "error"; message: string };
 
 /**
  * Shape of the tool the provider's factory returns. The runtime registers it
@@ -465,6 +493,23 @@ export interface WebSearchProvider {
 	autoDetectOrder?: number;
 	isConfigured(cfg: BrigadeConfig, env?: NodeJS.ProcessEnv): boolean;
 	createTool(ctx: WebProviderContext): WebProviderToolDefinition | null;
+	/**
+	 * Optional onboarding wizard — invoked by the CLI when the operator
+	 * selects this provider in `brigade onboard`. Providers that ship a
+	 * custom wizard (Brave OAuth flow, Tavily key validation) implement
+	 * this; providers without one are handled by the generic env-var prompt.
+	 */
+	runSetup?(ctx: WebProviderSetupContext): Promise<WebProviderSetupOutcome>;
+	/**
+	 * Optional runtime introspection — called once per turn before
+	 * `createTool` to decide transport / model / feature-flag hints. Lands
+	 * on `WebProviderContext.runtimeMetadata`. Used by providers with
+	 * multi-transport choices (e.g. Perplexity Search-API vs Sonar-chat).
+	 */
+	resolveRuntimeMetadata?(
+		cfg: BrigadeConfig,
+		env?: NodeJS.ProcessEnv,
+	): Record<string, unknown> | null;
 }
 
 /**
@@ -489,6 +534,13 @@ export interface WebFetchProvider {
 	autoDetectOrder?: number;
 	isConfigured(cfg: BrigadeConfig, env?: NodeJS.ProcessEnv): boolean;
 	createTool(ctx: WebProviderContext): WebProviderToolDefinition | null;
+	/** See `WebSearchProvider.runSetup` — same contract. */
+	runSetup?(ctx: WebProviderSetupContext): Promise<WebProviderSetupOutcome>;
+	/** See `WebSearchProvider.resolveRuntimeMetadata` — same contract. */
+	resolveRuntimeMetadata?(
+		cfg: BrigadeConfig,
+		env?: NodeJS.ProcessEnv,
+	): Record<string, unknown> | null;
 }
 
 /* ─────────────────────────── memory plugin SDK ─────────────────────────── */

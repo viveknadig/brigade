@@ -51,6 +51,8 @@ export type {
 	// Web tools (search + fetch providers)
 	WebFetchProvider,
 	WebProviderContext,
+	WebProviderSetupContext,
+	WebProviderSetupOutcome,
 	WebProviderToolDefinition,
 	WebSearchProvider,
 	// Memory plugin SDK

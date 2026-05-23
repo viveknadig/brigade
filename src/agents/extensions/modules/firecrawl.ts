@@ -1,16 +1,28 @@
 /**
- * Firecrawl web-fetch provider — bundled, API-key-gated.
+ * Firecrawl web-fetch + web-search provider — bundled, API-key-gated.
  *
- * Falls back from the built-in raw HTTP fetcher when:
+ * **Fetch path** falls back from the built-in raw HTTP fetcher when:
  *   - the page is JS-heavy (built-in returns empty / shell HTML)
  *   - the upstream blocks Node's default User-Agent
  *   - the built-in throws a network error
+ *   - Readability bails on a JS-heavy page (provider beats regex fallback)
  *
  * Hits `https://api.firecrawl.dev/v2/scrape` with the configured API key,
  * asks for `markdown` format, and returns the markdown + metadata.
  *
- * Operator config: set `FIRECRAWL_API_KEY` env OR `tools.web.fetch.providers.firecrawl.apiKey`
- * in `brigade.json`. Sign-up at https://firecrawl.dev (free tier ~500 pages/mo).
+ * **Search path** is the `/v2/search` endpoint — used as the default
+ * `web_search` provider when Firecrawl is configured. The operator can pin a
+ * different search provider via `tools.web.search.provider: "<id>"`.
+ *
+ * Operator config (set in `brigade.json`):
+ *   tools.web.fetch.providers.firecrawl: {
+ *     apiKey?, proxy?, storeInCache?, maxAgeMs?, timeoutSeconds?, onlyMainContent?
+ *   }
+ *   tools.web.search.providers.firecrawl: {
+ *     apiKey? (shared with fetch), sources?, categories?, scrapeResults?
+ *   }
+ *
+ * Sign-up at https://firecrawl.dev (free tier ~500 pages/mo).
  */
 
 import { defineModule } from "../types.js";
@@ -19,11 +31,15 @@ import type {
 	WebFetchProvider,
 	WebProviderContext,
 	WebProviderToolDefinition,
+	WebSearchProvider,
 } from "../types.js";
 import type { BrigadeConfig } from "../../../config/io.js";
 import { DEFAULT_TIMEOUT_SECONDS, readResponseText } from "../../tools/web-shared.js";
 
-const FIRECRAWL_ENDPOINT = "https://api.firecrawl.dev/v2/scrape";
+const FIRECRAWL_SCRAPE_ENDPOINT = "https://api.firecrawl.dev/v2/scrape";
+const FIRECRAWL_SEARCH_ENDPOINT = "https://api.firecrawl.dev/v2/search";
+
+/* ─────────────────────────── shared key resolver ─────────────────────────── */
 
 /**
  * Strip any character that would let an attacker break out of an HTTP
@@ -49,8 +65,96 @@ function resolveFirecrawlApiKey(cfg: BrigadeConfig, env?: NodeJS.ProcessEnv): st
 	return cleaned.length > 0 ? cleaned : undefined;
 }
 
-/** Build the Firecrawl provider. Activates when `FIRECRAWL_API_KEY` is present. */
-function createFirecrawlProvider(): WebFetchProvider {
+/* ─────────────────────────── operator config readers ─────────────────────────── */
+
+interface FirecrawlFetchConfig {
+	apiKey?: string;
+	proxy?: "auto" | "basic" | "stealth";
+	storeInCache?: boolean;
+	maxAgeMs?: number;
+	timeoutSeconds?: number;
+	onlyMainContent?: boolean;
+}
+
+interface FirecrawlSearchConfig {
+	apiKey?: string;
+	sources?: string[];
+	categories?: string[];
+	scrapeResults?: boolean;
+}
+
+function readFirecrawlFetchConfig(cfg: BrigadeConfig): FirecrawlFetchConfig {
+	const slot = (
+		cfg as {
+			tools?: { web?: { fetch?: { providers?: { firecrawl?: FirecrawlFetchConfig } } } };
+		}
+	).tools?.web?.fetch?.providers?.firecrawl;
+	return slot ?? {};
+}
+
+function readFirecrawlSearchConfig(cfg: BrigadeConfig): FirecrawlSearchConfig {
+	const slot = (
+		cfg as {
+			tools?: { web?: { search?: { providers?: { firecrawl?: FirecrawlSearchConfig } } } };
+		}
+	).tools?.web?.search?.providers?.firecrawl;
+	return slot ?? {};
+}
+
+/* ─────────────────────────── shared HTTP helper ─────────────────────────── */
+
+interface PostFirecrawlOptions {
+	endpoint: string;
+	apiKey: string;
+	body: Record<string, unknown>;
+	timeoutMs: number;
+	signal?: AbortSignal;
+}
+
+async function postFirecrawl(opts: PostFirecrawlOptions): Promise<Record<string, unknown>> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(new Error("timeout")), opts.timeoutMs);
+	timer.unref?.();
+	const combined = mergeSignals([opts.signal, controller.signal]);
+	try {
+		const response = await fetch(opts.endpoint, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: `Bearer ${opts.apiKey}`,
+			},
+			body: JSON.stringify(opts.body),
+			signal: combined,
+		});
+		const { text: rawBody } = await readResponseText(response.body, 2_000_000);
+		if (response.status !== 200) {
+			// Strip control chars and cap before surfacing — the upstream body
+			// is attacker-influenceable text and lands in a thrown Error.message.
+			const safeSnippet = rawBody.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 200);
+			throw new Error(`firecrawl: HTTP ${response.status} — ${safeSnippet}`);
+		}
+		const json = (() => {
+			try {
+				return JSON.parse(rawBody) as Record<string, unknown>;
+			} catch {
+				return null;
+			}
+		})();
+		if (!json || json.success === false) {
+			const errMsg = typeof (json as { error?: unknown } | null)?.error === "string"
+				? (json as { error: string }).error
+				: "firecrawl returned no success payload";
+			throw new Error(`firecrawl: ${errMsg}`);
+		}
+		return json;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/* ─────────────────────────── fetch provider ─────────────────────────── */
+
+function createFirecrawlFetchProvider(): WebFetchProvider {
 	return {
 		id: "firecrawl",
 		label: "Firecrawl",
@@ -60,14 +164,19 @@ function createFirecrawlProvider(): WebFetchProvider {
 		signupUrl: "https://firecrawl.dev",
 		docsUrl: "https://docs.firecrawl.dev/api-reference/endpoint/scrape",
 		placeholder: "fc-…",
-		autoDetectOrder: 10, // wins over built-in raw on fallback when configured
+		autoDetectOrder: 10,
 		isConfigured(cfg, env) {
 			return resolveFirecrawlApiKey(cfg, env) !== undefined;
 		},
 		createTool(ctx: WebProviderContext): WebProviderToolDefinition | null {
 			const apiKey = resolveFirecrawlApiKey(ctx.config, ctx.env);
 			if (!apiKey) return null;
-			const timeoutMs = (ctx.runtime?.timeoutMs ?? DEFAULT_TIMEOUT_SECONDS * 1_000) | 0;
+			const fetchCfg = readFirecrawlFetchConfig(ctx.config);
+			const configuredTimeoutSec = fetchCfg.timeoutSeconds;
+			const fallbackTimeoutMs = (ctx.runtime?.timeoutMs ?? DEFAULT_TIMEOUT_SECONDS * 1_000) | 0;
+			const timeoutMs = typeof configuredTimeoutSec === "number" && configuredTimeoutSec > 0
+				? (configuredTimeoutSec * 1_000) | 0
+				: fallbackTimeoutMs;
 			return {
 				description: "Firecrawl scrape (markdown extraction with JS rendering).",
 				parameters: {
@@ -83,75 +192,136 @@ function createFirecrawlProvider(): WebFetchProvider {
 					const url = String((args as { url?: unknown }).url ?? "").trim();
 					if (!url) throw new Error("firecrawl: missing url");
 
-					const controller = new AbortController();
-					const timer = setTimeout(() => controller.abort(new Error("timeout")), timeoutMs);
-					timer.unref?.();
-					const combined = mergeSignals([signal, controller.signal]);
-					try {
-						const response = await fetch(FIRECRAWL_ENDPOINT, {
-							method: "POST",
-							headers: {
-								"content-type": "application/json",
-								authorization: `Bearer ${apiKey}`,
-							},
-							body: JSON.stringify({
-								url,
-								formats: ["markdown"],
-								onlyMainContent: true,
-							}),
-							signal: combined,
-						});
-						const { text: body } = await readResponseText(response.body, 2_000_000);
-						if (response.status !== 200) {
-							// Strip control chars and cap before surfacing — the upstream body
-							// is attacker-influenceable text and lands in a thrown Error.message.
-							const safeSnippet = body
-								.replace(/[\x00-\x1f\x7f]/g, " ")
-								.slice(0, 200);
-							throw new Error(`firecrawl: HTTP ${response.status} — ${safeSnippet}`);
-						}
-						const json = (() => {
-							try {
-								return JSON.parse(body) as Record<string, unknown>;
-							} catch {
-								return null;
-							}
-						})();
-						if (!json || json.success === false) {
-							const errMsg =
-								typeof (json as { error?: unknown } | null)?.error === "string"
-									? (json as { error: string }).error
-									: "firecrawl returned no success payload";
-							throw new Error(`firecrawl: ${errMsg}`);
-						}
-						const data = json.data as Record<string, unknown> | undefined;
-						const markdown =
-							typeof data?.markdown === "string"
-								? data.markdown
-								: typeof data?.content === "string"
-									? data.content
-									: "";
-						const metadata = (data?.metadata ?? {}) as Record<string, unknown>;
-						return {
-							provider: "firecrawl",
-							url,
-							finalUrl:
-								typeof metadata.sourceURL === "string" ? (metadata.sourceURL as string) : url,
-							status: 200,
-							contentType: "text/markdown",
-							title: typeof metadata.title === "string" ? (metadata.title as string) : undefined,
-							text: markdown,
-							rawLength: markdown.length,
-							extractor: "firecrawl",
-						};
-					} finally {
-						clearTimeout(timer);
+					// Build the request body with operator-configurable knobs.
+					// Default `onlyMainContent: true` matches OpenClaw's posture
+					// for one-shot model consumption.
+					const body: Record<string, unknown> = {
+						url,
+						formats: ["markdown"],
+						onlyMainContent: fetchCfg.onlyMainContent ?? true,
+					};
+					if (fetchCfg.proxy === "auto" || fetchCfg.proxy === "basic" || fetchCfg.proxy === "stealth") {
+						body.proxy = fetchCfg.proxy;
 					}
+					if (typeof fetchCfg.storeInCache === "boolean") {
+						body.storeInCache = fetchCfg.storeInCache;
+					}
+					if (typeof fetchCfg.maxAgeMs === "number" && fetchCfg.maxAgeMs >= 0) {
+						body.maxAge = fetchCfg.maxAgeMs;
+					}
+					if (typeof configuredTimeoutSec === "number" && configuredTimeoutSec > 0) {
+						body.timeout = configuredTimeoutSec * 1_000;
+					}
+
+					const json = await postFirecrawl({
+						endpoint: FIRECRAWL_SCRAPE_ENDPOINT,
+						apiKey,
+						body,
+						timeoutMs,
+						signal,
+					});
+					const data = json.data as Record<string, unknown> | undefined;
+					const markdown = typeof data?.markdown === "string"
+						? data.markdown
+						: typeof data?.content === "string"
+							? data.content
+							: "";
+					const metadata = (data?.metadata ?? {}) as Record<string, unknown>;
+					return {
+						provider: "firecrawl",
+						url,
+						finalUrl: typeof metadata.sourceURL === "string" ? metadata.sourceURL : url,
+						status: typeof metadata.statusCode === "number" ? metadata.statusCode : 200,
+						contentType: "text/markdown",
+						title: typeof metadata.title === "string" ? metadata.title : undefined,
+						text: markdown,
+						rawLength: markdown.length,
+						extractor: "firecrawl",
+					};
 				},
 			};
 		},
 	};
 }
+
+/* ─────────────────────────── search provider ─────────────────────────── */
+
+function createFirecrawlSearchProvider(): WebSearchProvider {
+	return {
+		id: "firecrawl",
+		label: "Firecrawl Search",
+		hint: "Firecrawl's /v2/search endpoint. Same API key as Firecrawl scrape.",
+		requiresCredential: true,
+		envVars: ["FIRECRAWL_API_KEY"],
+		signupUrl: "https://firecrawl.dev",
+		docsUrl: "https://docs.firecrawl.dev/api-reference/endpoint/search",
+		placeholder: "fc-…",
+		// `firecrawl` keyed beats DuckDuckGo (200) but loses to the operator
+		// picking a structured/paid provider explicitly.
+		autoDetectOrder: 50,
+		isConfigured(cfg, env) {
+			return resolveFirecrawlApiKey(cfg, env) !== undefined;
+		},
+		createTool(ctx: WebProviderContext): WebProviderToolDefinition | null {
+			const apiKey = resolveFirecrawlApiKey(ctx.config, ctx.env);
+			if (!apiKey) return null;
+			const searchCfg = readFirecrawlSearchConfig(ctx.config);
+			const timeoutMs = (ctx.runtime?.timeoutMs ?? DEFAULT_TIMEOUT_SECONDS * 1_000) | 0;
+			return {
+				description: "Search the web via Firecrawl. Returns ranked URL hits with titles + snippets.",
+				parameters: {
+					type: "object",
+					properties: {
+						query: { type: "string" },
+						count: { type: "integer", minimum: 1, maximum: 25 },
+					},
+					required: ["query"],
+				},
+				async execute(args, signal) {
+					const query = String((args as { query?: unknown }).query ?? "").trim();
+					if (!query) throw new Error("firecrawl_search: missing query");
+					const count = Math.min(
+						Math.max(Number((args as { count?: unknown }).count ?? 10) | 0, 1),
+						25,
+					);
+					const body: Record<string, unknown> = { query, limit: count };
+					if (Array.isArray(searchCfg.sources) && searchCfg.sources.length > 0) {
+						body.sources = searchCfg.sources;
+					}
+					if (Array.isArray(searchCfg.categories) && searchCfg.categories.length > 0) {
+						body.categories = searchCfg.categories;
+					}
+					if (searchCfg.scrapeResults === true) {
+						body.scrapeOptions = { formats: ["markdown"] };
+					}
+					const json = await postFirecrawl({
+						endpoint: FIRECRAWL_SEARCH_ENDPOINT,
+						apiKey,
+						body,
+						timeoutMs,
+						signal,
+					});
+					const rawData = (json.data ?? json.web ?? []) as unknown;
+					const hits: Array<Record<string, unknown>> = Array.isArray(rawData)
+						? rawData.filter((h): h is Record<string, unknown> => !!h && typeof h === "object")
+						: [];
+					const results = hits.map((hit) => ({
+						title: typeof hit.title === "string" ? hit.title : "",
+						url: typeof hit.url === "string" ? hit.url : "",
+						snippet: typeof hit.description === "string"
+							? hit.description
+							: typeof hit.snippet === "string"
+								? hit.snippet
+								: undefined,
+					})).filter((h) => h.title && h.url);
+					return { provider: "firecrawl", results };
+				},
+			};
+		},
+	};
+}
+
+/* ─────────────────────────── misc helpers ─────────────────────────── */
 
 /** Merge multiple `AbortSignal`s into one that aborts when ANY input aborts. */
 function mergeSignals(signals: ReadonlyArray<AbortSignal | undefined>): AbortSignal | undefined {
@@ -174,8 +344,15 @@ function mergeSignals(signals: ReadonlyArray<AbortSignal | undefined>): AbortSig
 export const firecrawlModule = defineModule({
 	id: "firecrawl",
 	register(b: BrigadeExtensionContext) {
-		b.webFetch(createFirecrawlProvider());
+		b.webFetch(createFirecrawlFetchProvider());
+		b.webSearch(createFirecrawlSearchProvider());
 	},
 });
 
-export { createFirecrawlProvider, resolveFirecrawlApiKey };
+export {
+	createFirecrawlFetchProvider,
+	createFirecrawlSearchProvider,
+	readFirecrawlFetchConfig,
+	readFirecrawlSearchConfig,
+	resolveFirecrawlApiKey,
+};

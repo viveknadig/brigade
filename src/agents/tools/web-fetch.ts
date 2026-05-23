@@ -100,6 +100,13 @@ export interface FetchUrlDetails {
 	text: string;
 	warning?: string;
 	cached?: true;
+	/**
+	 * Internal hint: the primary raw extractor returned an unusable result
+	 * (Readability bailed on JS-heavy page) and the provider is preferred
+	 * over the basic-html fallback. Stripped before the payload reaches
+	 * the model — never on the wire.
+	 */
+	_fallbackPreferred?: true;
 }
 
 /* ─────────────────────────── cache ─────────────────────────── */
@@ -190,16 +197,19 @@ export function makeFetchUrlTool(opts: MakeFetchUrlToolOptions = {}): AnyBrigade
 				rawError = err;
 			}
 
-			// Provider fallback when raw failed, returned non-OK, OR returned
-			// effectively-empty content (SPAs that 200 with a shell HTML). We
-			// gauge "empty" by the EXTRACTED text length, not the raw body —
-			// a 50 KB SPA shell that extracts to ~80 chars of nav text should
-			// still trigger the fallback.
+			// Provider fallback when raw failed, returned non-OK, returned
+			// effectively-empty content (SPAs that 200 with a shell HTML), OR
+			// the raw extractor signalled it would do worse than the provider
+			// (Readability bailed on JS-heavy markup — basic-html regex would
+			// be a poor substitute for a real headless renderer).
 			const looksEmpty = payload?.status !== undefined
 				&& payload.status < 400
 				&& payload.rawLength < 200;
+			const readabilityBailed = payload?._fallbackPreferred === true;
 			const shouldFallback =
-				(!payload || payload.status >= 400 || looksEmpty) && opts.provider && opts.providerCtx;
+				(!payload || payload.status >= 400 || looksEmpty || readabilityBailed)
+				&& opts.provider
+				&& opts.providerCtx;
 			if (shouldFallback) {
 				onUpdate?.({
 					content: [{ type: "text", text: `Built-in fetch failed — falling back to ${opts.provider!.id}…` }],
@@ -271,6 +281,13 @@ async function fetchRawAndExtract(args: {
 	const status = response.status;
 	const contentType = normalizeContentType(response.headers.get("content-type"));
 
+	// Cloudflare's "Markdown for Agents" responds with `text/markdown` plus an
+	// `x-markdown-tokens` header carrying the precomputed token count. We log
+	// it as a capacity-planning hint — useful when the operator needs to know
+	// whether their fetch budget will land before the LLM call.
+	const cfTokens = response.headers.get("x-markdown-tokens");
+	if (cfTokens) log.debug("cf pre-rendered markdown", { tokens: cfTokens });
+
 	const body = await readResponseText(response.body, args.maxBytes);
 	const rawLength = body.text.length;
 
@@ -280,17 +297,30 @@ async function fetchRawAndExtract(args: {
 	});
 
 	let extracted: ExtractedContent;
+	// `fallbackPreferred` flags an attempt where the primary extractor returned
+	// nothing useful (e.g. Readability bailed on a JS-heavy SPA). The outer
+	// fallback gate then prefers the configured provider over basic-html.
+	let fallbackPreferred = false;
 	if (status >= 400) {
 		// Non-OK: still try to extract a useful error body for the model.
 		extracted = extractBasicHtmlContent(body.text);
 		extracted.extractor = "raw";
 	} else if (contentType?.startsWith("text/markdown")) {
-		extracted = { text: body.text, extractor: "raw" };
+		// CF Markdown-for-Agents pre-renders. Tag with `cf-markdown` when the
+		// CF header is present so logs/details show provenance.
+		extracted = { text: body.text, extractor: cfTokens ? "cf-markdown" : "raw" };
 	} else if (contentType?.startsWith("application/json")) {
 		extracted = { text: prettyJson(body.text), extractor: "json" };
 	} else if (contentType?.startsWith("text/html") || looksLikeHtml(body.text)) {
 		const fromReadability = await extractReadableContent(body.text, finalUrl).catch(() => null);
-		extracted = fromReadability ?? extractBasicHtmlContent(body.text);
+		if (fromReadability) {
+			extracted = fromReadability;
+		} else {
+			// Readability bailed — fall through to basic-html but signal the
+			// outer gate that the provider would do better than regex here.
+			extracted = extractBasicHtmlContent(body.text);
+			fallbackPreferred = true;
+		}
 	} else {
 		// Plain text / unknown — passthrough.
 		extracted = { text: body.text, extractor: "raw" };
@@ -330,6 +360,7 @@ async function fetchRawAndExtract(args: {
 		tookMs: 0, // filled in by caller after end-to-end timing
 		text: wrapped,
 		warning,
+		...(fallbackPreferred ? { _fallbackPreferred: true as const } : {}),
 	};
 }
 
@@ -405,9 +436,13 @@ function normalizeProviderPayload(args: {
 /* ─────────────────────────── helpers ─────────────────────────── */
 
 function jsonResult(payload: FetchUrlDetails): AgentToolResult<FetchUrlDetails> {
+	// Strip internal-only hints (the `_fallbackPreferred` flag is for the
+	// runtime's decision tree, never for the model).
+	const { _fallbackPreferred: _omit, ...sanitized } = payload;
+	void _omit;
 	return {
-		content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-		details: payload,
+		content: [{ type: "text", text: JSON.stringify(sanitized, null, 2) }],
+		details: sanitized as FetchUrlDetails,
 	};
 }
 
