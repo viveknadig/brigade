@@ -9,6 +9,7 @@ import {
   REASONING_FORMAT_GUIDANCE,
   SKILLS_GUIDANCE,
   shouldUseReasoningFormat,
+  WEB_TOOLS_GUIDANCE,
 } from "./guidance.js";
 import type { ContextFile } from "./types.js";
 import type { BootstrapPhase } from "../workspace/state.js";
@@ -77,6 +78,9 @@ export interface AssembleArgs {
     memory?: boolean;
     skills?: boolean;
     subAgents?: boolean;
+    /** Web tools (`fetch_url` and/or `web_search`) wired into this session.
+     *  Gates the ## Web behavioural guidance + untrusted-content posture. */
+    web?: boolean;
   };
   // Pre-rendered `<available_skills>` XML (Primitive #5). Discovered + filtered
   // + rendered upstream (agents/skills) and passed in; the assembler just
@@ -307,6 +311,17 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
       lines.push(args.skillsPromptBlock.trim());
       lines.push("");
     }
+  }
+
+  // 7d. ## Web (conditional on web tools being wired this turn).
+  // Emitted whenever `fetch_url` / `web_search` are in the agent's tool
+  // surface. Teaches when to use which, citation expectations, and the
+  // untrusted-content posture so the model treats fetched bodies as data
+  // rather than instructions. Pairs with the in-tool `<<<EXTERNAL_…>>>`
+  // envelope the fetcher already wraps every body in.
+  if (args.capabilities?.web) {
+    lines.push(WEB_TOOLS_GUIDANCE);
+    lines.push("");
   }
 
   // 8. ## Reasoning Format.

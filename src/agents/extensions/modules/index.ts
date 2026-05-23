@@ -8,6 +8,17 @@
  */
 
 import { whatsAppModule } from "../../channels/whatsapp/module.js";
+import { duckduckgoModule } from "./duckduckgo.js";
+import { firecrawlModule } from "./firecrawl.js";
 import type { BrigadeModule } from "../types.js";
 
-export const BUNDLED_MODULES: BrigadeModule[] = [whatsAppModule];
+export const BUNDLED_MODULES: BrigadeModule[] = [
+	whatsAppModule,
+	// Web-search provider: keyless HTML scraper. Activates by default — sorted last
+	// by `autoDetectOrder=100` so any keyed provider an operator adds wins.
+	duckduckgoModule,
+	// Web-fetch provider: API-key gated. Inert until `FIRECRAWL_API_KEY` is set;
+	// then it auto-becomes the fallback when the built-in raw fetcher fails or
+	// returns non-2xx (JS-heavy pages, bot-blocked sites).
+	firecrawlModule,
+];

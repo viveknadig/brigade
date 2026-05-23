@@ -62,6 +62,8 @@ export class BrigadeExtensionRegistry {
 	private readonly contextEngineMap = new Map<string, import("./types.js").ContextEngineCapability>();
 	private readonly compactionProviderMap = new Map<string, import("./types.js").CompactionProvider>();
 	private readonly agentHarnessMap = new Map<string, import("./types.js").AgentHarness>();
+	private readonly webSearchMap = new Map<string, import("./types.js").WebSearchProvider>();
+	private readonly webFetchMap = new Map<string, import("./types.js").WebFetchProvider>();
 	private readonly integrationMap = new Map<string, Integration>();
 	private readonly serviceMap = new Map<string, Service>();
 	private readonly httpRouteMap = new Map<string, HttpRoute>();
@@ -127,6 +129,12 @@ export class BrigadeExtensionRegistry {
 			agentHarness: (harness) => {
 				this.agentHarnessMap.set(harness.id, harness);
 			},
+			webSearch: (provider) => {
+				this.webSearchMap.set(provider.id, provider);
+			},
+			webFetch: (provider) => {
+				this.webFetchMap.set(provider.id, provider);
+			},
 			integration: (integration) => {
 				this.integrationMap.set(integration.id, integration);
 			},
@@ -174,6 +182,40 @@ export class BrigadeExtensionRegistry {
 	}
 	get agentHarnesses(): import("./types.js").AgentHarness[] {
 		return [...this.agentHarnessMap.values()];
+	}
+	get webSearchProviders(): import("./types.js").WebSearchProvider[] {
+		return [...this.webSearchMap.values()];
+	}
+	get webFetchProviders(): import("./types.js").WebFetchProvider[] {
+		return [...this.webFetchMap.values()];
+	}
+
+	/**
+	 * Resolve the active web-search provider for the agent loop.
+	 *
+	 *   1. If `tools.web.search.provider` is pinned in config, return that
+	 *      provider — if missing or not-yet-configured, return `null` (the
+	 *      pin is honored verbatim; we don't silently fall back).
+	 *   2. Otherwise sort by `autoDetectOrder` ascending and return the
+	 *      first provider whose `isConfigured(cfg, env)` returns true.
+	 *   3. If none are credentialed, fall back to the first provider with
+	 *      `requiresCredential === false` (e.g. DuckDuckGo HTML scrape).
+	 *   4. Otherwise `null` — no search provider is reachable.
+	 *
+	 * Same shape (parallel function) for `resolveActiveWebFetchProvider`.
+	 */
+	resolveActiveWebSearchProvider(
+		cfg: BrigadeConfig,
+		env?: NodeJS.ProcessEnv,
+	): import("./types.js").WebSearchProvider | null {
+		return resolveActiveWebProvider(this.webSearchProviders, cfg, env, "search");
+	}
+
+	resolveActiveWebFetchProvider(
+		cfg: BrigadeConfig,
+		env?: NodeJS.ProcessEnv,
+	): import("./types.js").WebFetchProvider | null {
+		return resolveActiveWebProvider(this.webFetchProviders, cfg, env, "fetch");
 	}
 
 	/**
@@ -347,4 +389,62 @@ export class BrigadeExtensionRegistry {
 			}
 		};
 	}
+}
+
+/**
+ * Shared resolver for `webSearch` and `webFetch` providers — same selection
+ * algorithm both sides. Reads `tools.web.<kind>.provider` for an explicit
+ * pin; otherwise sorts candidates by `autoDetectOrder` (ascending; lower
+ * wins) and returns the first one whose `isConfigured` returns true.
+ * Falls back to the first `requiresCredential: false` candidate when no
+ * credentialed provider exists — so a zero-config provider like DuckDuckGo
+ * always works on a fresh install.
+ */
+function resolveActiveWebProvider<
+	T extends {
+		id: string;
+		autoDetectOrder?: number;
+		requiresCredential?: boolean;
+		isConfigured(cfg: BrigadeConfig, env?: NodeJS.ProcessEnv): boolean;
+	},
+>(
+	candidates: ReadonlyArray<T>,
+	cfg: BrigadeConfig,
+	env: NodeJS.ProcessEnv | undefined,
+	kind: "search" | "fetch",
+): T | null {
+	if (candidates.length === 0) return null;
+	const cfgRoot = cfg as { tools?: { web?: { search?: { provider?: string }; fetch?: { provider?: string } } } };
+	const pinnedId = cfgRoot.tools?.web?.[kind]?.provider?.trim();
+	if (pinnedId) {
+		// Explicit pin: honor it verbatim. If the operator pinned a provider
+		// that isn't yet configured, return null so the tool surfaces an
+		// actionable "this provider needs an API key" error rather than
+		// silently choosing a different one.
+		const pinned = candidates.find((c) => c.id === pinnedId);
+		if (!pinned) return null;
+		const isConfigured = (() => {
+			try {
+				return pinned.isConfigured(cfg, env);
+			} catch {
+				return false;
+			}
+		})();
+		return isConfigured ? pinned : null;
+	}
+	const sorted = [...candidates].sort(
+		(a, b) => (a.autoDetectOrder ?? 100) - (b.autoDetectOrder ?? 100) || a.id.localeCompare(b.id),
+	);
+	for (const c of sorted) {
+		try {
+			if (c.isConfigured(cfg, env)) return c;
+		} catch {
+			/* a buggy isConfigured shouldn't sink the whole pick */
+		}
+	}
+	// No credentialed provider — fall back to the first keyless candidate.
+	for (const c of sorted) {
+		if (c.requiresCredential === false) return c;
+	}
+	return null;
 }

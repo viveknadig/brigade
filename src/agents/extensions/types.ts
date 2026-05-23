@@ -405,6 +405,92 @@ export interface Integration {
 	isConfigured(cfg: BrigadeConfig, env?: NodeJS.ProcessEnv): boolean;
 }
 
+/* ─────────────────────────── web provider SDK ─────────────────────────── */
+
+/**
+ * Context handed to a web provider when its `createTool(ctx)` factory runs.
+ * Carries the resolved Brigade config + env + per-tool config slice the
+ * resolver pulled out (e.g. `tools.web.search.providers.brave.apiKey`) so the
+ * provider can read its own credentials without re-deriving them.
+ */
+export interface WebProviderContext {
+	readonly config: BrigadeConfig;
+	readonly env: NodeJS.ProcessEnv;
+	readonly workspaceDir: string;
+	/** Provider-scoped config slice (e.g. `tools.web.search.providers.<id>`). */
+	readonly providerConfig?: Record<string, unknown>;
+	/** Runtime hints carried in from the resolver — currently just timeoutMs. */
+	readonly runtime?: { timeoutMs?: number; maxBytes?: number };
+}
+
+/**
+ * Shape of the tool the provider's factory returns. The runtime registers it
+ * under a stable name (`fetch_url`, `web_search`) and wraps the execute via
+ * `withToolUpdates` for `onUpdate` streaming. The provider declares its own
+ * `parameters` (TypeBox/JSON-schema record) and `execute` body; the result
+ * normalizer downstream forces every provider's free-form return into the
+ * canonical `{content, details}` envelope.
+ */
+export interface WebProviderToolDefinition {
+	description: string;
+	parameters: Record<string, unknown>;
+	execute(
+		args: Record<string, unknown>,
+		signal?: AbortSignal,
+	): Promise<Record<string, unknown>>;
+}
+
+/**
+ * A web-search provider (Brave / Tavily / Exa / DuckDuckGo / Serper / Kagi /
+ * SearXNG / Perplexity / etc.). Provider IS a tool factory — when active, its
+ * `createTool(ctx)` returns the `web_search` tool the agent calls. The
+ * runtime appends the resolved tool to the agent's `customTools` list
+ * alongside built-ins.
+ *
+ * Auto-selection: providers are sorted by `autoDetectOrder` ascending (lower
+ * wins), then the first credentialed one is picked. `requiresCredential:
+ * false` lets a provider win without any env/config (e.g. DuckDuckGo HTML
+ * scrape). The operator pins a specific provider via
+ * `tools.web.search.provider: "<id>"` in `brigade.json`.
+ */
+export interface WebSearchProvider {
+	id: string;
+	label: string;
+	hint: string;
+	requiresCredential?: boolean;
+	envVars?: string[];
+	placeholder?: string;
+	signupUrl?: string;
+	docsUrl?: string;
+	autoDetectOrder?: number;
+	isConfigured(cfg: BrigadeConfig, env?: NodeJS.ProcessEnv): boolean;
+	createTool(ctx: WebProviderContext): WebProviderToolDefinition | null;
+}
+
+/**
+ * A web-fetch provider (Firecrawl / Jina-Reader / Browserless / raw HTTP).
+ * Same `createTool(ctx)` factory pattern as `WebSearchProvider`. Today
+ * Brigade also ships a BUILT-IN raw fetch tool that doesn't go through this
+ * abstraction — providers exist as the FALLBACK when the built-in errors or
+ * returns non-OK (JS-heavy pages, blocked-by-bot-detection sites).
+ *
+ * Auto-selection mirrors `WebSearchProvider`: sort by `autoDetectOrder`,
+ * first-credentialed wins; pin via `tools.web.fetch.provider`.
+ */
+export interface WebFetchProvider {
+	id: string;
+	label: string;
+	hint: string;
+	requiresCredential?: boolean;
+	envVars?: string[];
+	placeholder?: string;
+	signupUrl?: string;
+	docsUrl?: string;
+	autoDetectOrder?: number;
+	isConfigured(cfg: BrigadeConfig, env?: NodeJS.ProcessEnv): boolean;
+	createTool(ctx: WebProviderContext): WebProviderToolDefinition | null;
+}
+
 /* ─────────────────────────── memory plugin SDK ─────────────────────────── */
 
 /**
@@ -797,6 +883,21 @@ export interface BrigadeExtensionContext {
 	compactionProvider(provider: CompactionProvider): void;
 	/** Register an alternative agent harness shape (Codex / Claude-Code / etc). */
 	agentHarness(harness: AgentHarness): void;
+	/**
+	 * Register a web-search provider. Multiple providers can coexist; the
+	 * resolver picks based on `tools.web.search.provider` config OR the
+	 * first-credentialed candidate in `autoDetectOrder` priority. Each
+	 * provider's `createTool(ctx)` factory runs per-session to inject its
+	 * `web_search` tool into the agent's toolset.
+	 */
+	webSearch(provider: WebSearchProvider): void;
+	/**
+	 * Register a web-fetch provider. Same factory shape as `webSearch`. These
+	 * act as the FALLBACK when the built-in raw-HTTP `fetch_url` returns
+	 * non-OK or errors (JS-heavy pages, bot-blocked sites). Operators ship
+	 * Firecrawl / Jina-Reader / Browserless as fallbacks.
+	 */
+	webFetch(provider: WebFetchProvider): void;
 	integration(integration: Integration): void;
 	/** Register a long-lived background service (started at boot, stopped on shutdown). */
 	service(service: Service): void;

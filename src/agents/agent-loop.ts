@@ -467,6 +467,10 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // the "scan the skills listed below" guidance with no list beneath it is
     // misleading. promptBlock is undefined exactly when there's nothing to show.
     skills: skillDiscovery.promptBlock !== undefined,
+    // Wired below — flipped to `true` once the web-tool resolver decides at
+    // least one of `fetch_url` / `web_search` lands in `customTools`. The
+    // ## Web section in the prompt is gated on this flag.
+    web: false as boolean,
   };
   // `agents.defaults.toolset` (when set in `brigade.json`) narrows the active
   // tool profile — e.g. `"minimal" | "coding" | "messaging"`. The registry
@@ -487,10 +491,73 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     extensionFactories: [extensionRegistry.toPiExtensionFactory({ toolset: toolsetProfile })],
   } as never);
   await (brigadeResourceLoader as unknown as { reload: () => Promise<void> }).reload();
+
+  // ── Web tools (fetch_url + web_search) ────────────────────────────────────
+  // Build the canonical `fetch_url` tool with the configured WebFetchProvider
+  // as fallback (Firecrawl when keyed; built-in raw stays primary always).
+  // Build `web_search` only when an active WebSearchProvider resolved
+  // (DuckDuckGo is keyless and ships bundled, so it's always available
+  // unless explicitly opted out). Both join the customTools slot + the
+  // unknown-tool allowlist below.
+  const webProviderCtx = {
+    config: turnConfig as never,
+    env: process.env,
+    workspaceDir,
+  };
+  const activeFetchProvider = extensionRegistry.resolveActiveWebFetchProvider(
+    turnConfig as never,
+    process.env,
+  );
+  // Operator-configurable cache TTLs. `tools.web.{fetch,search}.cacheTtlMinutes`
+  // — unset/garbage → defaults (15min). Number conversion is permissive
+  // because TypeBox-validated config may flow through unknown shapes.
+  const webConfigShape = (turnConfig as {
+    tools?: {
+      web?: {
+        fetch?: { cacheTtlMinutes?: number };
+        search?: { cacheTtlMinutes?: number };
+      };
+    };
+  }).tools?.web;
+  const fetchCacheTtlMinutes = typeof webConfigShape?.fetch?.cacheTtlMinutes === "number"
+    ? webConfigShape.fetch.cacheTtlMinutes
+    : undefined;
+  const searchCacheTtlMinutes = typeof webConfigShape?.search?.cacheTtlMinutes === "number"
+    ? webConfigShape.search.cacheTtlMinutes
+    : undefined;
+  const fetchUrlTool = (await import("./tools/web-fetch.js")).makeFetchUrlTool({
+    provider: activeFetchProvider ?? null,
+    providerCtx: activeFetchProvider ? webProviderCtx : undefined,
+    cacheTtlMinutes: fetchCacheTtlMinutes,
+  });
+  const activeSearchProvider = extensionRegistry.resolveActiveWebSearchProvider(
+    turnConfig as never,
+    process.env,
+  );
+  const webSearchTool = activeSearchProvider
+    ? (await import("./tools/web-search.js")).makeWebSearchTool({
+        provider: activeSearchProvider,
+        providerCtx: webProviderCtx,
+        cacheTtlMinutes: searchCacheTtlMinutes,
+      })
+    : null;
+  const webTools = [fetchUrlTool, ...(webSearchTool ? [webSearchTool] : [])];
+  const webToolNames = webTools.map((t) => t.name);
+  brigadeCustomTools.push(...webTools);
+  // Gate the system-prompt ## Web section on whether ANY web tool actually
+  // landed in customTools. `fetch_url` is always available (built-in raw
+  // fetch needs no provider), so this is effectively always true today;
+  // becomes meaningful if a future flag disables web tools entirely.
+  if (webTools.length > 0) promptCapabilities.web = true;
+
   // Extension tool names join the allowlist so the unknown-tool guard + Pi's
   // `tools` activation gate accept them alongside the built-ins + memory tools.
   const allEnabledToolNames = [
-    ...new Set([...enabledToolNames, ...extensionRegistry.toolNames({ toolset: toolsetProfile })]),
+    ...new Set([
+      ...enabledToolNames,
+      ...extensionRegistry.toolNames({ toolset: toolsetProfile }),
+      ...webToolNames,
+    ]),
   ];
 
   // ── Lane J: agent-harness slot warning ────────────────────────────────────

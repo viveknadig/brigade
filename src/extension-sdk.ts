@@ -48,6 +48,11 @@ export type {
 	MediaGenProvider,
 	SpeechProvider,
 	TranscriptionProvider,
+	// Web tools (search + fetch providers)
+	WebFetchProvider,
+	WebProviderContext,
+	WebProviderToolDefinition,
+	WebSearchProvider,
 	// Memory plugin SDK
 	MemoryCapability,
 	MemoryEmbeddingProvider,
