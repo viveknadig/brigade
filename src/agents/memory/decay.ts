@@ -1,21 +1,21 @@
 /**
- * Memory decay GC — Boop's `applyMemoryDecay` (`server/memory/clean.ts`)
- * ported to the file store. Pure arithmetic over importance / accessCount /
- * lastAccessedAt — no model call — so it runs cheaply inside the gateway's
- * background sweep alongside extraction.
+ * Memory decay GC — file-store version of recall-frequency-driven promotion.
+ * Pure arithmetic over importance / accessCount / lastAccessedAt — no model
+ * call — so it runs cheaply inside the gateway's background sweep alongside
+ * extraction.
  *
  * A fact's live score decays exponentially with time-since-last-access, on a
  * half-life that's LONGER for important facts (so identity sticks, context
  * fades), and is reinforced by how often it's been recalled. Neglected facts
  * archive then prune; `permanent`-tier facts (identity) never decay. This is
- * the self-pruning that keeps the structured store from growing without bound
- * — the file analog of OpenClaw's recall-frequency-driven promotion.
+ * the self-pruning that keeps the structured store from growing without
+ * bound.
  */
 
 import { FactStore, type MemoryRecord } from "./records.js";
 
 const DAY_MS = 86_400_000;
-/** Base half-life in days; scaled up by importance (Boop: BASE_HALF_LIFE_DAYS). */
+/** Base half-life in days; scaled up by importance. */
 const BASE_HALF_LIFE_DAYS = 11.25;
 const DECAY_BETA = 0.8;
 /** Below this live score → prune (dead). */
@@ -25,8 +25,8 @@ const ARCHIVE_THRESHOLD = 0.15;
 
 /**
  * Current live score in [0,1]. `permanent` tier is pinned at 1 (never decays).
- * Mirrors Boop's effective-score formula: importance-scaled half-life,
- * per-segment decay trim, and log-reinforcement from recall count.
+ * Effective-score formula: importance-scaled half-life, per-segment decay
+ * trim, and log-reinforcement from recall count.
  */
 export function effectiveScore(rec: MemoryRecord, now: number = Date.now()): number {
 	if (rec.tier === "permanent") return 1;

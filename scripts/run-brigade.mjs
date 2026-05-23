@@ -1,19 +1,18 @@
 #!/usr/bin/env node
 /**
- * Brigade dev runner — mirrors openclaw's `scripts/run-node.mjs`. Auto-rebuilds
- * `dist/` when source has drifted, then dispatches to `brigade.mjs` (the bin
- * shim) with the user's args.
+ * Brigade dev runner — auto-rebuilds `dist/` when source has drifted, then
+ * dispatches to `brigade.mjs` (the bin shim) with the user's args.
  *
  * Used by:
  *   npm run dev                 — bare invocation (defaults to TUI)
  *   npm run dev -- onboard      — run any subcommand against current source
- *   npm run dev:gateway         — equivalent of `pnpm gateway:dev` in OpenClaw
+ *   npm run dev:gateway         — gateway-only dev run
  *
  * End-users running `npm install -g brigade` never touch this — they go
  * through `brigade.mjs` directly. This is a developer ergonomic only.
  *
- * Staleness check (cheaper than OpenClaw's full build-stamp + git-head model
- * because Brigade's surface is small):
+ * Staleness check (small Brigade surface = lighter check than full
+ * build-stamp + git-head models):
  *   1. dist/entry.js missing            → build
  *   2. tsconfig.build.json newer        → build
  *   3. Any src/**\/*.ts mtime newer than dist/entry.js → build

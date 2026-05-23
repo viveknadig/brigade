@@ -3,12 +3,12 @@
  *
  *   - `recall_memory` — lexical search across MEMORY.md + memory/*.md daily
  *     notes (markdown, via BrigadeStorage) AND the structured fact store
- *     (memory/facts.jsonl, via FactStore). Mirrors OpenClaw's `memory_search`.
- *   - `read_memory`   — bounded excerpt read of one memory file (`memory_get`).
- *   - `write_memory`  — persist a structured durable fact (Boop's
- *     `write_memory`): one sentence + segment + importance. Recall hits bump
- *     the fact's accessCount (decay reinforcement); the post-turn extraction
- *     subagent writes through the same store.
+ *     (memory/facts.jsonl, via FactStore).
+ *   - `read_memory`   — bounded excerpt read of one memory file.
+ *   - `write_memory`  — persist a structured durable fact: one sentence +
+ *     segment + importance. Recall hits bump the fact's accessCount (decay
+ *     reinforcement); the post-turn extraction subagent writes through
+ *     the same store.
  *
  * Markdown reads/searches go through `BrigadeStorage` (Phase-2 DB-swap seam);
  * structured facts go through `FactStore`. Daily-note free-form writes still
@@ -251,9 +251,9 @@ interface WriteMemoryDetails {
 }
 
 /**
- * Build the `write_memory` tool bound to a FactStore. Mirrors Boop's
- * `write_memory` — persist a single distilled fact tagged by segment, with
- * tier/importance/decay derived from that segment.
+ * Build the `write_memory` tool bound to a FactStore. Persists a single
+ * distilled fact tagged by segment, with tier/importance/decay derived
+ * from that segment.
  */
 export function makeWriteMemoryTool(
 	factStore: FactStore,

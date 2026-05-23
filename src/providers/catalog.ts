@@ -25,11 +25,10 @@ export interface ProviderInfo {
 	envVar: string;
 	/**
 	 * Optional fallback env vars Brigade-side detection will try when `envVar`
-	 * itself isn't set. Mirrors openclaw's per-provider candidate list
-	 * (`src/secrets/provider-env-vars.ts:8-15`) — e.g. Anthropic accepts
-	 * either `ANTHROPIC_API_KEY` or `ANTHROPIC_OAUTH_TOKEN`. When ANY of
-	 * these is set, the auto-select path treats the provider as
-	 * "env-detected".
+	 * itself isn't set. Each provider can list multiple candidate vars —
+	 * e.g. Anthropic accepts either `ANTHROPIC_API_KEY` or
+	 * `ANTHROPIC_OAUTH_TOKEN`. When ANY of these is set, the auto-select
+	 * path treats the provider as "env-detected".
 	 *
 	 * Note: Pi's own `getEnvApiKey` only checks the primary `envVar`; this
 	 * extra layer is Brigade-side and is consulted by the auto-select

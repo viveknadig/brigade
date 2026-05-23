@@ -521,10 +521,9 @@ const MODEL_NOT_FOUND_PATTERNS_DETAILED = [
 ];
 
 /**
- * Detailed classifier (object return). Mirrors openclaw's primary classifier
- * shape for the retry-policy ladder. Returns `{class, retryAfterMs?, message,
- * retryableOnSameModel}` — `decideRetry` reads these fields to pick a
- * backoff strategy.
+ * Detailed classifier (object return) used by the retry-policy ladder.
+ * Returns `{class, retryAfterMs?, message, retryableOnSameModel}` —
+ * `decideRetry` reads these fields to pick a backoff strategy.
  *
  * Use `classifyError` (above) when you only need the category string.
  */

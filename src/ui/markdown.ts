@@ -11,10 +11,9 @@
  * placeholders inside the workspace template files (`_(pick something you
  * like)_`, `_Fill this in._`, etc.) — leak through with raw underscores.
  *
- * Same Pi-TUI version is used by the OpenClaw mirror, which has the same
- * symptom. This is a Brigade-side fix (templates stay untouched, agent
- * outputs aren't post-processed elsewhere — only the renderer is taught to
- * accept both italic flavours).
+ * This is a Brigade-side fix in the renderer (templates stay untouched,
+ * agent outputs aren't post-processed elsewhere — only the renderer is
+ * taught to accept both italic flavours).
  *
  * Replacement scope (`normalizeMarkdownItalic`):
  *   - Convert `_X_` to `*X*` ONLY when:

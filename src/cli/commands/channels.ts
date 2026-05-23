@@ -78,39 +78,54 @@ function snapshotChannel(adapter: ChannelAdapter, config: unknown): ChannelSnaps
 
 /**
  * Read the operator's account id from the channel's auth-store, when one exists.
- * Today this is a Baileys-specific peek (the only channel implemented), but the
- * shape is generic — other channels can grow their own state-file parsers as
- * they land. Returns `undefined` when we can't pull a hint without doing a
- * full link probe (a connect just to read selfId would defeat the whole point
- * of the short-circuit).
+ *
+ * Returns:
+ *   - `{ state: "linked", accountHint }` — fully linked; the link command
+ *     should print "already linked" and exit.
+ *   - `{ state: "partial" }` — creds artifacts exist BUT we can't read an
+ *     account id (interrupted first-link, missing `me.id`, or stale
+ *     allow-list-only state). The link command should refuse with a clear
+ *     "previous link is incomplete; run `wa:unlink` then retry" message
+ *     unless `--force` is set, in which case we wipe + start fresh.
+ *   - `undefined` — no link artifacts; proceed with a clean QR-and-link.
+ *
+ * Today this is a WhatsApp-specific peek (the only channel implemented), but
+ * the shape is generic — other channels can grow their own state-file parsers
+ * as they land.
  */
-function describeExistingLink(channelId: string): { accountHint?: string } | undefined {
+type ExistingLinkState = { state: "linked"; accountHint: string } | { state: "partial" } | undefined;
+function describeExistingLink(channelId: string): ExistingLinkState {
 	const stateDir = resolveChannelStateDir(channelId);
 	if (!hasLinkArtifacts(stateDir)) return undefined;
-	// WhatsApp / Baileys: creds live at <stateDir>/auth/creds.json with
-	// `me.id` = jid like "15551234567:1@s.whatsapp.net". Strip the device
-	// suffix to get the canonical phone digits we display in the success card.
 	if (channelId === "whatsapp") {
+		// Baileys creds at <stateDir>/auth/creds.json. The presence of an
+		// auth dir + a creds.json with `me.id` set means a full link
+		// completed at some point. If creds.json is missing OR `me.id` is
+		// absent (interrupted between QR-scan and 515-restart), report
+		// partial so the operator gets actionable guidance.
 		const credsPath = path.join(stateDir, "auth", "creds.json");
-		if (existsSync(credsPath)) {
-			try {
-				const creds = JSON.parse(readFileSync(credsPath, "utf8")) as {
-					me?: { id?: string };
-				};
-				const jid = creds?.me?.id;
-				if (typeof jid === "string" && jid.length > 0) {
-					const beforeAt = jid.split("@")[0] ?? jid;
-					const beforeColon = beforeAt.split(":")[0] ?? beforeAt;
-					const digits = beforeColon.replace(/\D/g, "");
-					if (digits.length >= 7) return { accountHint: digits };
-				}
-			} catch {
-				// Corrupted creds.json — still report linked (artifacts present)
-				// without a phone hint. The next link/unlink will heal it.
+		if (!existsSync(credsPath)) return { state: "partial" };
+		try {
+			const creds = JSON.parse(readFileSync(credsPath, "utf8")) as {
+				me?: { id?: string };
+			};
+			const jid = creds?.me?.id;
+			if (typeof jid === "string" && jid.length > 0) {
+				const beforeAt = jid.split("@")[0] ?? jid;
+				const beforeColon = beforeAt.split(":")[0] ?? beforeAt;
+				const digits = beforeColon.replace(/\D/g, "");
+				if (digits.length >= 7) return { state: "linked", accountHint: digits };
 			}
+			// creds.json present but no usable id — partial.
+			return { state: "partial" };
+		} catch {
+			// Corrupted creds.json — treat as partial; recovery path is unlink.
+			return { state: "partial" };
 		}
 	}
-	return {};
+	// Unknown channel with artifacts on disk — we know it's linked, just no
+	// account hint to surface.
+	return { state: "linked", accountHint: "" };
 }
 
 /** "Looks linked" = the channel's state dir has at least one non-empty file. */
@@ -174,7 +189,7 @@ export async function runChannelsList(opts: { json?: boolean } = {}): Promise<nu
 		return 0;
 	}
 	if (rows.length === 0) {
-		process.stdout.write("No channels available. (Try installing one under ~/.brigade/extensions/.)\n");
+		process.stdout.write("No channels available. Run `brigade channels add --help` to see how to install one.\n");
 		return 0;
 	}
 	const header = `${"ID".padEnd(14)} ${"LABEL".padEnd(16)} ENABLED  LINKED`;
@@ -201,11 +216,13 @@ export async function runChannelsStatus(
 		process.stdout.write(`${JSON.stringify({ ...snap, gateway }, null, 2)}\n`);
 		return 0;
 	}
+	// Human-readable status. The raw `stateDir` lives only on the `--json` path
+	// for machine consumers; the operator-visible block stays free of on-disk
+	// paths so it reads cleanly in a screenshot or copy-paste.
 	process.stdout.write(`${snap.label} (${snap.id})\n`);
 	process.stdout.write(`  enabled  : ${snap.enabled ? "yes" : "no"}\n`);
 	process.stdout.write(`  configured: ${snap.configured ? "yes" : "no"}\n`);
 	process.stdout.write(`  linked   : ${snap.linked ? "yes" : "no"}\n`);
-	process.stdout.write(`  authDir  : ${snap.stateDir}\n`);
 	process.stdout.write(`  gateway  : ${gateway ? "running" : "stopped"}\n`);
 	return 0;
 }
@@ -213,7 +230,7 @@ export async function runChannelsStatus(
 /* ─────────────────────────── link ─────────────────────────── */
 
 export async function runChannelsLink(
-	args: { channel?: string; timeoutMs?: number },
+	args: { channel?: string; timeoutMs?: number; force?: boolean },
 	opts: { json?: boolean } = {},
 ): Promise<number> {
 	if (gatewayIsRunning()) {
@@ -230,13 +247,13 @@ export async function runChannelsLink(
 	const adapter = chosen.adapter;
 	const timeoutMs = args.timeoutMs ?? 180_000;
 
-	// Short-circuit: if the channel already has on-disk creds, don't print a
-	// QR + push the operator through a full pair handshake. They probably
-	// re-ran `wa:link` to check status or because they forgot they'd done it.
-	// Tell them who's currently linked and exit cleanly. To force a fresh QR
-	// they can run `wa:unlink` first (or `--force`, plumbed below).
+	// Inspect on-disk artifacts BEFORE printing a QR. Three branches:
+	//   1) Fully linked → print the "already linked" card + exit.
+	//   2) Partial / interrupted previous link → refuse with a clear recovery
+	//      path UNLESS --force is set, in which case wipe + proceed.
+	//   3) No artifacts → clean link flow.
 	const existingLinkInfo = describeExistingLink(adapter.id);
-	if (existingLinkInfo) {
+	if (existingLinkInfo?.state === "linked" && !args.force) {
 		if (opts.json) {
 			process.stdout.write(
 				`${JSON.stringify({ ok: true, alreadyLinked: true, account: existingLinkInfo.accountHint }, null, 2)}\n`,
@@ -250,7 +267,8 @@ export async function runChannelsLink(
 					existingLinkInfo.accountHint
 						? `   Connected as: ${formatAccountForDisplay(adapter.id, existingLinkInfo.accountHint)}`
 						: "",
-					`   Run \`brigade channels unlink --channel ${adapter.id}\` first if you want a fresh QR.`,
+					`   Run \`brigade channels unlink --channel ${adapter.id}\` first if you want a fresh QR,`,
+					"   or pass `--force` to overwrite the existing link.",
 					"",
 				]
 					.filter(Boolean)
@@ -258,6 +276,39 @@ export async function runChannelsLink(
 			);
 		}
 		return 0;
+	}
+	if (existingLinkInfo?.state === "partial" && !args.force) {
+		const msg = [
+			"",
+			`⚠️   ${adapter.label} has an incomplete previous link on disk`,
+			"   ━━━━━━━━━━━━━━━━━━━━━━",
+			"   It looks like a previous link was interrupted before it finished.",
+			"   Pick one:",
+			`     • \`brigade channels unlink --channel ${adapter.id}\`  — clear it, then re-run \`brigade channels link\``,
+			`     • re-run with \`--force\`                                — Brigade will clear the stale state for you`,
+			"",
+		].join("\n") + "\n";
+		if (opts.json) {
+			process.stdout.write(`${JSON.stringify({ ok: false, reason: "incomplete previous link" }, null, 2)}\n`);
+		} else {
+			process.stderr.write(msg);
+		}
+		return 1;
+	}
+	if (args.force && existingLinkInfo) {
+		// Operator opted into a fresh link. Wipe the state dir before starting
+		// so the adapter's `useMultiFileAuthState` opens on a clean slate.
+		// Failure to wipe is non-fatal — the link will still try, and may
+		// happen to work; surface the warning so it isn't silent.
+		const dir = resolveChannelStateDir(adapter.id);
+		try {
+			if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+			process.stdout.write(`(forced: cleared previous ${adapter.label} state before linking)\n`);
+		} catch (err) {
+			process.stderr.write(
+				`(warning: --force could not clear previous state: ${err instanceof Error ? err.message : String(err)})\n`,
+			);
+		}
 	}
 
 	const abort = new AbortController();
@@ -351,7 +402,7 @@ export async function runChannelsLink(
 			setChannelEnabled(adapter.id, true);
 		} catch (err) {
 			process.stderr.write(
-				`(warning: linked successfully but failed to update brigade.json: ${err instanceof Error ? err.message : String(err)})\n`,
+				`(warning: linked, but Brigade could not enable the channel in your config: ${err instanceof Error ? err.message : String(err)})\n`,
 			);
 		}
 	} catch (err) {
@@ -403,7 +454,7 @@ export async function runChannelsLink(
 	// after `adapter.stop()`; without an explicit exit, Node sees a pending
 	// top-level await on the entry shim and emits an "unsettled top-level
 	// await" warning while it exits anyway. Exiting cleanly here avoids the
-	// warning and matches OpenClaw's link-command behavior (one-shot exit).
+	// warning. The link command is a one-shot exit.
 	process.exit(outcome.ok ? 0 : 1);
 }
 
@@ -440,7 +491,7 @@ export async function runChannelsUnlink(
 	if (!args.yes && process.stdin.isTTY) {
 		const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
 		try {
-			const answer = (await rl.question(`Delete ${dir} and disable ${id}? [y/N] `)).trim().toLowerCase();
+			const answer = (await rl.question(`Unlink ${id} and erase its saved credentials? [y/N] `)).trim().toLowerCase();
 			if (answer !== "y" && answer !== "yes") {
 				process.stderr.write("Cancelled.\n");
 				return 1;
@@ -455,7 +506,10 @@ export async function runChannelsUnlink(
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		if (opts.json) process.stdout.write(`${JSON.stringify({ ok: false, reason: msg })}\n`);
-		else process.stderr.write(`Failed to remove ${dir}: ${msg}\n`);
+		// Operator-visible: no on-disk path, just the failure reason. The full
+		// path lives in the operator log (resolved via `resolveChannelStateDir`)
+		// for diagnostics.
+		else process.stderr.write(`Failed to remove the channel's saved credentials: ${msg}\n`);
 		return 1;
 	}
 	try {
@@ -479,7 +533,7 @@ async function setEnableFlag(channel: string | undefined, enabled: boolean, json
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		if (json) process.stdout.write(`${JSON.stringify({ ok: false, reason: msg })}\n`);
-		else process.stderr.write(`Failed to update brigade.json: ${msg}\n`);
+		else process.stderr.write(`Failed to update Brigade config: ${msg}\n`);
 		return 1;
 	}
 	const verb = enabled ? "enabled" : "disabled";
@@ -541,7 +595,7 @@ export async function runChannelsAdd(
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		if (opts.json) process.stdout.write(`${JSON.stringify({ ok: false, reason: msg })}\n`);
-		else process.stderr.write(`Failed to write brigade.json: ${msg}\n`);
+		else process.stderr.write(`Failed to write Brigade config: ${msg}\n`);
 		return 1;
 	}
 	if (opts.json) {

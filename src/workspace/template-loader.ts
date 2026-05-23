@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 // alongside brigade. Templates live as plain markdown on disk so users (and
 // future tooling) can edit them without touching compiled code.
 //
-// Resolution order matches what openclaw users will recognise:
+// Resolution order:
 //   1. <brigade-package-root>/templates/workspace/    — wins on installed copies
 //   2. <cwd>/templates/workspace/                     — wins when running from a clone
 //   3. baked fallback relative to this compiled module — safety net

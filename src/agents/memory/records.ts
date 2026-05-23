@@ -1,9 +1,7 @@
 /**
- * Structured memory records — the Brigade mirror of Boop's memory model
- * (`server/memory/types.ts`), adapted from Convex tables to an append-only
- * JSONL file (`<workspace>/memory/facts.jsonl`). Single-user, so reads scan
- * the whole file and writes are read-modify-write — no concurrency budget to
- * fight, unlike Convex's 500/150-row scan caps.
+ * Structured memory records — an append-only JSONL file
+ * (`<workspace>/memory/facts.jsonl`). Single-user, so reads scan the whole
+ * file and writes are read-modify-write — no concurrency budget to fight.
  *
  * A "memory" here is a structured fact, NOT a raw note: one declarative
  * sentence tagged with a `segment` (what kind of fact) and a `tier` +
@@ -12,10 +10,10 @@
  * lexical recall layer (storage.ts) searches these alongside MEMORY.md +
  * daily notes.
  *
- * Conflict resolution mirrors Boop: `supersedes` archives older records, the
+ * Conflict resolution: `supersedes` archives older records, the
  * `correction` segment overturns a prior belief, and a decay GC ages out
- * neglected facts. (Boop's 3-LLM consolidation debate is intentionally NOT
- * ported in v1 — supersede + decay cover the common cases.)
+ * neglected facts. (A heavier 3-LLM consolidation debate is intentionally
+ * NOT done in v1 — supersede + decay cover the common cases.)
  */
 
 import * as fs from "node:fs";
@@ -63,9 +61,8 @@ export interface MemoryRecord {
 }
 
 /**
- * Per-segment defaults — ported from Boop's `SEGMENT_DEFAULTS`
- * (`server/memory/types.ts:37-45`). `identity` is the most durable (permanent,
- * slow decay); `context` the most ephemeral (short tier, fast decay).
+ * Per-segment defaults. `identity` is the most durable (permanent, slow
+ * decay); `context` the most ephemeral (short tier, fast decay).
  */
 export const SEGMENT_DEFAULTS: Record<
 	MemorySegment,
@@ -97,8 +94,7 @@ export const MAX_FACT_CONTENT_CHARS = 1000;
  * Jaccard-similarity threshold above which two facts are treated as the same
  * at write time (dedup). Deliberately HIGH (0.85) so only near-identical
  * restatements collapse — distinct facts that merely share words (e.g. two
- * different facts about the same topic) are kept separate. Mirrors Boop's
- * dreaming dedupe similarity.
+ * different facts about the same topic) are kept separate.
  */
 export const DEDUP_SIMILARITY = 0.85;
 
@@ -121,7 +117,7 @@ function jaccard(a: Set<string>, b: Set<string>): number {
 	return union === 0 ? 0 : inter / union;
 }
 
-/** `mem_<base36 time>_<rand>` — Boop's id shape, time-sortable. */
+/** `mem_<base36 time>_<rand>` — a time-sortable id shape. */
 export function makeMemoryId(): string {
 	return `mem_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -261,11 +257,11 @@ export class FactStore {
 	}
 
 	/**
-	 * Lexical search over active facts. Scores by how many query tokens appear
-	 * in the content (substring), tie-broken by importance then recency —
-	 * Boop's substring-fallback ranking. Marks every returned record accessed
-	 * (recall reinforcement) unless `markAccessed: false`. Returns at most
-	 * `limit` hits (default 8), each with its score.
+	 * Lexical search over active facts. Scores by how many query tokens
+	 * appear in the content (substring), tie-broken by importance then
+	 * recency — a substring-fallback ranking. Marks every returned record
+	 * accessed (recall reinforcement) unless `markAccessed: false`. Returns
+	 * at most `limit` hits (default 8), each with its score.
 	 */
 	search(query: string, opts: { limit?: number; markAccessed?: boolean } = {}): Array<MemoryRecord & { score: number }> {
 		const tokens = query

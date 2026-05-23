@@ -30,8 +30,24 @@ import { isAbortTrigger } from "./abort-triggers.js";
 import { channelSessionKey } from "./session-key.js";
 import { sanitizeReplyForChannel } from "./reply-sanitizer.js";
 import { classifyErrorReason, isBrigadeRetryError } from "../error-classifier.js";
+import { isRetryExhaustedError } from "../retry-policy.js";
 
 const log = createSubsystemLogger("channels/manager");
+
+/**
+ * Pairing-challenge grace window for queued-during-downtime DMs.
+ *
+ * After Brigade reconnects, the platform replays every inbound it queued while
+ * we were offline. Without this guard, every stranger who DM'd during that
+ * window would get a pairing code in a burst — looks like spam and trips
+ * anti-abuse on some channels. Messages stamped MORE than this many ms
+ * before our latest connection are treated as history: we still record the
+ * pairing request so the operator can approve by code, but we don't send the
+ * stranger a reply. 30s is the same grace window the reference implementation
+ * uses; tuned to be larger than typical clock skew but small enough that a
+ * stranger who messaged ~10s before our restart still gets a live reply.
+ */
+const PAIRING_REPLY_HISTORY_GRACE_MS = 30_000;
 
 /** Per-channel access-control config (DM + group policy + declarative allow-from). */
 interface ChannelAccessConfig {
@@ -80,10 +96,19 @@ function configIds(list: string[] | undefined): string[] {
  * sees a clean human sentence.
  */
 function buildOperatorFacingErrorReply(err: unknown): string {
-	// Prefer the structured reason carried by BrigadeRetryError; fall back to
-	// re-classifying the raw error so unstructured throws still get a useful
-	// category.
-	const reason = isBrigadeRetryError(err) ? err.reason : classifyErrorReason(err);
+	// Reason resolution prefers (in order): the structured `BrigadeRetryError`
+	// carrying `.reason`, then `RetryExhaustedError` carrying `.lastReason`
+	// (the retry-loop's final classification), then a re-classification of
+	// the raw error walking `.cause` recursively. Without the
+	// `isRetryExhaustedError` branch, a 402 OpenRouter billing error wrapped
+	// in a retry-exhausted shell was being classified as `unknown` and
+	// recipients got the generic apology instead of the "out of credits"
+	// message — that's the user-reported regression this branch fixes.
+	const reason = isBrigadeRetryError(err)
+		? err.reason
+		: isRetryExhaustedError(err)
+			? err.lastReason
+			: classifyErrorReason(err);
 	switch (reason) {
 		case "billing":
 			return [
@@ -372,12 +397,18 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 			if (reply) await adapter.sendText(a.conversationId, reply);
 		};
 
-		/** Flush a pending debounce slot — combine parts, dispatch. */
-		const flushDispatch = async (conversationId: string): Promise<void> => {
-			const slot = pendingDispatches.get(conversationId);
+		/**
+		 * Flush a pending debounce slot — combine parts, dispatch. `dispatchKey`
+		 * is the map key (`conversationId` for DMs, `conversationId#senderId`
+		 * for group rooms); we read the slot, then dispatch to the slot's
+		 * actual `baseMsg.conversationId` so the reply lands in the room.
+		 */
+		const flushDispatch = async (dispatchKey: string): Promise<void> => {
+			const slot = pendingDispatches.get(dispatchKey);
 			if (!slot) return;
-			pendingDispatches.delete(conversationId);
+			pendingDispatches.delete(dispatchKey);
 			const combined = slot.parts.join("\n\n");
+			const conversationId = slot.baseMsg.conversationId;
 			try {
 				await dispatchTurn({ text: combined, sessionKey: slot.sessionKey, conversationId });
 			} catch (err) {
@@ -475,12 +506,36 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 							});
 							return;
 						}
+						// Pairing-grace window — if the inbound was platform-stamped
+						// BEFORE the channel's most recent connection (minus a 30s
+						// jitter buffer), treat it as queued-during-downtime history
+						// and suppress the REPLY. We still record the pairing
+						// request so an operator can approve by code later, but we
+						// don't burst-spam strangers the moment Brigade reconnects.
+						const connectedAt = adapter.connectedAt?.() ?? null;
+						const historicalCutoff =
+							connectedAt !== null ? connectedAt - PAIRING_REPLY_HISTORY_GRACE_MS : null;
+						const isHistorical =
+							historicalCutoff !== null &&
+							msg.messageTimestampMs !== undefined &&
+							msg.messageTimestampMs < historicalCutoff;
 						const { code, isNew } = upsertPairingRequest({
 							channelId: adapter.id,
 							senderId: challengeSenderId,
 							senderName: msg.fromName,
 						});
-						log.info("issued pairing challenge", { channel: adapter.id, sender: challengeSenderId, isNew });
+						log.info("issued pairing challenge", {
+							channel: adapter.id,
+							sender: challengeSenderId,
+							isNew,
+							skipReply: isHistorical,
+						});
+						if (isHistorical) {
+							// Recorded the request silently. Operator can approve via
+							// `brigade pairing approve <code>` and the stranger will
+							// see normal replies once they DM again.
+							return;
+						}
 						await adapter.sendText(
 							msg.conversationId,
 							buildChallengeReply({ code, senderId: challengeSenderId, channelLabel: adapter.label }),
@@ -513,15 +568,18 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 					// Recognized BEFORE channel commands so the operator can always
 					// cancel even if the channel registered a "/stop" command.
 					if (isAbortTrigger(text)) {
-						// Cancel any pending debounce slot too — a stop should erase
-						// queued-but-not-yet-dispatched text, not let it slip through.
-						const pending = pendingDispatches.get(msg.conversationId);
-						if (pending) {
-							clearTimeout(pending.timer);
-							pendingDispatches.delete(msg.conversationId);
+						// Cancel EVERY pending debounce slot for this conversation
+						// (a group can have N slots, one per speaker — a single
+						// "stop" should clear them all, not just the speaker's own).
+						let cancelledAny = false;
+						for (const [key, slot] of pendingDispatches) {
+							if (slot.baseMsg.conversationId !== msg.conversationId) continue;
+							clearTimeout(slot.timer);
+							pendingDispatches.delete(key);
+							cancelledAny = true;
 						}
 						const active = inflight.get(msg.conversationId);
-						if (active || pending) {
+						if (active || cancelledAny) {
 							active?.abort();
 							if (active) inflight.delete(msg.conversationId);
 							await adapter.sendText(msg.conversationId, "Stopped.");
@@ -561,21 +619,25 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 						? `${msg.conversationId}#${msg.threadId}`
 						: msg.conversationId;
 					const sessionKey = channelSessionKey(args.agentId, adapter.id, convScope);
-					// Optional debounce — coalesce rapid-fire DMs into a single turn.
-					// Off by default (`channels.<id>.debounceMs <= 0` ⇒ immediate).
+					// Optional debounce — coalesce rapid-fire messages into a single
+					// turn. Off by default (`channels.<id>.debounceMs <= 0` ⇒
+					// immediate). For groups we key per-speaker so different
+					// participants typing in the same room don't accidentally get
+					// their distinct messages glued into one combined turn.
 					const debounceMs = Math.max(0, Number(cfgEntry.debounceMs ?? 0)) | 0;
 					if (debounceMs > 0) {
-						const existing = pendingDispatches.get(msg.conversationId);
+						const dispatchKey = isGroup ? `${msg.conversationId}#${msg.from}` : msg.conversationId;
+						const existing = pendingDispatches.get(dispatchKey);
 						if (existing) {
 							clearTimeout(existing.timer);
 							existing.parts.push(text);
-							existing.timer = setTimeout(() => void flushDispatch(msg.conversationId), debounceMs);
+							existing.timer = setTimeout(() => void flushDispatch(dispatchKey), debounceMs);
 						} else {
-							pendingDispatches.set(msg.conversationId, {
+							pendingDispatches.set(dispatchKey, {
 								parts: [text],
 								baseMsg: msg,
 								sessionKey,
-								timer: setTimeout(() => void flushDispatch(msg.conversationId), debounceMs),
+								timer: setTimeout(() => void flushDispatch(dispatchKey), debounceMs),
 							});
 						}
 						return;

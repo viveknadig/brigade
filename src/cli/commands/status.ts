@@ -1,8 +1,7 @@
 /**
- * `brigade status` — runtime snapshot. Mirrors openclaw's `openclaw status`
- * but Brigade-sized: 5 sections instead of 9, no plugin compatibility, no
- * pairing recovery, no security audit (those Phase-2/3 surfaces don't exist
- * here yet).
+ * `brigade status` — runtime snapshot. Brigade-sized: 5 sections, no
+ * plugin compatibility, no pairing recovery, no security audit (those
+ * Phase-2/3 surfaces don't exist here yet).
  *
  * Reports:
  *   - Configured provider/model + workspace dir
@@ -257,17 +256,16 @@ function formatStatusText(r: StatusReport): string {
 		if (r.gateway.error) {
 			lines.push(`  reason:        ${chalk.dim(r.gateway.error)}`);
 		}
-		// Actionable next-step hint mirrors openclaw's "Recommendation: run
-		// `openclaw doctor`" line in status.print.ts:101-104. Helps the user
-		// know what to do instead of staring at a bare error.
+		// Actionable next-step hint — helps the user know what to do
+		// instead of staring at a bare error.
 		lines.push(`  hint:          ${chalk.dim("run `brigade gateway` to start it, or `brigade doctor` for a full health check.")}`);
 	}
 	lines.push("");
 	lines.push(chalk.dim("Logs"));
 	lines.push(`  today:         ${r.logPath}`);
-	// Surface the most-recent error from today's log so operators can diagnose
-	// failures without `tail -f`. Mirrors openclaw's status.print.ts:172-193.
-	// Only shown when an error exists — keeps the happy-path output clean.
+	// Surface the most-recent error from today's log so operators can
+	// diagnose failures without `tail -f`. Only shown when an error
+	// exists — keeps the happy-path output clean.
 	if (r.lastError) {
 		const ts = r.lastError.ts ? new Date(r.lastError.ts).toLocaleTimeString() : "";
 		const tsStr = ts ? `${chalk.dim(ts)} ` : "";

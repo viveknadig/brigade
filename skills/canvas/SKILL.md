@@ -69,7 +69,7 @@ In the active Brigade config file (`$BRIGADE_CONFIG_PATH`, default `~/.brigade/b
   "canvasHost": {
     "enabled": true,
     "port": 18793,
-    "root": "/Users/you/clawd/canvas",
+    "root": "/Users/you/brigade/canvas",
     "liveReload": true
   },
   "gateway": {
@@ -92,10 +92,10 @@ Great for development!
 
 ### 1. Create HTML content
 
-Place files in the canvas root directory (default `~/clawd/canvas/`):
+Place files in the canvas root directory (default `~/brigade/canvas/`):
 
 ```bash
-cat > ~/clawd/canvas/my-game.html << 'HTML'
+cat > ~/brigade/canvas/my-game.html << 'HTML'
 <!DOCTYPE html>
 <html>
 <head><title>My Game</title></head>
@@ -189,8 +189,8 @@ If live reload isn't working:
 The canvas host serves from `/__brigade__/canvas/` prefix:
 
 ```
-http://<host>:18793/__brigade__/canvas/index.html  → ~/clawd/canvas/index.html
-http://<host>:18793/__brigade__/canvas/games/snake.html → ~/clawd/canvas/games/snake.html
+http://<host>:18793/__brigade__/canvas/index.html  → ~/brigade/canvas/index.html
+http://<host>:18793/__brigade__/canvas/games/snake.html → ~/brigade/canvas/games/snake.html
 ```
 
 The `/__brigade__/canvas/` prefix is defined by `CANVAS_HOST_PATH` constant.

@@ -22,11 +22,10 @@
  *     the FULL reason (Pi pipes that into the synthetic tool_result it
  *     sees), so the operator deserves the same fidelity.
  *
- * Mirrors openclaw's interactive-mode tool-result rendering shape (which
- * uses Pi-TUI's MarkdownComponent.append for streamed output). Brigade's
- * shorter format trades depth for compactness — a one-line preview keeps
- * the chat scannable, but ERROR results break that rule because their
- * call-to-action lives in the body.
+ * Renders tool results using Pi-TUI's MarkdownComponent.append for
+ * streamed output. Brigade's shorter format trades depth for compactness
+ * — a one-line preview keeps the chat scannable, but ERROR results break
+ * that rule because their call-to-action lives in the body.
  */
 export interface ToolResultSummary {
 	/** Preview text. For errors, may contain newlines; for success, single line. */

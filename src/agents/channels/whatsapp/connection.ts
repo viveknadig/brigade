@@ -19,6 +19,9 @@
  * ChannelAdapter contract.
  */
 
+import { existsSync, readFileSync } from "node:fs";
+import { join as joinPath } from "node:path";
+
 import type { ConnectionState, WAMessage, WASocket } from "@whiskeysockets/baileys";
 
 import { createDedupeCache } from "../dedupe.js";
@@ -35,6 +38,14 @@ export interface WaInboundText {
 	messageId?: string;
 	/** Baileys `msg.key.participant` (groups only) — used as the read-receipt participant id. */
 	participantId?: string;
+	/**
+	 * When the platform stamped the message (epoch ms). Used by the access-
+	 * control gate to suppress pairing-challenge replies to messages that
+	 * arrived AT the gateway but were originally sent before this socket
+	 * came up — i.e. queued-since-last-restart DMs that would otherwise
+	 * burst-spam every stranger with codes the moment Brigade reconnects.
+	 */
+	messageTimestampMs?: number;
 	/** Sender JID (canonical digits-only E.164). */
 	from: string;
 	/** WhatsApp display name, when present. */
@@ -90,6 +101,8 @@ export interface WhatsAppConnection {
 	current(): WASocket | null;
 	/** The linked self id in canonical form (digits-only E.164), or null pre-connect. */
 	selfId(): string | null;
+	/** Epoch ms of the most recent successful `connection: "open"` event; `null` pre-connect. */
+	connectedAt(): number | null;
 	/** Send a text message to a chat JID. */
 	sendText(conversationId: string, text: string): Promise<void>;
 	/** Send a media attachment (image / video / audio / voice / document / sticker). */
@@ -155,27 +168,77 @@ interface LidLookup {
 }
 
 /**
+ * Read the on-disk LID-reverse mapping file Baileys writes alongside its
+ * multi-file auth store. When `signalRepository.lidMapping.getPNForLID` hasn't
+ * cached a mapping yet (typical right after a fresh link), the cached reverse
+ * file is the only place to find the LID → phone translation. Path shape:
+ *   `<authDir>/lid-mapping-<lid>_reverse.json` → JSON containing the phone
+ *   number (string or number) the LID is aliased to.
+ *
+ * Sync (single small JSON file, microseconds); the caller's outer resolver is
+ * async because the runtime lookup is async. Returns null when the file is
+ * absent, unreadable, or carries a null/empty value.
+ */
+function readLidReverseMappingSync(authDir: string | null | undefined, lidDigits: string): string | null {
+	if (!authDir || !lidDigits) return null;
+	// Best-effort filesystem read — gated by a quick exists check so the
+	// happy-path "no mapping yet" branch doesn't spam the disk.
+	try {
+		const mappingPath = joinPath(authDir, `lid-mapping-${lidDigits}_reverse.json`);
+		if (!existsSync(mappingPath)) return null;
+		const raw = readFileSync(mappingPath, "utf8");
+		const parsed = JSON.parse(raw) as string | number | null;
+		if (parsed === null || parsed === undefined) return null;
+		const digits = String(parsed).replace(/\D/g, "");
+		return digits.length >= 7 ? digits : null;
+	} catch {
+		// Missing / malformed / racing-with-write — degrade silently to the
+		// runtime-lookup path so a transient read error doesn't drop the msg.
+		return null;
+	}
+}
+
+/**
  * Resolve a WhatsApp jid to a canonical phone number (digits-only E.164),
- * including LID-aliased jids that need a runtime lookup. Returns `null` when:
+ * including LID-aliased jids that need a runtime lookup. Resolution order
+ * for LID jids:
+ *   1. On-disk reverse mapping at `<authDir>/lid-mapping-<lid>_reverse.json`
+ *      (Baileys persists these across reconnects — survives the cold-start
+ *      window where `signalRepository.lidMapping` is empty).
+ *   2. `signalRepository.lidMapping.getPNForLID()` — the live in-memory cache.
+ *
+ * Returns `null` when:
  *   - `jid` is empty/missing
- *   - the jid is in LID form AND the socket can't (or won't) map it to a phone
+ *   - the jid is in LID form AND neither resolution path yields a phone
  *   - the resolved value isn't a recognized phone-jid shape
  *
  * Callers MUST drop messages with a `null` resolution rather than inventing a
  * fake sender id from raw LID digits — those digits aren't a phone number, and
  * downstream pairing/allow-list code keys on E.164.
+ *
+ * `authDir` is optional so tests can call without an on-disk store; when
+ * omitted only the runtime lookup is consulted.
  */
 export async function resolveJidToE164(
 	sock: WASocket | null,
 	jid: string | null | undefined,
+	authDir?: string,
 ): Promise<string | null> {
 	if (!jid) return null;
 	const direct = jid.match(WA_PHONE_JID_RE);
 	if (direct) return direct[1] ?? null;
-	if (!WA_LID_JID_RE.test(jid)) return null;
-	// LID jid — need the runtime to translate. Some Baileys builds expose
+	const lidMatch = jid.match(WA_LID_JID_RE);
+	if (!lidMatch) return null;
+	const lidDigits = lidMatch[1] ?? "";
+	// First: on-disk reverse mapping. Baileys' multi-file auth store writes
+	// these the moment it sees a LID's phone translation, so right after a
+	// fresh link they're available even while the in-memory `lidMapping` is
+	// still warming up.
+	const fromDisk = readLidReverseMappingSync(authDir, lidDigits);
+	if (fromDisk) return fromDisk;
+	// Then: runtime lookup. Some Baileys builds expose
 	// `signalRepository.lidMapping`; older / partially-initialized sockets
-	// don't. Treat a missing lookup as "unresolvable".
+	// don't. Treat a missing lookup as "unresolvable" — we already tried disk.
 	const lookup = (sock as unknown as { signalRepository?: { lidMapping?: LidLookup } } | null)?.signalRepository
 		?.lidMapping;
 	if (!lookup?.getPNForLID) return null;
@@ -204,9 +267,23 @@ function backoffDelay(attempt: number): number {
 	return Math.max(0, Math.round(base + jitter));
 }
 
-/** Extract plain text from a Baileys message, unwrapping the common envelopes. */
+/**
+ * Extract plain text from a Baileys message, unwrapping the common envelopes
+ * (`ephemeralMessage`, `viewOnceMessage*`, `documentWithCaptionMessage`) and
+ * surfacing placeholder text for content kinds without a natural body —
+ * shared contacts, location pins, polls — so the LLM at least sees that the
+ * user sent SOMETHING and can acknowledge it instead of silently dropping
+ * the inbound.
+ */
 function extractText(message: WAMessage["message"], normalize: (m: unknown) => unknown): string {
-	const content = (normalize(message) ?? {}) as Record<string, unknown>;
+	// `normalize` is Baileys' own envelope-flattener; we still wrap it in our
+	// wrapper-chain walk in case `normalize` itself leaves a wrapper in place
+	// for shapes it doesn't recognize (newer Baileys variants).
+	const flattened = (normalize(message) ?? {}) as WAMessage["message"];
+	let content = flattened as Record<string, unknown>;
+	const fromWrappers = unwrapWrapperEnvelopes(flattened);
+	if (fromWrappers) content = fromWrappers as Record<string, unknown>;
+
 	if (typeof content.conversation === "string") return content.conversation;
 	const ext = content.extendedTextMessage as { text?: string } | undefined;
 	if (ext && typeof ext.text === "string") return ext.text;
@@ -217,7 +294,66 @@ function extractText(message: WAMessage["message"], normalize: (m: unknown) => u
 	if (vid && typeof vid.caption === "string") return vid.caption;
 	const doc = content.documentMessage as { caption?: string } | undefined;
 	if (doc && typeof doc.caption === "string") return doc.caption;
+
+	// Contact card — placeholder so the LLM knows a contact was shared.
+	const contact = content.contactMessage as { displayName?: string } | undefined;
+	if (contact && typeof contact.displayName === "string" && contact.displayName.length > 0) {
+		return `[contact shared: ${contact.displayName}]`;
+	}
+	const contactsArray = content.contactsArrayMessage as { contacts?: { displayName?: string }[] } | undefined;
+	if (contactsArray?.contacts && contactsArray.contacts.length > 0) {
+		const names = contactsArray.contacts
+			.map((c) => (typeof c?.displayName === "string" ? c.displayName : ""))
+			.filter(Boolean);
+		if (names.length > 0) return `[contacts shared: ${names.join(", ")}]`;
+	}
+	// Location pin — placeholder with lat/lon when present.
+	const loc = content.locationMessage as
+		| { degreesLatitude?: number; degreesLongitude?: number; name?: string }
+		| undefined;
+	if (loc && (typeof loc.degreesLatitude === "number" || typeof loc.name === "string")) {
+		const named = typeof loc.name === "string" && loc.name ? `"${loc.name}"` : "";
+		const coords =
+			typeof loc.degreesLatitude === "number" && typeof loc.degreesLongitude === "number"
+				? `(${loc.degreesLatitude.toFixed(6)}, ${loc.degreesLongitude.toFixed(6)})`
+				: "";
+		return `[location shared ${named}${named && coords ? " " : ""}${coords}]`.trim();
+	}
+	// Live-location update — placeholder so a stream of these doesn't drop silently.
+	if (content.liveLocationMessage) return "[live location update]";
 	return "";
+}
+
+/**
+ * Wrapper envelopes Baileys' own `normalizeMessageContent` may not unwrap
+ * (newer message kinds, hosted-LID variants). Walks the chain in lock-step
+ * with `inbound-extras.ts:unwrapMessage` so caller behavior is consistent.
+ */
+const WRAPPER_KEYS = [
+	"ephemeralMessage",
+	"viewOnceMessage",
+	"viewOnceMessageV2",
+	"viewOnceMessageV2Extension",
+	"documentWithCaptionMessage",
+	"botInvokeMessage",
+	"groupMentionedMessage",
+];
+function unwrapWrapperEnvelopes(message: WAMessage["message"]): WAMessage["message"] | undefined {
+	let current = message;
+	for (let depth = 0; depth < 8 && current; depth += 1) {
+		const obj = current as Record<string, unknown>;
+		let inner: WAMessage["message"] | undefined;
+		for (const key of WRAPPER_KEYS) {
+			const wrapper = obj[key] as { message?: WAMessage["message"] } | undefined;
+			if (wrapper?.message) {
+				inner = wrapper.message;
+				break;
+			}
+		}
+		if (!inner) return current;
+		current = inner;
+	}
+	return current;
 }
 
 /**
@@ -288,12 +424,21 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 	// the inbound `fromMe` echo (WhatsApp mirrors our own sends back through
 	// `messages.upsert`) can be distinguished from a genuine self-chat. Without
 	// this we'd have to blanket-drop `fromMe`, which silences the operator
-	// DMing themselves (selfChat). 20-min TTL matches OpenClaw's recent-outbound
-	// window — long enough to survive a slow reconnect, short enough to bound
-	// memory on a chatty account.
+	// DMing themselves (selfChat). 20-min TTL — long enough to survive a
+	// slow reconnect, short enough to bound memory on a chatty account.
 	const outboundDedupe = createDedupeCache({ maxEntries: 5_000, ttlMs: 20 * 60 * 1_000 });
-	const recordOutboundId = (id: string | undefined | null): void => {
-		if (id) outboundDedupe.remember(id);
+	/**
+	 * Compose the outbound-dedupe key from the destination jid + the WhatsApp
+	 * `msg.key.id`. WAMIDs are statistically unique, but defence-in-depth: if
+	 * a future Baileys build ever reuses short ids across chats, an id-only
+	 * key would collide and Brigade would mis-classify a real inbound from
+	 * one chat as an echo of an outbound from another. Conversation-scoped
+	 * keys close that window with no real cost.
+	 */
+	const outboundKey = (conversationId: string, messageId: string): string =>
+		`${conversationId}:${messageId}`;
+	const recordOutboundId = (conversationId: string, id: string | undefined | null): void => {
+		if (id) outboundDedupe.remember(outboundKey(conversationId, id));
 	};
 	// Track the last QR we surfaced so a Baileys QR refresh (same string) doesn't
 	// flood the operator's terminal with duplicate prints. Only NEW QRs reach
@@ -302,6 +447,23 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 	// Pending creds writes are tracked so a reconnect (notably the 515 that
 	// follows first-link) can wait for them to flush before rebuilding.
 	let pendingCredsSave: Promise<void> = Promise.resolve();
+	// Epoch ms of the most recent `connection: "open"` event. Inbound messages
+	// older than `connectedAtMs - PAIRING_GRACE_MS` are treated as queued-since-
+	// last-restart history — the access-control gate uses this to suppress
+	// pairing-challenge replies to historical DMs (otherwise every stranger
+	// who messaged Brigade since the last shutdown gets a code in a burst
+	// the moment the gateway reconnects).
+	let connectedAtMs: number | null = null;
+	// Watchdog state — `lastInboundAt` is bumped on every inbound (text, media,
+	// presence; anything that proves the link is alive). A 60s timer checks
+	// elapsed time and force-reconnects when WhatsApp has gone silent past the
+	// stale threshold. Defends against the classic Baileys "open but silent"
+	// failure mode (operator's home network blips, WhatsApp tear down stream
+	// without telling us). Disabled in linkMode (link command is a one-shot).
+	let lastInboundAt = Date.now();
+	let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+	const WATCHDOG_CHECK_MS = 60_000;
+	const WATCHDOG_STALE_MS = 10 * 60 * 1_000;
 
 	/** Detach every listener from a socket and end it — no zombie emits. */
 	const teardownSocket = (s: WASocket | null): void => {
@@ -404,6 +566,9 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 				if (connection === "open") {
 					reconnectAttempts = 0; // healthy link — reset backoff
 					lastQr = null; // any future QR is genuinely a re-pair
+					const now = Date.now();
+					lastInboundAt = now; // reset watchdog clock on fresh link
+					connectedAtMs = now; // anchor the pairing-grace window
 					// Gateway mode: always log the structured event.
 					// Link mode: the CLI renders the polished success card itself,
 					//   so suppress the duplicate "connected" log here.
@@ -462,6 +627,11 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 			// `notify` = live messages; `append`/history-sync are ignored so we
 			// never replay old chats on reconnect.
 			if (payload.type !== "notify") return;
+			// Bump the watchdog timestamp — even a heartbeat-shaped notify (no
+			// messages we ultimately surface) proves the link is alive. We do
+			// this BEFORE the per-message filtering so status / system frames
+			// also keep the watchdog satisfied.
+			lastInboundAt = Date.now();
 			// Process each message in its own async task so media download (a
 			// network round-trip) doesn't block the next message's dedupe claim.
 			for (const m of payload.messages) {
@@ -484,9 +654,10 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 						// echoes we recognize (id we just sent), let everything else
 						// (including unrecognized fromMe = self-chat DM) flow through.
 						if (m.key.fromMe) {
-							if (!msgId || outboundDedupe.peek(msgId)) {
+							if (!msgId || outboundDedupe.peek(outboundKey(jid, msgId))) {
 								// Either no id (can't dedupe — defensive drop) or a known
-								// echo of our own send. Either way: not user input.
+								// echo of our own send to this conversation. Either way:
+								// not user input.
 								return;
 							}
 							// Unrecognized fromMe = the operator typed this on a linked
@@ -526,7 +697,7 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 						const rawParticipant = m.key.participant?.trim();
 						const senderJid =
 							isGroup && rawParticipant && rawParticipant.length > 0 ? rawParticipant : jid;
-						const fromCanonical = await resolveJidToE164(sock, senderJid);
+						const fromCanonical = await resolveJidToE164(sock, senderJid, args.authDir);
 						if (!fromCanonical) {
 							args.log("inbound dropped — could not resolve sender jid to phone (LID unmapped)", {
 								jid,
@@ -538,12 +709,26 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 						// pulled here so the manager can gate group activation cleanly and
 						// the LLM gets the "user replied to X" context for free. Async
 						// because LID mentions need the same resolver above.
-						const mentions = normalized ? await extractMentions(normalized, sock) : [];
-						const replyTo = normalized ? await extractReplyContext(normalized, sock) : undefined;
+						const mentions = normalized ? await extractMentions(normalized, sock, args.authDir) : [];
+						const replyTo = normalized
+							? await extractReplyContext(normalized, sock, args.authDir)
+							: undefined;
+						// Baileys' `messageTimestamp` is in seconds (Long or number).
+						// Normalize to epoch ms; the manager uses this to decide
+						// whether a stranger's DM is "live" or "since-restart
+						// history" for the pairing-grace window.
+						const tsRaw = m.messageTimestamp;
+						const tsSec =
+							typeof tsRaw === "number"
+								? tsRaw
+								: tsRaw && typeof (tsRaw as { toNumber?: () => number }).toNumber === "function"
+									? (tsRaw as { toNumber: () => number }).toNumber()
+									: undefined;
 						args.onMessage({
 							conversationId: jid,
 							messageId: msgId ?? undefined,
 							participantId: isGroup ? rawParticipant : undefined,
+							messageTimestampMs: typeof tsSec === "number" && tsSec > 0 ? tsSec * 1000 : undefined,
 							from: fromCanonical,
 							fromName: m.pushName ?? undefined,
 							text,
@@ -571,6 +756,31 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 
 	sock = buildSocket();
 
+	// Watchdog — once-a-minute check that WhatsApp is still delivering. If the
+	// socket sits "open" but goes silent past the stale threshold (typical
+	// flaky-home-network failure mode where Baileys never gets the stream
+	// teardown), force a reconnect so the operator doesn't sit there wondering
+	// why nothing arrives. Disabled in linkMode (one-shot pair, no daemon).
+	if (!args.linkMode) {
+		watchdogTimer = setInterval(() => {
+			if (closed || !sock) return;
+			const elapsed = Date.now() - lastInboundAt;
+			if (elapsed < WATCHDOG_STALE_MS) return;
+			args.log("WhatsApp watchdog — no inbound activity, forcing reconnect", {
+				elapsedMs: elapsed,
+				staleThresholdMs: WATCHDOG_STALE_MS,
+			});
+			const dying = sock;
+			sock = null;
+			teardownSocket(dying);
+			scheduleReconnect();
+			// Reset the clock so a flapping link doesn't trigger another forced
+			// reconnect before the new socket has a chance to open.
+			lastInboundAt = Date.now();
+		}, WATCHDOG_CHECK_MS);
+		watchdogTimer.unref?.();
+	}
+
 	const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref?.());
 
 	/**
@@ -581,65 +791,87 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 	 * a reconnect-replaced socket is used on the next attempt). Permanent
 	 * errors (e.g. "jid not registered") propagate after the first try.
 	 */
+	const TRANSIENT_SEND_ERROR = /closed|reset|timed?\s*out|disconnect|not\s*open|stream\s*error|ws/i;
+	const SEND_MAX_ATTEMPTS = 3;
+
+	/**
+	 * Run an outbound send against the LIVE `sock` reference with retry on
+	 * transient WS / disconnect errors. Used by text / media / reaction /
+	 * presence paths so a single reconnect mid-flight doesn't silently drop
+	 * the send. Permanent errors (e.g. "jid not registered") propagate after
+	 * the first try. `kind` is just a log tag — every line for one send shares
+	 * a correlation id so operators can grep for it.
+	 */
+	async function sendWithRetry<T>(
+		kind: string,
+		send: (live: WASocket) => Promise<T>,
+		log: (msg: string, meta?: Record<string, unknown>) => void,
+		extra?: Record<string, unknown>,
+	): Promise<T> {
+		const correlationId = `wa-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+		const startedAt = Date.now();
+		let lastErr: unknown;
+		for (let attempt = 1; attempt <= SEND_MAX_ATTEMPTS; attempt++) {
+			const live = sock;
+			if (live) {
+				try {
+					const result = await send(live);
+					log(`WhatsApp ${kind} ok`, {
+						correlationId,
+						attempt,
+						durationMs: Date.now() - startedAt,
+						...extra,
+					});
+					return result;
+				} catch (err) {
+					lastErr = err;
+					const message = err instanceof Error ? err.message : String(err);
+					if (!TRANSIENT_SEND_ERROR.test(message)) {
+						log(`WhatsApp ${kind} permanent error`, { correlationId, attempt, error: message });
+						throw err;
+					}
+					log(`WhatsApp ${kind} transient — retrying`, { correlationId, attempt, error: message });
+				}
+			} else {
+				lastErr = new Error("WhatsApp socket not connected");
+				log(`WhatsApp ${kind} paused — socket reconnecting`, { correlationId, attempt });
+			}
+			if (attempt < SEND_MAX_ATTEMPTS) await delay(500 * attempt);
+		}
+		log(`WhatsApp ${kind} failed after retries`, {
+			correlationId,
+			attempts: SEND_MAX_ATTEMPTS,
+			durationMs: Date.now() - startedAt,
+			error: lastErr instanceof Error ? lastErr.message : String(lastErr),
+		});
+		throw lastErr ?? new Error(`WhatsApp ${kind} failed after retries`);
+	}
+
+	/** Send a single text chunk with retry. Records the outbound id for echo-dedupe. */
 	async function sendOneChunkWithRetry(
 		conversationId: string,
 		chunk: string,
 		log: (msg: string, meta?: Record<string, unknown>) => void,
 	): Promise<void> {
-		// Per-chunk correlation id — every log line for this send is searchable
-		// via grep on the gateway log so operators can answer "did this reply
-		// actually land?" with a single id, not a fuzzy time match.
-		const correlationId = `wa-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
-		const startedAt = Date.now();
-		const TRANSIENT = /closed|reset|timed?\s*out|disconnect|not\s*open|stream\s*error|ws/i;
-		const MAX_ATTEMPTS = 3;
-		let lastErr: unknown;
-		for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-			const live = sock;
-			if (live) {
-				try {
-					const result = (await live.sendMessage(conversationId, { text: chunk })) as
-						| { key?: { id?: string } }
-						| undefined;
-					// Remember the outbound message id so the inbound `fromMe` echo
-					// can be distinguished from a genuine self-chat message (see
-					// outboundDedupe in the upsert handler).
-					recordOutboundId(result?.key?.id);
-					log("WhatsApp send ok", {
-						correlationId,
-						attempt,
-						chunkBytes: chunk.length,
-						messageId: result?.key?.id,
-						durationMs: Date.now() - startedAt,
-					});
-					return;
-				} catch (err) {
-					lastErr = err;
-					const message = err instanceof Error ? err.message : String(err);
-					if (!TRANSIENT.test(message)) {
-						log("WhatsApp send permanent error", { correlationId, attempt, error: message });
-						throw err;
-					}
-					log("WhatsApp send transient — retrying", { correlationId, attempt, error: message });
-				}
-			} else {
-				lastErr = new Error("WhatsApp socket not connected");
-				log("WhatsApp send paused — socket reconnecting", { correlationId, attempt });
-			}
-			if (attempt < MAX_ATTEMPTS) await delay(500 * attempt);
-		}
-		log("WhatsApp send failed after retries", {
-			correlationId,
-			attempts: MAX_ATTEMPTS,
-			durationMs: Date.now() - startedAt,
-			error: lastErr instanceof Error ? lastErr.message : String(lastErr),
-		});
-		throw lastErr ?? new Error("WhatsApp send failed after retries");
+		const result = await sendWithRetry(
+			"send",
+			async (live) =>
+				(await live.sendMessage(conversationId, { text: chunk })) as
+					| { key?: { id?: string } }
+					| undefined,
+			log,
+			{ chunkBytes: chunk.length },
+		);
+		// Remember the outbound message id so the inbound `fromMe` echo
+		// can be distinguished from a genuine self-chat message (see
+		// outboundDedupe in the upsert handler).
+		recordOutboundId(conversationId, result?.key?.id);
 	}
 
 	return {
 		current: () => sock,
 		selfId: () => canonicalWhatsAppId(sock?.user?.id) || null,
+		connectedAt: () => connectedAtMs,
 		async sendText(conversationId: string, text: string): Promise<void> {
 			// Convert agent-style markdown (**bold**, headings, tables, [links])
 			// into WhatsApp's sparse formatting (*bold*, • bullets, "label (url)")
@@ -672,7 +904,6 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 			conversationId: string,
 			media: import("../../extensions/types.js").OutboundMedia,
 		): Promise<void> {
-			if (!sock) throw new Error("WhatsApp socket not connected");
 			// Map Brigade's media kind onto Baileys' payload shape. Caption rides
 			// the media (a single message) so the agent doesn't have to issue two
 			// sends; voice = audio + ptt=true with opus mime.
@@ -704,23 +935,39 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 					payload = { sticker: { url }, mimetype: media.mimeType ?? "image/webp" };
 					break;
 			}
-			const mediaResult = (await sock.sendMessage(conversationId, payload as never)) as
-				| { key?: { id?: string } }
-				| undefined;
-			recordOutboundId(mediaResult?.key?.id);
+			// Same transient-retry shape as text — a reconnect mid-upload
+			// otherwise drops the media silently. The actual Baileys upload
+			// happens inside `live.sendMessage`; if it fails transiently we
+			// retry against whatever socket the reconnect loop hands us next.
+			const mediaResult = await sendWithRetry(
+				`sendMedia(${media.kind})`,
+				async (live) =>
+					(await live.sendMessage(conversationId, payload as never)) as
+						| { key?: { id?: string } }
+						| undefined,
+				args.log,
+			);
+			recordOutboundId(conversationId, mediaResult?.key?.id);
 		},
 		async react(conversationId: string, messageId: string, emoji: string, fromMe?: boolean): Promise<void> {
-			if (!sock) throw new Error("WhatsApp socket not connected");
 			// Reactions need the original message's key (jid + id + fromMe). When
 			// the caller only has the inbound's id (the common case), pass
 			// fromMe=false; for clearing our own reaction, pass fromMe=true.
-			const reactResult = (await sock.sendMessage(conversationId, {
-				react: {
-					text: emoji, // "" clears any prior reaction
-					key: { remoteJid: conversationId, id: messageId, fromMe: fromMe ?? false },
-				},
-			})) as { key?: { id?: string } } | undefined;
-			recordOutboundId(reactResult?.key?.id);
+			// Wrapped in sendWithRetry so a transient reconnect mid-reaction
+			// doesn't silently drop it (reactions are cheap; better to retry
+			// than to leave a half-acknowledged inbound).
+			const reactResult = await sendWithRetry(
+				"react",
+				async (live) =>
+					(await live.sendMessage(conversationId, {
+						react: {
+							text: emoji, // "" clears any prior reaction
+							key: { remoteJid: conversationId, id: messageId, fromMe: fromMe ?? false },
+						},
+					})) as { key?: { id?: string } } | undefined,
+				args.log,
+			);
+			recordOutboundId(conversationId, reactResult?.key?.id);
 		},
 		async markRead(conversationId: string, messageId: string, participant?: string): Promise<void> {
 			// Read receipts are cosmetic — drop silently when the socket is
@@ -750,6 +997,10 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 			if (reconnectTimer) {
 				clearTimeout(reconnectTimer);
 				reconnectTimer = null;
+			}
+			if (watchdogTimer) {
+				clearInterval(watchdogTimer);
+				watchdogTimer = null;
 			}
 			// `logout()` would invalidate creds; we want a clean disconnect that
 			// keeps the link, so just tear the socket down.

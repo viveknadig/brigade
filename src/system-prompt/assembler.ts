@@ -56,10 +56,9 @@ export interface AssembleArgs {
   // Optional per-turn additions (sub-agent task framing, ephemeral notes).
   // Lives below the cache boundary so it doesn't bust the prefix.
   ephemeralSuffix?: string;
-  // Lifecycle phase from the workspace state file. Matches OpenClaw: the
-  // assembler does NOT emit synthetic guidance based on this. First-turn
-  // behaviour comes from BOOTSTRAP.md content alone, exactly like OpenClaw
-  // (`system-prompt.ts:380-927` has no per-turn branching).
+  // Lifecycle phase from the workspace state file. The assembler does NOT
+  // emit synthetic guidance based on this — first-turn behaviour comes
+  // from BOOTSTRAP.md content alone (no per-turn branching here).
   bootstrapPhase?: BootstrapPhase;
   // Active model id. Drives `shouldUseReasoningFormat` gating for the
   // `## Reasoning Format` block. Aggregator-prefix tolerant
@@ -96,8 +95,8 @@ export interface AssembledPrompt {
   budget: BudgetResult;
 }
 
-// Canonical persona file order — matches OpenClaw's sort. Files NOT in
-// this list keep their original caller order at the end.
+// Canonical persona file order. Files NOT in this list keep their
+// original caller order at the end.
 const PERSONA_CANONICAL_ORDER = [
   "agents.md",
   "soul.md",
@@ -122,10 +121,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   const lines: string[] = [];
 
   // 1. Identity opener.
-  // Exact lift-and-shift of OpenClaw's identity line at
-  // `system-prompt.ts:632` ("You are a personal assistant running inside
-  // OpenClaw.") with the only Brigade-native substitution being the brand
-  // name. Eight words. One brand mention. No marketing nouns. The earlier
+  // Eight words. One brand mention. No marketing nouns. An earlier
   // verbose form ("You are the user's Brigade assistant — a personal AI
   // inside their Brigade crew. Defer to the workspace persona files…")
   // taught the model to parrot "your Brigade assistant" / "personal AI
@@ -137,20 +133,18 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   lines.push("You are a personal assistant running inside Brigade.");
   lines.push("");
 
-  // No first-turn synthetic guidance. Mirrors OpenClaw's choice to drive
-  // first-turn behaviour from BOOTSTRAP.md content alone. The earlier
-  // `**First turn: ... verbatim**` nudge regressed both gpt-5.4 (over-literal
-  // bullet dumps) and Claude (auto-write USER.md without asking).
-  // `bootstrapPhase` is still threaded through for future per-model-family
-  // hints if a smaller model needs one.
+  // No first-turn synthetic guidance — first-turn behaviour comes from
+  // BOOTSTRAP.md content alone. The earlier `**First turn: ... verbatim**`
+  // nudge regressed both gpt-5.4 (over-literal bullet dumps) and Claude
+  // (auto-write USER.md without asking). `bootstrapPhase` is still threaded
+  // through for future per-model-family hints if a smaller model needs one.
   void args.bootstrapPhase;
 
   // 2. ## Tooling.
-  // OpenClaw `system-prompt.ts:634-668` lift. Tool list + universal
-  // trailing rules: TOOLS.md disclaimer, anti-poll closer. The empty-list
-  // path uses Brigade's terser permissive line (Pi's 14-tool hardcoded
-  // fallback in OpenClaw bakes in tool names that may not match what
-  // Brigade actually wires).
+  // Tool list + universal trailing rules: TOOLS.md disclaimer, anti-poll
+  // closer. The empty-list path uses Brigade's terser permissive line
+  // (Pi's 14-tool hardcoded fallback bakes in tool names that may not
+  // match what Brigade actually wires).
   lines.push("## Tooling");
   if (args.toolDescriptions.length === 0) {
     lines.push(
@@ -162,7 +156,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
       const summary = t.summary?.trim();
       lines.push(summary ? `- ${t.name}: ${summary}` : `- ${t.name}`);
     }
-    // OpenClaw universal trailing rules (`system-prompt.ts:657, 668`).
+    // Universal trailing rules.
     lines.push(
       "TOOLS.md does not control tool availability; it is user guidance for how to use external tools.",
     );
@@ -173,10 +167,9 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   lines.push("");
 
   // 3. ## Tool Call Style.
-  // OpenClaw `system-prompt.ts:677-689` lift. Narration rules; what we
-  // synthesise vs what we show the play-by-play of. Three universal lines
-  // from OpenClaw (keep narration brief / plain language / prefer tools
-  // over CLI suggestions) were missing — added back.
+  // Narration rules; what we synthesise vs what we show the play-by-play
+  // of. Three universal lines (keep narration brief / plain language /
+  // prefer tools over CLI suggestions) were previously missing — added back.
   lines.push("## Tool Call Style");
   lines.push(
     "Default: do not narrate routine, low-risk tool calls (just call the tool).",
@@ -196,12 +189,12 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   lines.push("");
 
   // 4. ## Execution Bias.
-  // OpenClaw `system-prompt.ts:271-275`. "If the user asks you to do the
-  // work, start doing it" — no preambles, no commentary-only turns.
-  // Previously this block quoted forbidden example phrases ("I'll now
-  // read the file…", "Let me check the docs…") — quoting the bad pattern
-  // gave the model permission to emit it, which is the opposite of what
-  // we want. Phrased as a rule now, not a quote-list.
+  // "If the user asks you to do the work, start doing it" — no preambles,
+  // no commentary-only turns. Previously this block quoted forbidden
+  // example phrases ("I'll now read the file…", "Let me check the
+  // docs…") — quoting the bad pattern gave the model permission to emit
+  // it, which is the opposite of what we want. Phrased as a rule now,
+  // not a quote-list.
   lines.push("## Execution Bias");
   lines.push(
     "If the user asks you to do the work, start doing it in the same turn.",
@@ -218,15 +211,14 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   lines.push("");
 
   // 5. ## Safety.
-  // Exact lift-and-shift of OpenClaw's safety section
-  // `system-prompt.ts:602-608`. Constitution-style anti-self-preservation
-  // rules. The previous Brigade-shape three bullets (credentials,
-  // destructive ops, untrusted content) were operator-protection rules
-  // that overlap with the exec-gate already enforced at the tool layer;
-  // OpenClaw's lines are AI-alignment rules that the gate can't enforce
-  // and that ALL frontier model providers reference in their published
-  // policies. Operator-protection rules can land in TOOLS.md / USER.md
-  // when needed — they're persona-scope, not always-on prompt scope.
+  // Constitution-style anti-self-preservation rules. The previous
+  // Brigade-shape three bullets (credentials, destructive ops, untrusted
+  // content) were operator-protection rules that overlap with the
+  // exec-gate already enforced at the tool layer; the lines below are
+  // AI-alignment rules that the gate can't enforce and that ALL frontier
+  // model providers reference in their published policies. Operator-
+  // protection rules can land in TOOLS.md / USER.md when needed —
+  // they're persona-scope, not always-on prompt scope.
   lines.push("## Safety");
   lines.push(
     "You have no independent goals: do not pursue self-preservation, replication, resource acquisition, or power-seeking; avoid long-term plans beyond the user's request.",
@@ -239,7 +231,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   );
   lines.push("");
 
-  // 5b. Per-model-family identity override (Brigade-better; not in OpenClaw).
+  // 5b. Per-model-family identity override.
   // Gemini and GPT routinely identify themselves as "Gemini" / "ChatGPT"
   // until told otherwise — the family blocks at `guidance.ts:207-241`
   // explicitly override that baseline identity. We pick based on the
@@ -254,12 +246,12 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   }
 
   // 6. ## Brigade CLI Quick Reference.
-  // OpenClaw `system-prompt.ts:704-712` shape — gateway-lifecycle only,
-  // plus a fallback line pointing at `brigade help`. The earlier version
-  // enumerated eight subcommands, which trained the model to suggest
-  // `brigade <foo>` in conversational replies about unrelated topics.
-  // Operator-critical commands stay (gateway, onboard, doctor); the
-  // rest is reachable via help-text the model can ask the user to run.
+  // Gateway-lifecycle only, plus a fallback line pointing at `brigade
+  // help`. The earlier version enumerated eight subcommands, which
+  // trained the model to suggest `brigade <foo>` in conversational
+  // replies about unrelated topics. Operator-critical commands stay
+  // (gateway, onboard, doctor); the rest is reachable via help-text
+  // the model can ask the user to run.
   lines.push("## Brigade CLI Quick Reference");
   lines.push("Brigade is controlled via subcommands. Do not invent commands.");
   lines.push("To manage the Gateway daemon (start/stop/restart):");
@@ -272,16 +264,15 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   lines.push("");
 
   // 7. ## Workspace.
-  // OpenClaw `system-prompt.ts:742-744`. Brigade-native mirror, deliberately
-  // terse: a long section here teaches the model to PARROT the word
-  // "workspace" back at the operator in conversational replies ("running
-  // inside your Brigade workspace…", "beyond the workspace setup…").
-  // Pi's session cwd already defaults to this dir so the model doesn't
-  // need explicit absolute-path coaching here; the per-family guidance
-  // block (guidance.ts:GOOGLE_FAMILY_GUIDANCE) handles model-specific
-  // absolute-path nudges where they're actually needed. The persona
-  // files themselves are injected as Project Context — listing them
-  // here too is redundant noise.
+  // Deliberately terse: a long section here teaches the model to PARROT
+  // the word "workspace" back at the operator in conversational replies
+  // ("running inside your Brigade workspace…", "beyond the workspace
+  // setup…"). Pi's session cwd already defaults to this dir so the model
+  // doesn't need explicit absolute-path coaching here; the per-family
+  // guidance block (guidance.ts:GOOGLE_FAMILY_GUIDANCE) handles model-
+  // specific absolute-path nudges where they're actually needed. The
+  // persona files themselves are injected as Project Context — listing
+  // them here too is redundant noise.
   lines.push("## Workspace");
   lines.push(`Your working directory is: ${args.runtime.workspaceDir}`);
   lines.push(
@@ -292,11 +283,10 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // 7b. ## Memory (conditional on the memory capability).
   // Primitive #4. Emitted only when the session has the memory tools
   // (recall_memory / read_memory) wired — gated on `capabilities.memory`.
-  // Mirrors OpenClaw's `memory-core` "## Memory Recall" prompt section
-  // (`extensions/memory-core/src/prompt-section.ts`): the model is told
-  // to search memory BEFORE answering and how durable facts are stored.
-  // MEMORY.md itself is injected separately as a persona file in
-  // `# Project Context` below — this section is the behavioural wrapper.
+  // The model is told to search memory BEFORE answering and how durable
+  // facts are stored. MEMORY.md itself is injected separately as a
+  // persona file in `# Project Context` below — this section is the
+  // behavioural wrapper.
   if (args.capabilities?.memory) {
     lines.push(MEMORY_GUIDANCE);
     lines.push("");
@@ -320,24 +310,22 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   }
 
   // 8. ## Reasoning Format.
-  // OpenClaw `system-prompt.ts:858-860, 558-569`. ONLY emitted when
-  // `thinkingLevel` is on AND the model isn't a native-reasoning family
-  // (Claude w/ extended thinking, o1/o3 — those manage reasoning natively
-  // and adding tag rules would conflict).
+  // ONLY emitted when `thinkingLevel` is on AND the model isn't a
+  // native-reasoning family (Claude w/ extended thinking, o1/o3 — those
+  // manage reasoning natively and adding tag rules would conflict).
   if (shouldUseReasoningFormat(args.modelId, args.thinkingLevel)) {
     lines.push(REASONING_FORMAT_GUIDANCE);
     lines.push("");
   }
 
   // 9. # Project Context — STABLE persona files (above the cache boundary).
-  // OpenClaw `system-prompt.ts:108-114` + `:869-875`. Preamble lifted
-  // verbatim from OpenClaw — the previous Brigade version ("...canonical
-  // description of the agent's identity, values, and ways of working.")
-  // taught the model to echo those four nouns in replies. The OpenClaw
-  // preamble is bland on purpose. The SOUL.md tone-nudge fires only when
-  // soul.md is in the persona set; smaller models tend to skim past
-  // SOUL.md without it. Sort canonically so cache-hits stay stable
-  // across turns even if the loader's order varies.
+  // The previous Brigade version ("...canonical description of the
+  // agent's identity, values, and ways of working.") taught the model to
+  // echo those four nouns in replies; the current preamble is bland on
+  // purpose. The SOUL.md tone-nudge fires only when soul.md is in the
+  // persona set; smaller models tend to skim past SOUL.md without it.
+  // Sort canonically so cache-hits stay stable across turns even if the
+  // loader's order varies.
   if (args.personaFiles.length > 0) {
     lines.push("# Project Context");
     lines.push("The following project context files have been loaded:");
@@ -365,15 +353,15 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     }
 
     // 10. CACHE BOUNDARY.
-    // OpenClaw `system-prompt-cache-boundary.ts`. Everything above here is
-    // stable and gets prompt-cache-hit on Anthropic. Below, every-turn
-    // dynamic stuff (heartbeat, ephemeral notes, runtime line).
+    // Everything above here is stable and gets prompt-cache-hit on
+    // Anthropic. Below, every-turn dynamic stuff (heartbeat, ephemeral
+    // notes, runtime line).
     lines.push(CACHE_BOUNDARY_MARKER_LINE);
     lines.push("");
 
     // 11. # Dynamic Project Context — HEARTBEAT.md (below boundary).
-    // OpenClaw `system-prompt.ts:900-906`. HEARTBEAT.md changes per cycle
-    // so it's deliberately below the cache marker.
+    // HEARTBEAT.md changes per cycle so it's deliberately below the
+    // cache marker.
     if (args.heartbeatFile) {
       lines.push("# Dynamic Project Context");
       lines.push("");
@@ -384,9 +372,9 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     }
 
     // 12. # Per-turn Notes — sub-agent task framing or ephemeral context.
-    // Brigade-specific addition (no direct OpenClaw equivalent at v1
-    // single-user — OpenClaw's group/subagent context section serves the
-    // same niche). Stays below the cache marker.
+    // Brigade-specific addition for single-user v1 (a group/subagent
+    // context section would serve the same niche). Stays below the
+    // cache marker.
     if (args.ephemeralSuffix && args.ephemeralSuffix.trim()) {
       lines.push("# Per-turn Notes");
       lines.push(sanitizeForPromptLiteral(args.ephemeralSuffix));
@@ -394,11 +382,10 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     }
 
     // 13. ## Runtime.
-    // OpenClaw `system-prompt.ts:920-924, 929-971`. Trailing `Reasoning:`
-    // line lifts OpenClaw `:923` so the model knows whether its <think>
-    // output will be visible to the operator. Brigade-native:
-    // `/thinking` slash + `/status` mention OpenClaw's surface; we omit
-    // those because Brigade exposes the level on the TUI header instead.
+    // The trailing `Reasoning:` line lets the model know whether its
+    // <think> output will be visible to the operator. Brigade omits the
+    // `/thinking` and `/status` slash mentions because the TUI header
+    // already exposes the level.
     lines.push("## Runtime");
     lines.push(formatRuntimeLine(args.runtime));
     lines.push(

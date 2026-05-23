@@ -7,11 +7,10 @@ import { sanitizeForPromptLiteral } from "./sanitize.js";
 
 // Persona files brigade expects to find in <agentDir>/workspace/. Order
 // matters — it determines the sequence inside the assembled prompt's
-// `# Project Context` section. This mirrors OpenClaw's
-// `loadWorkspaceBootstrapFiles` order (AGENTS → SOUL → TOOLS → IDENTITY →
-// USER → BOOTSTRAP → MEMORY). HEARTBEAT.md is intentionally absent: it
-// belongs in the *dynamic suffix* (below the cache boundary) and is loaded
-// via loadHeartbeatFile.
+// `# Project Context` section. The canonical order is AGENTS → SOUL →
+// TOOLS → IDENTITY → USER → BOOTSTRAP → MEMORY. HEARTBEAT.md is
+// intentionally absent: it belongs in the *dynamic suffix* (below the
+// cache boundary) and is loaded via loadHeartbeatFile.
 const STABLE_FILE_ORDER = [
   "AGENTS.md",
   "SOUL.md",
@@ -37,9 +36,8 @@ export async function loadWorkspaceContextFiles(workspaceDir: string): Promise<C
     // when the user hasn't personalised the file yet. The on-disk copy is
     // never touched — this is a load-time normalisation so the agent reads
     // a stable identity from the system prompt instead of echoing the
-    // template placeholder back into chat. Mirrors OpenClaw's
-    // `resolveAssistantIdentity` 3-tier fallback (src/gateway/assistant-
-    // identity.ts:81-96).
+    // template placeholder back into chat. Uses the standard 3-tier
+    // identity-resolution fallback.
     //
     // ORDER: defaults run BEFORE sanitization because the defaults regex
     // is line-anchored (^\s*[-*]\s*\*\*Name:\*\*) and sanitizeForPromptLiteral

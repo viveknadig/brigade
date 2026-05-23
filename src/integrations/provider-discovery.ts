@@ -2,12 +2,11 @@
  * Cloud-provider model discovery — best-effort live metadata for a model id
  * that isn't in the static catalog.
  *
- * Mirrors OpenClaw's provider discovery hooks (it fetches a provider's model
- * list to resolve + enrich uncatalogued ids). Brigade uses this from the
- * never-miss resolver (`agents/model-resolution.ts`): on a `ModelRegistry.find`
- * miss for a cloud provider, we hit the provider's models endpoint to (a)
- * confirm the id exists and (b) read accurate capabilities (context window,
- * vision, reasoning) so the synthesized Model isn't all-defaults.
+ * Used by the never-miss resolver (`agents/model-resolution.ts`): on a
+ * `ModelRegistry.find` miss for a cloud provider, we hit the provider's
+ * models endpoint to (a) confirm the id exists and (b) read accurate
+ * capabilities (context window, vision, reasoning) so the synthesized
+ * Model isn't all-defaults.
  *
  * Everything here is defensive: short timeouts, every failure path returns
  * `{ exists: false, meta: {} }` so the caller falls back to template/default

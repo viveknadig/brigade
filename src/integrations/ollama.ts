@@ -196,9 +196,9 @@ export async function writeOllamaToModelsJson(
 }
 
 /**
- * Runtime re-discovery for local Ollama — the Brigade equivalent of OpenClaw's
- * Ollama discovery hook (it enumerates `/api/tags` into the provider config so
- * any pulled model resolves without a manual catalog edit).
+ * Runtime re-discovery for local Ollama — enumerates `/api/tags` into the
+ * provider config so any pulled model resolves without a manual catalog
+ * edit.
  *
  * Called when the model registry MISSES an `ollama/<model>` id: the user has
  * almost certainly `ollama pull`ed a model since onboarding. We re-query the

@@ -8,9 +8,6 @@
  * (`ownerOnly`, `displaySummary`) carry Brigade-specific metadata used by
  * the TUI / gateway / future channels.
  *
- * Mirrors OpenClaw's pattern at `src/agents/tools/common.ts:9-22`
- * (`AgentToolWithMeta`, `AnyAgentTool`) with Brigade-native naming.
- *
  * Pi's `AgentTool<TParameters, TDetails>` already requires:
  *   - `name: string`
  *   - `description: string`
@@ -65,7 +62,6 @@ export interface BrigadeTool<
  * use this alias to round-trip without dragging generics through every
  * call site.
  *
- * Mirrors OpenClaw's `AnyAgentTool` at `src/agents/tools/common.ts:22`.
  * The `any` is documented and isolated — tools opt in via `BrigadeTool`
  * at definition time, then collapse to `AnyBrigadeTool` for storage.
  */

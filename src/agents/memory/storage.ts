@@ -2,19 +2,17 @@
  * Brigade memory storage — the abstraction Primitive #4 ships and Phase 2
  * (DB-backed multi-user) swaps out.
  *
- * Mirrors OpenClaw's `MemorySearchManager` contract
- * (`src/memory-host-sdk/host/types.ts:77`) with Brigade-native naming and
- * a deliberately narrow v1 surface: `search` + `read` + `status`. No
+ * Deliberately narrow v1 surface: `search` + `read` + `status`. No
  * embeddings, no SQLite, no vector index in v1 — `search` is a lexical
- * (term-overlap) scan over the same corpus OpenClaw's `builtin` backend
- * reads: `MEMORY.md` (persona-level, always also injected into the prompt)
- * plus the daily notes under `memory/YYYY-MM-DD.md`.
+ * (term-overlap) scan over `MEMORY.md` (persona-level, always also
+ * injected into the prompt) plus the daily notes under
+ * `memory/YYYY-MM-DD.md`.
  *
  * Writing is NOT part of this interface. The agent appends durable facts
  * to `memory/<today>.md` using its ordinary `write` / `edit` tool — Pi's
  * session cwd is the workspace dir, so `write({path: "memory/2026-05-21.md"})`
- * lands in the right place. This is exactly OpenClaw's model: it has no
- * `write_memory` tool; memory writes go through the normal file tool.
+ * lands in the right place. There is no dedicated low-level write tool;
+ * memory writes go through the normal file tool.
  *
  * Phase 2 implements `BrigadeStorage` over a database. Because the contract
  * is just these three methods, the memory tools (`recall_memory`,

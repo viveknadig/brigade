@@ -6,9 +6,9 @@
  *   1. Write a BUILD STAMP — `dist/buildstamp.json = { builtAt, head }` (git
  *      commit + timestamp). The runtime reads it (see `src/version.ts`) so
  *      `brigade --version` and the gateway boot banner report the EXACT build
- *      that's running. Mirrors OpenClaw's `scripts/build-stamp.mjs`
- *      (`dist/.buildstamp`); Brigade uses a non-dot filename so it's reliably
- *      included by the `files: ["dist/**\/*"]` package glob.
+ *      that's running. Brigade uses a non-dot filename
+ *      (`dist/buildstamp.json`) so it's reliably included by the
+ *      `files: ["dist/**\/*"]` package glob.
  *   2. Print a gold "Build complete" banner pointing at what to run next.
  *
  * Cosmetic/best-effort — wrapped so it can NEVER fail the build, and

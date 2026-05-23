@@ -40,8 +40,8 @@ export interface OnboardCommandOptions {
 	 */
 	noEnvDetect?: boolean;
 	/**
-	 * Storage shape for accepted env-key credentials. Mirrors OpenClaw's
-	 * `--secret-input-mode` flag.
+	 * Storage shape for accepted env-key credentials, switched by the
+	 * `--secret-input-mode` CLI flag.
 	 *   - "plaintext" (default) — copy the literal value into Brigade's state.
 	 *   - "ref" — write a `keyRef` pointer; literal value never lands on disk.
 	 * Threaded through from the `--secret-input-mode` CLI flag.
@@ -91,7 +91,7 @@ export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promi
 	// writes `{}` on construction and mirrors set() to disk). The wizard now
 	// uses `AuthStorage.inMemory()` so a fresh onboard never recreates this
 	// file — but stale ones from older builds keep showing up in `ls
-	// ~/.brigade/`, which surprised the user. Mirror OpenClaw: there's no
+	// ~/.brigade/`, which surprised the user. The canonical layout has no
 	// `auth.json`, only `auth-profiles.json`. Best-effort delete; missing
 	// or unreadable file is fine.
 	try {
@@ -108,8 +108,8 @@ export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promi
 	// `AuthStorage.create(path)` would write `{}` to `~/.brigade/auth.json`
 	// on construction AND mirror every `set()` to disk — that produced an
 	// orphaned `auth.json` file on every onboard run AND leaked the literal
-	// API key to a second on-disk location in ref mode. OpenClaw doesn't
-	// have an `auth.json` at all; mirror that.
+	// API key to a second on-disk location in ref mode. Brigade has no
+	// `auth.json` at all.
 	//
 	// `set()` in memory is still useful: it lets the wizard process see the
 	// key for the rest of the run (online validation already takes the key

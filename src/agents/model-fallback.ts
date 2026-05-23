@@ -82,7 +82,6 @@ export interface RunWithModelFallbackResult<T> {
 
 /**
  * Cap on `LiveSessionModelSwitchError` retries within a single fallback run.
- * Mirrors OpenClaw's `MAX_LIVE_SWITCH_RETRIES = 5` (`agent-command.ts:849`).
  * Without this, a hook that throws a fresh switch error on every attempt
  * would loop forever (each new candidate rejecting with another switch
  * request). 5 is more than any reasonable user-driven /model swap cascade
@@ -135,10 +134,10 @@ export async function runWithModelFallback<T>(
       // was) is discarded — the user asked for a different model, they
       // get the result of the new model.
       //
-      // Max-retries guard mirrors OpenClaw's `MAX_LIVE_SWITCH_RETRIES = 5`
-      // (`agent-command.ts:849`). A buggy hook could otherwise chain
-      // switches forever (each new model immediately throws another
-      // LiveSessionModelSwitchError) — surface as a hard error after 5.
+      // Max-retries guard caps live-switch chaining. A buggy hook could
+      // otherwise chain switches forever (each new model immediately
+      // throws another LiveSessionModelSwitchError) — surface as a hard
+      // error after MAX_LIVE_SWITCH_RETRIES.
       if (isLiveSessionModelSwitchError(err)) {
         if (liveSwitchRetries >= MAX_LIVE_SWITCH_RETRIES) {
           log.error("live model switch retries exhausted", {

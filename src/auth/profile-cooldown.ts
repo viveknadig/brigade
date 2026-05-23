@@ -61,8 +61,8 @@ export interface ProfileStateFile {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Constants. Match the OpenClaw observed defaults but are configurable here
-// so brigade.json can override later without an API change.
+// Constants. The established defaults are configurable here so
+// brigade.json can override later without an API change.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const COOLDOWN_MS_TIER_1 = 30_000;        // first transient failure

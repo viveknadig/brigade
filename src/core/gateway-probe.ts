@@ -5,18 +5,17 @@
  *
  * Two facets here:
  *
- *   1. **WS probe** (`probeGateway`): connect to ws://host:port, wait for the
- *      server's automatic `state` event on connect, return a friendly snapshot.
- *      Mirrors openclaw's `probeGatewayStatus` (`src/cli/daemon-cli/probe.ts:17`)
- *      but uses Brigade's own state-on-connect event instead of an RPC method.
+ *   1. **WS probe** (`probeGateway`): connect to ws://host:port, wait for
+ *      the server's automatic `state` event on connect, return a friendly
+ *      snapshot. Uses Brigade's state-on-connect event instead of an RPC
+ *      method.
  *
  *   2. **PID file** (`readPidFile`, `writePidFile`, `clearPidFile`): the
  *      gateway writes `~/.brigade/gateway.pid` on boot and unlinks it on
  *      clean shutdown. `brigade gateway stop` reads that file, sends SIGTERM,
- *      and waits for the file to disappear (or times out). Brigade-native
- *      replacement for openclaw's OS-service-manager + netstat-pid-discovery
- *      stack (`src/infra/gateway-processes.ts`) — way simpler because brigade
- *      v1 has no service installer.
+ *      and waits for the file to disappear (or times out). Brigade v1 has no
+ *      service installer, so no OS-service-manager + netstat-pid-discovery
+ *      stack is needed — this PID-file flow is the entire mechanism.
  */
 
 import * as fs from "node:fs";
@@ -31,10 +30,9 @@ import type { SessionStateSnapshot } from "../protocol.js";
 export const GATEWAY_PID_PATH = path.join(BRIGADE_DIR, "gateway.pid");
 
 /**
- * Categorised reason a probe failed. Mirrors openclaw's
- * `resolveProbeFailureMessage` distinction (`src/cli/daemon-cli/probe.ts:8-11`)
- * so callers (status, doctor, error formatters) can surface specific
- * recovery hints instead of dumping a raw error string.
+ * Categorised reason a probe failed — callers (status, doctor, error
+ * formatters) can surface specific recovery hints instead of dumping a
+ * raw error string.
  */
 export type GatewayProbeFailureKind =
   /** Connection refused — nothing listening on host:port. */

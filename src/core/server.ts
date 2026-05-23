@@ -55,8 +55,8 @@ import {
 // longer holds a long-lived Pi session: every inbound `prompt` builds a
 // fresh session via `runResilientTurn`, resumes the JSONL transcript by
 // sessionKey, runs the full Brigade safety stack, and drops the session
-// when the turn settles. This mirrors OpenClaw, where each turn is its own
-// `runEmbeddedAttempt` and no session lives between turns. The in-flight
+// when the turn settles. Each turn builds and tears down its own session
+// — no session lives between turns. The in-flight
 // session is surfaced for the turn's lifetime via `onSessionReady` so the
 // gateway can steer / abort / switch-model mid-stream.
 import { runResilientTurn, type RunSingleTurnResult } from "../agents/agent-loop.js";
@@ -165,14 +165,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<ServerHandl
 	}
 
 	// Capture the boot start time so the `ready (Xs)` line can report total
-	// startup duration. Mirrors openclaw's `serverStartedAt = Date.now()`
-	// (`src/gateway/server.impl.ts:408`) threaded through the boot chain.
+	// startup duration. Threaded through the boot chain.
 	const startupStartedAt = Date.now();
 
 	// Phase logger — emits to the verbose console-stream when present, falls
 	// back to plain stderr lines so the bare-mode boot still surfaces
-	// progress. Mirrors openclaw's `gatewayLog.info("loading configuration…")`
-	// pattern from `src/cli/gateway-cli/run.ts:301` etc.
+	// progress (e.g. "loading configuration…").
 	const bootLog = (message: string): void => {
 		if (opts.consoleStream) {
 			opts.consoleStream.info(message);
@@ -184,12 +182,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<ServerHandl
 	// Phase 1 — acquire the gateway lock BEFORE we touch the port. Two
 	// `brigade gateway run` invocations both reach this line; only one
 	// gets the lock. The other receives a typed GatewayLockError that
-	// `cli/commands/gateway.ts` formats with the OpenClaw-shape "gateway
+	// `cli/commands/gateway.ts` formats with the canonical "gateway
 	// already running (pid X); lock timeout after 5000ms" message.
 	//
 	// We DON'T emit a "phase" log line for the lock attempt because in
-	// the happy path it's instant and silent (mirrors openclaw — its lock
-	// also doesn't log on success).
+	// the happy path it's instant and silent.
 	const lockHandle: GatewayLockHandle = await acquireGatewayLock({ port });
 
 	try {
@@ -223,15 +220,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<ServerHandl
 			}
 		}
 
-		// Phase 3 — Loading configuration. Mirrors openclaw's
-		// `gatewayLog.info("loading configuration…")` immediately before
-		// `loadConfig()` (`src/cli/gateway-cli/run.ts:301`).
+		// Phase 3 — Loading configuration. Emits the standard
+		// "loading configuration…" line immediately before `loadConfig()`.
 		bootLog("loading configuration…");
 		const config = await loadConfig();
 
-		// Phase 4 — Resolving authentication. Mirrors openclaw's
-		// `gatewayLog.info("resolving authentication…")`
-		// (`src/cli/gateway-cli/run.ts:424`).
+		// Phase 4 — Resolving authentication. Emits the standard
+		// "resolving authentication…" line.
 		bootLog("resolving authentication…");
 		// Read auth from Brigade's `~/.brigade/agents/main/agent/auth-profiles.json`
 		// (the file `brigade onboard` writes), NOT from Pi's vanilla
@@ -241,10 +236,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<ServerHandl
 		const modelRegistry = ModelRegistry.create(authStorage, `${BRIGADE_DIR}/models.json`);
 
 		// F:\Brigade's brigade.json (post-2026-05-02 wizard refactor) stores
-		// the default model under `agents.defaults.{provider, model.primary}`
-		// to mirror the reference shape. The lifted code expected the older
-		// flat `config.defaultProvider` / `config.defaultModelId` fields, so
-		// we read the new shape here and project to local string vars.
+		// the default model under `agents.defaults.{provider, model.primary}`.
+		// Earlier code expected the older flat `config.defaultProvider` /
+		// `config.defaultModelId` fields, so we read the new shape here
+		// and project to local string vars.
 		const wizardDefaults = (config.agents as { defaults?: { provider?: string; model?: { primary?: string } } } | undefined)?.defaults;
 		const provider: string | undefined = wizardDefaults?.provider;
 		const modelId: string | undefined = wizardDefaults?.model?.primary;
@@ -264,8 +259,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<ServerHandl
 			throw new Error(`server: model ${provider}/${modelId} not in registry`);
 		}
 
-		// Phase 5 — Starting. Mirrors openclaw's `gatewayLog.info("starting...")`
-		// (`src/cli/gateway-cli/run.ts:539`) right before the runtime build.
+		// Phase 5 — Starting. Emits the standard "starting..." line right
+		// before the runtime build.
 		bootLog("starting...");
 
 		return await continueBoot({
@@ -356,8 +351,8 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// After a turn settles we DEBOUNCE a batched sweep: during quiet time it
 	// distills the NEW transcript turns into structured facts in ONE extra
 	// model call, so the per-turn path stays at a single call. This is the
-	// scalable shape (OpenClaw-style off-hot-path + batching) over Boop's
-	// extraction algorithm — see agents/memory/extract.ts. Kill-switch:
+	// scalable shape (off-hot-path + batching) — see agents/memory/extract.ts.
+	// Kill-switch:
 	// BRIGADE_DISABLE_MEMORY_EXTRACT=1 turns off the ENTIRE background memory
 	// sweep — extraction AND the decay GC AND consolidation that ride in the
 	// same quiet window (runDecayGc + runConsolidation live inside
@@ -554,8 +549,8 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 
 	/* ──────────────── transport ──────────────── */
 
-	// Phase 6 — Starting HTTP server. Mirrors openclaw's
-	// `log.info("starting HTTP server...")` (`src/gateway/server.impl.ts:423`).
+	// Phase 6 — Starting HTTP server. Emits the standard
+	// "starting HTTP server..." line.
 	bootLog("starting HTTP server...");
 	const httpServer: HttpServer = createServer();
 	const wss = new WebSocketServer({ server: httpServer });
@@ -1135,17 +1130,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		});
 	});
 
-	// Phase 7 — agent model resolved. Mirrors openclaw's
-	// `agent model: <provider>/<model>` line (`src/gateway/server-startup-log.ts:24-27`).
+	// Phase 7 — agent model resolved. Emits the standard
+	// `agent model: <provider>/<model>` line.
 	bootLog(`agent model: ${provider}/${modelId}`);
 
-	// Phase 8 — Listening on bound port. Mirrors openclaw's
-	// `listening on ws://${host}:${port}` line that the verbose banner emits.
+	// Phase 8 — Listening on bound port. Emits the standard
+	// `listening on ws://${host}:${port}` verbose-banner line.
 	bootLog(`listening on ws://${host}:${port}`);
 
-	// Phase 9 — ready marker with timing. Mirrors openclaw's
-	// `ready (N plugins: ...; Xs)` line (`src/gateway/server-startup-log.ts:32`).
-	// Brigade has zero plugins in v1, so the body is timing-only — `ready (Xs)`.
+	// Phase 9 — ready marker with timing. Brigade has zero plugins in v1,
+	// so the body is timing-only — `ready (Xs)`.
 	const startupDurationMs = Date.now() - startupStartedAt;
 	const startupDurationLabel = `${(startupDurationMs / 1000).toFixed(1)}s`;
 	bootLog(`ready (${startupDurationLabel})`);
@@ -1159,8 +1153,8 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		bootLog(`build: ${build.head.slice(0, 7)}${builtAt}`);
 	}
 
-	// Phase 10 — log-file pointer. Mirrors openclaw's
-	// `log file: <path>` line (`src/gateway/server-startup-log.ts:33`).
+	// Phase 10 — log-file pointer. Emits the standard
+	// `log file: <path>` line.
 	bootLog(`log file: ${getTodayLogPath()}`);
 
 	// HTTP request handler for module-registered routes. Attached once; it reads

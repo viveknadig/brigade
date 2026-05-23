@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Brigade entry shim — mirrors openclaw.mjs's shape. The bin file is small
-// on purpose; src/entry.ts (compiled to dist/entry.js) does the real work.
+// Brigade entry shim. The bin file is small on purpose; src/entry.ts
+// (compiled to dist/entry.js) does the real work.
 //
 // Three responsibilities live here intentionally:
 //
@@ -115,8 +115,7 @@ const srcEntry = join(here, "src", "entry.ts");
 // Distinguish "the entry file itself is missing" from "the entry loaded but
 // hit ERR_MODULE_NOT_FOUND on a transitive import". Without this, a real
 // dependency-resolution bug would silently turn into "missing dist" and the
-// user would chase the wrong error. Mirrors openclaw.mjs's
-// `isDirectModuleNotFoundError`.
+// user would chase the wrong error.
 function isDirectMissing(err, specifierUrl) {
   if (!err || typeof err !== "object" || err.code !== "ERR_MODULE_NOT_FOUND") {
     return false;

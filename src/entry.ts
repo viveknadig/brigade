@@ -10,7 +10,7 @@ import { installTerminalCleanupHandler } from "./ui/terminal-cleanup.js";
 // catches every exit path including crashes during chat / connect.
 installTerminalCleanupHandler();
 
-// Brigade entry point. Mirrors OpenClaw's entry.ts dispatch shape:
+// Brigade entry point. Dispatch shape:
 //
 //   1. Defensive compile-cache enable (brigade.mjs already did this for
 //      bin invocations, but `tsx src/entry.ts` and `node dist/entry.js`

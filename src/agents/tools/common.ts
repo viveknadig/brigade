@@ -20,8 +20,7 @@
  *      shapes so a tool author can name params however they like in
  *      the schema and still receive the value.
  *
- * Mirrors OpenClaw's `src/agents/tools/common.ts:72-199`. Pure functions;
- * no module-level state.
+ * Pure functions; no module-level state.
  */
 
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
@@ -32,8 +31,6 @@ import type { AgentToolResult } from "@mariozechner/pi-agent-core";
  * the model — the model sees the `.message` string and can self-correct
  * on the next turn. The status code is informational only (Brigade has
  * no HTTP transport between the tool and Pi yet).
- *
- * Mirrors OpenClaw's `ToolInputError` at `src/agents/tools/common.ts:38`.
  */
 export class BrigadeToolInputError extends Error {
 	readonly status: number = 400;
@@ -52,9 +49,6 @@ export class BrigadeToolInputError extends Error {
  * Today (single-user v1) every sender is the owner; this class is
  * reserved for Phase 2 (multi-user / channels) when non-owner senders
  * become a real concept.
- *
- * Mirrors OpenClaw's `ToolAuthorizationError` at
- * `src/agents/tools/common.ts:47`.
  */
 export class BrigadeToolAuthorizationError extends BrigadeToolInputError {
 	override readonly status = 403;
@@ -80,8 +74,6 @@ export const OWNER_ONLY_TOOL_ERROR = "Tool restricted to the workspace owner.";
  * case + snake-case tool arg keys regardless of the schema. The
  * helper checks both forms so the tool author can name keys however
  * they like.
- *
- * Mirrors OpenClaw's `readSnakeCaseParamRaw` at `src/param-key.ts`.
  */
 function readParamRaw(params: Record<string, unknown>, key: string): unknown {
 	if (key in params) return params[key];
@@ -250,8 +242,6 @@ export function stringifyToolPayload(payload: unknown): string {
  * Build a successful `AgentToolResult` with a single text `content`
  * block and the caller-supplied `details`. The model sees `text`;
  * the UI / logs see `details`.
- *
- * Mirrors OpenClaw's `textResult` at `src/agents/tools/common.ts:243`.
  */
 export function textResult<TDetails>(
 	text: string,
@@ -270,8 +260,6 @@ export function textResult<TDetails>(
  * doesn't distinguish "success" vs "failure" results; the model
  * reads the content and adjusts. We expose this helper anyway to
  * keep the failure shape consistent across tools.
- *
- * Mirrors OpenClaw's `failedTextResult` at `src/agents/tools/common.ts:255`.
  */
 export function failedTextResult<TDetails extends { status: "failed" }>(
 	text: string,
@@ -285,8 +273,6 @@ export function failedTextResult<TDetails extends { status: "failed" }>(
  * text) AND the raw payload (as `details`). Useful for tools whose
  * result IS the payload — e.g., a config-getter returns `{key, value}`
  * and the model sees the JSON while the UI sees the structured object.
- *
- * Mirrors OpenClaw's `payloadTextResult` at `src/agents/tools/common.ts:262`.
  */
 export function payloadTextResult<TDetails>(
 	payload: TDetails,
@@ -298,8 +284,6 @@ export function payloadTextResult<TDetails>(
  * JSON-formatted result with the raw payload as `details`. Convenience
  * for tools that want the model to receive structured data as JSON
  * text without invoking the snake_case-aware stringifier.
- *
- * Mirrors OpenClaw's `jsonResult` at `src/agents/tools/common.ts:266`.
  */
 export function jsonResult(payload: unknown): AgentToolResult<unknown> {
 	return textResult(JSON.stringify(payload, null, 2), payload);

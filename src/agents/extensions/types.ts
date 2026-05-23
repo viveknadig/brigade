@@ -89,6 +89,14 @@ export interface InboundMessage {
 	 * group rooms where the platform tracks read state per-participant.
 	 */
 	participantId?: string;
+	/**
+	 * When the platform stamped this message (epoch ms). Compared against
+	 * `adapter.connectedAt()` to detect "queued during the gateway downtime"
+	 * messages — those are SUPPRESSED from triggering pairing challenges, so
+	 * a Brigade restart doesn't burst-spam every stranger who DM'd while we
+	 * were offline. `undefined` for channels without per-message timestamps.
+	 */
+	messageTimestampMs?: number;
 	/** Sender id within the channel (phone/user id). */
 	from: string;
 	/** Plain text of the message (may be empty when media has no caption). */
@@ -199,6 +207,15 @@ export interface ChannelAdapter {
 	 * `undefined` before the first successful connection.
 	 */
 	selfId?(): string | undefined;
+	/**
+	 * Epoch-ms of the channel's most recent successful connection. The manager
+	 * uses this with `InboundMessage.messageTimestampMs` to detect "queued
+	 * since last restart" inbounds and suppress pairing-challenge replies
+	 * for them (avoids burst-spamming strangers with codes after every
+	 * gateway restart). Returns `null` pre-connect or for channels that
+	 * don't track connection timing.
+	 */
+	connectedAt?(): number | null;
 	/**
 	 * Optional: mark a previously-received message as read (e.g. WhatsApp "blue
 	 * ticks"). Called by the manager AFTER access control allows the inbound so

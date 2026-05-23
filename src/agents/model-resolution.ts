@@ -1,9 +1,8 @@
 /**
- * Never-miss model resolution — the Brigade mirror of OpenClaw's layered
- * resolution net (`resolveModelWithRegistry` → discovery → `resolveDynamicModel`
- * → `resolveConfiguredFallbackModel`). The invariant: a `ModelRegistry.find`
- * returning `undefined` is NEVER terminal while we can still discover or
- * synthesize a usable Model.
+ * Never-miss model resolution — a layered resolution net (static registry
+ * find → discovery → dynamic resolve → configured fallback). The
+ * invariant: a `ModelRegistry.find` returning `undefined` is NEVER
+ * terminal while we can still discover or synthesize a usable Model.
  *
  * Resolution order (each step only runs if earlier ones miss):
  *   1. Static registry find — Pi built-in catalog + models.json.
@@ -102,9 +101,9 @@ export async function resolveModelNeverMiss(args: ResolveModelArgs): Promise<unk
 
 	// 4. Synthesize from the provider template (clone routing, override the
 	// per-model fields). We synthesize even when discovery couldn't confirm
-	// existence — mirroring OpenClaw's catch-all dynamic resolvers, the live
-	// API call validates the id and surfaces a precise provider error for a
-	// genuine typo, which is strictly better than an opaque "not registered".
+	// existence — a catch-all dynamic resolver pattern. The live API call
+	// validates the id and surfaces a precise provider error for a genuine
+	// typo, which is strictly better than an opaque "not registered".
 	if (template) {
 		return synthFromTemplate(template, modelId, discovery.meta);
 	}

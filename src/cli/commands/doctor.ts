@@ -1,17 +1,14 @@
 /**
- * `brigade doctor` — health checks. Brigade-sized port of openclaw's
- * `openclaw doctor` (`src/flows/doctor-health.ts`). Openclaw runs 26 checks
- * across plugins, daemons, OAuth, sandboxes, browser MCP, etc. — Brigade has
- * none of that surface yet, so the doctor here covers exactly what Brigade
- * has built: node, dirs, config, providers, workspace, log sink, gateway.
+ * `brigade doctor` — health checks. Brigade-sized: covers exactly what
+ * Brigade has built today (node, dirs, config, providers, workspace, log
+ * sink, gateway). No plugins / daemons / OAuth / sandboxes / browser MCP
+ * surface to check yet.
  *
  * Each check returns `{ status, message }` where status is "ok" | "warn" |
  * "fail". The runner prints them with color-coded glyphs and exits 0 — even
- * when there are warnings — to mirror openclaw's exit semantics
- * (`register.maintenance.ts:39 — exit(0)` regardless). `brigade doctor`
- * REPORTS, it doesn't gate. `brigade doctor --strict` flips that: any
- * warn/fail becomes a non-zero exit so CI / supervisor scripts can fail
- * fast.
+ * when there are warnings — by default: `brigade doctor` REPORTS, it
+ * doesn't gate. `brigade doctor --strict` flips that: any warn/fail
+ * becomes a non-zero exit so CI / supervisor scripts can fail fast.
  *
  * No --repair / --fix flags (yet). Brigade's surface is small enough that
  * each problem has a one-line "run X to fix" hint embedded in the message.

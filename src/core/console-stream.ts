@@ -153,16 +153,18 @@ export function createConsoleStream(opts: ConsoleStreamOptions = {}): ConsoleStr
 					break;
 				case "turn_end": {
 					const usage = ev.message?.usage;
-					// `usage.cost` is sometimes provider-derived (input × inputCost +
-					// output × outputCost) — if a price column is missing the product
-					// is NaN, which then leaks into the log as `cost=$NaN`. Gate on
-					// `Number.isFinite` so we omit the field entirely when the math
-					// breaks down instead of printing junk.
-					const costNum = usage?.cost !== undefined ? Number(usage.cost) : Number.NaN;
+					// `usage.cost` is the Pi SDK's structured cost record —
+					// `{ input, output, cacheRead, cacheWrite, total }` (not a number).
+					// We surface only `total`, gated on `Number.isFinite` so a missing
+					// price column (which leaves `total` as NaN or undefined) prints
+					// nothing instead of `$NaN`. Treating the field as a plain Number
+					// would always yield NaN because the object has no valueOf.
+					const cost = usage?.cost as { total?: unknown } | undefined;
+					const total = typeof cost?.total === "number" ? cost.total : Number.NaN;
 					body = `${arrow("event")} turn_end ${fields({
 						in: usage?.input,
 						out: usage?.output,
-						cost: Number.isFinite(costNum) ? `$${costNum.toFixed(4)}` : undefined,
+						cost: Number.isFinite(total) ? `$${total.toFixed(4)}` : undefined,
 					})}`;
 					break;
 				}

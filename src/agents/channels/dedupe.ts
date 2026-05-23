@@ -21,6 +21,14 @@ export interface DedupeCache {
 	/** True if this id was recorded (claimed or remembered) and is still within
 	 *  the TTL window. Non-mutating — does not refresh LRU position. */
 	peek(id: string): boolean;
+	/**
+	 * Remove a previously-claimed id so a future `claim()` returns true again.
+	 * Used by the 2-phase inbound dedupe: if the agent turn for an inbound
+	 * fails with a retryable error, releasing the id lets WhatsApp's
+	 * eventual redelivery on the next reconnect re-claim and retry. Without
+	 * release, transient errors permanently lose the message.
+	 */
+	release(id: string): void;
 	/** Clear the cache (tests + shutdown). */
 	clear(): void;
 	/** Current size; mostly for tests + diagnostics. */
@@ -81,6 +89,10 @@ export function createDedupeCache(opts: DedupeOptions = {}): DedupeCache {
 			const existing = seen.get(id);
 			if (existing === undefined) return false;
 			return Date.now() - existing < ttlMs;
+		},
+		release(id: string): void {
+			if (!id) return;
+			seen.delete(id);
 		},
 		clear() {
 			seen.clear();

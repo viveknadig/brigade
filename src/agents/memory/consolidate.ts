@@ -4,13 +4,14 @@
  * Windows" lingering next to a later "user is on macOS now" correction the
  * model never wired with `supersedes`) and semantic (non-lexical) duplicates.
  *
- * Design (scalable): Boop runs a 3-LLM debate (Proposer/Adversary/Judge) every
- * 24h — too heavy. This is a SINGLE LLM call: given the active fact set, return
- * the ids to archive. It runs inside the gateway's existing background sweep
- * (off the hot path), THROTTLED (default once / 30 min) and only when there are
- * enough facts to be worth it — so per-turn cost is unaffected and the extra
- * call is rare. Archive (not delete) keeps an audit trail; decay GC handles
- * pure age-out separately.
+ * Design (scalable): a SINGLE LLM call — given the active fact set, return
+ * the ids to archive. (A 3-LLM debate Proposer/Adversary/Judge every 24h is
+ * the heavier alternative; we explicitly avoid it.) It runs inside the
+ * gateway's existing background sweep (off the hot path), THROTTLED
+ * (default once / 30 min) and only when there are enough facts to be
+ * worth it — so per-turn cost is unaffected and the extra call is rare.
+ * Archive (not delete) keeps an audit trail; decay GC handles pure age-out
+ * separately.
  */
 
 import * as fs from "node:fs";
@@ -23,7 +24,7 @@ import { FactStore } from "./records.js";
 const log = createSubsystemLogger("memory/consolidate");
 
 const CONSOLIDATE_STATE_PATH = path.join("memory", ".dreams", "consolidate-state.json");
-/** Skip consolidation below this many active facts (nothing to merge — Boop uses 6). */
+/** Skip consolidation below this many active facts (nothing to merge). */
 const MIN_FACTS_TO_CONSOLIDATE = 6;
 /** Throttle: at most one consolidation call per this window. */
 export const DEFAULT_CONSOLIDATE_INTERVAL_MS = 30 * 60 * 1000;

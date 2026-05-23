@@ -6,6 +6,7 @@ import {
   RetryExhaustedError,
   computeBackoffMs,
   getRetryPolicy,
+  isRetryExhaustedError,
   resolveMaxRunRetryIterations,
   runWithRetry,
 } from "./retry-policy.js";
@@ -205,4 +206,51 @@ test("runWithRetry: onAttemptFailed observer is invoked on each failure", async 
   assert.match(observed[0]!, /^0:rate_limit:true$/);
   assert.match(observed[1]!, /^1:rate_limit:true$/);
   assert.match(observed[2]!, /^2:rate_limit:false$/);
+});
+
+/* ───────────────────── RetryExhaustedError shape ───────────────────── */
+
+test("RetryExhaustedError chains the underlying error as `cause`", async () => {
+  // The downstream error classifier walks `.cause` looking for known reason
+  // markers. Without the chain, a 402 billing wrapped in a retry-exhausted
+  // shell was being classified as `unknown` and recipients saw the generic
+  // apology reply instead of "out of credits" — that regression closed here.
+  const innerErr = Object.assign(new Error("402 insufficient credits"), { status: 402 });
+  let caught: unknown;
+  try {
+    await runWithRetry({
+      attempt: async () => {
+        throw innerErr;
+      },
+    });
+  } catch (e) {
+    caught = e;
+  }
+  assert.ok(caught instanceof RetryExhaustedError, "should throw RetryExhaustedError");
+  const wrapped = caught as RetryExhaustedError & { cause?: unknown };
+  assert.equal(wrapped.cause, innerErr, ".cause must point at the underlying error");
+  assert.equal(wrapped.lastReason, "billing", "lastReason should carry the classifier verdict");
+});
+
+test("isRetryExhaustedError type guard accepts RetryExhaustedError, rejects other shapes", () => {
+  const real = new RetryExhaustedError(
+    [
+      {
+        attemptIndex: 0,
+        reason: "billing",
+        policy: getRetryPolicy("billing"),
+        willRetry: false,
+        backoffMs: 0,
+        errorSummary: "402",
+        error: new Error("402"),
+      },
+    ],
+    new Error("402"),
+  );
+  assert.equal(isRetryExhaustedError(real), true);
+  assert.equal(isRetryExhaustedError(new Error("plain")), false);
+  assert.equal(isRetryExhaustedError(new BrigadeRetryError({ message: "x", reason: "billing" })), false);
+  assert.equal(isRetryExhaustedError(null), false);
+  assert.equal(isRetryExhaustedError(undefined), false);
+  assert.equal(isRetryExhaustedError({ name: "RetryExhaustedError" }), false, "name alone insufficient");
 });

@@ -21,8 +21,8 @@ const MOCK_RUNTIME = {
 	repoRoot: undefined,
 };
 
-describe("assembleSystemPrompt — universal sections (OpenClaw mirror order)", () => {
-	it("emits the OpenClaw-mirrored section sequence in the right order", () => {
+describe("assembleSystemPrompt — universal sections (standard order)", () => {
+	it("emits the universal section sequence in the right order", () => {
 		const out = assembleSystemPrompt({
 			runtime: MOCK_RUNTIME,
 			personaFiles: [
@@ -58,7 +58,7 @@ describe("assembleSystemPrompt — universal sections (OpenClaw mirror order)", 
 		assert.match(out.text, /## Tool Call Style/);
 		assert.match(out.text, /do not narrate routine, low-risk tool calls/i);
 		assert.match(out.text, /sensitive actions/i);
-		// New OpenClaw-lifted lines that were previously missing.
+		// Universal narration lines that were previously missing.
 		assert.match(out.text, /Keep narration brief and value-dense/i);
 		assert.match(out.text, /When a first-class tool exists/i);
 	});
@@ -71,8 +71,8 @@ describe("assembleSystemPrompt — universal sections (OpenClaw mirror order)", 
 		});
 		assert.match(out.text, /## Execution Bias/);
 		assert.match(out.text, /start doing it/);
-		// OpenClaw-mirror: Execution Bias is the 4 universal lines only — no
-		// Brigade-specific response-length / anti-checklist editorializing.
+		// Execution Bias is the 4 universal lines only — no Brigade-specific
+		// response-length / anti-checklist editorializing.
 		assert.match(out.text, /Commentary-only turns are incomplete/);
 		assert.doesNotMatch(out.text, /Match response length to the question/);
 	});
@@ -84,10 +84,10 @@ describe("assembleSystemPrompt — universal sections (OpenClaw mirror order)", 
 			toolDescriptions: [],
 		});
 		assert.match(out.text, /## Safety/);
-		// OpenClaw-lifted constitution-style baseline (anti-self-preservation,
-		// human-oversight priority, no-self-modification). Replaces the
-		// earlier operator-protection bullets which were already covered at
-		// the exec-gate layer (workdir/env refusal + decideApproval).
+		// Constitution-style baseline (anti-self-preservation, human-
+		// oversight priority, no-self-modification). Replaces the earlier
+		// operator-protection bullets which were already covered at the
+		// exec-gate layer (workdir/env refusal + decideApproval).
 		assert.match(out.text, /no independent goals/i);
 		assert.match(out.text, /human oversight/i);
 		assert.match(out.text, /never bypass safeguards/i);
@@ -101,11 +101,10 @@ describe("assembleSystemPrompt — universal sections (OpenClaw mirror order)", 
 			toolDescriptions: [],
 		});
 		assert.match(out.text, /## Brigade CLI Quick Reference/);
-		// Trimmed to gateway lifecycle + onboard + doctor (mirror of OpenClaw
-		// `system-prompt.ts:704-712`). The earlier enumeration of every
-		// subcommand trained the model to suggest `brigade <foo>` in
-		// conversational replies about unrelated topics — see assembler.ts
-		// comment at the CLI block for details.
+		// Trimmed to gateway lifecycle + onboard + doctor. The earlier
+		// enumeration of every subcommand trained the model to suggest
+		// `brigade <foo>` in conversational replies about unrelated topics
+		// — see assembler.ts comment at the CLI block for details.
 		assert.match(out.text, /brigade gateway/);
 		assert.match(out.text, /brigade gateway status/);
 		assert.match(out.text, /brigade gateway stop/);
@@ -152,7 +151,7 @@ describe("assembleSystemPrompt — universal sections (OpenClaw mirror order)", 
 	});
 });
 
-describe("assembleSystemPrompt — Reasoning Format (OpenClaw mirror, conditional)", () => {
+describe("assembleSystemPrompt — Reasoning Format (conditional)", () => {
 	it("emits <think>/<final> guidance for non-native-reasoning model with thinking ON", () => {
 		const out = assembleSystemPrompt({
 			runtime: MOCK_RUNTIME,
@@ -360,8 +359,8 @@ describe("assembleSystemPrompt — tool listing", () => {
 				{ name: "bash", summary: "Run a shell command" },
 			],
 		});
-		// OpenClaw-mirror opener; case-sensitivity is enforced by the
-		// unknown-tool guard at the tool layer, not narrated in the prompt.
+		// Standard opener; case-sensitivity is enforced by the unknown-tool
+		// guard at the tool layer, not narrated in the prompt.
 		assert.match(out.text, /Tool availability \(filtered by policy\):/);
 		assert.match(out.text, /- read: Read a file/);
 		assert.match(out.text, /- bash: Run a shell command/);

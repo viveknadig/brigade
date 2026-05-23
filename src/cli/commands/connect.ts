@@ -200,13 +200,13 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	// Elapsed-time tracker for the running agent. Started on `agent_start`,
 	// cleared on `agent_end`. Read by the 1s ticker below to refresh the
 	// header so the user can see "thinking… 12s" / "thinking… 1m 4s" instead
-	// of a static "thinking…". Mirrors openclaw's `tui-waiting.ts` shimmer +
-	// elapsed but Brigade-shape (no phrase rotation, just clean numbers).
+	// of a static "thinking…". Brigade-shape (no phrase rotation, just
+	// clean numbers).
 	let agentStartedAt: number | null = null;
-	// Whimsical phrase rotator for the loader. Mirrors openclaw's verb rotation
-	// in tui-waiting.ts — rotates in the header tail every 4s while the agent
-	// is busy. Pi-TUI's CancellableLoader doesn't expose a label setter so we
-	// pipe the phrase into the header `extra` slot instead.
+	// Whimsical phrase rotator for the loader. Rotates in the header tail
+	// every 4s while the agent is busy. Pi-TUI's CancellableLoader doesn't
+	// expose a label setter so we pipe the phrase into the header `extra`
+	// slot instead.
 	const WHIMSICAL_PHRASES = [
 		"thinking",
 		"flibbertigibbeting",
@@ -226,10 +226,9 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	// flipped to `true` via the `/show-thinking` slash command, the
 	// extractor includes `{ type: "thinking" }` block text alongside the
 	// regular text blocks, dimmed so it stays distinct from the agent's
-	// final reply. Mirrors the `Ctrl+T` toggle openclaw exposes on its
-	// custom-editor (Brigade uses the base Pi-TUI Editor which doesn't
-	// expose key handlers, so we surface the same behaviour through the
-	// slash-command path).
+	// final reply. Brigade uses the base Pi-TUI Editor which doesn't
+	// expose key handlers, so the toggle is surfaced through the slash-
+	// command path instead of a `Ctrl+T` binding.
 	let showThinking = false;
 
 	const updateHeader = (extra?: string): void => {
@@ -378,8 +377,7 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 
 	/**
 	 * Extract the renderable text for an assistant message — mirrors
-	 * chat.ts's `extractAssistantText` and OpenClaw's `composeThinkingAndContent`
-	 * shape. See chat.ts for the full rationale.
+	 * chat.ts's `extractAssistantText`. See chat.ts for the full rationale.
 	 */
 	const extractAssistantText = (message: any): string => {
 		if (!message || !Array.isArray(message.content)) return "";
@@ -428,9 +426,9 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 
 	/**
 	 * Format an elapsed-millisecond duration into a compact label for the
-	 * status line. Matches the `12s` / `1m 4s` / `2h 3m` shape openclaw's
-	 * `tui-waiting.ts` uses, minus the shimmer animation (Brigade keeps the
-	 * loader Pi-TUI provides; only the elapsed counter is new).
+	 * status line — `12s` / `1m 4s` / `2h 3m`. Brigade keeps the loader
+	 * Pi-TUI provides; only the elapsed counter is new (no shimmer
+	 * animation).
 	 */
 	const formatElapsed = (ms: number): string => {
 		const total = Math.max(0, Math.floor(ms / 1000));
@@ -444,9 +442,9 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	};
 
 	// No auto-kickoff. Brigade used to auto-send "Wake up, my friend!" as a
-	// synthetic first user turn on fresh-bootstrap workspaces; removed to
-	// mirror OpenClaw, whose TUI client never auto-sends. The user types
-	// the first message themselves.
+	// synthetic first user turn on fresh-bootstrap workspaces; removed so
+	// the TUI client never auto-sends. The user types the first message
+	// themselves.
 
 	// State snapshots from the gateway — every mutation pushes one.
 	client.on("state", (snap) => {
@@ -698,8 +696,7 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		// /reasoning [on|off] — toggle whether the assistant's thinking blocks
 		// render before each reply. Pi pushes thinking via `pi` events
 		// regardless; this is purely a local view filter applied in
-		// `extractAssistantText`. Mirrors OpenClaw's `/reasoning <on|off>`
-		// (`tui-command-handlers.ts:394-411`).
+		// `extractAssistantText`.
 		if (trimmed === "/reasoning" || trimmed.startsWith("/reasoning ")) {
 			editor.setText("");
 			const arg = trimmed === "/reasoning" ? "" : trimmed.slice("/reasoning ".length).trim().toLowerCase();
@@ -724,9 +721,8 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		}
 
 		// /usage — render the cumulative usage block from the latest state
-		// snapshot. Mirrors openclaw's `/usage` slash command (`src/tui/
-		// commands.ts:56-149`). All fields come from the server's
-		// SessionStateSnapshot — no extra RPC needed.
+		// snapshot. All fields come from the server's SessionStateSnapshot
+		// — no extra RPC needed.
 		if (trimmed === "/usage") {
 			editor.setText("");
 			const snap = lastSnapshot;

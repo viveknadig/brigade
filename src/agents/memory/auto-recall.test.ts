@@ -49,7 +49,7 @@ describe("buildAutoRecallBlock", () => {
 		buildAutoRecallBlock(dir, "windows platform");
 		// Auto-recall is a passive pre-turn injection — it must not inflate
 		// accessCount (that's reserved for the explicit recall_memory tool, so
-		// decay reinforcement isn't double-counted). Mirrors Boop.
+		// decay reinforcement isn't double-counted).
 		assert.equal(new FactStore(dir).list()[0]?.accessCount, 0);
 	});
 

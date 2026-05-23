@@ -6,9 +6,8 @@
  * per-turn runtime). When the user runs `brigade chat` and no gateway is up,
  * we spawn one as a DETACHED background process so it survives the chat
  * session — later `brigade chat` / `brigade connect` reattach to the same
- * daemon instantly. This mirrors OpenClaw, whose native apps manage a
- * long-lived gateway subprocess (macOS `GatewayProcessManager`) and whose
- * TUI is always a client, never the agent host.
+ * daemon instantly. Native apps and the TUI are always clients of a
+ * long-lived gateway subprocess; the TUI is never the agent host.
  *
  * The spawned daemon is independent: we `unref()` it so the parent (chat)
  * can exit without tearing it down. Stopping it is explicit:
@@ -94,9 +93,9 @@ function resolveGatewaySpawnArgv(host: string, port: number): { cmd: string; arg
 function spawnDetachedGateway(host: string, port: number): ChildProcess {
 	const { cmd, args } = resolveGatewaySpawnArgv(host, port);
 	return spawn(cmd, args, {
-		// Detach so the daemon outlives the chat process (the user chose the
-		// persistent, OpenClaw-style lifecycle). `stdio: "ignore"` because the
-		// daemon writes to its own JSONL log + console stream, not our TTY.
+		// Detach so the daemon outlives the chat process (persistent
+		// long-lived lifecycle). `stdio: "ignore"` because the daemon writes
+		// to its own JSONL log + console stream, not our TTY.
 		detached: true,
 		stdio: "ignore",
 		windowsHide: true,

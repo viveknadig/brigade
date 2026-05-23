@@ -83,11 +83,11 @@ function readBrigadeCredentials(agentId: string): Record<string, unknown> {
       // Fall through to env-backed bootstrap.
     }
   }
-  // Env-backed bootstrap — mirrors OpenClaw's `addEnvBackedPiCredentials`
-  // (src/agents/pi-model-discovery.ts:243). If a user has ANTHROPIC_API_KEY (etc)
-  // exported in their shell but never ran `brigade onboard`, Pi's registry would
-  // hide the provider unless we surface that key here. Profile-stored keys take
-  // precedence — env is only consulted when a provider has no profile entry.
+  // Env-backed bootstrap. If a user has ANTHROPIC_API_KEY (etc) exported
+  // in their shell but never ran `brigade onboard`, Pi's registry would
+  // hide the provider unless we surface that key here. Profile-stored keys
+  // take precedence — env is only consulted when a provider has no profile
+  // entry.
   for (const provider of PROVIDERS) {
     if (!provider.envVar || provider.noAuth) continue;
     if (out[provider.id] !== undefined) continue;

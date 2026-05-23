@@ -48,13 +48,13 @@
  *     With the guard, the writer throws a typed error so the operator sees
  *     the misuse instead of having it papered over.
  *
- * Brigade-shape vs OpenClaw:
- *   - OpenClaw routes approvals through a multi-channel async pipeline
- *     (Slack/Discord/web/CLI all-or-any) with timeouts + queue. Brigade is
- *     CLI-only in v1, so the gate is in-process and synchronous. The async
- *     channel surface lands in v3 when channels do.
- *   - OpenClaw stores approvals scoped per-channel + per-account. Brigade
- *     stores a flat `{ commands: string[], patterns: string[] }`.
+ * Brigade-shape choices:
+ *   - Brigade is CLI-only in v1, so the gate is in-process and
+ *     synchronous. The async multi-channel approval surface (Slack /
+ *     Discord / web / CLI all-or-any with timeouts + queue) lands in v3
+ *     when channels do.
+ *   - Brigade stores a flat `{ commands: string[], patterns: string[] }`
+ *     instead of scoping approvals per-channel + per-account.
  *
  * Storage layout (`~/.brigade/exec-approvals.json`):
  *   {

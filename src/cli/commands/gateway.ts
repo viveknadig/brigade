@@ -44,7 +44,7 @@ import { restoreTerminal } from "../../ui/terminal-cleanup.js";
 // `process.exit(0)` and tear the listening socket down. The gateway itself
 // resolves clean shutdown via SIGINT/SIGTERM handlers.
 //
-// Subcommand layout (mirrors openclaw `openclaw gateway <run|status|stop>`):
+// Subcommand layout:
 //
 //   brigade gateway          — run (back-compat — `gateway` alone is `gateway run`)
 //   brigade gateway run      — same as above; explicit form
@@ -120,10 +120,9 @@ export async function runGatewayStatusCommand(opts: { host?: string; port?: numb
 	const probe = await probeGateway({ host: opts.host, port: opts.port });
 	const pid = readPidFile();
 	const logPath = getTodayLogPath();
-	// Inspect the port even when the probe says reachable — surfaces a stale
-	// process when a different PID is bound (port hijack / supervisor mismatch),
-	// which is exactly the "stale gateway" failure openclaw's status catches
-	// (`src/cli/daemon-cli/status.print.ts:232-246`).
+	// Inspect the port even when the probe says reachable — surfaces a
+	// stale process when a different PID is bound (port hijack /
+	// supervisor mismatch) so "stale gateway" failures are caught.
 	const listeners = inspectPortListeners(port);
 	// Only fetch last error when the gateway is NOT reachable — operators
 	// looking at a healthy gateway don't want stale errors front-and-centre.
@@ -211,9 +210,8 @@ const STOP_POLL_INTERVAL_MS = 100;
  * wait for the ack. Returns true when the gateway acknowledged the shutdown,
  * false on any failure (no listener, malformed reply, timeout). Used by
  * `runGatewayStopCommand` to attempt a graceful stop before falling back to
- * SIGTERM. Mirrors openclaw's pattern of preferring service-manager stop
- * over raw signals — Brigade has no service manager, so a self-administered
- * RPC is the cross-platform-clean equivalent.
+ * SIGTERM. Brigade has no service manager, so a self-administered RPC is
+ * the cross-platform-clean equivalent of service-manager-mediated stop.
  */
 async function sendShutdownRpc(args: { host?: string; port?: number; timeoutMs: number }): Promise<boolean> {
 	const { WebSocket } = await import("ws");
@@ -432,10 +430,9 @@ export async function runGatewayCommand(opts: GatewayCommandOptions = {}): Promi
 		// 5000ms acquire window expired. The error message already names the
 		// holder PID; we add operator-facing recovery hints + a port-owner
 		// listing (cross-platform via netstat / lsof / ss) so the user can
-		// see exactly which process is holding the port. Mirrors openclaw's
-		// `Gateway failed to start: ...\nIf the gateway is supervised, stop
-		// it with: openclaw gateway stop` format from
-		// `src/cli/gateway-cli/run.ts:574-589`.
+		// see exactly which process is holding the port. The canonical
+		// shape is `Gateway failed to start: ...\nIf the gateway is
+		// supervised, stop it with: brigade gateway stop`.
 		if (isGatewayLockError(err)) {
 			const listeners = inspectPortListeners(port);
 			let body =

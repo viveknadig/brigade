@@ -64,8 +64,6 @@ export function trimToolCallName(name: unknown): string {
  * helper, the layers diverge — earlier audits caught the bash gate
  * doing lowercase matching while the path guards used raw casing.
  *
- * Mirrors OpenClaw's `normalizeToolName` at
- * `src/agents/tool-policy.ts` (Brigade-native rename).
  */
 export function normalizeToolName(name: unknown): string {
 	if (typeof name !== "string") return "";

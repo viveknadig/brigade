@@ -2,12 +2,12 @@ import { Command } from "commander";
 
 import { formatVersion } from "../../version.js";
 
-// Mirrors OpenClaw's lazy command-registration pattern. Each subcommand's
-// real body (action handler) lives in a separate module under
-// `src/cli/commands/`. Commander still needs each command DECLARED at the
-// program level so `brigade --help` lists all of them, BUT the heavy import
-// chain (Pi SDK init, model registry, TUI widgets, gateway server, ws
-// stack, etc.) only loads when the user actually picks that command.
+// Lazy command-registration pattern. Each subcommand's real body (action
+// handler) lives in a separate module under `src/cli/commands/`. Commander
+// still needs each command DECLARED at the program level so `brigade
+// --help` lists all of them, BUT the heavy import chain (Pi SDK init,
+// model registry, TUI widgets, gateway server, ws stack, etc.) only loads
+// when the user actually picks that command.
 //
 // In practice: `brigade onboard` doesn't pay for chat/gateway/connect's
 // import time, and `brigade tui` doesn't pay for gateway's. The savings
@@ -17,9 +17,10 @@ import { formatVersion } from "../../version.js";
 //
 // Primitive #1/#2 surface (onboard + agent + tui) is unchanged in shape;
 // gateway + connect were lifted from the published v0.1.3 codebase. The
-// status / doctor / config / gateway-subcommands surfaces match openclaw's
-// `openclaw <status|doctor|config|gateway run|gateway status|gateway stop>`
-// shape — Brigade-sized ports, no plugin/daemon-installer scope creep.
+// status / doctor / config / gateway-subcommands surfaces give Brigade
+// the canonical `brigade <status|doctor|config|gateway run|gateway
+// status|gateway stop>` shape — Brigade-sized ports, no plugin/daemon-
+// installer scope creep.
 
 export function buildProgram(): Command {
   const program = new Command();
@@ -51,7 +52,7 @@ export function buildProgram(): Command {
     .option("--no-env-detect", "ignore API keys from the shell environment")
     .option(
       "--secret-input-mode <mode>",
-      "how accepted env-keys persist: 'plaintext' (default, copies value into ~/.brigade/) or 'ref' (stores a keyRef; literal value never lands on disk)",
+      "how accepted env-keys persist: 'plaintext' (default, copies value into Brigade's local config) or 'ref' (stores a keyRef; literal value never lands on disk)",
       "plaintext",
     )
     .action(async (opts: { envDetect?: boolean; secretInputMode?: string }) => {
@@ -94,10 +95,10 @@ export function buildProgram(): Command {
     });
 
   /* ────────────────────── gateway parent + subcommands ────────────────────── */
-  // Mirror of openclaw `openclaw gateway <run|status|stop|...>`. The bare
-  // `brigade gateway` invocation stays back-compat — it dispatches to `run`.
-  // status/stop are quick reads of port 7777 + the PID file, so they don't
-  // need the Pi SDK or the gateway server module to load.
+  // `brigade gateway <run|status|stop|...>`. The bare `brigade gateway`
+  // invocation stays back-compat — it dispatches to `run`. status/stop
+  // are quick reads of port 7777 + the PID file, so they don't need the
+  // Pi SDK or the gateway server module to load.
   const gw = program.command("gateway").description("Run or manage the Brigade gateway (WebSocket daemon)");
 
   gw.option("-p, --port <port>", "TCP port to bind", (v) => parseInt(v, 10))
@@ -225,7 +226,7 @@ export function buildProgram(): Command {
   program
     .command("doctor")
     .description(
-      "Run health checks against ~/.brigade/, providers, workspace, and the gateway.\n" +
+      "Run health checks against your Brigade install, providers, workspace, and the gateway.\n" +
         "  Examples:\n" +
         "    brigade doctor                  # human-readable output\n" +
         "    brigade doctor --json           # machine-readable\n" +
@@ -243,10 +244,10 @@ export function buildProgram(): Command {
     });
 
   /* ─────────────────────────────── config ─────────────────────────────── */
-  // Mirror of openclaw `openclaw config <list|get|set|unset|file>`.
-  // Brigade-shape: no schema/validate subcommands (Brigade's TypeBox
-  // schema is private and validation runs automatically on every write).
-  const cfg = program.command("config").description("Read or modify brigade.json");
+  // `brigade config <list|get|set|unset|file>`. No schema/validate
+  // subcommands — Brigade's TypeBox schema is private and validation
+  // runs automatically on every write.
+  const cfg = program.command("config").description("Read or modify your Brigade configuration");
 
   cfg
     .command("list")
@@ -311,7 +312,7 @@ export function buildProgram(): Command {
 
   cfg
     .command("file")
-    .description("Print the absolute path to brigade.json")
+    .description("Print the absolute path to your Brigade config file")
     .option("--json", "emit JSON instead of bare-path output", false)
     .action(async (opts: { json?: boolean }) => {
       const { runConfigFile } = await import("../commands/config-cmd.js");
@@ -320,7 +321,7 @@ export function buildProgram(): Command {
 
   cfg
     .command("schema")
-    .description("Print the brigade.json TypeBox schema as JSON")
+    .description("Print the Brigade config TypeBox schema as JSON")
     .action(async () => {
       const { runConfigSchema } = await import("../commands/config-cmd.js");
       process.exit(await runConfigSchema());
@@ -328,7 +329,7 @@ export function buildProgram(): Command {
 
   cfg
     .command("validate")
-    .description("Validate brigade.json against the schema; exit non-zero on issues")
+    .description("Validate your Brigade config against the schema; exit non-zero on issues")
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runConfigValidate } = await import("../commands/config-cmd.js");
@@ -368,15 +369,20 @@ export function buildProgram(): Command {
     .description(
       "Pair a device with a channel (e.g. scan a WhatsApp QR).\n" +
         "  Requires the gateway to be stopped so the channel socket isn't shared.\n" +
+        "  Use --force to overwrite an existing link or recover from an interrupted previous link.\n" +
         "  Example: brigade channels link --channel whatsapp",
     )
     .option("--channel <id>", "channel id (auto-picked when only one is available)")
     .option("--timeout <ms>", "max time to wait for pairing (default 180000)", (v) => parseInt(v, 10))
+    .option("--force", "clear any previous link state and start a fresh pair", false)
     .option("--json", "emit JSON instead of human-readable text", false)
-    .action(async (opts: { channel?: string; timeout?: number; json?: boolean }) => {
+    .action(async (opts: { channel?: string; timeout?: number; force?: boolean; json?: boolean }) => {
       const { runChannelsLink } = await import("../commands/channels.js");
       process.exit(
-        await runChannelsLink({ channel: opts.channel, timeoutMs: opts.timeout }, { json: opts.json }),
+        await runChannelsLink(
+          { channel: opts.channel, timeoutMs: opts.timeout, force: opts.force },
+          { json: opts.json },
+        ),
       );
     });
 
@@ -396,7 +402,7 @@ export function buildProgram(): Command {
 
   channels
     .command("enable")
-    .description("Set channels.<id>.enabled=true in brigade.json (no link)")
+    .description("Enable this channel in your Brigade config (no link)")
     .option("--channel <id>", "channel id (auto-picked when only one is available)")
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; json?: boolean }) => {
@@ -406,7 +412,7 @@ export function buildProgram(): Command {
 
   channels
     .command("disable")
-    .description("Set channels.<id>.enabled=false in brigade.json (creds untouched)")
+    .description("Disable this channel in your Brigade config (credentials untouched)")
     .option("--channel <id>", "channel id (auto-picked when only one is available)")
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; json?: boolean }) => {
@@ -536,10 +542,10 @@ export function buildProgram(): Command {
   /* ───────────────────────────── secrets ───────────────────────────── */
   const secrets = program
     .command("secrets")
-    .description("Find suspected leaked credentials inside ~/.brigade");
+    .description("Find suspected leaked credentials inside your Brigade install");
   secrets
     .command("audit")
-    .description("Scan ~/.brigade for plaintext-key shapes (sk-…, Bearer …, …)")
+    .description("Scan your Brigade install for plaintext-key shapes (sk-…, Bearer …, …)")
     .option("--strict", "exit non-zero on findings (CI mode)", false)
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { strict?: boolean; json?: boolean }) => {
@@ -592,11 +598,11 @@ export function buildProgram(): Command {
   // alive (locks would fight) unless --force is passed.
   const backup = program
     .command("backup")
-    .description("Snapshot, verify, and restore ~/.brigade as a single .tar.gz");
+    .description("Snapshot, verify, and restore your Brigade install as a single .tar.gz");
 
   backup
     .command("create")
-    .description("Write a sha256-manifest'd .tar.gz snapshot of ~/.brigade")
+    .description("Write a sha256-manifest'd .tar.gz snapshot of your Brigade install")
     .option("--output <path>", "where to write the archive (default: ./brigade-backup-<ts>.tar.gz)")
     .option("--force", "back up even if the gateway is running (risk: torn writes)", false)
     .option("--json", "emit JSON instead of human-readable text", false)
@@ -616,8 +622,8 @@ export function buildProgram(): Command {
 
   backup
     .command("restore <archive>")
-    .description("Extract an archive into ~/.brigade (or --target). Refuses if target exists without --force")
-    .option("--target <path>", "where to extract (default: ~/.brigade)")
+    .description("Extract an archive into your Brigade install (or --target). Refuses if target exists without --force")
+    .option("--target <path>", "where to extract (default: your Brigade install directory)")
     .option("--force", "overwrite an existing target / restore while gateway is running", false)
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (archive: string, opts: { target?: string; force?: boolean; json?: boolean }) => {
@@ -634,7 +640,7 @@ export function buildProgram(): Command {
   // operator explicitly approves them with `brigade exec allow`.
   const exec = program
     .command("exec")
-    .description("Manage the bash-tool approval allowlist (~/.brigade/exec-approvals.json)");
+    .description("Manage the bash-tool approval allowlist used by Brigade");
 
   exec
     .command("list")

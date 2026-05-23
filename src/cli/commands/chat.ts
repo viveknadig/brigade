@@ -3,8 +3,8 @@
  * Brigade gateway (the single per-turn runtime).
  *
  * As of the single-path refactor, `brigade chat` no longer hosts its own Pi
- * session. It mirrors OpenClaw, where the TUI is always a client and the
- * gateway daemon owns the agent loop. The boot flow is:
+ * session. The TUI is always a client and the gateway daemon owns the
+ * agent loop. The boot flow is:
  *
  *   1. Refuse non-TTY environments (the TUI needs a real terminal).
  *   2. Require a configured provider/model (point at `brigade onboard`).
@@ -83,7 +83,7 @@ export async function runChatCommand(opts: ChatCommandOptions = {}): Promise<Con
 	}
 
 	// Ensure a gateway is running, spawning a detached one if needed. The
-	// spawned daemon persists after we exit (the OpenClaw-style lifecycle).
+	// spawned daemon persists after we exit (long-lived lifecycle).
 	try {
 		const result = await ensureGatewayRunning({
 			host,

@@ -130,9 +130,8 @@ export interface RunSingleTurnArgs {
   // the agent has a stable home regardless of where the operator invoked
   // brigade from. The agent is NOT a project-rooted coding agent — it
   // operates in its own workspace and reaches project files via ABSOLUTE
-  // paths (taught by the system prompt). Mirrors OpenClaw's behaviour at
-  // src/agents/pi-embedded-runner/run/attempt.ts:1031-1032 where
-  // `cwd: resolvedWorkspace` is the AGENT'S workspace, not process.cwd().
+  // paths (taught by the system prompt). The session cwd resolves to the
+  // AGENT'S workspace, not process.cwd().
   cwd?: string;
   // Pi accepts "off" | "low" | "medium" | "high". Some providers (e.g. Gemini
   // 2.5 Pro) reject "off" — derive from model.reasoning when wiring tools.
@@ -149,9 +148,9 @@ export interface RunSingleTurnArgs {
    * runs. This is the per-turn mirror's seam: the gateway / TUI driver holds
    * the returned session for the DURATION of this turn so it can `steer()`,
    * `abort()`, or `switchModelMidTurn()` mid-stream, then drops the reference
-   * when the turn settles. Mirrors OpenClaw, where each `runEmbeddedAttempt`
-   * builds a fresh session and the surface interacts with it only for that
-   * turn's lifetime (there is no long-lived session between turns).
+   * when the turn settles. Each turn builds a fresh session and the
+   * surface interacts with it only for that turn's lifetime — there is no
+   * long-lived session between turns.
    */
   onSessionReady?: (session: AgentSession) => void;
 }
@@ -176,12 +175,11 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   const sessionKey = args.sessionKey ?? defaultSessionKey(agentId);
   const agentDir = resolveAgentDir(agentId);
   const workspaceDir = resolveAgentWorkspaceDir(agentId, args.workspaceDir);
-  // Default Pi's cwd to the agent's workspace dir (mirror of OpenClaw's
-  // `resolvedWorkspace` semantics). Relative tool paths now resolve into
-  // the persona directory naturally — `write({path: "USER.md"})` lands
-  // at `<workspace>/USER.md` without any path-jail guard. Absolute paths
-  // are passed through unchanged so the agent can still reach project
-  // files when the operator gives it one.
+  // Default Pi's cwd to the agent's workspace dir. Relative tool paths
+  // now resolve into the persona directory naturally — `write({path:
+  // "USER.md"})` lands at `<workspace>/USER.md` without any path-jail
+  // guard. Absolute paths are passed through unchanged so the agent can
+  // still reach project files when the operator gives it one.
   const cwd = args.cwd ?? workspaceDir;
   const modelsFile = resolveModelsPath(agentId);
   const authProfilesPath = resolveAuthProfilesPath(agentId);
@@ -225,10 +223,11 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
     );
   }
   let model = registryAsFinder.find(args.provider, args.modelId);
-  // Never-miss resolution (OpenClaw mirror). On a static miss, discover or
-  // synthesize a usable Model: Ollama re-queries /api/tags; cloud providers hit
-  // their /models endpoint for accurate metadata and synthesize from a
-  // catalogued template (inheriting api/baseUrl/auth). See model-resolution.ts.
+  // Never-miss resolution. On a static miss, discover or synthesize a
+  // usable Model: Ollama re-queries /api/tags; cloud providers hit their
+  // /models endpoint for accurate metadata and synthesize from a
+  // catalogued template (inheriting api/baseUrl/auth). See
+  // model-resolution.ts.
   if (!model) {
     model = await resolveModelNeverMiss({
       modelRegistry,
@@ -449,9 +448,8 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   //
   // Path-mutating tools (`write`, `edit`) are intentionally NOT gated
   // here — Pi resolves their relative paths against the session cwd
-  // (the agent's workspace dir), and absolute paths pass through.
-  // Mirrors OpenClaw's `tools.fs.workspaceOnly = false` default at
-  // `src/agents/tool-fs-policy.ts:11`.
+  // (the agent's workspace dir), and absolute paths pass through. This
+  // matches the established `tools.fs.workspaceOnly = false` default.
   const sessionWithBeforeHook = session as AgentSession & {
     agent?: {
       beforeToolCall?: BrigadeBeforeToolCallHook;
@@ -635,8 +633,8 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // gateway WebSocket broadcast, debug logs) can group them. The
   // forwarder pipes Pi's per-event stream into the global bus and
   // is detached at the end of the function so listeners don't pile
-  // up across the gateway's long-running process. Mirrors OpenClaw's
-  // `src/infra/agent-events.ts` global registry pattern.
+  // up across the gateway's long-running process. This is the standard
+  // global agent-events registry pattern.
   const runId = randomUUID();
   // Publish runId+agentId+sessionKey to the closure-bag so any
   // `tool-blocked` events emitted during this turn carry accurate
@@ -1213,12 +1211,11 @@ async function waitForStreamSettled(session: AgentSession): Promise<void> {
 // Surface a provider/transport failure that Pi reports as DATA rather than a
 // thrown exception.
 //
-// Mirrors OpenClaw's embedded-runner contract: there, `runEmbeddedAttempt`
-// returns the settled `lastAssistant` message and a failover layer inspects
-// its `stopReason`/`errorMessage` to decide retry → rotate → fallback-model →
-// surface (see openclaw assistant-failover + failover-policy). Pi emits the
-// same shape: a SETTLED assistant message with `stopReason: "error"` and an
-// `errorMessage` — not an exception, and not an intentionally-empty reply.
+// Pi emits provider/transport failures as a SETTLED assistant message
+// with `stopReason: "error"` and an `errorMessage` — not an exception,
+// and not an intentionally-empty reply. A failover layer can inspect
+// `stopReason`/`errorMessage` to decide retry → rotate → fallback-model
+// → surface.
 //
 // Brigade reaches the same outcome through its existing throw-based machinery:
 // we convert that error-as-data into a thrown error carrying the cleaned
@@ -1239,10 +1236,9 @@ function assertNoProviderErrorStop(session: AgentSession): void {
     if (!m || m.role !== "assistant") continue;
     if (m.stopReason === "error") {
       const raw = m.errorMessage?.trim();
-      // cleanProviderError peels the provider's JSON error blob down to its
-      // human-readable message (Brigade's equivalent of OpenClaw's
-      // formatAssistantErrorText) so the classifier matches on real text and
-      // the user sees a readable line, not a raw payload.
+      // cleanProviderError peels the provider's JSON error blob down to
+      // its human-readable message so the classifier matches on real
+      // text and the user sees a readable line, not a raw payload.
       throw new Error(
         raw
           ? cleanProviderError(raw)

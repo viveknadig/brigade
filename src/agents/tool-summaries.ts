@@ -7,10 +7,9 @@
 // so the model picks the right name on the first try and doesn't invent
 // aliases like `cat` or `ls -la`.
 //
-// Lifted as a pattern from OpenClaw's `coreToolSummaries` (Brigade's own
-// rewrite — same shape, our wording). When Pi adds a tool name we don't
-// recognise, the renderer falls back to "no summary" and lets the model
-// rely on its tool schema.
+// Short, action-oriented summaries by tool name. When Pi adds a tool name
+// we don't recognise, the renderer falls back to "no summary" and lets
+// the model rely on its tool schema.
 
 export const BRIGADE_TOOL_SUMMARIES: Record<string, string> = {
   read: "Read file contents (text or binary).",
@@ -22,7 +21,7 @@ export const BRIGADE_TOOL_SUMMARIES: Record<string, string> = {
   ls: "List the contents of a directory.",
   // Primitive #4 (Memory). Recall = search; read = bounded excerpt.
   // Writing memory uses the `write` tool (memory/<today>.md), not a
-  // dedicated tool — mirrors OpenClaw.
+  // dedicated low-level tool.
   recall_memory: "Search your durable memory (MEMORY.md + memory/*.md) before answering.",
   read_memory: "Read a bounded excerpt of a memory file found via recall_memory.",
   // Reserved for future Brigade additions — keep them documented even when

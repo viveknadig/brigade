@@ -28,8 +28,7 @@ const LOGS_DIR = path.join(BRIGADE_DIR, "logs");
 /**
  * Per-file size cap. Once today's `.jsonl` exceeds this, we rotate to
  * `<day>.jsonl.1` (rotating any prior `.1` to `.2`, up to MAX_LOG_BACKUPS).
- * Mirrors openclaw's `MAX_LOG_FILE_BYTES = 500 * 1024 * 1024` from
- * `src/logging/logger.ts:50`. Brigade's surface is smaller so 100 MB is
+ * Brigade's surface is smaller than a multi-tenant gateway so 100 MB is
  * plenty in normal use; runaway days (broken stream loops, attack-style
  * spam) are still bounded.
  */
@@ -82,8 +81,7 @@ export function attachEventLogger(session: AgentSession): () => void {
 		const filePath = todayFile();
 		// Periodically check file size and rotate before write to keep log
 		// files bounded. Cheap stat every N writes — checking on every write
-		// would dominate hot paths during streaming. Mirrors openclaw's
-		// size-cap pattern (`src/logging/logger.ts:183-197`).
+		// would dominate hot paths during streaming.
 		if (writeCount % SIZE_CHECK_EVERY_N_WRITES === 0) {
 			rotateIfTooLarge(filePath);
 		}
@@ -219,8 +217,7 @@ export function getTodayLogPath(): string {
  *   - No event in the last `lookbackBytes` slice looks like an error.
  *   - File is unreadable.
  *
- * Mirrors openclaw's "Last gateway error: ..." line in
- * `src/cli/daemon-cli/status.print.ts:172-193`.
+ * Surfaces a "Last gateway error: ..." snapshot for status output.
  */
 export interface LastErrorSnapshot {
   ts: string;

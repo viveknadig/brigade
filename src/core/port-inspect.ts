@@ -1,14 +1,13 @@
 /**
  * Cross-platform "who's holding this port?" helper.
  *
- * Mirror of openclaw's `src/infra/ports-inspect.ts` + `ports-format.ts`,
  * Brigade-shaped to the single use case we have today: when
  * `brigade gateway run` fails because port 7777 is already bound, OR
  * when `brigade gateway status` wants to surface the listener,
  * print one line that names the PID and (if we can extract it) the
  * command line of the holder.
  *
- * Implementation strategy — same as openclaw:
+ * Implementation strategy:
  *
  *   - Windows: parse `netstat -ano -p tcp` + enrich with `tasklist /FI`
  *   - macOS:   `lsof -nP -iTCP:<port> -sTCP:LISTEN -FpFcn`
@@ -49,7 +48,7 @@ export function inspectPortListeners(port: number): PortListener[] {
   }
 }
 
-/** Pretty-print a single listener. Matches openclaw's `ports-format.ts:126-132`. */
+/** Pretty-print a single listener. */
 export function formatPortListener(l: PortListener): string {
   const cmd = l.commandLine || l.command || "unknown";
   const addr = l.address ? ` (${l.address})` : "";

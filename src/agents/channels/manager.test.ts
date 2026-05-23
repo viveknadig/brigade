@@ -436,4 +436,234 @@ describe("startChannels", () => {
 		await mgr.stop();
 		assert.equal(f.ctx().signal.aborted, true);
 	});
+
+	/* ───────────────────── error-class-aware reply behavior ───────────────────── */
+
+	it("recipient-facing reply on `billing` error names credits, not the model", async () => {
+		const f = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => {
+				// Throw a BrigadeRetryError so the classifier picks `billing` directly.
+				const { BrigadeRetryError } = await import("../error-classifier.js");
+				throw new BrigadeRetryError({
+					message: "402 This request requires more credits, or fewer max_tokens",
+					reason: "billing",
+					status: 402,
+				});
+			},
+		});
+		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "hi" });
+		assert.equal(f.sent.length, 1);
+		const reply = f.sent[0]?.text ?? "";
+		assert.match(reply, /credits/i, "billing reply must mention credits");
+		assert.doesNotMatch(reply, /402|max_tokens|openrouter|claude|gpt/i, "must not leak status code or model id");
+		await mgr.stop();
+	});
+
+	it("recipient-facing reply on `rate_limit` error tells the sender to retry in a moment", async () => {
+		const f = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => {
+				const { BrigadeRetryError } = await import("../error-classifier.js");
+				throw new BrigadeRetryError({ message: "429 rate limited", reason: "rate_limit", status: 429 });
+			},
+		});
+		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "hi" });
+		assert.equal(f.sent.length, 1);
+		const reply = f.sent[0]?.text ?? "";
+		assert.match(reply, /capacity|moment/i);
+		assert.doesNotMatch(reply, /429/);
+		await mgr.stop();
+	});
+
+	it("falls back to a polite generic reply on truly unclassifiable error", async () => {
+		const f = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => {
+				throw new Error("something opaque exploded");
+			},
+		});
+		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "hi" });
+		assert.equal(f.sent.length, 1);
+		const reply = f.sent[0]?.text ?? "";
+		assert.match(reply, /sorry|error|try again/i, "generic reply must read as an apology");
+		assert.ok(reply.length < 300, "generic reply should stay short");
+		await mgr.stop();
+	});
+
+	it("recipient-facing reply on RetryExhaustedError still surfaces the underlying class (billing)", async () => {
+		// This is the user-reported regression: a 402 OpenRouter billing error
+		// wrapped by the retry loop's exhaustion-shell used to fall through to
+		// the generic apology because the classifier couldn't see past the
+		// wrapper. The fix chains `cause` AND consults `.lastReason` directly.
+		const f = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => {
+				const { RetryExhaustedError } = await import("../retry-policy.js");
+				const { getRetryPolicy } = await import("../retry-policy.js");
+				throw new RetryExhaustedError(
+					[
+						{
+							attemptIndex: 0,
+							reason: "billing",
+							policy: getRetryPolicy("billing"),
+							willRetry: false,
+							backoffMs: 0,
+							errorSummary: "402 insufficient credits",
+							error: new Error("402 insufficient credits"),
+						},
+					],
+					new Error("402 insufficient credits"),
+				);
+			},
+		});
+		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "hi" });
+		assert.equal(f.sent.length, 1);
+		const reply = f.sent[0]?.text ?? "";
+		assert.match(reply, /credits/i, "wrapped billing reason must surface as 'credits' reply");
+		assert.doesNotMatch(reply, /402|retry|exhausted/i, "must not leak the wrapper internals");
+		await mgr.stop();
+	});
+
+	/* ───────────────────── reply sanitization (channel-side <think> strip) ───────────────────── */
+
+	it("strips <think>…</think> from the agent's reply before sending to the channel", async () => {
+		const f = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => ({ reply: "<think>plan: greet them warmly</think>\nHey, what's up?" }),
+		});
+		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "ping" });
+		assert.equal(f.sent.length, 1);
+		const reply = f.sent[0]?.text ?? "";
+		assert.equal(reply, "Hey, what's up?");
+		assert.doesNotMatch(reply, /<think>|<\/think>/);
+		await mgr.stop();
+	});
+
+	/* ───────────────────── markRead / setComposing ordering ───────────────────── */
+
+	it("calls adapter.markRead AFTER the access gate allows the inbound (not before)", async () => {
+		const order: string[] = [];
+		const f = makeFakeChannel({
+			markRead: async () => {
+				order.push("markRead");
+			},
+			setComposing: async (_c, state) => {
+				order.push(`composing:${state}`);
+			},
+		});
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => {
+				order.push("runTurn");
+				return { reply: "ok" };
+			},
+		});
+		await f.ctx().onInbound({
+			channel: "fake",
+			conversationId: "c1",
+			messageId: "m1",
+			from: "u",
+			text: "ping",
+		});
+		// Expected order: markRead → composing:composing → runTurn → composing:paused
+		assert.deepEqual(order, ["markRead", "composing:composing", "runTurn", "composing:paused"]);
+		await mgr.stop();
+	});
+
+	it("does NOT call markRead / setComposing on a BLOCKED inbound (block-policy + unknown sender)", async () => {
+		const blockedConfig = { channels: { fake: { dmPolicy: "disabled" } } } as unknown as BrigadeConfig;
+		const calls: string[] = [];
+		const f = makeFakeChannel({
+			markRead: async () => {
+				calls.push("markRead");
+			},
+			setComposing: async () => {
+				calls.push("setComposing");
+			},
+		});
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: blockedConfig,
+			agentId: "main",
+			runTurn: async () => ({ reply: "should-not-run" }),
+		});
+		await f.ctx().onInbound({
+			channel: "fake",
+			conversationId: "c1",
+			messageId: "m1",
+			from: "stranger",
+			text: "hi",
+		});
+		assert.deepEqual(calls, [], "blocked sender must not get a read receipt or typing indicator");
+		await mgr.stop();
+	});
+
+	/* ───────────── pairing-reply history-grace window ───────────── */
+
+	it("suppresses the pairing-CHALLENGE REPLY on a historical inbound (queued during downtime)", async () => {
+		// Default `pairing` DM policy + a stranger + a message timestamped
+		// well before the channel reported "connected". The pairing request
+		// should be RECORDED (operator can approve later) but the stranger
+		// should NOT get a code reply (avoids burst-spam on every restart).
+		const f = makeFakeChannel({
+			connectedAt: () => Date.now(),
+		});
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: { channels: { fake: { dmPolicy: "pairing" } } } as unknown as BrigadeConfig,
+			agentId: "main",
+			runTurn: async () => ({ reply: "should-not-run" }),
+		});
+		await f.ctx().onInbound({
+			channel: "fake",
+			conversationId: "c1",
+			messageId: "m-old",
+			from: "+15551234567",
+			text: "hi from days ago",
+			// Stamped 10 minutes BEFORE now → outside the 30s grace window.
+			messageTimestampMs: Date.now() - 10 * 60 * 1_000,
+		});
+		assert.equal(f.sent.length, 0, "history inbound must NOT trigger a pairing-reply send");
+		await mgr.stop();
+	});
+
+	it("sends the pairing CHALLENGE REPLY for a fresh inbound (live, post-connect)", async () => {
+		const f = makeFakeChannel({
+			connectedAt: () => Date.now() - 5_000, // connected 5s ago
+		});
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: { channels: { fake: { dmPolicy: "pairing" } } } as unknown as BrigadeConfig,
+			agentId: "main",
+			runTurn: async () => ({ reply: "should-not-run" }),
+		});
+		await f.ctx().onInbound({
+			channel: "fake",
+			conversationId: "c1",
+			messageId: "m-live",
+			from: "+15551234567",
+			text: "hi just now",
+			messageTimestampMs: Date.now(), // live
+		});
+		assert.equal(f.sent.length, 1, "fresh stranger must receive a pairing code reply");
+		await mgr.stop();
+	});
 });

@@ -33,8 +33,8 @@ import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
  *   - Users who want more reasoning can `/thinking high` at runtime.
  */
 export function pickInitialThinkingLevel(model: Model<any>): ThinkingLevel {
-	// Primary signal: the catalog's `reasoning` flag (mirrors OpenClaw's
-	// `resolveThinkingDefaultForModel` — reasoning → "low", else "off").
+	// Primary signal: the catalog's `reasoning` flag — reasoning → "low",
+	// else "off".
 	if (model.reasoning) return "low";
 	// Robustness fallback: aggregators (OpenRouter, Vercel AI Gateway, etc.)
 	// frequently ship model metadata WITHOUT the reasoning flag set, even for

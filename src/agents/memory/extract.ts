@@ -1,14 +1,14 @@
 /**
- * Post-turn memory extraction — Boop's extraction *algorithm*, run OpenClaw-
- * style OFF the hot path.
+ * Post-turn memory extraction — distillation algorithm run OFF the hot path.
  *
- * Design rationale (scalable / enterprise): Boop runs an extraction LLM call
- * after EVERY turn (≈2× model calls/turn, cost grows with volume). OpenClaw
- * keeps the per-turn path at one call and does the expensive distillation in a
- * scheduled, batched sweep. We take OpenClaw's shape: a debounced background
- * sweep (driven by the long-lived gateway) reads the NEW transcript turns
- * since a cursor, distills them in ONE extraction call (many turns → one
- * call), stores the resulting structured facts, and advances the cursor.
+ * Design rationale (scalable / enterprise): the per-turn path stays at one
+ * model call; the expensive distillation happens in a debounced background
+ * sweep (driven by the long-lived gateway) that reads the NEW transcript
+ * turns since a cursor, distills them in ONE extraction call (many turns →
+ * one call), stores the resulting structured facts, and advances the
+ * cursor. We deliberately avoid the alternative of running an extraction
+ * LLM call after EVERY turn (≈2× model calls/turn, cost grows with
+ * volume).
  *
  * This module is the engine + cursor. The LLM call is INJECTED
  * (`ExtractionLlm`) so the distillation logic is unit-testable without a
@@ -34,7 +34,7 @@ const log = createSubsystemLogger("memory/extract");
 /** Cursor store — tracks how many transcript messages we've already distilled. */
 const CURSOR_RELATIVE_PATH = path.join("memory", ".dreams", "extract-cursor.json");
 
-/** Boop's extraction prompt, adapted to distill a BATCH of recent turns. */
+/** Extraction prompt — distills a BATCH of recent turns into durable facts. */
 export const EXTRACTION_PROMPT = `You are a memory-extraction subagent for a personal AI assistant.
 You are given a slice of recent conversation (one or more USER/ASSISTANT turns).
 Extract any DURABLE facts about the user or their world that are worth remembering long-term.
@@ -60,8 +60,8 @@ export interface ExtractedFact {
 }
 
 /**
- * Parse the extraction model's reply into facts. Robust to prose-wrapped JSON
- * (grabs the first {...} block, like Boop's `/\{[\s\S]*\}/`). Never throws.
+ * Parse the extraction model's reply into facts. Robust to prose-wrapped
+ * JSON (grabs the first `{...}` block via a permissive regex). Never throws.
  */
 export function parseExtractedFacts(text: string): ExtractedFact[] {
 	if (!text) return [];
@@ -110,8 +110,8 @@ export function storeExtractedFacts(
 			segment: f.segment as MemorySegment,
 			...(f.importance !== undefined ? { importance: f.importance } : {}),
 			...(sourceTurn ? { sourceTurn } : {}),
-			// `corrects` only belongs on a correction (Boop gates it the same way);
-			// a misbehaving model could attach it to any segment.
+			// `corrects` only belongs on a correction; a misbehaving model
+			// could attach it to any segment, so we drop it elsewhere.
 			...(f.corrects && f.segment === "correction" ? { metadata: { corrects: f.corrects } } : {}),
 		});
 		stored += 1;

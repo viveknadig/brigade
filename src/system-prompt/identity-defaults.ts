@@ -1,25 +1,23 @@
 /**
  * IDENTITY.md runtime defaults.
  *
- * Mirrors OpenClaw's identity-resolution pattern (`src/gateway/assistant-
- * identity.ts:81-96`'s 3-tier fallback + `src/agents/identity-file.ts:24-45`'s
- * placeholder detection): the file on disk stays untouched, but at the
- * moment we LOAD it for system-prompt injection we substitute a sensible
- * default for any field still holding a template placeholder.
+ * A 3-tier identity-resolution + placeholder-detection pattern: the file on
+ * disk stays untouched, but at the moment we LOAD it for system-prompt
+ * injection we substitute a sensible default for any field still holding a
+ * template placeholder.
  *
  * The most user-visible case is the Name field. Until the user personalises
  * IDENTITY.md, the template ships with `_(pick something you like)_` (the
  * v0.1.3 placeholder). Without this substitution the agent reads that
  * placeholder verbatim out of the system prompt and echoes it back into
  * chat ("hi! _(pick something you like)_..."). Replacing the placeholder
- * with `Brigade` at load time gives the agent a stable name from boot,
- * exactly like OpenClaw's `DEFAULT_ASSISTANT_IDENTITY.name = "Assistant"`.
+ * with `Brigade` at load time gives the agent a stable name from boot.
  *
  * Scope (intentionally narrow):
  *   - ONLY the Name field gets a default substitution. Other fields
- *     (Creature, Vibe, Emoji, Avatar) stay as their template placeholders —
- *     OpenClaw filters them out at parse time but Brigade injects raw
- *     markdown, so leaving the placeholder text is the safer floor.
+ *     (Creature, Vibe, Emoji, Avatar) stay as their template placeholders.
+ *     Brigade injects raw markdown rather than filtering placeholders at
+ *     parse time, so leaving the placeholder text is the safer floor.
  *   - The user's on-disk IDENTITY.md is NEVER modified. We only return a
  *     normalised in-memory copy.
  *   - `extractIdentityName` is the single source of truth for "is the name
@@ -32,7 +30,7 @@ import { extractIdentityName } from "../core/system-prompt.js";
 /**
  * The string the agent uses for itself before the user picks a name. Surfaces
  * in: the chat label, the system-prompt injection of IDENTITY.md, the gateway
- * state snapshot. Mirrors OpenClaw's `DEFAULT_ASSISTANT_IDENTITY.name`.
+ * state snapshot.
  */
 export const DEFAULT_AGENT_NAME = "Brigade";
 

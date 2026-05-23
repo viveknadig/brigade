@@ -16,11 +16,9 @@
  * gated here — Pi resolves their relative paths against the session
  * cwd (the agent's workspace dir), and absolute paths are passed
  * through. The agent's "home" is its persona directory; project files
- * are reached via absolute paths the operator gives it. Mirrors
- * OpenClaw's `tools.fs.workspaceOnly = false` default at
- * `src/agents/tool-fs-policy.ts:11` and the `createAgentSession({cwd:
- * resolvedWorkspace})` wiring at
- * `src/agents/pi-embedded-runner/run/attempt.ts:1031-1032`.
+ * are reached via absolute paths the operator gives it. This matches the
+ * `tools.fs.workspaceOnly = false` default and `createAgentSession({cwd:
+ * resolvedWorkspace})` wiring.
  *
  * What this gate enforces:
  *
@@ -138,8 +136,8 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 			?? {};
 
 		// Pull the command out of the tool args. Pi's `bash` tool accepts
-		// `command` (the OpenClaw/Anthropic convention); some providers
-		// emit `cmd` or `script` instead — fall back through them.
+		// `command` (the Anthropic convention); some providers emit `cmd`
+		// or `script` instead — fall back through them.
 		const cmdRaw =
 			(args && typeof args === "object"
 				? ((args as { command?: unknown }).command

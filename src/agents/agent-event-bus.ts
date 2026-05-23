@@ -1,11 +1,10 @@
 /**
  * Process-singleton agent event bus.
  *
- * Mirrors OpenClaw's `src/infra/agent-events.ts:286` — a global listener
- * registry that survives Pi `AgentSession` recreation across turns. The
- * bus lets multiple consumers (the in-process TUI, the gateway's
- * WebSocket broadcaster, debug logs, future plugins) subscribe ONCE
- * at process boot and receive events from every turn that runs in
+ * A global listener registry that survives Pi `AgentSession` recreation
+ * across turns. The bus lets multiple consumers (the in-process TUI, the
+ * gateway's WebSocket broadcaster, debug logs, future plugins) subscribe
+ * ONCE at process boot and receive events from every turn that runs in
  * this process.
  *
  * Architecture choice: a global module-level Set is fine for Brigade's

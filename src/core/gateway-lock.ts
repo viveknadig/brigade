@@ -1,12 +1,12 @@
 /**
- * Gateway lock — Brigade-shape mirror of openclaw's `src/infra/gateway-lock.ts`.
+ * Gateway lock — single-profile lockfile guarding port 7777.
  *
  * Purpose: prevent two `brigade gateway run` invocations from both binding to
  * port 7777 and racing the EADDRINUSE failure path. Instead, the second
  * invocation sees a clean "gateway already running (pid X); lock timeout
  * after 5000ms" message that points the operator at `brigade gateway stop`.
  *
- * Mechanism (matches openclaw's pattern):
+ * Mechanism:
  *
  *   1. Atomic exclusive create — `fs.open(lockPath, "wx")`. The "wx" flag
  *      makes the syscall fail with EEXIST when the file already exists, so
@@ -25,17 +25,14 @@
  *      file. The gateway server calls this from its `stop()` method, which
  *      runs on SIGTERM/SIGINT.
  *
- * Brigade-shape simplifications vs openclaw:
+ * Brigade-shape simplifications:
  *
- *   - Lock path is `~/.brigade/gateway.lock` (one constant). Openclaw uses
- *     `${TMPDIR}/openclaw-${UID}/gateway.${SHA256(configPath).slice(0,8)}.lock`
- *     to support multiple concurrent gateway profiles. Brigade is
- *     single-profile in v1, so a single fixed path is enough.
+ *   - Lock path is a single fixed `~/.brigade/gateway.lock`. Brigade is
+ *     single-profile in v1, so a per-profile path scheme isn't needed.
  *
- *   - We DON'T probe the bound port to enrich the "owner" detection.
- *     Openclaw's full path checks `lsof`/`netstat` to confirm the holder
- *     PID matches the port listener. For Brigade's single-port flow, the
- *     PID-from-lockfile + alive-check is sufficient.
+ *   - We DON'T probe the bound port to enrich the "owner" detection. For
+ *     Brigade's single-port flow, the PID-from-lockfile + alive-check is
+ *     sufficient (no `lsof` / `netstat` cross-check).
  *
  *   - We DON'T do Linux's `/proc/<pid>/stat` start-time matching to detect
  *     PID recycling. The 30s stale-window covers the realistic risk:
@@ -84,8 +81,7 @@ interface LockPayload {
 /**
  * Typed error so callers can distinguish lock-contention failures from other
  * boot errors and format the message specifically (point at `brigade gateway
- * stop`, show port-PID diagnostics, etc.). Mirrors openclaw's
- * `GatewayLockError` (`src/infra/gateway-lock.ts`).
+ * stop`, show port-PID diagnostics, etc.).
  */
 export class GatewayLockError extends Error {
   readonly holderPid: number | undefined;

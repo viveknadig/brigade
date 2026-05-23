@@ -13,11 +13,11 @@
  * `agents/agent-loop.ts:runSingleTurn` → a single `createAgentSession` — and
  * every surface funnels through it: `brigade agent` calls it directly, and
  * the gateway (which `brigade chat` / `brigade connect` are thin WebSocket
- * clients of) runs it once per turn. This mirrors OpenClaw's single
- * `runEmbeddedAttempt`. These helpers are factored out of that one path so
- * the tool set + guards stay legible and unit-testable; per-provider
- * behaviour lives in the stream-fn wrappers (see `stream-wrappers.ts`),
- * never per-model loop branching — OpenClaw's "one loop + provider adapters".
+ * clients of) runs it once per turn. These helpers are factored out of
+ * that one path so the tool set + guards stay legible and unit-testable;
+ * per-provider behaviour lives in the stream-fn wrappers (see
+ * `stream-wrappers.ts`), never per-model loop branching. The shape is
+ * deliberately "one loop + provider adapters".
  */
 
 import { makeExecGate } from "./exec-gate.js";

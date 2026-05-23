@@ -3,9 +3,9 @@
 //
 // The build stamp (`dist/buildstamp.json`, written by scripts/build-done.mjs in
 // the postbuild hook) carries the git commit + build time, so `--version` and
-// the gateway boot banner can report the EXACT build that's running — mirroring
-// OpenClaw's `.buildstamp` → version surfacing. Reads are best-effort: in a dev
-// source tree (no stamp) we fall back to the bare version string.
+// the gateway boot banner can report the EXACT build that's running. Reads
+// are best-effort: in a dev source tree (no stamp) we fall back to the bare
+// version string.
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";

@@ -1,5 +1,5 @@
 /**
- * Argv classification helpers — mirrors OpenClaw's `src/cli/argv.ts` shape.
+ * Argv classification helpers.
  *
  * Used by entry.ts to decide if a request can short-circuit the heavy
  * Commander load. `--version` / `-v` and `--help` / `-h` at the root level

@@ -74,7 +74,12 @@ export function createWhatsAppAdapter(): ChannelAdapter {
 					ctx.onConnected?.();
 				},
 				onLoggedOut: () => {
-					ctx.log(`WhatsApp was unlinked. Delete ${authDir} and restart to scan a new QR code.`);
+					// Recipient-friendly wording — no on-disk paths, no "delete X then …"
+					// instructions. The operator gets a clean recovery flow via the CLI
+					// (`brigade channels unlink` wipes the local credentials; then
+					// `brigade channels link` walks them through a fresh scan). Path
+					// names belong in operator logs, not in user-visible CLI output.
+					ctx.log("WhatsApp was unlinked. Run `brigade channels unlink --channel whatsapp` then `brigade channels link` to scan a new code.");
 					ctx.onLoggedOut?.();
 				},
 				onMessage: (msg) => {
@@ -83,6 +88,7 @@ export function createWhatsAppAdapter(): ChannelAdapter {
 						conversationId: msg.conversationId,
 						messageId: msg.messageId,
 						participantId: msg.participantId,
+						messageTimestampMs: msg.messageTimestampMs,
 						from: msg.from,
 						fromName: msg.fromName,
 						text: msg.text,
@@ -126,6 +132,9 @@ export function createWhatsAppAdapter(): ChannelAdapter {
 		},
 		selfId(): string | undefined {
 			return connection?.selfId() ?? undefined;
+		},
+		connectedAt(): number | null {
+			return connection?.connectedAt() ?? null;
 		},
 	};
 }

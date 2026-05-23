@@ -1,6 +1,6 @@
 # Brigade Primitive #2 — System Prompt smoke test.
 #
-# Verifies the OpenClaw-style first-turn experience end-to-end:
+# Verifies the canonical first-turn experience end-to-end:
 #   - bootstrap-phase machine (first-turn nudge fires once, marker written)
 #   - layered persona files drive identity (BOOTSTRAP/IDENTITY/SOUL/AGENTS/USER/TOOLS/HEARTBEAT)
 #   - session transcript persists across turns (recall name + self-name)

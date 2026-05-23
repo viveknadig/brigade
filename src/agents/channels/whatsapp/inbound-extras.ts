@@ -30,11 +30,57 @@ const CONTEXT_BEARING_KEYS = [
 	"listResponseMessage",
 ];
 
+/**
+ * Wrapper envelopes that contain a NESTED `message` to be unwrapped before
+ * looking for `contextInfo`. Disappearing-message rooms wrap content in
+ * `ephemeralMessage`; "view once" media (a single-view photo/video) wraps in
+ * `viewOnceMessage` / `viewOnceMessageV2` / `viewOnceMessageV2Extension`;
+ * documents with captions sometimes wrap in `documentWithCaptionMessage`;
+ * Baileys' "bot invoke" path uses `botInvokeMessage`; group-mention
+ * detail-broadcasts use `groupMentionedMessage`. Each wrapper has a
+ * `.message` field containing the real envelope. We walk the chain until
+ * we hit something that ISN'T a wrapper.
+ */
+const MESSAGE_WRAPPER_KEYS = [
+	"ephemeralMessage",
+	"viewOnceMessage",
+	"viewOnceMessageV2",
+	"viewOnceMessageV2Extension",
+	"documentWithCaptionMessage",
+	"botInvokeMessage",
+	"groupMentionedMessage",
+];
+
+/**
+ * Unwrap a Baileys message envelope by following the wrapper chain. Returns
+ * the innermost message (the one carrying real content) so callers can search
+ * for `contextInfo`, text, captions, etc. on the right shape. Hard-capped at
+ * 8 iterations defensively — production payloads have ≤2 levels.
+ */
+function unwrapMessage(message: WAMessage["message"]): WAMessage["message"] | undefined {
+	let current = message;
+	for (let depth = 0; depth < 8 && current; depth += 1) {
+		const obj = current as Record<string, unknown>;
+		let unwrapped: WAMessage["message"] | undefined;
+		for (const wrapperKey of MESSAGE_WRAPPER_KEYS) {
+			const wrapper = obj[wrapperKey] as { message?: WAMessage["message"] } | undefined;
+			if (wrapper?.message) {
+				unwrapped = wrapper.message;
+				break;
+			}
+		}
+		if (!unwrapped) return current;
+		current = unwrapped;
+	}
+	return current;
+}
+
 function findContextInfo(message: WAMessage["message"]): Record<string, unknown> | undefined {
-	if (!message) return undefined;
-	const m = message as Record<string, unknown>;
+	const m = unwrapMessage(message);
+	if (!m) return undefined;
+	const obj = m as Record<string, unknown>;
 	for (const key of CONTEXT_BEARING_KEYS) {
-		const env = m[key] as Record<string, unknown> | undefined;
+		const env = obj[key] as Record<string, unknown> | undefined;
 		const ctx = env?.contextInfo as Record<string, unknown> | undefined;
 		if (ctx) return ctx;
 	}
@@ -43,18 +89,21 @@ function findContextInfo(message: WAMessage["message"]): Record<string, unknown>
 
 /**
  * Extract mentioned jids in canonical E.164 form. LID-aliased mentions go
- * through the signalRepository LID table; unresolvable ones are dropped.
+ * through the resolver chain: on-disk reverse-mapping (under `authDir`,
+ * survives socket cold-start) → live `signalRepository.lidMapping` →
+ * dropped. The `authDir` argument is optional; tests can omit it.
  */
 export async function extractMentions(
 	message: WAMessage["message"],
 	sock: WASocket | null,
+	authDir?: string,
 ): Promise<string[]> {
 	const ctx = findContextInfo(message);
 	if (!ctx) return [];
 	const raw = (ctx.mentionedJid as string[] | undefined) ?? [];
 	const out: string[] = [];
 	for (const jid of raw) {
-		const id = await resolveJidToE164(sock, jid);
+		const id = await resolveJidToE164(sock, jid, authDir);
 		if (id) out.push(id);
 	}
 	return [...new Set(out)];
@@ -77,13 +126,15 @@ function quotedTextOf(quoted: Record<string, unknown> | undefined): string | und
 
 /**
  * Pull a reply-context shape from the inbound, when this message quotes another.
- * `from` is async-resolved through the LID table; unresolvable participants
- * become `undefined` (we keep the body + messageId so the LLM still sees the
+ * `from` is async-resolved through the LID chain (on-disk reverse-mapping +
+ * live `signalRepository.lidMapping`); unresolvable participants become
+ * `undefined` (we keep the body + messageId so the LLM still sees the
  * quote, just without a phone-number attribution).
  */
 export async function extractReplyContext(
 	message: WAMessage["message"],
 	sock: WASocket | null,
+	authDir?: string,
 ): Promise<InboundReplyContext | undefined> {
 	const ctx = findContextInfo(message);
 	if (!ctx) return undefined;
@@ -91,7 +142,7 @@ export async function extractReplyContext(
 	const participant = typeof ctx.participant === "string" ? ctx.participant : undefined;
 	const body = quotedTextOf(ctx.quotedMessage as Record<string, unknown> | undefined);
 	if (!stanzaId && !body && !participant) return undefined;
-	const fromE164 = participant ? await resolveJidToE164(sock, participant) : undefined;
+	const fromE164 = participant ? await resolveJidToE164(sock, participant, authDir) : undefined;
 	return {
 		messageId: stanzaId,
 		body: body ? body.slice(0, 280) : undefined, // truncate so LLM context isn't gobbled

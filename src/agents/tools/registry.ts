@@ -13,9 +13,8 @@
  * tool-assembly seam) so adding a tool later is a one-line change in
  * `createBrigadeTools` rather than a multi-file rewire.
  *
- * Mirrors OpenClaw's pattern at `src/agents/openclaw-tools.ts:51-114`
- * (`createOpenClawTools` factory) with Brigade-native naming + a much
- * narrower scope (no plugins, no channels, no MCP).
+ * Tool-factory pattern with Brigade-native naming and a deliberately
+ * narrow scope (no plugins, no channels, no MCP).
  */
 
 import { FileMemoryStore } from "../memory/storage.js";
@@ -69,7 +68,7 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// facts (factStore), reinforcing recalled facts against decay.
 		makeRecallMemoryTool(memoryStore, factStore),
 		makeReadMemoryTool(memoryStore),
-		// write_memory persists distilled structured facts (Boop model).
+		// write_memory persists distilled structured facts.
 		makeWriteMemoryTool(factStore),
 	];
 }

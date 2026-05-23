@@ -49,7 +49,7 @@ describe("createBrigadeTools — Primitive #4 (memory)", () => {
 		}
 	});
 
-	it("includes the structured write_memory tool (Boop model)", () => {
+	it("includes the structured write_memory tool", () => {
 		const tools = createBrigadeTools({
 			workspaceDir: tmpWorkspace,
 			agentId: "main",

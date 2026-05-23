@@ -13,7 +13,7 @@
 //   overloaded         yes        3        2s+jitter    yes             503 / 529
 //   timeout            yes        3        1s+jitter    yes             econn*, deadline
 //   unknown            yes        2        1s+jitter    yes             collapse-into-retry
-//   billing            no         0        n/a          rotate-model    402 → failover chain / surface (mirrors openclaw)
+//   billing            no         0        n/a          rotate-model    402 → failover chain / surface
 //   format             no         0        n/a          n/a             same body re-fails
 //   model_not_found    no         0        n/a          rotate-model    fallback chain
 //   auth               no         0        n/a          yes             try other profile
@@ -86,9 +86,9 @@ export function getRetryPolicy(reason: RetryReason): RetryPolicy {
         consumesProbeSlot: true,
       };
     case "billing":
-      // Mirror OpenClaw: billing (402 insufficient credits) is a FAILOVER
-      // reason, never a same-model retry. The same model on the same account
-      // has the same credits — re-poking it just wastes a round-trip. So fail
+      // billing (402 insufficient credits) is a FAILOVER reason, never a
+      // same-model retry. The same model on the same account has the
+      // same credits — re-poking it just wastes a round-trip. So fail
       // fast at the policy layer (no same-model retry) and let the model
       // fallback chain try a different (provider, model); if none is
       // configured, the error surfaces immediately. Same shape as
@@ -240,13 +240,27 @@ export class RetryExhaustedError extends Error {
     const lastReason: RetryReason = last?.reason ?? "unknown";
     const summary =
       last?.errorSummary ?? (lastError instanceof Error ? lastError.message : String(lastError));
+    // Chain the underlying error as `cause`. Recipient-facing classification
+    // walks `.cause` to find a known reason; without this, a 402 OpenRouter
+    // billing error wrapped in a retry-exhausted shell was being classified
+    // as `unknown` and recipients got the generic "Sorry I hit an error"
+    // reply instead of the friendly "I'm out of credits" message.
     super(
       `Retry exhausted after ${attempts.length} attempt(s); last reason=${lastReason}: ${summary}`,
+      lastError instanceof Error ? { cause: lastError } : undefined,
     );
     this.name = "RetryExhaustedError";
     this.attempts = attempts;
     this.lastReason = lastReason;
   }
+}
+
+/** Type predicate — checks for the structured `RetryExhaustedError` shape so
+ *  callers can read `.lastReason` directly without re-classifying. */
+export function isRetryExhaustedError(value: unknown): value is RetryExhaustedError {
+  if (!value || typeof value !== "object") return false;
+  const v = value as { name?: unknown; lastReason?: unknown };
+  return v.name === "RetryExhaustedError" && typeof v.lastReason === "string";
 }
 
 export async function runWithRetry<T>(args: RunWithRetryArgs<T>): Promise<T> {

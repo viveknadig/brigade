@@ -72,13 +72,13 @@ export interface OnboardingOptions {
 	 */
 	noEnvDetect?: boolean;
 	/**
-	 * Storage shape for accepted env-key credentials. Mirrors OpenClaw's
-	 * `--secret-input-mode` flag (see openclaw `provider-auth-helpers.ts`).
+	 * Storage shape for accepted env-key credentials. Modeled on the
+	 * `--secret-input-mode` flag pattern.
 	 *
 	 *   - "plaintext" (DEFAULT) — accepted env value is COPIED into Brigade's
 	 *     own state (brigade.json::env + auth-profiles.json with literal `key`).
 	 *     Persists across shell restarts and machine moves. Same as today's
-	 *     behaviour, same as OpenClaw's default.
+	 *     behaviour and the established default.
 	 *
 	 *   - "ref" — accepted env value is NEVER written to disk. Auth-profiles.json
 	 *     stores `keyRef: { source: "env", id: "OPENROUTER_API_KEY" }`; the
@@ -106,12 +106,11 @@ export async function runOnboarding(
 	// just rewinds to the previous step. This is what makes invalid keys
 	// recoverable instead of a one-shot abort.
 	//
-	// No "auto-select from env" shortcut — mirrors OpenClaw's wizard shape.
-	// Even when EXACTLY ONE provider has an env key set, the user goes
-	// through the picker → `ensureApiKey` → "Use existing X?" Yes/No prompt
-	// (with default = Yes). Skipping silently to "we picked for you" is a
-	// Brigade-specific behaviour the user explicitly rejected because it
-	// removes the explicit choice that OpenClaw always shows.
+	// No "auto-select from env" shortcut. Even when EXACTLY ONE provider
+	// has an env key set, the user goes through the picker → `ensureApiKey`
+	// → "Use existing X?" Yes/No prompt (with default = Yes). Skipping
+	// silently to "we picked for you" was explicitly rejected because it
+	// removes the explicit choice the user expects.
 	let step: "provider" | "key" | "model" = "provider";
 	let provider = "";
 	let modelId = "";
@@ -163,10 +162,10 @@ export async function runOnboarding(
 		break;
 	}
 
-	// No agent-naming step — mirrors OpenClaw's onboarding shape (its wizard
-	// ends at provider+auth+model, with the agent's identity left for the
-	// agent itself to discover via BOOTSTRAP.md on first turn). Workspace
-	// scaffolding still happens at agent boot via `buildAgent → seedDefaultPrompts`.
+	// No agent-naming step. The wizard ends at provider+auth+model — the
+	// agent's identity is left for the agent itself to discover via
+	// BOOTSTRAP.md on first turn. Workspace scaffolding still happens at
+	// agent boot via `buildAgent → seedDefaultPrompts`.
 	await saveConfig({ defaultProvider: provider, defaultModelId: modelId });
 
 	renderScreen(tui, ""); // brand-only frame for the "Ready." moment
@@ -269,9 +268,8 @@ export async function ensureApiKey(
 	//      does NOT consult shell env, so this fallback is what makes the
 	//      env-confirmation flow below actually fire — without it, a user
 	//      with `OPENROUTER_API_KEY` exported sees the paste-key prompt
-	//      instead of "Use existing OPENROUTER_API_KEY?". Mirrors OpenClaw's
-	//      `resolveEnvApiKey()` which reads `process.env` directly at
-	//      key-entry time (post-provider-selection).
+	//      instead of "Use existing OPENROUTER_API_KEY?". `process.env`
+	//      is read directly at key-entry time (post-provider-selection).
 	//
 	// CRITICAL: an env var being PRESENT doesn't mean it WORKS — stale
 	// leftover values silently auto-completed onboarding before, letting
@@ -282,24 +280,22 @@ export async function ensureApiKey(
 	// pretend no credential exists. This is the enterprise / CI escape
 	// hatch — operators wanting TYPED-only auth flip the flag and Brigade
 	// never silently consults `$env:OPENROUTER_API_KEY` or its peers.
-	// Env-key detection — mirrors OpenClaw's `ensureApiKeyFromEnvOrPrompt`
-	// (provider-auth-input.ts:163-222): read process.env directly, prompt to
-	// confirm whenever found, fall through to typed-paste on No or no-env.
+	// Env-key detection — read process.env directly, prompt to confirm
+	// whenever found, fall through to typed-paste on No or no-env.
 	//
 	// CRITICAL: env-confirm fires WHENEVER a shell env var is present, even
-	// if a saved profile from a previous onboard already exists. That matches
-	// OpenClaw — the user gets to re-affirm the env value (default Yes) or
-	// switch to a freshly typed key. Skipping the prompt when "already saved"
-	// is a Brigade-specific shortcut the user explicitly rejected.
+	// if a saved profile from a previous onboard already exists. The user
+	// gets to re-affirm the env value (default Yes) or switch to a freshly
+	// typed key. Skipping the prompt when "already saved" was explicitly
+	// rejected because it removes that choice.
 	//
 	// `noEnvDetect` short-circuits env entirely (CI / typed-only operators).
 	const envKey = opts.noEnvDetect ? undefined : readProviderEnvKey(provider);
 	if (envKey) {
-		// Env-supplied key: confirm with the user before adopting it. Wording
-		// + shape mirrors OpenClaw's `Use existing OPENROUTER_API_KEY (env:
-		// OPENROUTER_API_KEY, sk-o…52b5)?` confirm prompt
-		// (provider-auth-input.ts:204-213). Single line, default = Yes.
-		// No explanatory paragraphs (OpenClaw doesn't show any).
+		// Env-supplied key: confirm with the user before adopting it. The
+		// canonical form is `Use existing OPENROUTER_API_KEY (env:
+		// OPENROUTER_API_KEY, sk-o…52b5)?`. Single line, default = Yes.
+		// No explanatory paragraphs.
 		const envVar = provider.envVar ?? "the env var";
 		renderScreen(tui, `Step 2 of 3 · ${provider.name}`);
 		tui.addChild(
@@ -320,7 +316,7 @@ export async function ensureApiKey(
 			selectListTheme,
 			{ minPrimaryColumnWidth: 6, maxPrimaryColumnWidth: 8 },
 		);
-		confirmList.setSelectedIndex(0); // default Yes — same as OpenClaw's `initialValue: true`
+		confirmList.setSelectedIndex(0); // default Yes
 		tui.addChild(confirmList);
 		tui.setFocus(confirmList);
 		tui.requestRender();
@@ -369,10 +365,10 @@ export async function ensureApiKey(
 		tui.removeChild(envLoader);
 
 		if (envCheck.ok) {
-			// Two persistence shapes, mirroring OpenClaw's `--secret-input-mode`
-			// (see openclaw `provider-auth-helpers.ts:84-111`). Both write to
-			// `~/.brigade/agents/<id>/agent/auth-profiles.json` under the same
-			// `profileId(provider)`; the shape on disk differs:
+			// Two persistence shapes, switched by `secretInputMode`. Both
+			// write to `~/.brigade/agents/<id>/agent/auth-profiles.json`
+			// under the same `profileId(provider)`; the shape on disk
+			// differs:
 			//
 			//   PLAINTEXT (default):
 			//     { type: "api_key", provider, key: "sk-or-v1-abc…" }
@@ -518,8 +514,8 @@ async function promptTypedKey(
 		}
 
 		// Step 3: only persist after both checks pass.
-		// Wizard owns ALL persistence (mirrors OpenClaw's pattern — no
-		// post-wizard bridge mirror that could clobber a keyRef profile):
+		// Wizard owns ALL persistence (no post-wizard bridge mirror that
+		// could clobber a keyRef profile):
 		//   - upsertApiKeyProfile → ~/.brigade/agents/<id>/agent/auth-profiles.json
 		//     (the canonical credential store; `rm -rf ~/.brigade` wipes it)
 		//   - authStorage.set → Pi's in-memory store + ~/.brigade/auth.json

@@ -1,22 +1,18 @@
 /**
  * `brigade config <list|get|set|unset|file>` — config CRUD over brigade.json.
- * Brigade-shape mirror of openclaw's `openclaw config <get|set|unset|file|...>`
- * (`src/cli/config-cli.ts`). The big differences:
  *
- *   - 4 subcommands instead of 6 (no `schema` / `validate` — Brigade's
- *     TypeBox schema is private and validation happens automatically on
- *     every write through `writeBrigadeConfig`).
+ *   - 4 subcommands (no `schema` / `validate` — Brigade's TypeBox schema is
+ *     private and validation happens automatically on every write through
+ *     `writeBrigadeConfig`).
  *   - Dot-notation only (no `path[0]` array indexing) — Brigade's super-
  *     config has no positional arrays the user would target by index.
  *   - JSON5 parsing for `set` values when --strict-json is off (numbers,
- *     booleans, arrays, objects) with raw-string fallback. Same shape as
- *     openclaw `parseValue` (`src/cli/config-cli.ts:163`).
+ *     booleans, arrays, objects) with raw-string fallback.
  *   - Atomic write + 4-deep .bak rotation already inherited from
  *     `writeBrigadeConfig` — no extra wiring needed.
  *   - Secrets redaction in `list`/`get`: any segment matching
  *     /^(key|apiKey|token|password|secret)$/i (case-insensitive) renders
- *     as `__BRIGADE_REDACTED__`. Mirrors openclaw's REDACTED_SENTINEL
- *     pattern (`src/config/redact-snapshot.ts:93`).
+ *     as `__BRIGADE_REDACTED__`.
  *
  * On-disk path: `~/.brigade/brigade.json` (resolved via BRIGADE_DIR).
  */
@@ -62,10 +58,9 @@ export interface ConfigListOptions {
  *   - bracket array index: `agents.fallbacks[0]`   → ["agents", "fallbacks", "0"]
  *   - bracket literal key: `secrets.providers["my.vault"]` → ["secrets", "providers", "my.vault"]
  *
- * Mirrors openclaw's `parsePath` (`src/cli/config-cli.ts:111-161`) — bracket
- * support is the genuine ergonomic win (operators editing array slots in
- * `agents.defaults.model.fallbacks[]` shouldn't have to fall through to
- * `--strict-json` whole-array overwrites).
+ * Bracket support is the genuine ergonomic win (operators editing array
+ * slots in `agents.defaults.model.fallbacks[]` shouldn't have to fall
+ * through to `--strict-json` whole-array overwrites).
  */
 function parsePath(raw: string): string[] {
 	const trimmed = raw.trim();
@@ -329,9 +324,8 @@ export async function runConfigFile(opts: { json?: boolean } = {}): Promise<numb
 }
 
 /**
- * Print the brigade.json TypeBox schema as JSON. Mirrors openclaw's
- * `openclaw config schema` (`src/cli/config-cli.ts:1265-1273`) — useful for
- * IDE / external-tool autocompletion against the live shape.
+ * Print the brigade.json TypeBox schema as JSON — useful for IDE /
+ * external-tool autocompletion against the live shape.
  *
  * The output is the in-memory TypeBox schema descriptor (with `type`,
  * `properties`, `required`, etc.) — JSON-Schema-compatible enough to feed
@@ -344,8 +338,7 @@ export async function runConfigSchema(_opts: {} = {}): Promise<number> {
 
 /**
  * Validate the on-disk brigade.json against the TypeBox schema. Reports a
- * pass/fail line plus per-issue path + message when invalid. Mirrors
- * openclaw's `openclaw config validate` (`src/cli/config-cli.ts:1275-1324`).
+ * pass/fail line plus per-issue path + message when invalid.
  *
  * Exit codes:
  *   0 — config is valid (or doesn't exist yet — empty file is benign)
