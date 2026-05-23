@@ -76,6 +76,13 @@ export interface ConnectWhatsAppArgs {
 	 * caller's outer timeout can act on it.
 	 */
 	linkMode?: boolean;
+	/**
+	 * Called during link with a single polished status string (e.g. when the
+	 * post-pair 515 restart fires). The CLI renders this as a clean
+	 * "Finalising link…" line instead of two scary "restart required" /
+	 * "reconnecting" logs. Ignored outside linkMode.
+	 */
+	onLinkProgress?: (status: string) => void;
 }
 
 export interface WhatsAppConnection {
@@ -218,7 +225,32 @@ function extractText(message: WAMessage["message"], normalize: (m: unknown) => u
  * first socket is constructed (NOT once connected — QR/open events arrive via
  * the callbacks). The returned handle owns the reconnect loop.
  */
+/**
+ * Patch `console.info` ONCE per process so the libsignal protocol library
+ * (Baileys' Signal implementation) stops dumping massive `Closing session:
+ * SessionEntry { … }` objects into the gateway log on every key-ratchet step.
+ * That's a debug print inside `libsignal/src/session_record.js` we can't reach
+ * to remove; filtering at the console layer keeps the gateway log readable
+ * without losing real `console.info` calls.
+ *
+ * Idempotent — the patch checks for its own marker so a second `connectWhatsApp`
+ * call doesn't double-wrap.
+ */
+const LIBSIGNAL_FILTER_MARKER = Symbol.for("brigade.libsignal.console.filter");
+function installLibsignalConsoleFilter(): void {
+	const flag = console as unknown as { [LIBSIGNAL_FILTER_MARKER]?: true };
+	if (flag[LIBSIGNAL_FILTER_MARKER]) return;
+	const original = console.info.bind(console);
+	console.info = ((...callArgs: unknown[]) => {
+		const first = callArgs[0];
+		if (typeof first === "string" && first.startsWith("Closing session:")) return;
+		original(...callArgs);
+	}) as typeof console.info;
+	flag[LIBSIGNAL_FILTER_MARKER] = true;
+}
+
 export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsAppConnection> {
+	installLibsignalConsoleFilter();
 	const baileys = await import("@whiskeysockets/baileys");
 	const makeWASocket = (baileys.default ?? baileys.makeWASocket) as typeof import("@whiskeysockets/baileys").makeWASocket;
 	const { DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, normalizeMessageContent, useMultiFileAuthState } =
@@ -292,7 +324,7 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 		}
 	};
 
-	const scheduleReconnect = (): void => {
+	const scheduleReconnect = (opts: { immediate?: boolean } = {}): void => {
 		if (closed || reconnectTimer) return;
 		if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
 			args.log("WhatsApp reconnect attempts exhausted — giving up until restart", {
@@ -300,9 +332,19 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 			});
 			return;
 		}
-		const delay = backoffDelay(reconnectAttempts);
+		// `immediate: true` is set by the 515 first-link recovery path — we know
+		// the creds just landed and there's no rate-limit risk reconnecting at
+		// once. Skipping the 2s backoff turns a 7-second pair into a 2-second
+		// pair and avoids a window where neither socket nor timer is anchoring
+		// the Node event loop. For drop recoveries we keep the jittered backoff.
+		const delay = opts.immediate ? 0 : backoffDelay(reconnectAttempts);
 		reconnectAttempts += 1;
-		args.log("WhatsApp reconnecting", { attempt: reconnectAttempts, delayMs: delay });
+		// During linkMode the CLI is rendering a polished status; the technical
+		// "reconnecting attempt=N delayMs=…" line would clutter the link UX.
+		// Gateway mode keeps the structured log — operators want that detail.
+		if (!args.linkMode) {
+			args.log("WhatsApp reconnecting", { attempt: reconnectAttempts, delayMs: delay });
+		}
 		reconnectTimer = setTimeout(() => {
 			reconnectTimer = null;
 			if (closed) return;
@@ -315,7 +357,14 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 					sock = buildSocket();
 				});
 		}, delay);
-		reconnectTimer.unref?.();
+		// In gateway mode we `.unref()` so a permanently-broken link can't keep
+		// the daemon alive across shutdown. In linkMode we MUST NOT unref — the
+		// CLI's outer `await done` is the only thing holding the event loop
+		// open across the brief gap between socket teardown and rebuild; an
+		// unref'd timer plus a torn-down socket = nothing anchoring the loop,
+		// which surfaces as "Detected unsettled top-level await" and an early
+		// exit BEFORE the new socket reaches `open`.
+		if (!args.linkMode) reconnectTimer.unref?.();
 	};
 
 	const buildSocket = (): WASocket => {
@@ -355,7 +404,10 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 				if (connection === "open") {
 					reconnectAttempts = 0; // healthy link — reset backoff
 					lastQr = null; // any future QR is genuinely a re-pair
-					args.log("connected to WhatsApp");
+					// Gateway mode: always log the structured event.
+					// Link mode: the CLI renders the polished success card itself,
+					//   so suppress the duplicate "connected" log here.
+					if (!args.linkMode) args.log("connected to WhatsApp");
 					args.onConnected?.();
 				}
 				if (connection === "close") {
@@ -374,9 +426,20 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 						// Expected immediately after first-link; reconnect promptly
 						// without consuming the backoff budget. This single hop is
 						// honored even in linkMode — it's part of the pair handshake.
-						args.log("WhatsApp restart required (post-link) — reconnecting");
+						// During linkMode we emit a single polished progress string
+						// instead of the technical "restart required" log; the CLI
+						// renders it as "Finalising link…" — much friendlier than
+						// "restart required → reconnecting" which sounds like an error.
+						if (args.linkMode) {
+							args.onLinkProgress?.("Finalising link…");
+						} else {
+							args.log("WhatsApp restart required (post-link) — reconnecting");
+						}
 						reconnectAttempts = 0;
-						scheduleReconnect();
+						// Immediate reconnect — the creds-flush promise still gates
+						// the rebuild, but there's no jittered 2s delay. Halves the
+						// total link time and closes the unref'd-timer race window.
+						scheduleReconnect({ immediate: true });
 						return;
 					}
 					// In one-shot link mode, treat any non-515 close as a hard failure

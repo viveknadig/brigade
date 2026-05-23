@@ -154,6 +154,14 @@ export interface ChannelStartContext {
 	 * vs serve distinction can ignore it.
 	 */
 	linkMode?: boolean;
+	/**
+	 * Linking progress callback. The adapter emits short polished status
+	 * strings here during multi-step link handshakes (e.g. WhatsApp's
+	 * post-pair restart). The CLI renders them as clean status lines instead
+	 * of letting protocol-level logs leak through. Only fires when `linkMode`
+	 * is true.
+	 */
+	onLinkProgress?: (status: string) => void;
 }
 
 /**

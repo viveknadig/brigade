@@ -28,6 +28,8 @@ import {
 } from "./access-control/index.js";
 import { isAbortTrigger } from "./abort-triggers.js";
 import { channelSessionKey } from "./session-key.js";
+import { sanitizeReplyForChannel } from "./reply-sanitizer.js";
+import { classifyErrorReason, isBrigadeRetryError } from "../error-classifier.js";
 
 const log = createSubsystemLogger("channels/manager");
 
@@ -67,6 +69,53 @@ function configIds(list: string[] | undefined): string[] {
 }
 
 /**
+ * Build a human-readable failure reply for a channel recipient. Classifies the
+ * underlying error into one of the policy categories and renders a sentence
+ * the recipient can act on. Falls back to a polite generic message when the
+ * classifier can't pin the cause down.
+ *
+ * Deliberately framed for the *recipient* (a friend / coworker DMing the bot),
+ * not the operator: it never names model ids, providers, HTTP statuses, or
+ * stack frames. The operator sees those in the gateway log; the recipient
+ * sees a clean human sentence.
+ */
+function buildOperatorFacingErrorReply(err: unknown): string {
+	// Prefer the structured reason carried by BrigadeRetryError; fall back to
+	// re-classifying the raw error so unstructured throws still get a useful
+	// category.
+	const reason = isBrigadeRetryError(err) ? err.reason : classifyErrorReason(err);
+	switch (reason) {
+		case "billing":
+			return [
+				"⚠️  I'm out of credits to reply right now.",
+				"",
+				"The bot owner needs to top up the model provider account before I can answer. I'll be back online as soon as they do.",
+			].join("\n");
+		case "auth":
+		case "auth_permanent":
+			return [
+				"⚠️  I can't reach the model right now — my credentials need a refresh.",
+				"",
+				"I've pinged the bot owner. Try me again in a few minutes.",
+			].join("\n");
+		case "rate_limit":
+		case "overloaded":
+			return "⏳  I'm at capacity for a moment — please send that again in 30 seconds.";
+		case "context_overflow":
+			return "🧠  That message pushed us over the model's memory limit. Let's start a fresh thread — say 'new chat' and I'll reset.";
+		case "model_not_found":
+			return "⚠️  The model I usually use isn't reachable right now. The bot owner has been notified.";
+		case "timeout":
+			return "⏳  My reply timed out. Please send that again — it usually works on the second try.";
+		case "format":
+		case "session_expired":
+		case "unknown":
+		default:
+			return "⚠️  Sorry, I hit an error replying to that. Please try again in a moment — if it keeps happening, ping the bot owner.";
+	}
+}
+
+/**
  * The challenge reply addresses a non-technical recipient on the other side of
  * a private B2B assistant. Tone: friendly, polished, zero jargon. Emojis are
  * used as section anchors only (not littered) so the message scans cleanly
@@ -100,27 +149,21 @@ function buildChallengeReply(args: { code: string; senderId: string; channelLabe
 	// underscore italic, and backticks untouched, so this passes through.
 	return [
 		"🦁  *Brigade* — your private AI crew",
-		"━━━━━━━━━━━━━━━━━━━━━━",
-		"",
-		"👋  *Welcome!*",
-		"An administrator needs to approve your access before we can chat. It only takes a moment.",
-		"",
+		"╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+		"👋  *Welcome!*  An admin needs to approve you before we can chat.",
 		senderLineFor(args.senderId),
-		"",
 		"🔐  *Your one-time code*",
 		"```",
 		args.code,
 		"```",
-		"",
-		"Share this code with the person who set up Brigade. They'll approve you by running:",
-		"",
+		"Share it with your admin — they'll approve you by running:",
 		"```",
 		`brigade pairing approve ${args.code}`,
 		"```",
-		"",
-		"✨  Once approved, send your next message and we're off.",
-		"",
-		"⏱️  _This code expires in 1 hour._",
+		"✨  Once approved, just send your next message.",
+		"⏱️  _Expires in 1 hour._",
+		"╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+		"_powered by_ ✨ *Spinabot*",
 	].join("\n");
 }
 
@@ -320,7 +363,12 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 				}
 			}
 			if (controller.signal.aborted) return; // operator already saw "Stopped."
-			const reply = result.reply?.trim();
+			// Strip `<think>…</think>` reasoning blocks BEFORE sending. WhatsApp/
+			// Slack/Telegram clients render the raw XML tags to the recipient,
+			// which leaks the model's internal monologue and looks broken. The
+			// TUI handles reasoning in its own folded-panel renderer; channels
+			// see only the final answer.
+			const reply = sanitizeReplyForChannel(result.reply?.trim() ?? "");
 			if (reply) await adapter.sendText(a.conversationId, reply);
 		};
 
@@ -339,10 +387,10 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 					error: err instanceof Error ? err.message : String(err),
 				});
 				try {
-					await adapter.sendText(
-						conversationId,
-						"Sorry, I hit an error processing that — please try again in a moment.",
-					);
+					// Reuse the error-class-aware reply so the recipient sees the
+					// same friendly billing/auth/rate-limit messaging across both
+					// the immediate and the debounced dispatch paths.
+					await adapter.sendText(conversationId, buildOperatorFacingErrorReply(err));
 				} catch {
 					/* best-effort */
 				}
@@ -542,14 +590,14 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 						conversationId: msg.conversationId,
 						error: errMsg,
 					});
-					// Tell the sender something went wrong — silent failure looks like
-					// the bot's ignoring them. Best-effort: if THIS sendText also fails
-					// (e.g. the socket is the actual problem) we just log and move on;
-					// the listener stays up either way.
+					// Tell the sender what kind of trouble we hit. Classifying the
+					// error means the recipient sees a useful message instead of a
+					// generic "something broke" — out-of-credits, model busy, and
+					// auth failures all look different to the end user.
 					try {
 						await adapter.sendText(
 							msg.conversationId,
-							"Sorry, I hit an error processing that message — please try again in a moment.",
+							buildOperatorFacingErrorReply(err),
 						);
 					} catch (sendErr) {
 						log.warn("failed to send error reply", {

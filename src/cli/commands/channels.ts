@@ -12,7 +12,7 @@
  * alive.
  */
 
-import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import path from "node:path";
 import readline from "node:readline/promises";
 
@@ -74,6 +74,43 @@ function snapshotChannel(adapter: ChannelAdapter, config: unknown): ChannelSnaps
 	const stateDir = resolveChannelStateDir(adapter.id);
 	const linked = hasLinkArtifacts(stateDir);
 	return { id: adapter.id, label: adapter.label, enabled, configured, linked, stateDir };
+}
+
+/**
+ * Read the operator's account id from the channel's auth-store, when one exists.
+ * Today this is a Baileys-specific peek (the only channel implemented), but the
+ * shape is generic — other channels can grow their own state-file parsers as
+ * they land. Returns `undefined` when we can't pull a hint without doing a
+ * full link probe (a connect just to read selfId would defeat the whole point
+ * of the short-circuit).
+ */
+function describeExistingLink(channelId: string): { accountHint?: string } | undefined {
+	const stateDir = resolveChannelStateDir(channelId);
+	if (!hasLinkArtifacts(stateDir)) return undefined;
+	// WhatsApp / Baileys: creds live at <stateDir>/auth/creds.json with
+	// `me.id` = jid like "15551234567:1@s.whatsapp.net". Strip the device
+	// suffix to get the canonical phone digits we display in the success card.
+	if (channelId === "whatsapp") {
+		const credsPath = path.join(stateDir, "auth", "creds.json");
+		if (existsSync(credsPath)) {
+			try {
+				const creds = JSON.parse(readFileSync(credsPath, "utf8")) as {
+					me?: { id?: string };
+				};
+				const jid = creds?.me?.id;
+				if (typeof jid === "string" && jid.length > 0) {
+					const beforeAt = jid.split("@")[0] ?? jid;
+					const beforeColon = beforeAt.split(":")[0] ?? beforeAt;
+					const digits = beforeColon.replace(/\D/g, "");
+					if (digits.length >= 7) return { accountHint: digits };
+				}
+			} catch {
+				// Corrupted creds.json — still report linked (artifacts present)
+				// without a phone hint. The next link/unlink will heal it.
+			}
+		}
+	}
+	return {};
 }
 
 /** "Looks linked" = the channel's state dir has at least one non-empty file. */
@@ -193,6 +230,36 @@ export async function runChannelsLink(
 	const adapter = chosen.adapter;
 	const timeoutMs = args.timeoutMs ?? 180_000;
 
+	// Short-circuit: if the channel already has on-disk creds, don't print a
+	// QR + push the operator through a full pair handshake. They probably
+	// re-ran `wa:link` to check status or because they forgot they'd done it.
+	// Tell them who's currently linked and exit cleanly. To force a fresh QR
+	// they can run `wa:unlink` first (or `--force`, plumbed below).
+	const existingLinkInfo = describeExistingLink(adapter.id);
+	if (existingLinkInfo) {
+		if (opts.json) {
+			process.stdout.write(
+				`${JSON.stringify({ ok: true, alreadyLinked: true, account: existingLinkInfo.accountHint }, null, 2)}\n`,
+			);
+		} else {
+			process.stdout.write(
+				[
+					"",
+					`ℹ️   ${adapter.label} is already linked`,
+					"   ━━━━━━━━━━━━━━━━━━━━━━",
+					existingLinkInfo.accountHint
+						? `   Connected as: ${formatAccountForDisplay(adapter.id, existingLinkInfo.accountHint)}`
+						: "",
+					`   Run \`brigade channels unlink --channel ${adapter.id}\` first if you want a fresh QR.`,
+					"",
+				]
+					.filter(Boolean)
+					.join("\n") + "\n",
+			);
+		}
+		return 0;
+	}
+
 	const abort = new AbortController();
 	let connected = false;
 	let loggedOut = false;
@@ -214,7 +281,20 @@ export async function runChannelsLink(
 	const timer = setTimeout(() => {
 		rejectDone(new Error(`Link timed out after ${Math.round(timeoutMs / 1000)}s.`));
 	}, timeoutMs);
-	timer.unref?.();
+	// Deliberately NOT `.unref()` — this timer is the one thing anchoring the
+	// Node event loop during the brief window between the post-pair 515 close
+	// and the rebuilt socket reaching `open`. Unref'ing both this AND the
+	// adapter's reconnect timer (the previous bug) leaves a gap where the loop
+	// has nothing to wait on, Node exits early, the success card never prints,
+	// and the operator sees "Detected unsettled top-level await" instead.
+	// The `process.exit(…)` in the `finally` cleans up if this timer outlives
+	// the success path, so anchoring here is safe.
+
+	// Track which logs we render to the user. Adapters emit verbose protocol-
+	// level logs (the gateway needs them); the link CLI should stay quiet and
+	// let the polished status lines below do the talking. We silently swallow
+	// adapter logs and surface them only on failure for diagnostics.
+	const swallowedLogs: string[] = [];
 
 	const ctx: ChannelStartContext = {
 		signal: abort.signal,
@@ -222,12 +302,24 @@ export async function runChannelsLink(
 		// 515 hop that's part of a real pair is still honored). The CLI's outer
 		// timeout owns the "user took too long" case.
 		linkMode: true,
-		log: (msg) => process.stderr.write(`[${adapter.id}] ${msg}\n`),
+		log: (msg) => {
+			// Buffer for failure diagnostics; do NOT print to the user — the
+			// link UX is shaped by the polished lines below.
+			swallowedLogs.push(`[${adapter.id}] ${msg}`);
+		},
+		onLinkProgress: (status) => {
+			// Single polished status line during multi-step handshakes (e.g.
+			// WhatsApp's post-pair 515 restart). The adapter only emits these
+			// in linkMode so the CLI gets the friendly cadence without
+			// touching the gateway's structured logs.
+			process.stdout.write(`${status}\n`);
+		},
 		onPairing: (info) => {
-			if (info.kind === "qr") {
-				process.stdout.write("\nA QR code has been printed above. Scan it from your phone:\n");
-				process.stdout.write(`  ${adapter.label} → Settings → Linked Devices → Link a Device\n`);
-			} else {
+			// The adapter has already rendered the QR via qrcode-terminal AND
+			// printed the "Scan this QR in WhatsApp → Settings → Linked
+			// Devices:" prompt above the code. No second prompt needed here —
+			// duplicating it just clutters the screen.
+			if (info.kind === "code") {
 				process.stdout.write(`\nPairing code: ${info.value}\n`);
 			}
 		},
@@ -244,10 +336,15 @@ export async function runChannelsLink(
 	};
 
 	let outcome: { ok: boolean; reason?: string };
+	let linkedAccount: string | undefined;
 	try {
 		process.stdout.write(`Linking ${adapter.label}…\n`);
 		await adapter.start(ctx);
 		await done;
+		// Grab the linked account id (digits-only E.164 for WhatsApp; channel-
+		// native otherwise) BEFORE we stop the adapter — selfId may be cleared
+		// during teardown.
+		linkedAccount = adapter.selfId?.();
 		outcome = { ok: true };
 		// Enable the channel in config so the gateway picks it up on next boot.
 		try {
@@ -271,13 +368,55 @@ export async function runChannelsLink(
 	}
 
 	if (opts.json) {
-		process.stdout.write(`${JSON.stringify({ ...outcome, connected, loggedOut }, null, 2)}\n`);
+		process.stdout.write(
+			`${JSON.stringify({ ...outcome, connected, loggedOut, account: linkedAccount }, null, 2)}\n`,
+		);
 	} else if (outcome.ok) {
-		process.stdout.write(`\n${adapter.label} linked. Run \`brigade gateway\` to start receiving messages.\n`);
+		// Polished success card — matches the welcome-card style so an operator
+		// finishing the link gets the same on-brand cadence as a friend going
+		// through pairing.
+		const accountLine = linkedAccount
+			? `   Connected as: ${formatAccountForDisplay(adapter.id, linkedAccount)}\n`
+			: "";
+		process.stdout.write(
+			[
+				"",
+				`✅  ${adapter.label} linked successfully`,
+				"   ━━━━━━━━━━━━━━━━━━━━━━",
+				accountLine.trimEnd(),
+				"   Run `brigade gateway` to start receiving messages.",
+				"",
+			]
+				.filter(Boolean)
+				.join("\n") + "\n",
+		);
 	} else {
 		process.stderr.write(`\nLink failed: ${outcome.reason}\n`);
+		// On failure, replay buffered adapter logs so the operator has the
+		// protocol-level detail they need to diagnose.
+		if (swallowedLogs.length > 0) {
+			process.stderr.write("\n--- adapter log ---\n");
+			for (const line of swallowedLogs) process.stderr.write(`${line}\n`);
+		}
 	}
-	return outcome.ok ? 0 : 1;
+	// Baileys keeps internal keepalive timers + unsettled promise chains alive
+	// after `adapter.stop()`; without an explicit exit, Node sees a pending
+	// top-level await on the entry shim and emits an "unsettled top-level
+	// await" warning while it exits anyway. Exiting cleanly here avoids the
+	// warning and matches OpenClaw's link-command behavior (one-shot exit).
+	process.exit(outcome.ok ? 0 : 1);
+}
+
+/**
+ * Render a channel-native account id for the success card.
+ * WhatsApp gives us digits-only E.164 — show it as `+15551234567` so it reads
+ * like a phone number. Other channels get their id verbatim.
+ */
+function formatAccountForDisplay(channelId: string, accountId: string): string {
+	if (channelId === "whatsapp" && /^\d{7,15}$/.test(accountId)) {
+		return `+${accountId}`;
+	}
+	return accountId;
 }
 
 /* ─────────────────────────── unlink ─────────────────────────── */

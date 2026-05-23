@@ -46,13 +46,32 @@ function ensureParentDir(filePath: string): void {
 
 function readJson<T>(filePath: string, fallback: T): T {
 	if (!existsSync(filePath)) return fallback;
+	let raw: string;
 	try {
-		return JSON.parse(readFileSync(filePath, "utf8")) as T;
+		raw = readFileSync(filePath, "utf8");
+	} catch {
+		return fallback;
+	}
+	// Zero-byte / whitespace-only files are a known artifact: `withFileLock`
+	// creates an empty placeholder before the first write, and an interrupted
+	// write can leave a partial file. Treat both as "absent" silently — no
+	// WARN, no recurring "unreadable" log on every turn.
+	if (raw.trim().length === 0) return fallback;
+	try {
+		return JSON.parse(raw) as T;
 	} catch (err) {
-		log.warn("access-control store unreadable — using empty state", {
+		// Genuinely corrupted JSON: log ONCE at INFO (not WARN — this is
+		// self-healing), then overwrite with the serialized fallback so the
+		// next read returns clean data instead of repeating this branch.
+		log.info("access-control store reset to empty state (file was corrupted)", {
 			path: filePath,
 			error: err instanceof Error ? err.message : String(err),
 		});
+		try {
+			writeJsonAtomic(filePath, fallback);
+		} catch {
+			/* best-effort heal */
+		}
 		return fallback;
 	}
 }

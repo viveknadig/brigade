@@ -30,13 +30,14 @@ async function printQr(qr: string): Promise<void> {
 	try {
 		const mod = await import("qrcode-terminal");
 		const qrcode = (mod.default ?? mod) as { generate: (text: string, opts: { small: boolean }) => void };
-		// eslint-disable-next-line no-console
-		console.log("\nScan this QR in WhatsApp → Settings → Linked Devices:\n");
+		// Friendly, on-brand prompt rendered ONCE above the QR. The CLI link
+		// command intentionally does not print a second prompt below — one
+		// instruction is enough, more is clutter.
+		process.stdout.write("\n📱  Scan this QR from WhatsApp → Settings → Linked Devices → Link a Device:\n\n");
 		qrcode.generate(qr, { small: true });
 	} catch {
 		// qrcode-terminal missing — fall back to the raw string so linking still works.
-		// eslint-disable-next-line no-console
-		console.log(`\nWhatsApp QR (paste into a QR renderer to link):\n${qr}\n`);
+		process.stdout.write(`\nWhatsApp QR (paste into a QR renderer to link):\n${qr}\n`);
 	}
 }
 
@@ -62,6 +63,8 @@ export function createWhatsAppAdapter(): ChannelAdapter {
 				// `channels link` command gets clean one-shot behavior, while the
 				// gateway path keeps its aggressive auto-reconnect.
 				linkMode: ctx.linkMode === true,
+				// Forward polished link-progress strings to the CLI when present.
+				onLinkProgress: ctx.onLinkProgress,
 				onQr: (qr) => {
 					ctx.onPairing?.({ kind: "qr", value: qr });
 					void printQr(qr);
