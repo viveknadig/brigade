@@ -26,20 +26,45 @@
 export { defineModule } from "./agents/extensions/types.js";
 export type { AgentToolResult, AgentToolUpdateCallback, AnyBrigadeTool, BrigadeTool } from "./agents/tools/types.js";
 export type {
+	// Core context + module shape
 	BrigadeExtensionContext,
 	BrigadeModule,
+	BrigadeModuleManifest,
+	// Channels
 	ChannelAdapter,
 	ChannelCommand,
 	ChannelCommandContext,
+	ChannelPairingAdapter,
+	ChannelSetupAdapter,
+	ChannelSetupCredentialKey,
 	ChannelStartContext,
+	InboundMediaAttachment,
+	InboundMessage,
+	InboundReplyContext,
+	OutboundMedia,
+	OutboundSendOptions,
+	// Voice / media / integrations
+	Integration,
+	MediaGenProvider,
+	SpeechProvider,
+	TranscriptionProvider,
+	// Memory plugin SDK
+	MemoryCapability,
+	MemoryEmbeddingProvider,
+	// Context engine / compaction / harness
+	AgentHarness,
+	CompactionProvider,
+	ContextEngineCapability,
+	// Hook system contracts
+	HookExecutionPattern,
+	HookResult,
+	// Provider auth (model providers — registered via b.modelProvider)
+	ProviderAuthMethod,
+	// Gateway extensibility
+	GatewayCaller,
 	GatewayMethodHandler,
 	HttpRoute,
 	HttpRouteHandler,
-	InboundMessage,
-	Integration,
-	MediaGenProvider,
 	Service,
 	ServiceStartContext,
-	SpeechProvider,
-	TranscriptionProvider,
 } from "./agents/extensions/types.js";

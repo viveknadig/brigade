@@ -9,14 +9,20 @@
  *
  * Authors import the stable `@brigade/extension-sdk` surface (defineModule + the
  * capability contracts), so a user module never reaches into Brigade internals.
+ *
+ * POSIX safety gates (non-Windows only): world-writable files are rejected
+ * (mode & 0o002), suspicious ownership (uid != current uid AND != root) is
+ * rejected, and a `realpath` escape from `extensionsDir` (via symlink) is
+ * rejected. Each rejection logs WHY and skips the candidate; the loader
+ * continues with the rest.
  */
 
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
-import type { BrigadeModule } from "./types.js";
+import type { BrigadeModule, BrigadeModuleManifest } from "./types.js";
 
 const log = createSubsystemLogger("extensions/discovery");
 
@@ -38,9 +44,22 @@ function importWithTimeout(href: string): Promise<unknown> {
 /** A discovered module plus where it came from (for conflict reporting + reload). */
 export interface DiscoveredModule {
 	module: BrigadeModule;
-	origin: "user";
+	/**
+	 * Where the module came from. Today discovery only walks the user dir
+	 * (`~/.brigade/extensions/`), so the value is always `"user"` from here;
+	 * the loader tags bundled-in-tree modules with `"bundled"` when it
+	 * merges them. The field is fixed at the discovery layer so downstream
+	 * tracing (activation logs, conflict reports) always has provenance.
+	 */
+	origin: "user" | "bundled";
 	/** Absolute path the module was imported from. */
 	source: string;
+	/**
+	 * Module manifest, when the module exported one. Surfaces capability
+	 * metadata WITHOUT requiring the module's `register` to run; informational
+	 * today, consumed by the future discovery planner.
+	 */
+	manifest?: BrigadeModuleManifest;
 }
 
 /** Duck-type check: a value is a usable BrigadeModule. */
@@ -53,6 +72,11 @@ function isModule(value: unknown): value is BrigadeModule {
 	);
 }
 
+/** Duck-type check for a BrigadeModuleManifest carried on a module export. */
+function isManifest(value: unknown): value is BrigadeModuleManifest {
+	return !!value && typeof value === "object" && typeof (value as BrigadeModuleManifest).id === "string";
+}
+
 /** Resolve the import entry for a directory candidate (index.js / index.mjs). */
 function dirEntry(dir: string): string | null {
 	for (const name of ["index.js", "index.mjs"]) {
@@ -63,6 +87,67 @@ function dirEntry(dir: string): string | null {
 			/* not present */
 		}
 	}
+	return null;
+}
+
+/**
+ * POSIX safety gate. Returns `null` when the candidate passes; otherwise a
+ * short reason string that the caller logs + uses to skip the candidate.
+ *
+ * Skipped entirely on Windows (`process.platform === "win32"`) — the POSIX
+ * mode/uid bits don't carry meaning there. Brigade ships to Windows, so this
+ * gate must never break that platform.
+ *
+ * Three checks (all non-Windows):
+ *   1. world-writable bit (`mode & 0o002`) — anyone could drop code in.
+ *   2. ownership: file owned by someone other than the current user AND not
+ *      root. Avoids loading code planted by a different unprivileged account.
+ *   3. realpath escape: `realpath(candidate)` must stay under
+ *      `realpath(extensionsDir)`. A symlink that points outside the dir
+ *      (e.g. → `/etc/something.js`) is rejected.
+ *
+ * `platformOverride` is a test seam — callers normally omit it.
+ */
+export function checkPosixSafety(
+	candidate: string,
+	extensionsDir: string,
+	platformOverride?: NodeJS.Platform,
+): string | null {
+	const platform = platformOverride ?? process.platform;
+	if (platform === "win32") return null;
+
+	let st: ReturnType<typeof statSync>;
+	try {
+		st = statSync(candidate);
+	} catch (err) {
+		return `stat failed: ${err instanceof Error ? err.message : String(err)}`;
+	}
+
+	// (1) world-writable bit — anyone could drop code in.
+	if ((st.mode & 0o002) !== 0) {
+		return `world-writable (mode=${(st.mode & 0o777).toString(8)})`;
+	}
+
+	// (2) ownership — file owned by someone other than the current uid AND
+	// not root. We can't enforce this in environments where getuid is not
+	// available (Windows: handled above; non-POSIX runtimes: skip).
+	const currentUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+	if (currentUid !== undefined && st.uid !== currentUid && st.uid !== 0) {
+		return `suspicious ownership (uid=${st.uid}, currentUid=${currentUid})`;
+	}
+
+	// (3) realpath escape — symlinks must not point outside extensionsDir.
+	try {
+		const realCandidate = realpathSync(candidate);
+		const realExtDir = realpathSync(extensionsDir);
+		const rel = path.relative(realExtDir, realCandidate);
+		if (rel.startsWith("..") || path.isAbsolute(rel)) {
+			return `symlink escape (resolves to ${realCandidate}, outside ${realExtDir})`;
+		}
+	} catch (err) {
+		return `realpath failed: ${err instanceof Error ? err.message : String(err)}`;
+	}
+
 	return null;
 }
 
@@ -119,16 +204,35 @@ export async function discoverUserModules(extensionsDir: string): Promise<Discov
 	if (!existsSync(extensionsDir)) return [];
 	const out: DiscoveredModule[] = [];
 	for (const source of candidateEntries(extensionsDir)) {
+		// POSIX safety gate — runs BEFORE the import so a malicious world-
+		// writable or symlink-escape candidate never executes its top-level.
+		const safetyReason = checkPosixSafety(source, extensionsDir);
+		if (safetyReason) {
+			log.warn("rejected user extension — POSIX safety check failed", {
+				source,
+				reason: safetyReason,
+			});
+			continue;
+		}
 		try {
 			const imported = (await importWithTimeout(pathToFileURL(source).href)) as {
 				default?: unknown;
 				module?: unknown;
+				manifest?: unknown;
 			};
 			const exported = imported.default ?? imported.module;
 			const candidates = Array.isArray(exported) ? exported : [exported];
+			// A module may carry `manifest` either as a top-level named export OR
+			// as a field on the module object itself. Prefer the top-level form
+			// (matches the documented authoring shape); fall back to the module
+			// field for compactness.
+			const topLevelManifest = isManifest(imported.manifest) ? imported.manifest : undefined;
 			for (const c of candidates) {
 				if (isModule(c)) {
-					out.push({ module: c, origin: "user", source });
+					const manifest =
+						topLevelManifest ??
+						(isManifest((c as BrigadeModule).manifest) ? (c as BrigadeModule).manifest : undefined);
+					out.push({ module: c, origin: "user", source, manifest });
 				} else {
 					log.warn("ignored user extension — no default BrigadeModule export", { source });
 				}

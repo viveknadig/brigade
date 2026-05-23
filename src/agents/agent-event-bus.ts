@@ -69,6 +69,28 @@ export type AgentBusEvent =
 			reason: string;
 	  }
 	| {
+			/**
+			 * Streaming interim status from a long-running tool. Emitted by
+			 * `withToolUpdates` (in `tools/common.ts`) every time Pi invokes
+			 * the tool's `onUpdate` callback. `payload` is the raw partial
+			 * result the tool pushed — typed `unknown` so consumers narrow
+			 * as they need without coupling the bus to Pi's tool-result shape.
+			 *
+			 * Correlation ids (`runId`, `agentId`, `sessionKey`) are
+			 * best-effort: a tool wrapped before its execution context is
+			 * known will emit events without them. Consumers that need
+			 * correlation should filter; consumers that just render
+			 * "still working" can ignore the missing ids.
+			 */
+			type: "tool-update";
+			runId?: string;
+			agentId?: string;
+			sessionKey?: string;
+			toolName: string;
+			toolCallId: string;
+			payload: unknown;
+	  }
+	| {
 			type: "slash-handled";
 			runId: string;
 			agentId: string;

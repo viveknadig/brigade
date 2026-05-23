@@ -20,9 +20,11 @@
  * deliberately "one loop + provider adapters".
  */
 
+import type { MemoryCapability } from "./extensions/types.js";
 import { makeExecGate } from "./exec-gate.js";
 import { type BrigadeBeforeToolCallHook, makeUnknownToolGuard } from "./tool-guard.js";
 import { makeToolLoopDetector } from "./tool-loop-detector.js";
+import { wrapOwnerOnlyToolExecution } from "./tools/common.js";
 import { createBrigadeTools } from "./tools/registry.js";
 import type { AnyBrigadeTool } from "./tools/types.js";
 
@@ -46,13 +48,44 @@ export interface BrigadeToolset {
  * Assemble Brigade's full tool surface for a session. Pure + cheap — safe
  * to call once per session build. `createBrigadeTools` constructs the
  * memory tools rooted at `workspaceDir`.
+ *
+ * `senderIsOwner` defaults to `true` so all existing CLI / TUI / gateway
+ * callers (which today ARE the workspace owner) keep their behaviour
+ * unchanged — the moment a channel adapter routes a non-owner DM through
+ * the per-turn path it MUST pass `senderIsOwner: false` explicitly so any
+ * `ownerOnly: true` tool refuses the call with `BrigadeToolAuthorizationError`
+ * before its body runs. The wrapper is a no-op for non-ownerOnly tools so
+ * applying it to the full custom-tool list is cheap.
  */
 export function assembleBrigadeToolset(opts: {
 	workspaceDir: string;
 	agentId: string;
 	cwd: string;
+	/**
+	 * Whether the sender driving this turn is the workspace owner. Defaults
+	 * to `true` — every direct-from-operator surface (TUI / `brigade agent` /
+	 * gateway-from-CLI) is the owner. Channel-routed turns MUST pass `false`
+	 * for non-owner senders so `ownerOnly` tools refuse with a 403-class
+	 * `BrigadeToolAuthorizationError`.
+	 */
+	senderIsOwner?: boolean;
+	/**
+	 * Active memory backend for the turn. The agent loop resolves this via
+	 * `resolveActiveMemoryCapability(...)` and threads it through; when
+	 * omitted the tool registry builds the built-in file-based default.
+	 */
+	memoryCapability?: MemoryCapability;
 }): BrigadeToolset {
-	const customTools = createBrigadeTools(opts);
+	const rawCustomTools = createBrigadeTools({
+		workspaceDir: opts.workspaceDir,
+		agentId: opts.agentId,
+		cwd: opts.cwd,
+		...(opts.memoryCapability ? { memoryCapability: opts.memoryCapability } : {}),
+	});
+	const senderIsOwner = opts.senderIsOwner ?? true;
+	// Wrap every tool — `wrapOwnerOnlyToolExecution` is a no-op for the owner
+	// AND for non-ownerOnly tools, so the cost is one identity-check per tool.
+	const customTools = rawCustomTools.map((t) => wrapOwnerOnlyToolExecution(t, senderIsOwner));
 	const brigadeToolNames = customTools.map((t) => t.name);
 	return {
 		builtinToolNames: [...BUILTIN_TOOL_NAMES],

@@ -10,15 +10,23 @@
  *     reinforcement); the post-turn extraction subagent writes through
  *     the same store.
  *
- * Markdown reads/searches go through `BrigadeStorage` (Phase-2 DB-swap seam);
- * structured facts go through `FactStore`. Daily-note free-form writes still
- * use the ordinary `write`/`edit` tool against the workspace cwd — `write_memory`
- * is for distilled, taggable facts.
+ * Search + persistence are routed through a `MemoryCapability` — the SDK seam
+ * (`extension-sdk` → `b.memory(...)`). When a plugin pins
+ * `extensions.slots.memory` to its id, `recall_memory` / `write_memory`
+ * delegate to that plugin's backend (vector DB, knowledge graph, etc.). When
+ * unset, the bundled default backend wraps the file-based `FactStore` +
+ * `FileMemoryStore` and renders the same rich notes+facts output the tool
+ * has always produced — back-compat is total.
+ *
+ * `read_memory` reads MEMORY.md / memory/*.md by path; it's a filesystem
+ * concern (not part of the memory-capability contract) so it stays bound to
+ * the `BrigadeStorage` view.
  */
 
 import { Type } from "typebox";
 
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { MemoryCapability } from "../extensions/types.js";
 import {
 	BrigadeMemoryPathError,
 	type BrigadeStorage,
@@ -26,6 +34,11 @@ import {
 	type MemorySearchResult,
 } from "../memory/storage.js";
 import { type FactStore, MEMORY_SEGMENTS, type MemorySegment } from "../memory/records.js";
+import {
+	createDefaultMemoryCapability,
+	type DefaultMemoryHit,
+	isDefaultMemoryCapability,
+} from "../memory/plugin-runtime.js";
 import { readNumberParam, readStringParam, textResult } from "./common.js";
 import type { BrigadeTool } from "./types.js";
 
@@ -52,22 +65,54 @@ interface RecalledFact {
 	score: number;
 }
 
+/**
+ * Plugin-shaped hit row surfaced when a non-default `MemoryCapability` is
+ * active. Mirrors the public SDK contract so consumers can render either
+ * the rich default layout or the minimal plugin layout from one details
+ * shape.
+ */
+interface PluginRecalledItem {
+	id: string;
+	content: string;
+	score: number;
+	source: "memory" | "session";
+}
+
 interface RecallMemoryDetails {
 	query: string;
 	resultCount: number;
+	/** File:line note hits (default backend only). */
 	results: MemorySearchResult[];
+	/** Structured fact hits (default backend only). */
 	facts: RecalledFact[];
+	/** Plugin-backend hits when a non-default capability handled the call. */
+	pluginHits?: PluginRecalledItem[];
+	/** Active backend id (`brigade.memory.default` or a plugin id). */
+	backend: string;
 }
 
 /**
- * Build the `recall_memory` tool. Searches markdown memory (BrigadeStorage)
- * and, when a FactStore is supplied, the structured fact store too — merging
- * both into one ranked result set and reinforcing recalled facts.
+ * Build the `recall_memory` tool. Searches go through the active
+ * `MemoryCapability` — bundled default (FactStore + FileMemoryStore) when
+ * no plugin is pinned, or a registered plugin backend (vector DB / KG / …)
+ * when `extensions.slots.memory` selects one.
+ *
+ * Back-compat: when no `capability` is supplied OR a `factStore` is supplied
+ * directly, the tool builds a default-backed capability over the same stores
+ * — the existing tests + the registry's pre-capability call sites keep
+ * working unchanged.
  */
 export function makeRecallMemoryTool(
-	store: BrigadeStorage,
-	factStore?: FactStore,
+	storeOrCapability: BrigadeStorage | MemoryCapability,
+	factStoreOrNothing?: FactStore,
 ): BrigadeTool<typeof RecallMemoryParams, RecallMemoryDetails> {
+	// Resolve the capability up front. Three calling shapes:
+	//   1. `(capability)`              — production path (registry passes one).
+	//   2. `(store)`                   — legacy: notes-only default backend
+	//                                    synthesized over the supplied store.
+	//   3. `(store, factStore)`        — legacy: full default backend over the
+	//                                    supplied stores (memory-tools.test.ts).
+	const capability = resolveToolCapability(storeOrCapability, factStoreOrNothing);
 	return {
 		name: "recall_memory",
 		label: "recall memory",
@@ -88,53 +133,95 @@ export function makeRecallMemoryTool(
 				integer: true,
 				label: "maxResults",
 			});
-			const results = await store.search(query, maxResults ? { maxResults } : {});
-			// Structured facts (memory/facts.jsonl). Searching marks hits accessed
-			// so frequently-recalled facts resist decay.
-			const factHits = (factStore?.search(query, maxResults ? { limit: maxResults } : {}) ?? []).map(
-				(r) => ({
-					memoryId: r.memoryId,
-					content: r.content,
-					segment: r.segment,
-					importance: r.importance,
-					score: r.score,
-				}),
+			// Default backend → render the rich notes+facts layout (file:line
+			// citations, segment + importance). Plugin backend → render the
+			// minimal SDK shape (id / content / score / source).
+			if (isDefaultMemoryCapability(capability)) {
+				const { notes, facts } = await capability.searchRich(
+					query,
+					maxResults !== undefined ? { limit: maxResults } : {},
+				);
+				const factHits = facts.map((f) => ({
+					memoryId: f.memoryId,
+					content: f.content,
+					segment: f.segment,
+					importance: f.importance,
+					score: f.score,
+				}));
+				const details: RecallMemoryDetails = {
+					query,
+					resultCount: notes.length + factHits.length,
+					results: notes,
+					facts: factHits,
+					backend: capability.id,
+				};
+				if (notes.length === 0 && factHits.length === 0) {
+					return textResult(
+						`No memory matched "${query}". Nothing has been noted about this yet — ` +
+							`if it's worth remembering, use write_memory (or jot it in memory/<today>.md).`,
+						details,
+					);
+				}
+				const sections: string[] = [];
+				if (factHits.length > 0) {
+					sections.push(
+						"Facts:\n" +
+							factHits
+								.map((f) => `- [${f.segment}] ${f.content} (importance ${f.importance.toFixed(2)})`)
+								.join("\n"),
+					);
+				}
+				if (notes.length > 0) {
+					sections.push(
+						"Notes:\n" +
+							notes
+								.map((r, i) => {
+									const loc = `${r.relPath}:${r.startLine}-${r.endLine}`;
+									return `[${i + 1}] ${loc} (score ${r.score.toFixed(1)})\n${r.snippet}`;
+								})
+								.join("\n\n"),
+					);
+				}
+				return textResult(
+					`Found ${details.resultCount} memory match${details.resultCount === 1 ? "" : "es"} for "${query}":\n\n${sections.join("\n\n")}`,
+					details,
+				);
+			}
+
+			// Plugin backend — minimal SDK shape. The plugin owns ranking +
+			// scoring; we render id / content / score / source so the model
+			// still sees actionable context (and the plugin's id, so a debug
+			// transcript shows which backend handled the call).
+			const hits = await capability.search(
+				query,
+				maxResults !== undefined ? { limit: maxResults } : {},
 			);
+			const pluginHits: PluginRecalledItem[] = hits.map((h) => ({
+				id: h.id,
+				content: h.content,
+				score: h.score,
+				source: h.source,
+			}));
 			const details: RecallMemoryDetails = {
 				query,
-				resultCount: results.length + factHits.length,
-				results,
-				facts: factHits,
+				resultCount: pluginHits.length,
+				results: [],
+				facts: [],
+				pluginHits,
+				backend: capability.id,
 			};
-			if (results.length === 0 && factHits.length === 0) {
+			if (pluginHits.length === 0) {
 				return textResult(
 					`No memory matched "${query}". Nothing has been noted about this yet — ` +
 						`if it's worth remembering, use write_memory (or jot it in memory/<today>.md).`,
 					details,
 				);
 			}
-			const sections: string[] = [];
-			if (factHits.length > 0) {
-				sections.push(
-					"Facts:\n" +
-						factHits
-							.map((f) => `- [${f.segment}] ${f.content} (importance ${f.importance.toFixed(2)})`)
-							.join("\n"),
-				);
-			}
-			if (results.length > 0) {
-				sections.push(
-					"Notes:\n" +
-						results
-							.map((r, i) => {
-								const loc = `${r.relPath}:${r.startLine}-${r.endLine}`;
-								return `[${i + 1}] ${loc} (score ${r.score.toFixed(1)})\n${r.snippet}`;
-							})
-							.join("\n\n"),
-				);
-			}
+			const lines = pluginHits
+				.map((h, i) => `[${i + 1}] (${h.source}, score ${h.score.toFixed(2)}) ${h.content}`)
+				.join("\n");
 			return textResult(
-				`Found ${details.resultCount} memory match${details.resultCount === 1 ? "" : "es"} for "${query}":\n\n${sections.join("\n\n")}`,
+				`Found ${pluginHits.length} memory match${pluginHits.length === 1 ? "" : "es"} for "${query}" via ${capability.id}:\n\n${lines}`,
 				details,
 			);
 		},
@@ -164,7 +251,10 @@ interface ReadMemoryDetails {
 }
 
 /**
- * Build the `read_memory` tool bound to a storage instance.
+ * Build the `read_memory` tool bound to a storage instance. Filesystem-only
+ * (reads `MEMORY.md` / `memory/<name>.md`) — NOT routed through the memory
+ * capability, because alternative backends (vector DB, KG) may not have a
+ * literal file path to read from. Keep this on the file store.
  */
 export function makeReadMemoryTool(
 	store: BrigadeStorage,
@@ -248,16 +338,26 @@ interface WriteMemoryDetails {
 	memoryId: string;
 	segment: string;
 	importance: number;
+	backend: string;
 }
 
 /**
- * Build the `write_memory` tool bound to a FactStore. Persists a single
- * distilled fact tagged by segment, with tier/importance/decay derived
- * from that segment.
+ * Build the `write_memory` tool. Routes through the active memory capability
+ * — default backend (file `FactStore`) for back-compat, OR a plugin's
+ * `recordFact` when `extensions.slots.memory` pins one.
+ *
+ * Default backend → preserves the existing rich return (segment / importance
+ * with two-decimal formatting) because we know we're talking to `FactStore`.
+ * Plugin backend → uses the SDK `recordFact` contract and reports the
+ * plugin's returned id.
+ *
+ * Legacy callers that pass a raw `FactStore` still work — we wrap it in a
+ * default capability internally so the tool body is one path.
  */
 export function makeWriteMemoryTool(
-	factStore: FactStore,
+	capabilityOrFactStore: MemoryCapability | FactStore,
 ): BrigadeTool<typeof WriteMemoryParams, WriteMemoryDetails> {
+	const capability = resolveWriteCapability(capabilityOrFactStore);
 	return {
 		name: "write_memory",
 		label: "write memory",
@@ -280,16 +380,187 @@ export function makeWriteMemoryTool(
 			const supersedes = Array.isArray(p.supersedes)
 				? (p.supersedes as unknown[]).filter((x): x is string => typeof x === "string")
 				: undefined;
-			const rec = factStore.write({
-				content,
-				segment,
-				...(importance !== undefined ? { importance } : {}),
-				...(supersedes && supersedes.length > 0 ? { supersedes } : {}),
-			});
+
+			// Default backend → speak directly to FactStore so we keep the rich
+			// per-segment defaults + supersedes archiving. Plugin backend →
+			// route through the SDK contract; pass segment / importance /
+			// supersedes via the `meta` bag (plugins may honour them or not).
+			if (isDefaultMemoryCapability(capability)) {
+				const rec = capability.factStore.write({
+					content,
+					segment,
+					...(importance !== undefined ? { importance } : {}),
+					...(supersedes && supersedes.length > 0 ? { supersedes } : {}),
+				});
+				return textResult(
+					`Remembered [${rec.segment}, importance ${rec.importance.toFixed(2)}]: ${rec.content}`,
+					{
+						memoryId: rec.memoryId,
+						segment: rec.segment,
+						importance: rec.importance,
+						backend: capability.id,
+					},
+				);
+			}
+
+			// Plugin backend — `meta` keys are string-typed by the SDK
+			// contract; stringify numerics / arrays so any plugin can read them.
+			const meta: Record<string, string> = { segment };
+			if (importance !== undefined) meta.importance = String(importance);
+			if (supersedes && supersedes.length > 0) meta.supersedes = supersedes.join(",");
+			const { id } = await capability.recordFact(content, { meta });
 			return textResult(
-				`Remembered [${rec.segment}, importance ${rec.importance.toFixed(2)}]: ${rec.content}`,
-				{ memoryId: rec.memoryId, segment: rec.segment, importance: rec.importance },
+				`Remembered [${segment}] via ${capability.id}: ${content}`,
+				{
+					memoryId: id,
+					segment,
+					importance: importance ?? 0,
+					backend: capability.id,
+				},
 			);
 		},
 	};
+}
+
+/* ───────────────────────── helpers ───────────────────────── */
+
+/**
+ * Resolve a `MemoryCapability` from the recall-tool factory's overloaded
+ * arguments. The three legacy shapes — `(capability)`, `(store)`,
+ * `(store, factStore)` — all collapse to one capability instance for the
+ * tool body to consume.
+ */
+function resolveToolCapability(
+	storeOrCapability: BrigadeStorage | MemoryCapability,
+	factStoreOrNothing: FactStore | undefined,
+): MemoryCapability {
+	if (isMemoryCapability(storeOrCapability)) {
+		return storeOrCapability;
+	}
+	// Legacy `(store)` / `(store, factStore)` — build a default capability
+	// that reuses the supplied stores. We can't construct one through
+	// `createDefaultMemoryCapability` (which makes its own stores from a
+	// workspaceDir), so we synthesize the same shape inline with the
+	// caller's stores. `workspaceDir` is unknown here, so we ALSO need to
+	// keep the supplied stores reachable — store + factStore are the
+	// underlying state, full stop.
+	const fileStore = storeOrCapability as BrigadeStorage;
+	const factStore = factStoreOrNothing;
+	return {
+		id: "brigade.memory.default",
+		label: "Brigade file-based memory (built-in)",
+		// Cast to the rich extended shape so isDefaultMemoryCapability(…)
+		// finds the searchRich/fileStore/factStore fields when this synthetic
+		// capability comes back through resolveToolCapability.
+		fileStore,
+		factStore: factStore ?? undefinedFactStoreSentinel(),
+		async searchRich(query: string, opts?: { limit?: number }) {
+			const limit = opts?.limit;
+			const notes = await fileStore.search(query, limit !== undefined ? { maxResults: limit } : {});
+			const facts =
+				factStore?.search(query, limit !== undefined ? { limit } : {}) ?? [];
+			return { notes, facts };
+		},
+		async search(query: string, opts?: { limit?: number }) {
+			const limit = opts?.limit;
+			const notes = await fileStore.search(query, limit !== undefined ? { maxResults: limit } : {});
+			const facts = factStore?.search(query, limit !== undefined ? { limit } : {}) ?? [];
+			const factHits: DefaultMemoryHit[] = facts.map((f) => ({
+				id: f.memoryId,
+				content: f.content,
+				score: f.score,
+				source: "memory",
+				kind: "fact",
+				segment: f.segment,
+				importance: f.importance,
+				accessCount: f.accessCount,
+			}));
+			const noteHits: DefaultMemoryHit[] = notes.map((n) => ({
+				id: `${n.relPath}:${n.startLine}-${n.endLine}`,
+				content: n.snippet,
+				score: n.score,
+				source: "session",
+				kind: "note",
+				relPath: n.relPath,
+				startLine: n.startLine,
+				endLine: n.endLine,
+				snippet: n.snippet,
+			}));
+			return [...factHits, ...noteHits];
+		},
+		async recordFact(content: string, opts?: { meta?: Record<string, string> }) {
+			if (!factStore) {
+				throw new Error(
+					"recordFact called on recall-only memory backend (no factStore wired)",
+				);
+			}
+			const meta = opts?.meta ?? {};
+			const segment = (meta.segment as string | undefined) ?? "context";
+			const rec = factStore.write({ content, segment: segment as never });
+			return { id: rec.memoryId };
+		},
+		async status() {
+			const itemCount = factStore?.list({ lifecycle: "active" }).length ?? 0;
+			return { ready: true, itemCount };
+		},
+	} as MemoryCapability;
+}
+
+/**
+ * Resolve a capability from the write-tool's overloaded argument — accepts
+ * either a `MemoryCapability` (production path) or a raw `FactStore`
+ * (legacy tests). The FactStore case is wrapped in a default-shaped
+ * capability so the tool body has one code path.
+ */
+function resolveWriteCapability(
+	capabilityOrFactStore: MemoryCapability | FactStore,
+): MemoryCapability {
+	if (isMemoryCapability(capabilityOrFactStore)) {
+		return capabilityOrFactStore;
+	}
+	const factStore = capabilityOrFactStore;
+	// `searchRich` / `fileStore` are stubbed because write_memory only ever
+	// touches `factStore.write` on the default branch. Tests that build a
+	// write tool from a raw FactStore never call search through it.
+	return {
+		id: "brigade.memory.default",
+		label: "Brigade file-based memory (built-in)",
+		factStore,
+		async searchRich(_query: string, _opts?: { limit?: number }) {
+			return { notes: [], facts: [] };
+		},
+		async search(_query: string, _opts?: { limit?: number }) {
+			return [];
+		},
+		async recordFact(content: string, opts?: { meta?: Record<string, string> }) {
+			const meta = opts?.meta ?? {};
+			const segment = (meta.segment as string | undefined) ?? "context";
+			const rec = factStore.write({ content, segment: segment as never });
+			return { id: rec.memoryId };
+		},
+		async status() {
+			return { ready: true, itemCount: factStore.list({ lifecycle: "active" }).length };
+		},
+	} as MemoryCapability;
+}
+
+/** Duck-type check — a capability has `search` AND `recordFact`. */
+function isMemoryCapability(x: unknown): x is MemoryCapability {
+	return (
+		!!x &&
+		typeof x === "object" &&
+		typeof (x as { search?: unknown }).search === "function" &&
+		typeof (x as { recordFact?: unknown }).recordFact === "function"
+	);
+}
+
+/**
+ * Sentinel used when the legacy `makeRecallMemoryTool(store)` shape is built
+ * WITHOUT a factStore — recordFact on the synthesized capability would throw,
+ * but the tool only ever calls search through it. Returning a never-touched
+ * placeholder keeps the type system happy without sneaking a usable
+ * FactStore into the shape.
+ */
+function undefinedFactStoreSentinel(): FactStore {
+	return undefined as unknown as FactStore;
 }

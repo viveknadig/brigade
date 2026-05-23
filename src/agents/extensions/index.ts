@@ -15,6 +15,7 @@ export type {
 	ChannelCommand,
 	ChannelCommandContext,
 	ChannelStartContext,
+	GatewayCaller,
 	GatewayMethodHandler,
 	HttpRoute,
 	HttpRouteHandler,

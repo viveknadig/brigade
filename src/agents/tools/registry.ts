@@ -17,8 +17,12 @@
  * narrow scope (no plugins, no channels, no MCP).
  */
 
+import type { MemoryCapability } from "../extensions/types.js";
 import { FileMemoryStore } from "../memory/storage.js";
-import { FactStore } from "../memory/records.js";
+import {
+	createDefaultMemoryCapability,
+	isDefaultMemoryCapability,
+} from "../memory/plugin-runtime.js";
 import { makeReadMemoryTool, makeRecallMemoryTool, makeWriteMemoryTool } from "./memory-tools.js";
 import type { AnyBrigadeTool } from "./types.js";
 
@@ -43,6 +47,14 @@ export interface CreateBrigadeToolsOptions {
 	workspaceDir: string;
 	agentId: string;
 	cwd: string;
+	/**
+	 * Active memory backend. The agent loop resolves this via
+	 * `resolveActiveMemoryCapability(...)` so a plugin pinned through
+	 * `extensions.slots.memory` automatically owns recall + write. Omitted →
+	 * the registry builds the built-in file-backed default (back-compat with
+	 * pre-SDK call sites + tests).
+	 */
+	memoryCapability?: MemoryCapability;
 }
 
 /**
@@ -56,20 +68,31 @@ export interface CreateBrigadeToolsOptions {
  * construct a deterministic registry without touching the filesystem.
  */
 export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeTool[] {
-	// Primitive #4 (Memory): markdown notes via `FileMemoryStore` (recall/read)
-	// + structured facts via `FactStore` (recall/write). Stores are constructed
-	// per-turn from the workspace dir; they're stateless (filesystem-backed), so
-	// there's no lifecycle to manage. Phase 2 swaps `FileMemoryStore` for a
-	// DB-backed `BrigadeStorage` here without touching the tools or the prompt.
-	const memoryStore = new FileMemoryStore(opts.workspaceDir);
-	const factStore = new FactStore(opts.workspaceDir);
+	// Primitive #4 (Memory): the active backend is a `MemoryCapability` — bundled
+	// default (file-based FactStore + FileMemoryStore) when no plugin is pinned,
+	// or a registered plugin (vector DB, KG, …) when `extensions.slots.memory`
+	// selects one. The agent loop resolves and passes `memoryCapability`; tests
+	// and legacy call sites omit it and get the default.
+	const capability =
+		opts.memoryCapability ?? createDefaultMemoryCapability({
+			workspaceDir: opts.workspaceDir,
+			agentId: opts.agentId,
+		});
+	// `read_memory` is filesystem-only (bounded read of MEMORY.md /
+	// memory/<name>.md), so it always binds to the file store. When the active
+	// capability IS the bundled default we reuse its store; otherwise we
+	// construct one over the same workspaceDir so the read tool keeps
+	// working alongside a plugin-backed search.
+	const fileStore = isDefaultMemoryCapability(capability)
+		? capability.fileStore
+		: new FileMemoryStore(opts.workspaceDir);
 	return [
-		// recall searches BOTH markdown notes (memoryStore) and structured
-		// facts (factStore), reinforcing recalled facts against decay.
-		makeRecallMemoryTool(memoryStore, factStore),
-		makeReadMemoryTool(memoryStore),
-		// write_memory persists distilled structured facts.
-		makeWriteMemoryTool(factStore),
+		// recall routes through the capability (rich render for the default,
+		// minimal SDK render for plugins).
+		makeRecallMemoryTool(capability),
+		makeReadMemoryTool(fileStore),
+		// write_memory persists distilled structured facts through the capability.
+		makeWriteMemoryTool(capability),
 	];
 }
 

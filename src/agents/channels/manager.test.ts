@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { BrigadeConfig } from "../../config/io.js";
-import type { ChannelAdapter, ChannelStartContext, InboundMessage } from "../extensions/types.js";
+import type { ChannelAdapter, ChannelStartContext, InboundMessage, OutboundSendOptions } from "../extensions/types.js";
 import { addAllowFrom, readPendingPairings } from "./access-control/index.js";
 import { startChannels } from "./manager.js";
 import { channelSessionKey } from "./session-key.js";
@@ -17,15 +17,25 @@ import { channelSessionKey } from "./session-key.js";
 // tests below pass their own config (`pairing` / `disabled` / `allowlist`).
 const CONFIG = { channels: { fake: { dmPolicy: "open" } } } as unknown as BrigadeConfig;
 
-/** A controllable fake channel that captures its start ctx + sent messages. */
+/**
+ * A controllable fake channel that captures its start ctx + sent messages.
+ *
+ * `sent` records the bare `{conversationId,text}` shape that pre-existing
+ * tests `deepEqual` against. `sentWithOpts` is a parallel log carrying the
+ * outbound `opts` (threadId, etc.) — tests that care about thread routing
+ * read from this second log to avoid changing the deep-equality shape every
+ * legacy test relies on.
+ */
 function makeFakeChannel(overrides: Partial<ChannelAdapter> = {}): {
 	adapter: ChannelAdapter;
 	ctx: () => ChannelStartContext;
 	sent: { conversationId: string; text: string }[];
+	sentWithOpts: { conversationId: string; text: string; opts?: OutboundSendOptions }[];
 	stopped: () => boolean;
 } {
 	let ctx: ChannelStartContext | undefined;
 	const sent: { conversationId: string; text: string }[] = [];
+	const sentWithOpts: { conversationId: string; text: string; opts?: OutboundSendOptions }[] = [];
 	let stopped = false;
 	const adapter: ChannelAdapter = {
 		id: "fake",
@@ -37,12 +47,13 @@ function makeFakeChannel(overrides: Partial<ChannelAdapter> = {}): {
 		async stop() {
 			stopped = true;
 		},
-		async sendText(conversationId, text) {
+		async sendText(conversationId, text, opts) {
 			sent.push({ conversationId, text });
+			sentWithOpts.push({ conversationId, text, opts });
 		},
 		...overrides,
 	};
-	return { adapter, ctx: () => ctx!, sent, stopped: () => stopped };
+	return { adapter, ctx: () => ctx!, sent, sentWithOpts, stopped: () => stopped };
 }
 
 describe("channelSessionKey", () => {
@@ -787,5 +798,117 @@ describe("startChannels", () => {
 			else process.env.BRIGADE_STATE_DIR = prev;
 			rmSync(tmp, { recursive: true, force: true });
 		}
+	});
+
+	/* ───────────────────── ChannelPairingAdapter consumption ───────────────────── */
+
+	it("uses the adapter's pairing.idLabel='username' for the challenge card (not the phone heuristic)", async () => {
+		// A sender id of pure digits would normally fall into the phone branch
+		// (`📞 Your number: +X`). When the adapter's `pairing.idLabel` says
+		// `"username"`, that explicit choice must win — the card should read
+		// `@ Your username: <id>` instead.
+		const tmp = mkdtempSync(join(tmpdir(), "brigade-pair-username-"));
+		const prev = process.env.BRIGADE_STATE_DIR;
+		process.env.BRIGADE_STATE_DIR = tmp;
+		try {
+			const f = makeFakeChannel({
+				connectedAt: () => Date.now() - 1_000,
+				pairing: { idLabel: "username" },
+			});
+			const mgr = await startChannels({
+				adapters: [f.adapter],
+				config: { channels: { fake: { dmPolicy: "pairing" } } } as unknown as BrigadeConfig,
+				agentId: "main",
+				runTurn: async () => ({ reply: "x" }),
+			});
+			await f.ctx().onInbound({
+				channel: "fake",
+				conversationId: "c1",
+				messageId: "m-1",
+				from: "alice42",
+				text: "hi",
+				messageTimestampMs: Date.now(),
+			});
+			assert.equal(f.sent.length, 1, "stranger gets a challenge");
+			const reply = f.sent[0]?.text ?? "";
+			assert.match(reply, /Your username/i, "must render the username line");
+			assert.match(reply, /alice42/, "must include the literal sender id");
+			assert.doesNotMatch(reply, /Your number|Your account/i, "must not fall back to other labels");
+			await mgr.stop();
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
+			else process.env.BRIGADE_STATE_DIR = prev;
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it("falls back to the phone heuristic for digit-shaped senders when adapter declares no pairing slot", async () => {
+		// No `adapter.pairing` → the legacy heuristic must still run, so a
+		// `+1555…` stranger sees `📞 Your number: +1555…` (back-compat for
+		// channels that haven't opted into the pairing-adapter slot yet).
+		const tmp = mkdtempSync(join(tmpdir(), "brigade-pair-phone-fb-"));
+		const prev = process.env.BRIGADE_STATE_DIR;
+		process.env.BRIGADE_STATE_DIR = tmp;
+		try {
+			const f = makeFakeChannel({
+				connectedAt: () => Date.now() - 1_000,
+				// Deliberately no `pairing` slot — exercise the fallback.
+			});
+			const mgr = await startChannels({
+				adapters: [f.adapter],
+				config: { channels: { fake: { dmPolicy: "pairing" } } } as unknown as BrigadeConfig,
+				agentId: "main",
+				runTurn: async () => ({ reply: "x" }),
+			});
+			await f.ctx().onInbound({
+				channel: "fake",
+				conversationId: "c1",
+				messageId: "m-1",
+				from: "+15557776666",
+				text: "hi",
+				messageTimestampMs: Date.now(),
+			});
+			assert.equal(f.sent.length, 1);
+			const reply = f.sent[0]?.text ?? "";
+			assert.match(reply, /Your number/i, "digit sender + no pairing slot → phone label via heuristic");
+			assert.match(reply, /\+15557776666/);
+			await mgr.stop();
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
+			else process.env.BRIGADE_STATE_DIR = prev;
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it("forwards inbound threadId as opts.threadId on adapter.sendText for the agent reply", async () => {
+		// Slack/Discord-style threading: when the inbound carried a threadId,
+		// the manager must pass it through to sendText so the reply lands in
+		// the same thread instead of the channel root.
+		const f = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [f.adapter],
+			config: CONFIG,
+			agentId: "main",
+			runTurn: async () => ({ reply: "in-thread reply" }),
+		});
+		await f.ctx().onInbound({
+			channel: "fake",
+			conversationId: "c-room",
+			from: "u",
+			text: "ping",
+			threadId: "t-abc",
+		});
+		assert.equal(f.sentWithOpts.length, 1);
+		assert.equal(f.sentWithOpts[0]?.opts?.threadId, "t-abc", "threadId must be forwarded as opts.threadId");
+		// Sanity: when there's no threadId, opts is omitted (or undefined).
+		await f.ctx().onInbound({
+			channel: "fake",
+			conversationId: "c-room",
+			from: "u",
+			text: "again",
+		});
+		assert.equal(f.sentWithOpts.length, 2);
+		assert.equal(f.sentWithOpts[1]?.opts, undefined, "no threadId → no opts passed");
+		await mgr.stop();
 	});
 });

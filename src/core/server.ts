@@ -61,7 +61,8 @@ import {
 // gateway can steer / abort / switch-model mid-stream.
 import { runResilientTurn, type RunSingleTurnResult } from "../agents/agent-loop.js";
 import { BrigadeExtensionRegistry, BUNDLED_MODULES, clearDiscoveryCache, loadModules } from "../agents/extensions/index.js";
-import type { HttpRouteHandler, Service } from "../agents/extensions/index.js";
+import type { GatewayCaller, GatewayMethodHandler, HttpRoute, Service } from "../agents/extensions/index.js";
+import { DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_MS, readBodyWithLimit } from "./webhook-guards.js";
 import { type ChannelManager, startChannels } from "../agents/channels/manager.js";
 import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
@@ -338,8 +339,14 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// `customMethods` is consulted by the request dispatcher's default branch so
 	// module-registered RPCs resolve; `serviceAbort` stops background services.
 	let extensionRegistry: BrigadeExtensionRegistry | undefined;
-	let customMethods = new Map<string, (params: unknown) => Promise<unknown> | unknown>();
-	let httpRoutes: { method?: string; path: string; handler: HttpRouteHandler }[] = [];
+	// Module-registered RPCs. Stored as the full `GatewayMethodHandler` (not just
+	// the bare fn) so the dispatcher can read `scope` for caller-aware gating
+	// before invoking, and pass the `caller` snapshot as the 2nd argument.
+	let customMethods = new Map<string, GatewayMethodHandler>();
+	// Module-registered HTTP routes. We carry the full `HttpRoute` (not just the
+	// handler) so the request dispatcher can apply `auth` / `match` / `maxBodyBytes`
+	// / `timeoutMs` per-route before delegating to the plugin's handler.
+	let httpRoutes: HttpRoute[] = [];
 	const startedServices: { id: string; service: Service }[] = [];
 	let serviceAbort: AbortController | undefined;
 
@@ -756,6 +763,14 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		text: string;
 		sessionKey: string;
 		signal?: AbortSignal;
+		/**
+		 * Channel-supplied owner flag. `true` for self-chat / TUI-equivalent
+		 * traffic, `false` for approved peers. Drives the BOOTSTRAP-nudge
+		 * gate in the agent loop — non-owners never see the operator-
+		 * onboarding intro. Defaults to `true` (TUI / RPC / non-channel
+		 * callers are always the operator).
+		 */
+		senderIsOwner?: boolean;
 	}): Promise<RunSingleTurnResult> =>
 		runQueued(async () => {
 			isAgentRunning = true;
@@ -793,6 +808,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					thinkingLevel: thinkingLevel as "off" | "low" | "medium" | "high",
 					fallbacks,
 					signal: turn.signal,
+					// Forward the channel's senderIsOwner verdict (defaults to true
+					// when undefined — TUI / direct RPC calls are always operator).
+					senderIsOwner: turn.senderIsOwner,
 					onSessionReady: (session) => {
 						// A fallback candidate builds a fresh session; tear down the
 						// previous candidate's wiring before attaching the new one.
@@ -831,6 +849,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	const handleRequest = async <M extends RequestMethod>(
 		method: M,
 		rawParams: unknown,
+		caller: GatewayCaller,
 	): Promise<ResponseFor[M]> => {
 		const params = rawParams as RequestParams[M];
 
@@ -985,7 +1004,20 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				// Module-registered gateway methods (extensions). These don't appear
 				// in the static RequestMethod union, so they resolve here.
 				const custom = customMethods.get(method as string);
-				if (custom) return (await custom(rawParams)) as ResponseFor[M];
+				if (custom) {
+					// Per-method scope gate. When a module declares
+					// `scope: "operator.admin"` we refuse callers that don't
+					// carry that scope. The default (no scope) means
+					// "anyone authenticated" — same as today's WS surface.
+					// We surface the failure as a typed RPC error so a
+					// client can distinguish auth from internal errors.
+					if (custom.scope && !caller.scopes.includes(custom.scope)) {
+						const err = new Error(`scope insufficient: method "${method}" requires "${custom.scope}"`);
+						(err as Error & { code?: string }).code = "scope-insufficient";
+						throw err;
+					}
+					return (await custom.handler(rawParams, caller)) as ResponseFor[M];
+				}
 				throw new Error(`unknown method: ${method}`);
 			}
 		}
@@ -1010,6 +1042,18 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		clients.add(ws);
 		const clientLabel = `${req.socket.remoteAddress ?? "?"}:${req.socket.remotePort ?? "?"}`;
 		opts.consoleStream?.clientConnected(clientLabel, clients.size);
+
+		// Caller-identity snapshot threaded into every RPC dispatch on this
+		// connection. Today the gateway is localhost-only (LOCALHOST_BINDS
+		// guard above) so every connected client is the operator and gets the
+		// full scope set; we encode that here. Phase 2 multi-user lands real
+		// per-connection auth (HTTP-session) — at that point this builder
+		// reads the connection's auth state and may produce a narrower
+		// scope set (e.g. `["operator.read"]` for a sub-account). The
+		// per-method `scope` gate in `handleRequest`'s default branch is
+		// already enforced regardless, so plugins that declare a scope
+		// today won't need a code change when multi-user lands.
+		const caller: GatewayCaller = { id: "local", scopes: ["operator.admin", "operator.write", "operator.read"] };
 
 		// Send the initial snapshot so the client can render its header
 		// before any user action.
@@ -1055,7 +1099,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			opts.consoleStream?.wsRequest(reqFrame.method, reqFrame.id, clientLabel);
 			const startedAt = Date.now();
 			try {
-				const payload = await handleRequest(reqFrame.method, reqFrame.params);
+				const payload = await handleRequest(reqFrame.method, reqFrame.params, caller);
 				const response: Frame = {
 					type: "res",
 					id: reqFrame.id,
@@ -1065,12 +1109,17 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(response));
 				opts.consoleStream?.wsResponse(reqFrame.method, reqFrame.id, true, Date.now() - startedAt);
 			} catch (err) {
+				// Honour a typed error code if the handler set one (e.g. the
+				// `scope-insufficient` thrown by the default-branch scope gate)
+				// so the client sees an auth-shaped failure instead of a
+				// generic "internal" bucket.
+				const code = (err as { code?: string } | undefined)?.code ?? "internal";
 				const response: Frame = {
 					type: "res",
 					id: reqFrame.id,
 					ok: false,
 					error: {
-						code: "internal",
+						code,
 						message: err instanceof Error ? err.message : String(err),
 					},
 				};
@@ -1160,17 +1209,108 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// HTTP request handler for module-registered routes. Attached once; it reads
 	// the live `httpRoutes` list, so a reload swaps routes without re-binding.
 	// WS upgrades use the separate 'upgrade' event and are unaffected.
+	//
+	// Per-route guards applied BEFORE the handler runs:
+	//   - `match`: "exact" (default) | "prefix" — prefix lets one route own a
+	//     sub-tree (e.g. `/webhooks/stripe` also matches `/webhooks/stripe/foo`)
+	//     so multi-event webhooks don't need 50 separate registrations.
+	//   - `auth`: "none" (default) | "operator" — operator routes are gated on
+	//     the same operator-auth used for WS clients. Today the WS surface is
+	//     localhost-only and unauthenticated; we treat every loopback request
+	//     as the operator and refuse non-loopback (matches the WS bind
+	//     policy). Plugin handlers that opt into "none" MUST verify
+	//     signatures themselves (use `webhook-guards.safeEqualHmac`).
+	//   - `maxBodyBytes`: cap (default 1 MiB). The body is pre-buffered to
+	//     this limit; oversize requests get a clean 413 BEFORE the handler
+	//     sees them, and the handler reads the buffer off `req.body`.
+	//   - `timeoutMs`: total handler budget (default 30s). The dispatcher
+	//     races the handler against a timer; on expiry it responds 408.
 	httpServer.on("request", (req, res) => {
 		void (async () => {
 			try {
-				const reqPath = (req.url ?? "").split("?")[0];
-				const route = httpRoutes.find((r) => r.path === reqPath && (!r.method || r.method === req.method));
+				const reqPath = (req.url ?? "").split("?")[0] ?? "";
+				const route = httpRoutes.find((r) => {
+					if (r.method && r.method !== req.method) return false;
+					const match = r.match ?? "exact";
+					if (match === "prefix") {
+						// Prefix match owns the path AND everything under a "/"
+						// boundary so `/foo` doesn't accidentally match `/foobar`.
+						return reqPath === r.path || reqPath.startsWith(r.path.endsWith("/") ? r.path : `${r.path}/`);
+					}
+					return reqPath === r.path;
+				});
 				if (!route) {
 					res.statusCode = 404;
 					res.end("Not found");
 					return;
 				}
-				await route.handler(req, res);
+
+				// Operator auth gate. Localhost-only today (LOCALHOST_BINDS),
+				// so every accepted connection is the operator. We still
+				// refuse anything that doesn't look loopback in case the bind
+				// guard is relaxed mid-process (defensive — the bind guard
+				// itself is the primary line). Phase 2 multi-user replaces
+				// this with the real HTTP-session check.
+				if (route.auth === "operator") {
+					const remote = req.socket.remoteAddress ?? "";
+					const isLoopback =
+						remote === "127.0.0.1" ||
+						remote === "::1" ||
+						remote === "::ffff:127.0.0.1" ||
+						remote === "localhost";
+					if (!isLoopback) {
+						opts.consoleStream?.info?.(
+							`http route ${route.path}: refused non-loopback caller ${remote} (auth: operator)`,
+						);
+						res.statusCode = 401;
+						res.setHeader("Content-Type", "application/json; charset=utf-8");
+						res.end(JSON.stringify({ error: "Unauthorized" }));
+						return;
+					}
+				}
+
+				// Pre-buffer the body to the route's cap. Methods that don't
+				// carry a body (GET/HEAD) skip the read — calling
+				// `readBodyWithLimit` on them works (it resolves to an empty
+				// Buffer) but it's a tiny perf win to skip.
+				const method = (req.method ?? "GET").toUpperCase();
+				const hasBody = method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
+				if (hasBody) {
+					const body = await readBodyWithLimit(req, res, {
+						maxBytes: route.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
+						timeoutMs: route.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+					});
+					if (body === null) return; // 413 / 408 / 400 already written
+					// Attach as a non-stream property the handler can read.
+					// We deliberately don't replace the IncomingMessage stream
+					// — its events have already fired — so the buffer lives
+					// on a side channel the plugin reads from.
+					(req as IncomingMessage & { body?: Buffer }).body = body;
+				}
+
+				// Total handler budget. We race the handler against a timer
+				// so a hung plugin can't pin the connection forever. The
+				// timer is set even when we already burned some of the
+				// budget on body-reading — that's intentional, the cap is
+				// the route's wall-clock budget end to end.
+				const timeoutMs = route.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+				let timeoutHandle: NodeJS.Timeout | undefined;
+				const timeoutPromise = new Promise<"__timeout__">((resolve) => {
+					timeoutHandle = setTimeout(() => resolve("__timeout__"), timeoutMs);
+					if (typeof (timeoutHandle as { unref?: () => void }).unref === "function") {
+						(timeoutHandle as { unref: () => void }).unref();
+					}
+				});
+				const result = await Promise.race([
+					Promise.resolve(route.handler(req, res)).then(() => "__done__" as const),
+					timeoutPromise,
+				]);
+				if (timeoutHandle) clearTimeout(timeoutHandle);
+				if (result === "__timeout__" && !res.headersSent) {
+					res.statusCode = 408;
+					res.setHeader("Content-Type", "application/json; charset=utf-8");
+					res.end(JSON.stringify({ error: `Request timeout (${timeoutMs}ms)` }));
+				}
 			} catch (err) {
 				opts.consoleStream?.info?.(`http route error: ${err instanceof Error ? err.message : String(err)}`);
 				if (!res.headersSent) {
@@ -1236,45 +1376,62 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				bootLog(`extension gateway method "${m.name}" ignored — the "system." prefix is reserved`);
 			}
 		}
-		const methods = new Map<string, (params: unknown) => Promise<unknown> | unknown>(
-			registry.gatewayMethods.filter((m) => !m.name.startsWith("system.")).map((m) => [m.name, m.handler]),
+		// Build the live method map. Module-registered RPCs are stored as the
+		// full `GatewayMethodHandler` so the dispatcher can read `scope` for
+		// caller-aware gating; the two built-ins are wrapped to the same shape.
+		const methods = new Map<string, GatewayMethodHandler>(
+			registry.gatewayMethods.filter((m) => !m.name.startsWith("system.")).map((m) => [m.name, m] as const),
 		);
-		methods.set("system.capabilities", () => ({
-			channels: registry.channels.map((c) => c.id),
-			voice: {
-				tts: registry.speechProviders.map((p) => p.id),
-				stt: registry.transcriptionProviders.map((p) => p.id),
-			},
-			media: registry.mediaGenProviders.map((p) => p.id),
-			integrations: registry.integrations.map((i) => i.id),
-			services: registry.services.map((s) => s.id),
-			httpRoutes: registry.httpRoutes.map((r) => ({ method: r.method ?? "ANY", path: r.path })),
-			gatewayMethods: registry.gatewayMethods.map((m) => m.name),
-			modules: registry.loadedModules.map((m) => m.id),
-		}));
-		methods.set("system.reload", () =>
-			// Serialized onto the extension-lifecycle chain — can't race boot or
-			// another reload (no double-start / leaked channel manager).
-			queueExtensionsOp(async () => {
-				await stopExtensions();
-				clearDiscoveryCache(); // re-scan ~/.brigade/extensions on reload
-				await startExtensions();
-				for (const m of extensionRegistry?.loadedModules ?? []) {
-					try {
-						await m.reload?.();
-					} catch (err) {
-						opts.consoleStream?.info?.(
-							`module ${m.id} reload error: ${err instanceof Error ? err.message : String(err)}`,
-						);
-					}
-				}
-				return { ok: true };
+		// Built-in RPCs. `system.capabilities` is read-equivalent; `system.reload`
+		// is admin (it mutates the gateway's loaded modules + restarts every
+		// channel/service). Today the localhost-only caller carries all scopes
+		// so this is academic, but the gate WILL be enforced once multi-user
+		// lands without any further code change here.
+		methods.set("system.capabilities", {
+			name: "system.capabilities",
+			scope: "operator.read",
+			handler: () => ({
+				channels: registry.channels.map((c) => c.id),
+				voice: {
+					tts: registry.speechProviders.map((p) => p.id),
+					stt: registry.transcriptionProviders.map((p) => p.id),
+				},
+				media: registry.mediaGenProviders.map((p) => p.id),
+				integrations: registry.integrations.map((i) => i.id),
+				services: registry.services.map((s) => s.id),
+				httpRoutes: registry.httpRoutes.map((r) => ({ method: r.method ?? "ANY", path: r.path })),
+				gatewayMethods: registry.gatewayMethods.map((m) => m.name),
+				modules: registry.loadedModules.map((m) => m.id),
 			}),
-		);
+		});
+		methods.set("system.reload", {
+			name: "system.reload",
+			scope: "operator.admin",
+			handler: () =>
+				// Serialized onto the extension-lifecycle chain — can't race boot or
+				// another reload (no double-start / leaked channel manager).
+				queueExtensionsOp(async () => {
+					await stopExtensions();
+					clearDiscoveryCache(); // re-scan ~/.brigade/extensions on reload
+					await startExtensions();
+					for (const m of extensionRegistry?.loadedModules ?? []) {
+						try {
+							await m.reload?.();
+						} catch (err) {
+							opts.consoleStream?.info?.(
+								`module ${m.id} reload error: ${err instanceof Error ? err.message : String(err)}`,
+							);
+						}
+					}
+					return { ok: true };
+				}),
+		});
 		customMethods = methods;
 
-		// HTTP routes — swap in the live list the request handler reads.
-		httpRoutes = registry.httpRoutes.map((r) => ({ method: r.method, path: r.path, handler: r.handler }));
+		// HTTP routes — swap in the live list the request handler reads. We carry
+		// the full `HttpRoute` (auth / match / maxBodyBytes / timeoutMs) so the
+		// request dispatcher can apply each route's guards before delegating.
+		httpRoutes = [...registry.httpRoutes];
 
 		// Channels — inbound runs through the SAME serialized turn queue as TUI
 		// prompts (`runGatewayTurn`), so a channel turn never overlaps a TUI turn.

@@ -152,11 +152,26 @@ const EXTENSION_ENTRY_SCHEMA = Type.Object({
 	config: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 });
 
+// Slots pick the active capability when multiple plugins register one (memory
+// backend, context engine, compaction, agent harness). The value is the id of
+// the registered capability; unset slots fall through to Brigade's built-in
+// path. The resolver lives on `BrigadeExtensionRegistry.resolveSlot`.
+const EXTENSIONS_SLOTS_SCHEMA = Type.Object(
+	{
+		memory: Type.Optional(Type.String()),
+		contextEngine: Type.Optional(Type.String()),
+		compaction: Type.Optional(Type.String()),
+		agentHarness: Type.Optional(Type.String()),
+	},
+	{ additionalProperties: false },
+);
+
 const EXTENSIONS_SCHEMA = Type.Object({
 	enabled: Type.Optional(Type.Boolean()),
 	// When non-empty, ONLY listed module ids load (allowlist).
 	allow: Type.Optional(Type.Array(Type.String())),
 	disabled: Type.Optional(Type.Array(Type.String())),
+	slots: Type.Optional(EXTENSIONS_SLOTS_SCHEMA),
 	entries: Type.Optional(Type.Record(Type.String(), EXTENSION_ENTRY_SCHEMA)),
 });
 

@@ -18,6 +18,7 @@ import readline from "node:readline/promises";
 
 import { BUNDLED_MODULES, loadModules } from "../../agents/extensions/index.js";
 import type { ChannelAdapter, ChannelStartContext } from "../../agents/extensions/index.js";
+import type { ChannelSetupCredentialKey } from "../../agents/extensions/types.js";
 import { addAllowFrom, readAllowFrom, removeAllowFrom } from "../../agents/channels/access-control/index.js";
 import { DEFAULT_AGENT_ID, resolveAgentWorkspaceDir, resolveChannelStateDir } from "../../config/paths.js";
 import { loadConfig, saveConfig } from "../../core/config.js";
@@ -547,50 +548,233 @@ export const runChannelsEnable = (args: { channel?: string }, opts: { json?: boo
 export const runChannelsDisable = (args: { channel?: string }, opts: { json?: boolean } = {}) =>
 	setEnableFlag(args.channel, false, opts.json);
 
-/* ─────────────────────────── add (non-interactive provisioning) ─────────────────────────── */
+/* ─────────────────────────── add (setup wizard) ─────────────────────────── */
 
 /**
- * Non-interactive provisioning for a token-based channel (Slack/Telegram/Discord
- * pattern — WhatsApp uses QR via `link`). Writes `channels.<id>` in brigade.json
- * with `enabled: true` plus any `--token`, `--account`, and free-form `--set k=v`
- * key/value pairs. Useful for CI / config-as-code; the operator never has to
- * paste a secret into a TUI.
+ * Prompt function shape — abstracts `readline/promises` so tests can drive the
+ * wizard without touching real stdin. Returns the operator's typed value
+ * (already trimmed of trailing newline by readline) or `null` if the operator
+ * cancelled (Ctrl+D / EOF).
+ */
+type CredentialPrompter = (key: ChannelSetupCredentialKey) => Promise<string | null>;
+
+/**
+ * Test injection hook — overrides the channel registry + prompter so tests can
+ * drive the wizard against a fake adapter without spinning up the bundled
+ * modules. Production callers leave this `undefined`; tests set it in
+ * `beforeEach` and clear it in `afterEach`.
+ */
+interface ChannelsAddTestHooks {
+	channels?: ChannelAdapter[];
+	prompter?: CredentialPrompter;
+}
+let testHooks: ChannelsAddTestHooks | undefined;
+
+/** @internal — tests only. */
+export function __setChannelsAddTestHooksForTests(hooks: ChannelsAddTestHooks | undefined): void {
+	testHooks = hooks;
+}
+
+/** Default readline-backed prompter. Hides input for `secret: true` keys. */
+async function defaultCredentialPrompter(key: ChannelSetupCredentialKey): Promise<string | null> {
+	const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+	try {
+		const labelParts = [key.prompt];
+		if (key.docsUrl) labelParts.push(`(${key.docsUrl})`);
+		const label = `${labelParts.join(" ")}: `;
+		if (key.secret) {
+			return await promptHidden(rl, label);
+		}
+		const answer = await rl.question(label);
+		return answer;
+	} catch {
+		return null;
+	} finally {
+		rl.close();
+	}
+}
+
+/**
+ * Hide raw-mode input for secret prompts. Falls back to a plain prompt if the
+ * stream isn't a TTY (CI / non-interactive); the wizard's `--non-interactive`
+ * gate is the right path for those flows, so this fallback only kicks in when
+ * an operator pipes input by accident.
+ */
+async function promptHidden(rl: readline.Interface, label: string): Promise<string> {
+	const stdin = process.stdin;
+	const isTTY = stdin.isTTY === true && typeof stdin.setRawMode === "function";
+	if (!isTTY) {
+		// No TTY — surface a "(input hidden where supported)" hint and read plain.
+		return await rl.question(`${label}`);
+	}
+	return await new Promise<string>((resolve) => {
+		process.stderr.write(label);
+		let buf = "";
+		stdin.setRawMode?.(true);
+		stdin.resume();
+		stdin.setEncoding("utf8");
+		const onData = (chunk: string) => {
+			for (const ch of chunk) {
+				if (ch === "\r" || ch === "\n") {
+					stdin.setRawMode?.(false);
+					stdin.pause();
+					stdin.removeListener("data", onData);
+					process.stderr.write("\n");
+					resolve(buf);
+					return;
+				}
+				if (ch === "") {
+					// Ctrl+C — restore the terminal and re-emit so SIGINT semantics work.
+					stdin.setRawMode?.(false);
+					stdin.pause();
+					stdin.removeListener("data", onData);
+					process.stderr.write("\n");
+					process.kill(process.pid, "SIGINT");
+					return;
+				}
+				if (ch === "" || ch === "\b") {
+					// Backspace.
+					if (buf.length > 0) buf = buf.slice(0, -1);
+					continue;
+				}
+				buf += ch;
+			}
+		};
+		stdin.on("data", onData);
+	});
+}
+
+/**
+ * Walk the operator through a channel's setup wizard:
+ *   1. Resolve the channel adapter (must declare a `setup` block — QR/OAuth
+ *      channels like WhatsApp don't, and get a friendly redirect to
+ *      `brigade channels link`).
+ *   2. Prompt for every declared credential key (env-var pre-fill where set,
+ *      hidden input for `secret: true`, re-prompt on validator rejection).
+ *   3. Build the `channels.<id>` config block (via `buildAccountConfig` when
+ *      the adapter provides one, otherwise the values verbatim) and merge it
+ *      into brigade.json with `enabled: true`.
+ *   4. Print a polished success card matching `channels link`.
+ *
+ * `--non-interactive` skips prompting entirely — every credential MUST come
+ * from its declared `envVar`, otherwise the wizard errors out cleanly. That's
+ * the path for CI / config-as-code setups.
  */
 export async function runChannelsAdd(
-	args: { channel: string; token?: string; account?: string; set?: string[] },
+	args: { channel?: string; nonInteractive?: boolean },
 	opts: { json?: boolean } = {},
 ): Promise<number> {
-	const id = args.channel.trim();
-	if (!id) {
-		process.stderr.write("--channel <id> is required.\n");
+	const channels = testHooks?.channels
+		? testHooks.channels.map((adapter) => ({ adapter }))
+		: (await loadChannels()).channels;
+	const chosen = selectChannel(channels, args.channel);
+	if (!chosen) return reportUnknownChannel(channels, args.channel);
+	const adapter = chosen.adapter;
+
+	if (!adapter.setup) {
+		const msg = `This channel uses pairing/QR — run \`brigade channels link --channel ${adapter.id}\` instead.`;
+		if (opts.json) {
+			process.stdout.write(`${JSON.stringify({ ok: false, reason: msg, channel: adapter.id })}\n`);
+		} else {
+			process.stderr.write(`${msg}\n`);
+		}
 		return 2;
 	}
-	const cfg = loadConfig() as Record<string, unknown>;
-	const channels = (cfg.channels as Record<string, Record<string, unknown>> | undefined) ?? {};
-	const entry = { ...(channels[id] ?? {}) } as Record<string, unknown>;
-	entry.enabled = true;
-	if (args.token) entry.token = args.token;
-	if (args.account) entry.accountId = args.account;
-	for (const kv of args.set ?? []) {
-		const eq = kv.indexOf("=");
-		if (eq === -1) {
-			process.stderr.write(`--set entry must be "key=value" (got ${JSON.stringify(kv)}).\n`);
+
+	const setup = adapter.setup;
+	const prompter = testHooks?.prompter ?? defaultCredentialPrompter;
+	const values: Record<string, string> = {};
+	const nonInteractive = args.nonInteractive === true;
+
+	// Header — only the human path gets the card-style intro.
+	if (!opts.json) {
+		process.stdout.write(`\nConfiguring ${adapter.label} (${adapter.id})…\n`);
+	}
+
+	for (const key of setup.credentialKeys) {
+		// 1) Env-var pre-fill — when set, use it without re-prompting (works
+		//    in both interactive and non-interactive modes; CI relies on this).
+		const envValue = key.envVar ? process.env[key.envVar] : undefined;
+		if (envValue !== undefined && envValue.length > 0) {
+			const trimmed = envValue.trim();
+			const validation = setup.validateInput?.(key.key, trimmed) ?? null;
+			if (validation) {
+				const msg = `Value from $${key.envVar} for "${key.key}" was rejected: ${validation}`;
+				if (opts.json) process.stdout.write(`${JSON.stringify({ ok: false, reason: msg })}\n`);
+				else process.stderr.write(`${msg}\n`);
+				return 2;
+			}
+			values[key.key] = trimmed;
+			if (!opts.json) process.stdout.write(`  • ${key.key}: using $${key.envVar}\n`);
+			continue;
+		}
+
+		// 2) Non-interactive + no env-var → bail with a clear message.
+		if (nonInteractive) {
+			const envHint = key.envVar ? ` (set $${key.envVar})` : "";
+			const msg = `Missing credential "${key.key}" in non-interactive mode${envHint}.`;
+			if (opts.json) process.stdout.write(`${JSON.stringify({ ok: false, reason: msg, key: key.key })}\n`);
+			else process.stderr.write(`${msg}\n`);
 			return 2;
 		}
-		const key = kv.slice(0, eq).trim();
-		const rawValue = kv.slice(eq + 1);
-		// Try JSON5-style parse so booleans/numbers/objects work; fall back to raw.
-		let parsed: unknown = rawValue;
-		try {
-			parsed = JSON.parse(rawValue);
-		} catch {
-			/* keep as string */
+
+		// 3) Interactive prompt with validator retry. Three attempts then we
+		//    give up — protects an operator who's typing the wrong value over
+		//    and over from an infinite loop in non-TTY-ish environments.
+		const MAX_ATTEMPTS = 3;
+		let accepted: string | undefined;
+		for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+			const raw = await prompter(key);
+			if (raw === null) {
+				if (opts.json) {
+					process.stdout.write(`${JSON.stringify({ ok: false, reason: "cancelled" })}\n`);
+				} else {
+					process.stderr.write("Cancelled.\n");
+				}
+				return 1;
+			}
+			const value = raw.trim();
+			if (!value) {
+				process.stderr.write(`  ${key.key} cannot be empty. Try again.\n`);
+				continue;
+			}
+			const validation = setup.validateInput?.(key.key, value) ?? null;
+			if (validation) {
+				process.stderr.write(`  ${validation}\n`);
+				continue;
+			}
+			accepted = value;
+			break;
 		}
-		if (key) entry[key] = parsed;
+		if (accepted === undefined) {
+			const msg = `Gave up after ${MAX_ATTEMPTS} attempts on "${key.key}".`;
+			if (opts.json) process.stdout.write(`${JSON.stringify({ ok: false, reason: msg })}\n`);
+			else process.stderr.write(`${msg}\n`);
+			return 1;
+		}
+		values[key.key] = accepted;
 	}
-	channels[id] = entry;
-	cfg.channels = channels;
+
+	// 4) Assemble the channels.<id> config block. `buildAccountConfig` lets
+	//    an adapter restructure raw inputs (e.g. nest under `slack.bot.*`)
+	//    before they hit brigade.json. When omitted, values land verbatim.
+	let block: Record<string, unknown>;
 	try {
+		block = setup.buildAccountConfig ? setup.buildAccountConfig(values) : { ...values };
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		if (opts.json) process.stdout.write(`${JSON.stringify({ ok: false, reason: msg })}\n`);
+		else process.stderr.write(`Failed to assemble channel config: ${msg}\n`);
+		return 1;
+	}
+
+	// 5) Merge into brigade.json under channels.<id>, mark enabled.
+	try {
+		const cfg = loadConfig() as Record<string, unknown>;
+		const cfgChannels = (cfg.channels as Record<string, Record<string, unknown>> | undefined) ?? {};
+		const existing = (cfgChannels[adapter.id] ?? {}) as Record<string, unknown>;
+		cfgChannels[adapter.id] = { ...existing, ...block, enabled: true };
+		cfg.channels = cfgChannels;
 		saveConfig(cfg as never);
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
@@ -598,10 +782,24 @@ export async function runChannelsAdd(
 		else process.stderr.write(`Failed to write Brigade config: ${msg}\n`);
 		return 1;
 	}
+
+	// 6) Polished success card — same cadence as `channels link`.
+	const credentialCount = Object.keys(values).length;
 	if (opts.json) {
-		process.stdout.write(`${JSON.stringify({ ok: true, channel: id, fields: Object.keys(entry) })}\n`);
+		process.stdout.write(
+			`${JSON.stringify({ ok: true, channel: adapter.id, credentialCount, fields: Object.keys(values) }, null, 2)}\n`,
+		);
 	} else {
-		process.stdout.write(`Provisioned ${id} (enabled${args.token ? ", token set" : ""}).\n`);
+		process.stdout.write(
+			[
+				"",
+				`✅  ${adapter.label} configured`,
+				"   ━━━━━━━━━━━━━━━━━━━━",
+				`   Saved ${credentialCount} credential${credentialCount === 1 ? "" : "s"} to your Brigade config.`,
+				"   Run `brigade gateway` to start receiving messages.",
+				"",
+			].join("\n") + "\n",
+		);
 	}
 	return 0;
 }
@@ -636,13 +834,17 @@ export async function runChannelsAllowAdd(
 	const { channels } = await loadChannels();
 	const chosen = selectChannel(channels, args.channel);
 	if (!chosen) return reportUnknownChannel(channels, args.channel);
-	const added = addAllowFrom(chosen.adapter.id, args.id);
+	// Per-channel normalization — the adapter may strip an `@` prefix or
+	// `<@U…>` mention syntax before the entry is persisted. Channels without
+	// `pairing.normalizeAllowEntry` see identity.
+	const normalized = chosen.adapter.pairing?.normalizeAllowEntry?.(args.id) ?? args.id;
+	const added = addAllowFrom(chosen.adapter.id, normalized);
 	if (opts.json) {
-		process.stdout.write(`${JSON.stringify({ ok: true, channel: chosen.adapter.id, added, id: args.id })}\n`);
+		process.stdout.write(`${JSON.stringify({ ok: true, channel: chosen.adapter.id, added, id: normalized })}\n`);
 	} else if (added) {
-		process.stdout.write(`Added "${args.id}" to ${chosen.adapter.label}'s allow-from list.\n`);
+		process.stdout.write(`Added "${normalized}" to ${chosen.adapter.label}'s allow-from list.\n`);
 	} else {
-		process.stdout.write(`"${args.id}" was already on ${chosen.adapter.label}'s allow-from list.\n`);
+		process.stdout.write(`"${normalized}" was already on ${chosen.adapter.label}'s allow-from list.\n`);
 	}
 	return 0;
 }

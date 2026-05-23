@@ -67,6 +67,7 @@ import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
 import { cleanProviderError } from "../core/model-caps.js";
 import { resolveModelNeverMiss } from "./model-resolution.js";
 import { buildAutoRecallBlock } from "./memory/auto-recall.js";
+import { resolveActiveMemoryCapability } from "./memory/plugin-runtime.js";
 import { buildBrigadeTransformContext } from "./payload-mutators.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
@@ -116,6 +117,49 @@ function resolveIdleTimeoutMs(): number {
   return Math.floor(n * 1000);
 }
 
+/**
+ * Compute the effective bootstrap phase for one agent turn, given:
+ *   - the workspace-level phase (whether `setupCompletedAt` is stamped),
+ *   - whether THIS session has already received the bootstrap context,
+ *   - whether the sender is the operator (owner).
+ *
+ * Truth table (the only one that matters for the user-visible behaviour):
+ *
+ *   workspacePhase    sessionHasBootstrap  senderIsOwner  → effective
+ *   ----------------  -------------------  -------------  ----------
+ *   "first-turn"       false                true          → "first-turn"   (operator's first conversation; do the BOOTSTRAP intro)
+ *   "first-turn"       true                 true          → "in-progress"  (operator continuing; no re-nudge)
+ *   "first-turn"       any                  false         → "in-progress"  (NON-OWNER never sees BOOTSTRAP — fixes the "friend gets identity onboarding" bug)
+ *   "in-progress"      any                  any           → "in-progress"
+ *   "complete"         any                  any           → "complete"
+ *
+ * Pure — no I/O — so the gate is unit-testable. Lifted out of the runSingleTurn
+ * body specifically so the regression "approved peer triggers the operator's
+ * onboarding ritual" can be locked at the helper level.
+ */
+export function resolveEffectiveBootstrapPhase(args: {
+  workspacePhase: BootstrapPhase;
+  sessionAlreadyHasBootstrap: boolean;
+  senderIsOwner: boolean;
+}): BootstrapPhase {
+  // BOOTSTRAP is an operator-onboarding flow (see templates/workspace/BOOTSTRAP.md
+  // — "You just woke up. Who am I? Who are you?"). Approved peers must NEVER
+  // see the FIRST-TURN nudge — collapse to in-progress for non-owners only
+  // when the workspace is still in first-turn. `in-progress` and `complete`
+  // are already peer-safe so they pass through unchanged.
+  if (!args.senderIsOwner && args.workspacePhase === "first-turn") {
+    return "in-progress";
+  }
+  // Operator path (or peer on a non-first-turn workspace) — apply the existing
+  // session-marker gate so the synthetic nudge fires only on the operator's
+  // first session-turn, not on every continuing-session turn just because
+  // BOOTSTRAP.md is still on disk.
+  if (args.workspacePhase === "first-turn" && args.sessionAlreadyHasBootstrap) {
+    return "in-progress";
+  }
+  return args.workspacePhase;
+}
+
 export interface RunSingleTurnArgs {
   agentId: string;
   provider: string;
@@ -153,6 +197,23 @@ export interface RunSingleTurnArgs {
    * long-lived session between turns.
    */
   onSessionReady?: (session: AgentSession) => void;
+  /**
+   * Whether the message originated from the operator themselves (TUI, self-chat
+   * DM, or an approved owner-equivalent peer). Defaults to `true` — the TUI is
+   * always the operator, and bash callers are too. Channel-driven turns set
+   * this to `false` when the sender is NOT `adapter.selfId()`.
+   *
+   * Used to gate the BOOTSTRAP "who am I / who are you" introduction — that
+   * ritual is an OPERATOR onboarding flow (see `templates/workspace/BOOTSTRAP.md`)
+   * and must NOT fire for arbitrary approved peers. When `false`, the
+   * bootstrap phase is collapsed to `in-progress` so non-owners see normal
+   * agent behaviour from their very first message, not a "let's figure out
+   * who we are together" identity script.
+   *
+   * (Distinct from `wrapOwnerOnlyToolExecution`'s `ownerOnly` tool gate —
+   * that one denies tool calls; this one suppresses a prompt nudge.)
+   */
+  senderIsOwner?: boolean;
 }
 
 export interface RunSingleTurnResult {
@@ -346,17 +407,6 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     },
   );
 
-  // Assemble Brigade's full tool surface via the SHARED helper — the SAME
-  // one `buildAgent` (TUI + gateway) uses, so every surface exposes an
-  // identical set (7 built-ins + memory tools). Pi's `tools` field is an
-  // allowlist of NAMES; `customTools` is the slot for the Brigade-native
-  // Tool objects. The unknown-tool guard's allowlist must include the
-  // custom names too (else `recall_memory` is refused as unknown), which
-  // `enabledToolNames` already covers.
-  const toolset = assembleBrigadeToolset({ workspaceDir, agentId, cwd });
-  const brigadeCustomTools = toolset.customTools;
-  const enabledToolNames = toolset.enabledToolNames;
-
   // Primitive #5 (Skills): discover the skills eligible for this turn — a
   // cheap synchronous scan of the bundled + workspace roots, OS/binary/env
   // filtered. The rendered <available_skills> block (if any) is injected into
@@ -368,14 +418,6 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // chance the two reads disagree if the file is rewritten mid-turn.
   const turnConfig = readConfigOrInit();
   const skillDiscovery = discoverEligibleSkills({ workspaceDir, config: turnConfig });
-  const promptCapabilities = {
-    ...toolset.capabilities,
-    // Gate on the RENDERED block, not the eligible count: a skill set that's
-    // entirely model-invocation-disabled yields an empty block, and emitting
-    // the "scan the skills listed below" guidance with no list beneath it is
-    // misleading. promptBlock is undefined exactly when there's nothing to show.
-    skills: skillDiscovery.promptBlock !== undefined,
-  };
 
   // Extension layer: load Brigade modules (bundled now; user `~/.brigade/extensions`
   // later) into a registry. Agent-level registrations (tools/hooks/commands) are
@@ -385,10 +427,55 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // getExtensions() stays empty. The loader runs ONLY our factory: every other
   // resource type is opted out because Brigade owns skills/prompts/themes/context
   // itself and the persona pin owns the system prompt.
+  //
+  // Loaded BEFORE the toolset assembly because the memory capability resolver
+  // (`extensions.slots.memory` slot pin) consults the registry — a plugin-
+  // registered backend has to be in `registry.memoryCapabilities` before we
+  // build the memory tools so `recall_memory` / `write_memory` route through
+  // it on this very turn.
   const extensionRegistry = await loadModules({
     modules: BUNDLED_MODULES,
     meta: { agentId, workspaceDir, cwd, config: turnConfig },
   });
+
+  // Resolve the active memory backend — plugin if `extensions.slots.memory`
+  // pins one, otherwise the built-in file-based default. Threaded into the
+  // tool registry AND the auto-recall helper so memory routes through one
+  // capability per turn (no per-call-site branching).
+  const memoryCapability = resolveActiveMemoryCapability({
+    config: turnConfig,
+    registry: extensionRegistry,
+    workspaceDir,
+    agentId,
+  });
+
+  // Assemble Brigade's full tool surface via the SHARED helper — the SAME
+  // one `buildAgent` (TUI + gateway) uses, so every surface exposes an
+  // identical set (7 built-ins + memory tools). Pi's `tools` field is an
+  // allowlist of NAMES; `customTools` is the slot for the Brigade-native
+  // Tool objects. The unknown-tool guard's allowlist must include the
+  // custom names too (else `recall_memory` is refused as unknown), which
+  // `enabledToolNames` already covers.
+  const toolset = assembleBrigadeToolset({ workspaceDir, agentId, cwd, memoryCapability });
+  const brigadeCustomTools = toolset.customTools;
+  const enabledToolNames = toolset.enabledToolNames;
+
+  const promptCapabilities = {
+    ...toolset.capabilities,
+    // Gate on the RENDERED block, not the eligible count: a skill set that's
+    // entirely model-invocation-disabled yields an empty block, and emitting
+    // the "scan the skills listed below" guidance with no list beneath it is
+    // misleading. promptBlock is undefined exactly when there's nothing to show.
+    skills: skillDiscovery.promptBlock !== undefined,
+  };
+  // `agents.defaults.toolset` (when set in `brigade.json`) narrows the active
+  // tool profile — e.g. `"minimal" | "coding" | "messaging"`. The registry
+  // filters extension-registered tools whose own `toolset` doesn't match (and
+  // isn't `"*"` / unset). Unset / `"full"` means "no filter" (full surface).
+  // The same value must reach BOTH the Pi factory (so excluded tools aren't
+  // registered) AND `toolNames()` (so the unknown-tool guard's allowlist
+  // agrees with what Pi sees).
+  const toolsetProfile = (turnConfig.agents?.defaults as { toolset?: string } | undefined)?.toolset;
   const brigadeResourceLoader = new DefaultResourceLoader({
     cwd,
     agentDir,
@@ -397,12 +484,63 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    extensionFactories: [extensionRegistry.toPiExtensionFactory()],
+    extensionFactories: [extensionRegistry.toPiExtensionFactory({ toolset: toolsetProfile })],
   } as never);
   await (brigadeResourceLoader as unknown as { reload: () => Promise<void> }).reload();
   // Extension tool names join the allowlist so the unknown-tool guard + Pi's
   // `tools` activation gate accept them alongside the built-ins + memory tools.
-  const allEnabledToolNames = [...new Set([...enabledToolNames, ...extensionRegistry.toolNames()])];
+  const allEnabledToolNames = [
+    ...new Set([...enabledToolNames, ...extensionRegistry.toolNames({ toolset: toolsetProfile })]),
+  ];
+
+  // ── Lane J: agent-harness slot warning ────────────────────────────────────
+  // Pi-coding-agent is the ONLY harness Brigade drives today. If an operator
+  // pinned `extensions.slots.agentHarness` to a registered plugin, log a
+  // warning that the slot won't activate yet — we don't swap the harness here
+  // (Pi's session is sacred; replacing it would lose auth wrapping and break
+  // every call silently). The slot becomes load-bearing the day a harness
+  // plugin actually ships; until then this warning is the safety net so the
+  // operator isn't silently ignored.
+  const pinnedHarness = extensionRegistry.resolveSlot(
+    "agentHarness",
+    turnConfig,
+    extensionRegistry.agentHarnesses,
+  );
+  if (pinnedHarness) {
+    log.warn(
+      "agentHarness slot pinned but Brigade uses Pi-coding-agent as the sole harness today — slot will activate when a harness plugin ships",
+      { slot: pinnedHarness.id },
+    );
+  }
+
+  // ── Lane J: context-engine systemPromptAddition merge ─────────────────────
+  // When an operator pins `extensions.slots.contextEngine` to a registered
+  // engine, call its `assemble()` and capture any `systemPromptAddition`
+  // string. That string is merged into the assembled persona's ephemeral
+  // (below-cache-boundary) slot so a future engine can layer extra context
+  // without busting the prompt cache. Today no engine ships, so this is a
+  // no-op; on plugin error we swallow rather than failing the turn (the
+  // built-in path takes over).
+  let contextEngineAddition: string | undefined;
+  const pinnedContextEngine = extensionRegistry.resolveSlot(
+    "contextEngine",
+    turnConfig,
+    extensionRegistry.contextEngines,
+  );
+  if (pinnedContextEngine?.assemble) {
+    try {
+      // Pi session isn't built yet — pass an empty array. The contract lets
+      // an engine assemble before-turn; richer "live session messages" wiring
+      // can land once a real engine ships and we know what it needs.
+      const result = await pinnedContextEngine.assemble({ sessionMessages: [] });
+      contextEngineAddition = result.systemPromptAddition;
+    } catch (err) {
+      log.warn("context-engine assemble() threw — falling back to built-in", {
+        slot: pinnedContextEngine.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   const { session } = await createAgentSession({
     cwd,
@@ -525,15 +663,16 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   const sessionAlreadyHasBootstrap = await hasDeliveredBootstrapToSession(
     resolved.transcriptPath,
   );
-  // The assembler should only emit the synthetic first-turn nudge when
-  // BOTH conditions hold: workspace says first-turn AND this session
-  // hasn't received the bootstrap context yet. This is what stops the
-  // nudge from re-firing on every continuing-session turn just because
-  // BOOTSTRAP.md still happens to be on disk.
-  const effectivePhase: BootstrapPhase =
-    phaseBefore === "first-turn" && sessionAlreadyHasBootstrap
-      ? "in-progress"
-      : phaseBefore;
+  // `senderIsOwner` defaults to true — TUI, bash, and direct-RPC callers are
+  // always the operator. Channel adapters set this to `false` when the
+  // approved peer is NOT the operator's own linked-channel id, so a friend's
+  // first DM doesn't trigger the operator's identity-onboarding ritual.
+  const senderIsOwner = args.senderIsOwner !== false;
+  const effectivePhase = resolveEffectiveBootstrapPhase({
+    workspacePhase: phaseBefore,
+    sessionAlreadyHasBootstrap,
+    senderIsOwner,
+  });
 
   // Query the actual tool names Pi wired to this session, then map each to
   // a one-line summary. We pass the resolved descriptions through to the
@@ -586,9 +725,18 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // the model has them without calling recall_memory. Sync + free. This is a
     // PASSIVE injection — it does NOT bump accessCount (only the explicit
     // recall_memory tool reinforces decay). Only present when memory is enabled.
-    ephemeralSuffix: promptCapabilities?.memory
-      ? buildAutoRecallBlock(workspaceDir, args.message)
-      : undefined,
+    //
+    // Lane J: when a `contextEngine` slot plugin returned a
+    // `systemPromptAddition`, append it AFTER the auto-recall block so it
+    // also lands below the cache boundary. Both are per-turn dynamic so they
+    // share the ephemeral slot; the assembler's sanitiser handles either as
+    // plain text.
+    ephemeralSuffix: mergeEphemeralSuffix(
+      promptCapabilities?.memory
+        ? await buildAutoRecallBlock(memoryCapability, args.message)
+        : undefined,
+      contextEngineAddition,
+    ),
   });
   if (personaPrompt) {
     applyPersonaOverrideToSession(session as AgentSession, personaPrompt);
@@ -943,6 +1091,22 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // races the turn boundary).
     gateCtxRef.value = {};
   }
+}
+
+// Merge two optional ephemeral-suffix strings into one. Auto-recall (Memory
+// Primitive #4) and the context-engine slot's `systemPromptAddition` (Lane J)
+// both target the same below-cache-boundary slot; when both are present, we
+// concatenate with a blank line between so each block reads as its own
+// section. Either-undefined / both-empty collapses to `undefined` so the
+// assembler skips the `# Per-turn Notes` block entirely.
+function mergeEphemeralSuffix(
+  ...parts: ReadonlyArray<string | undefined>
+): string | undefined {
+  const kept = parts
+    .map((p) => p?.trim())
+    .filter((p): p is string => typeof p === "string" && p.length > 0);
+  if (kept.length === 0) return undefined;
+  return kept.join("\n\n");
 }
 
 // Build the per-turn system prompt. Three steps:

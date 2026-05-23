@@ -213,6 +213,65 @@ export function evaluateCompactionDecision(args: CompactionDecisionArgs): Compac
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Slot-resolution shim for the COMPACTION provider extension slot.
+//
+// Lane J of the plugin-SDK parity work. Shape-only today — Brigade's default
+// behaviour is the two-tier head+tail truncation below; when an operator
+// pins `extensions.slots.compaction = "<plugin-id>"` in brigade.json AND a
+// `compactionProvider` plugin with that id has loaded, the resolver routes
+// `summarize()` to the plugin and the caller decides whether to use the
+// returned string. When no slot is pinned (or the pinned id isn't registered),
+// the caller falls back to its built-in compaction path — Brigade today does
+// not change behaviour, so this function returning `{fallback: true}` is
+// the steady-state.
+//
+// The function intentionally takes the registry rather than reaching for a
+// process-global so tests can inject a fresh registry per case and callers
+// from the per-turn path stay explicit about where the registry came from.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import type { BrigadeConfig } from "../config/io.js";
+import type { BrigadeExtensionRegistry } from "./extensions/registry.js";
+
+export interface CompactWithSlotResolutionArgs {
+  /** Messages handed to the slot-resolved compactor (caller-owned shape). */
+  messages: ReadonlyArray<unknown>;
+  /** 0..1 target compression ratio. Smaller = more aggressive. */
+  compressionRatio: number;
+  /** Extension registry — when omitted the resolver short-circuits to fallback. */
+  registry?: BrigadeExtensionRegistry;
+  /** Active brigade.json. The resolver reads `extensions.slots.compaction`. */
+  config: BrigadeConfig;
+  /** Optional abort signal passed through to the provider's summarize call. */
+  signal?: AbortSignal;
+}
+
+/**
+ * Resolve the active compaction provider via the slot config and call its
+ * `summarize` if pinned + registered; otherwise return `{fallback: true}`
+ * so the caller can fall back to the built-in head+tail truncation.
+ *
+ * No behaviour change today — Brigade ships no compaction-provider plugin
+ * and the in-tree compactor (`smartCompactToolResults` below) remains the
+ * single source of truth. This shim is the seam a future plugin slots into.
+ */
+export async function compactWithSlotResolution(
+  args: CompactWithSlotResolutionArgs,
+): Promise<string | { fallback: true }> {
+  const resolved = args.registry?.resolveSlot(
+    "compaction",
+    args.config,
+    args.registry.compactionProviders,
+  );
+  if (!resolved) return { fallback: true };
+  return resolved.summarize({
+    messages: args.messages,
+    compressionRatio: args.compressionRatio,
+    signal: args.signal,
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Two-tier message-history compaction (folded in from src/core/smart-compaction.ts).
 //
 // The recommender above tells you "should we compact?". This function does

@@ -17,6 +17,7 @@ import type { ExtensionAPI, ExtensionFactory } from "@mariozechner/pi-coding-age
 
 import type { BrigadeConfig } from "../../config/io.js";
 import type { AnyBrigadeTool } from "../tools/types.js";
+import { type BrigadeHookName, createHookRunner, type HookFireResult } from "./hook-runner.js";
 import type {
 	BrigadeExtensionContext,
 	ChannelAdapter,
@@ -28,6 +29,7 @@ import type {
 	Integration,
 	MediaGenProvider,
 	ModelProviderRegistration,
+	ProviderAuthMethodRegistration,
 	Service,
 	SpeechProvider,
 	ToolRegistration,
@@ -49,11 +51,17 @@ export class BrigadeExtensionRegistry {
 	private readonly hookRegs: HookRegistration[] = [];
 	private readonly commandRegs: CommandRegistration[] = [];
 	private readonly modelProviderRegs: ModelProviderRegistration[] = [];
+	private readonly providerAuthMethodRegs: ProviderAuthMethodRegistration[] = [];
 	private readonly channelMap = new Map<string, ChannelAdapter>();
 	private readonly channelCommandMap = new Map<string, ChannelCommand>();
 	private readonly speechMap = new Map<string, SpeechProvider>();
 	private readonly transcriptionMap = new Map<string, TranscriptionProvider>();
 	private readonly mediaGenMap = new Map<string, MediaGenProvider>();
+	private readonly memoryMap = new Map<string, import("./types.js").MemoryCapability>();
+	private readonly memoryEmbeddingMap = new Map<string, import("./types.js").MemoryEmbeddingProvider>();
+	private readonly contextEngineMap = new Map<string, import("./types.js").ContextEngineCapability>();
+	private readonly compactionProviderMap = new Map<string, import("./types.js").CompactionProvider>();
+	private readonly agentHarnessMap = new Map<string, import("./types.js").AgentHarness>();
 	private readonly integrationMap = new Map<string, Integration>();
 	private readonly serviceMap = new Map<string, Service>();
 	private readonly httpRouteMap = new Map<string, HttpRoute>();
@@ -83,6 +91,9 @@ export class BrigadeExtensionRegistry {
 			modelProvider: (name, config) => {
 				this.modelProviderRegs.push({ name, config });
 			},
+			providerAuthMethod: (providerName, method) => {
+				this.providerAuthMethodRegs.push({ providerName, method });
+			},
 			// product-level → gateway-level registries (dedupe by id, last wins)
 			channel: (adapter) => {
 				this.channelMap.set(adapter.id, adapter);
@@ -100,6 +111,21 @@ export class BrigadeExtensionRegistry {
 			},
 			mediaGen: (provider) => {
 				this.mediaGenMap.set(provider.id, provider);
+			},
+			memory: (capability) => {
+				this.memoryMap.set(capability.id, capability);
+			},
+			memoryEmbeddingProvider: (provider) => {
+				this.memoryEmbeddingMap.set(provider.id, provider);
+			},
+			contextEngine: (engine) => {
+				this.contextEngineMap.set(engine.id, engine);
+			},
+			compactionProvider: (provider) => {
+				this.compactionProviderMap.set(provider.id, provider);
+			},
+			agentHarness: (harness) => {
+				this.agentHarnessMap.set(harness.id, harness);
 			},
 			integration: (integration) => {
 				this.integrationMap.set(integration.id, integration);
@@ -134,6 +160,42 @@ export class BrigadeExtensionRegistry {
 	get mediaGenProviders(): MediaGenProvider[] {
 		return [...this.mediaGenMap.values()];
 	}
+	get memoryCapabilities(): import("./types.js").MemoryCapability[] {
+		return [...this.memoryMap.values()];
+	}
+	get memoryEmbeddingProviders(): import("./types.js").MemoryEmbeddingProvider[] {
+		return [...this.memoryEmbeddingMap.values()];
+	}
+	get contextEngines(): import("./types.js").ContextEngineCapability[] {
+		return [...this.contextEngineMap.values()];
+	}
+	get compactionProviders(): import("./types.js").CompactionProvider[] {
+		return [...this.compactionProviderMap.values()];
+	}
+	get agentHarnesses(): import("./types.js").AgentHarness[] {
+		return [...this.agentHarnessMap.values()];
+	}
+
+	/**
+	 * Resolve the active slot-selected capability for a given slot key.
+	 * `extensions.slots.<slot>` in `brigade.json` names the active plugin id;
+	 * when unset, returns `undefined` (Brigade's built-in path takes over).
+	 *
+	 *   const memory = registry.resolveSlot("memory", cfg, registry.memoryCapabilities);
+	 *
+	 * Generic so any slot uses the same lookup shape.
+	 */
+	resolveSlot<T extends { id: string }>(
+		slotName: "memory" | "contextEngine" | "compaction" | "agentHarness",
+		cfg: BrigadeConfig,
+		candidates: ReadonlyArray<T>,
+	): T | undefined {
+		const slots = (cfg as { extensions?: { slots?: Record<string, string> } }).extensions?.slots;
+		const pinnedId = slots?.[slotName]?.trim();
+		if (!pinnedId) return undefined;
+		return candidates.find((c) => c.id === pinnedId);
+	}
+
 	get integrations(): Integration[] {
 		return [...this.integrationMap.values()];
 	}
@@ -147,16 +209,72 @@ export class BrigadeExtensionRegistry {
 		return [...this.gatewayMethodMap.values()];
 	}
 
+	/**
+	 * Recorded provider auth methods, optionally filtered to a single provider.
+	 * Order = registration order — that's the order onboarding/resolution should
+	 * try methods in (first viable wins). Today this is shape-only — the
+	 * consumer-side resolver lands when the first OAuth provider plugin ships.
+	 */
+	providerAuthMethods(providerName?: string): ProviderAuthMethodRegistration[] {
+		if (!providerName) return [...this.providerAuthMethodRegs];
+		return this.providerAuthMethodRegs.filter((r) => r.providerName === providerName);
+	}
+
 	/* ── agent-level ── */
 
-	/** Eligible tool objects (passes the per-tool `check_fn` gate). */
-	eligibleTools(): AnyBrigadeTool[] {
-		return this.toolRegs.filter((t) => !t.eligible || t.eligible()).map((t) => t.tool);
+	/**
+	 * Eligible tool objects (passes the per-tool `check_fn` gate).
+	 *
+	 * When `opts.toolset` is supplied (e.g. `"minimal" | "coding" | "messaging"
+	 * | "full"`), the result is additionally filtered to tools whose recorded
+	 * `toolset` either matches that string, is `"*"` (universal opt-in), or is
+	 * `undefined` (no profile declared — always included so legacy / un-tagged
+	 * tools never disappear behind a profile switch). Unset / empty `toolset`
+	 * disables the filter — the tool list returns as if the knob weren't there
+	 * (full surface), which is the desired default for `agents.defaults.toolset`
+	 * being absent from `brigade.json`.
+	 */
+	eligibleTools(opts: { toolset?: string } = {}): AnyBrigadeTool[] {
+		const profile = opts.toolset?.trim();
+		const profileActive = profile !== undefined && profile.length > 0 && profile !== "full";
+		return this.toolRegs
+			.filter((t) => !t.eligible || t.eligible())
+			.filter((t) => {
+				if (!profileActive) return true;
+				if (t.toolset === undefined) return true;
+				if (t.toolset === "*") return true;
+				return t.toolset === profile;
+			})
+			.map((t) => t.tool);
 	}
 
 	/** Names of eligible tools — feed into `enabledToolNames` so the unknown-tool guard allows them. */
-	toolNames(): string[] {
-		return this.eligibleTools().map((t) => t.name);
+	toolNames(opts: { toolset?: string } = {}): string[] {
+		return this.eligibleTools(opts).map((t) => t.name);
+	}
+
+	/**
+	 * Fire a Brigade-native hook event through the 4-pattern runner. The pattern
+	 * is looked up by name from `HOOK_PATTERNS` (telemetry/modifying/claiming/
+	 * sync) — callers pass the payload and get back the merged outcome.
+	 *
+	 *   const claim = await registry.fireHook("inbound_claim", { channel, msg });
+	 *   if (claim.handled) return; // a plugin owns this inbound
+	 *
+	 * Returns `{ handlerCount }` plus pattern-specific fields:
+	 *   - claiming → `{ handled, by? }` (handler index 0-based that claimed)
+	 *   - modifying → `{ modifications }` (merged payload patch)
+	 *   - void / sync → just the count
+	 */
+	async fireHook<T = unknown>(name: BrigadeHookName, payload: T): Promise<HookFireResult> {
+		const matching = this.hookRegs.filter((h) => h.event === name);
+		const runner = createHookRunner(
+			matching.map((h) => ({
+				handler: h.handler as (p: unknown) => unknown,
+				priority: h.priority,
+			})),
+		);
+		return runner.fire(name, payload);
 	}
 
 	/** Recorded hooks sorted by priority (higher first); ties keep registration order. */
@@ -173,11 +291,21 @@ export class BrigadeExtensionRegistry {
 	 * result to `new DefaultResourceLoader({ extensionFactories: [factory] })`
 	 * (and remember to `await loader.reload()` — Brigade passes the loader in, so
 	 * `createAgentSession` won't reload it itself).
+	 *
+	 * `opts.toolset` mirrors `eligibleTools()` — when supplied, tools whose
+	 * `toolset` doesn't match (and isn't `"*"` / unset) are NOT registered into
+	 * Pi. The same value must be threaded into both `toolNames(opts)` (for the
+	 * unknown-tool guard's allowlist) and the factory so the two views agree.
 	 */
-	toPiExtensionFactory(): ExtensionFactory {
+	toPiExtensionFactory(opts: { toolset?: string } = {}): ExtensionFactory {
+		const profile = opts.toolset?.trim();
+		const profileActive = profile !== undefined && profile.length > 0 && profile !== "full";
 		return (pi: ExtensionAPI) => {
 			for (const t of this.toolRegs) {
 				if (t.eligible && !t.eligible()) continue;
+				if (profileActive) {
+					if (t.toolset !== undefined && t.toolset !== "*" && t.toolset !== profile) continue;
+				}
 				// AgentTool → Pi ToolDefinition: Pi's tool wrapper invokes execute with
 				// `ctx` as a trailing positional arg, which Brigade's 4-arg execute
 				// simply ignores; the required fields (name/label/description/parameters)

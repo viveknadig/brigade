@@ -173,6 +173,84 @@ export interface ChannelStartContext {
 }
 
 /**
+ * Optional outbound-send parameters. Channels that support threading (Slack,
+ * Discord) consume `threadId` to scope a reply to a specific thread; channels
+ * without threading silently ignore it. Adding fields here is backward-
+ * compatible because every consumer passes `opts?` and the channel decides
+ * what to honour.
+ */
+export interface OutboundSendOptions {
+	/** Reply within this thread (Slack thread_ts, Discord thread id). */
+	threadId?: string;
+}
+
+/**
+ * Per-channel pairing customization. Today the manager hard-codes a phone-
+ * vs-account heuristic + `🦁 Brigade` copy in the challenge card. As soon as
+ * a second channel ships, the operator-visible idLabel ("Your number" vs
+ * "Your account" vs "Your username") needs to vary per channel — that's
+ * what `idLabel` is for. `normalizeAllowEntry` lets a channel strip an
+ * operator-typed `@` prefix or `<@U…>` mention syntax before the entry
+ * lands in the allow-from store. `notifyApproval` is invoked by the CLI's
+ * `pairing approve` command so the requester sees confirmation in-channel.
+ */
+export interface ChannelPairingAdapter {
+	/** Friendly label for the sender id in the challenge card. */
+	idLabel: "phone" | "username" | "account";
+	/**
+	 * Normalize an allow-from entry the operator typed before it's stored.
+	 * Default behaviour (when omitted) is identity.
+	 */
+	normalizeAllowEntry?(entry: string): string;
+	/**
+	 * Notify the requester they've been approved. Optional — channels that
+	 * already auto-route can omit it; the CLI's `pairing approve` invokes
+	 * this when present so the requester sees confirmation in-channel.
+	 */
+	notifyApproval?(args: { senderId: string; senderName?: string }): Promise<void>;
+}
+
+/**
+ * A credential the channel needs to be configured (e.g. Slack bot token).
+ * The setup wizard prompts the operator for each declared key and writes the
+ * answer into `channels.<id>.*`. WhatsApp omits this entirely (QR pairing
+ * via `brigade channels link` covers it).
+ */
+export interface ChannelSetupCredentialKey {
+	/** Config path under `channels.<id>.*` (e.g. `"botToken"`). */
+	key: string;
+	/** Prompt shown to the operator. */
+	prompt: string;
+	/** When true, input is hidden in the terminal (passwords / tokens). */
+	secret?: boolean;
+	/** Optional env-var fallback the wizard reads if set. */
+	envVar?: string;
+	/** Optional reference URL shown next to the prompt. */
+	docsUrl?: string;
+}
+
+/**
+ * Channel-specific setup wizard. The `brigade channels add <id>` CLI walks
+ * the operator through these credential prompts and writes a fully-formed
+ * `channels.<id>` block to `brigade.json`. Channels that pair via QR/OAuth
+ * (WhatsApp) don't have a setup adapter — they use `channels link`.
+ */
+export interface ChannelSetupAdapter {
+	credentialKeys: ReadonlyArray<ChannelSetupCredentialKey>;
+	/**
+	 * Optional validation of operator input. Return `null` to accept, or an
+	 * error string to re-prompt.
+	 */
+	validateInput?(key: string, value: string): string | null;
+	/**
+	 * Final assembly — given a map of {credentialKey: value}, produce the
+	 * `channels.<id>` config block to merge into `brigade.json`. Default is
+	 * identity (write keys verbatim under `channels.<id>`).
+	 */
+	buildAccountConfig?(values: Record<string, string>): Record<string, unknown>;
+}
+
+/**
  * A messaging channel (Channels phase). WhatsApp is the first implementer; Slack/
  * Telegram/etc. implement the same shape. The gateway starts each configured
  * channel once, routes inbound → agent turn → `sendText` for the reply.
@@ -187,8 +265,12 @@ export interface ChannelAdapter {
 	start(ctx: ChannelStartContext): Promise<void>;
 	/** Stop listening + tear down. */
 	stop(): Promise<void>;
-	/** Send an outbound text reply to a conversation. */
-	sendText(conversationId: string, text: string): Promise<void>;
+	/**
+	 * Send an outbound text reply to a conversation. Optional `opts` carries
+	 * thread routing + future per-send hints; channels that don't honour an
+	 * option silently ignore it.
+	 */
+	sendText(conversationId: string, text: string, opts?: OutboundSendOptions): Promise<void>;
 	/**
 	 * Optional: send a media attachment (image / video / audio / voice / doc /
 	 * sticker) to a conversation. Channels that don't support media omit this
@@ -235,6 +317,21 @@ export interface ChannelAdapter {
 	 * indicator. Best-effort — channels without presence omit this slot.
 	 */
 	setComposing?(conversationId: string, state: "composing" | "paused"): Promise<void>;
+	/**
+	 * Optional: per-channel pairing customization. When present, the manager
+	 * uses this adapter's `idLabel` for the challenge card's "Your X" line
+	 * and calls `notifyApproval` after `brigade pairing approve` so the
+	 * requester sees confirmation in-channel. When absent, the manager
+	 * falls back to its built-in phone-vs-account heuristic.
+	 */
+	pairing?: ChannelPairingAdapter;
+	/**
+	 * Optional: declarative setup wizard the CLI's `brigade channels add`
+	 * walks the operator through. Channels with non-QR credentials (Slack
+	 * bot token, Discord app token, etc.) MUST provide this; channels with
+	 * QR/OAuth pairing (WhatsApp) leave it undefined.
+	 */
+	setup?: ChannelSetupAdapter;
 }
 
 /** Context for a channel command handler (a `/cmd` typed in a channel chat). */
@@ -308,6 +405,178 @@ export interface Integration {
 	isConfigured(cfg: BrigadeConfig, env?: NodeJS.ProcessEnv): boolean;
 }
 
+/* ─────────────────────────── memory plugin SDK ─────────────────────────── */
+
+/**
+ * Memory backend capability. A plugin can register an alternative memory
+ * backend (vector DB, knowledge graph, sqlite-fts) that replaces Brigade's
+ * bundled file-based store. Only one capability is active at a time — the
+ * `extensions.slots.memory` config knob picks the active plugin. When
+ * unset, Brigade uses the built-in file-based store.
+ */
+export interface MemoryCapability {
+	id: string;
+	label: string;
+	/** Search the memory store. Returns ranked hits with content + score. */
+	search(query: string, opts?: { limit?: number; sessionKey?: string }): Promise<
+		{ id: string; content: string; score: number; source: "memory" | "session" }[]
+	>;
+	/** Append a fact to the store. */
+	recordFact(content: string, opts?: { meta?: Record<string, string> }): Promise<{ id: string }>;
+	/** Optional: backend health for `brigade doctor`. */
+	status?(): Promise<{ ready: boolean; itemCount?: number; details?: string }>;
+}
+
+/**
+ * Embedding provider for vector-search memory backends. Registered separately
+ * from `MemoryCapability` so a backend and an embedding model can be mixed
+ * (e.g. lancedb + an OpenAI embedding adapter; or local node-llama embeddings).
+ */
+export interface MemoryEmbeddingProvider {
+	id: string;
+	label: string;
+	requiresEnv?: string[];
+	isConfigured(cfg: BrigadeConfig, env?: NodeJS.ProcessEnv): boolean;
+	/** Embed a single query string. */
+	embedQuery(text: string): Promise<number[]>;
+	/** Embed a batch of strings (vector-index population). */
+	embedBatch(texts: ReadonlyArray<string>): Promise<number[][]>;
+}
+
+/* ─────────────────────────── context-engine / compaction / harness ─────────────────────────── */
+
+/**
+ * Context-engine capability. Owns assembling messages + estimating tokens +
+ * compacting on-demand. Brigade's default is pass-through (the agent loop
+ * uses Pi's session messages); a plugin can register an alternative
+ * (semantic packing, sliding window, etc). Picked via
+ * `extensions.slots.contextEngine`. Today this is shape-only — the
+ * consumer-side resolver lands when the first alternative engine ships.
+ */
+export interface ContextEngineCapability {
+	id: string;
+	label: string;
+	/**
+	 * Assemble the context for the next turn. Returns the message array the
+	 * agent loop should send and optionally a `systemPromptAddition`
+	 * injected at the post-marker (ephemeral) slot. Omit `assemble` to use
+	 * the session's own messages verbatim.
+	 */
+	assemble?(args: {
+		sessionMessages: ReadonlyArray<unknown>;
+		signal?: AbortSignal;
+	}): Promise<{ messages: ReadonlyArray<unknown>; systemPromptAddition?: string }>;
+	/** Per-message ingest hook (e.g. for RAG indexing). */
+	ingest?(message: unknown): Promise<void>;
+	/** Post-turn callback (background work). */
+	afterTurn?(args: { turnIndex: number }): Promise<void>;
+}
+
+/**
+ * Compaction provider — pluggable summarizer. Brigade's default is the
+ * head+tail truncation in `smart-compaction.ts`; a plugin can register a
+ * full LLM-summary-based compactor. Shape-only today.
+ */
+export interface CompactionProvider {
+	id: string;
+	label: string;
+	/**
+	 * Summarize older messages into one. Receives the messages to compact
+	 * + the compression target ratio (0..1; smaller = more aggressive).
+	 */
+	summarize(args: {
+		messages: ReadonlyArray<unknown>;
+		compressionRatio: number;
+		signal?: AbortSignal;
+	}): Promise<string>;
+}
+
+/**
+ * Agent harness — pluggable agent-loop shape (Pi / Codex / Claude-Code).
+ * Brigade's default is the Pi-coding-agent shape; a plugin can register an
+ * alternative that runs the turn through a different engine. The resolver
+ * picks based on `supports(ctx)` priority. Shape-only today; the consumer-
+ * side selection lives in `agent-loop.ts` and currently always picks Pi.
+ */
+export interface AgentHarness {
+	id: string;
+	label: string;
+	/** Higher numbers win when multiple harnesses match. Pi default is 0. */
+	priority: number;
+	/** Does this harness know how to drive the given provider/model? */
+	supports(ctx: { provider: string; model?: string }): boolean;
+	/** Run one turn through this harness shape. */
+	runAttempt(args: {
+		prompt: string;
+		signal?: AbortSignal;
+	}): Promise<{ reply: string; toolCalls?: ReadonlyArray<unknown> }>;
+}
+
+/* ─────────────────────────── provider auth methods ─────────────────────────── */
+
+/**
+ * Auth method a model provider supports. Multiple methods can coexist (e.g.
+ * Anthropic supports API key + CLI + OAuth). The onboarding wizard offers each
+ * configured method; the runtime resolves the first viable one at session
+ * start. Shape-only today; current providers use the bundled API-key flow.
+ */
+export interface ProviderAuthMethod {
+	id: string;
+	label: string;
+	/** Auth kind — drives the onboarding UI shape. */
+	kind: "api_key" | "oauth" | "cli_token" | "custom";
+	/**
+	 * Interactive flow — invoked by `brigade onboard` to capture credentials.
+	 * Receives a logger callback for prompts; returns the credential record
+	 * to persist (or `null` if the operator cancelled).
+	 */
+	run?(args: { logger: (msg: string) => void }): Promise<Record<string, unknown> | null>;
+	/**
+	 * Non-interactive resolution — invoked when the gateway boots. Returns
+	 * the credentials when discoverable from env/files/keychain, else `null`.
+	 */
+	runNonInteractive?(args: { env: NodeJS.ProcessEnv }): Promise<Record<string, unknown> | null>;
+	/**
+	 * OAuth refresh — invoked when the runtime detects an expired token.
+	 * Returns the refreshed credentials. Only applicable to OAuth providers.
+	 */
+	refreshOAuth?(args: { stored: Record<string, unknown> }): Promise<Record<string, unknown> | null>;
+}
+
+/* ─────────────────────────── hook system contracts ─────────────────────────── */
+
+/**
+ * Hook result returned by a `modifying` or `claiming` hook handler.
+ *   - `handled: true` (claiming pattern): this handler took ownership; later
+ *     handlers are skipped.
+ *   - `shouldStop: true` (modifying pattern): early-stop the chain after
+ *     this handler's modifications are merged.
+ *   - `modifications`: opaque shape — the hook runner merges these into the
+ *     downstream payload per the hook's documented merge policy.
+ */
+export interface HookResult {
+	handled?: boolean;
+	shouldStop?: boolean;
+	modifications?: Record<string, unknown>;
+}
+
+/**
+ * Hook execution pattern. Each hook event declares its pattern; the runner
+ * dispatches accordingly:
+ *   - `"void"` — handlers run in parallel via Promise.all; results discarded.
+ *     Used for telemetry-only events (`turn_start`, `agent_end`).
+ *   - `"modifying"` — handlers run sequentially by priority; each returns
+ *     optional modifications merged into the payload. Early-stops on
+ *     `{shouldStop: true}`.
+ *   - `"claiming"` — handlers run sequentially; first to return
+ *     `{handled: true}` wins, rest skipped. Used for `inbound_claim` /
+ *     `before_dispatch` / `reply_dispatch` where one plugin owns the event.
+ *   - `"sync"` — sequential synchronous; throws if a handler returned a
+ *     Promise. Used for write-path-time mutators that must complete before
+ *     the next operation (`tool_result_persist`, `before_message_write`).
+ */
+export type HookExecutionPattern = "void" | "modifying" | "claiming" | "sync";
+
 /** Context handed to a background service when the gateway starts it. */
 export interface ServiceStartContext {
 	/** Subsystem logger. */
@@ -335,16 +604,72 @@ export type HttpRouteHandler = (req: IncomingMessage, res: ServerResponse) => vo
 export interface HttpRoute {
 	/** HTTP method; defaults to any when omitted. */
 	method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
-	/** Exact path, e.g. `/webhooks/stripe`. */
+	/** Path to match, e.g. `/webhooks/stripe`. Combined with `match`. */
 	path: string;
 	handler: HttpRouteHandler;
+	/**
+	 * Authentication model for the route:
+	 *   - `"none"` (default for back-compat) — public; the handler is
+	 *     responsible for verifying signatures / HMAC. Use for inbound
+	 *     webhooks that authenticate via provider-signed payloads.
+	 *   - `"operator"` — gateway gates the route on the same operator-auth
+	 *     used for WS clients. Use for plugin-supplied admin endpoints.
+	 * Plugin authors should set this deliberately — defaulting to `"none"`
+	 * preserves existing routes but newly-added ones should pick.
+	 */
+	auth?: "none" | "operator";
+	/**
+	 * Path-matching mode. `"exact"` (default) matches the literal path.
+	 * `"prefix"` matches everything under the path (e.g. `/webhooks/stripe`
+	 * also matches `/webhooks/stripe/foo`). Required for multi-event
+	 * webhook endpoints that route on a sub-path.
+	 */
+	match?: "exact" | "prefix";
+	/**
+	 * Body size cap in bytes. The gateway rejects requests larger than
+	 * this with HTTP 413 BEFORE invoking the handler. Defaults to 1 MiB
+	 * (matches the reference upstream's post-auth limit).
+	 */
+	maxBodyBytes?: number;
+	/**
+	 * Total request-handling timeout (ms). The gateway sends HTTP 408 if
+	 * the handler hasn't finished by then. Defaults to 30s.
+	 */
+	timeoutMs?: number;
+}
+
+/**
+ * Caller identity surfaced to gateway-RPC handlers. The gateway populates
+ * this from the WS connection's operator-auth state. Plugin handlers can
+ * gate on `scopes` to enforce per-method admin / write / read separation
+ * without re-implementing the auth check.
+ */
+export interface GatewayCaller {
+	/** Stable operator id from the WS connection (`null` for unauthenticated). */
+	readonly id: string | null;
+	/** Granted scopes — e.g. `["operator.read"]`, `["operator.admin"]`. */
+	readonly scopes: ReadonlyArray<string>;
 }
 
 /** A module-registered gateway RPC method clients can invoke. */
 export interface GatewayMethodHandler {
 	/** Method name clients invoke; namespaced by convention, e.g. `whatsapp.status`. */
 	name: string;
-	handler: (params: unknown) => Promise<unknown> | unknown;
+	/**
+	 * Handler invoked when a WS client (or local CLI) calls this RPC.
+	 * Receives parsed params plus an optional caller-identity snapshot —
+	 * gate sensitive operations on `caller.scopes` to enforce per-method
+	 * auth when WS is exposed beyond localhost. Existing handlers that
+	 * only declare `(params)` keep working; new ones can declare
+	 * `(params, caller)` to read the auth context.
+	 */
+	handler: (params: unknown, caller?: GatewayCaller) => Promise<unknown> | unknown;
+	/**
+	 * Required scope to invoke this method. The gateway refuses calls from
+	 * callers without the scope. Unset = anyone authenticated can invoke
+	 * (read-equivalent). Use `"operator.admin"` for state-changing methods.
+	 */
+	scope?: "operator.read" | "operator.write" | "operator.admin";
 }
 
 /* ─────────────────────────── the module context ─────────────────────────── */
@@ -353,6 +678,18 @@ export interface GatewayMethodHandler {
 export interface ModelProviderRegistration {
 	name: string;
 	config: unknown; // Pi's ProviderConfig (kept loose to avoid coupling the seam to Pi internals)
+}
+
+/**
+ * A recorded provider-auth-method registration. Brigade keeps these in its own
+ * registry (not replayed into Pi) because auth resolution happens BEFORE the Pi
+ * session boots — `runNonInteractive` is consulted at gateway start, `run`
+ * during onboarding. Multiple methods may register against the same
+ * `providerName`; iteration order = registration order.
+ */
+export interface ProviderAuthMethodRegistration {
+	providerName: string;
+	method: ProviderAuthMethod;
 }
 
 /** A recorded slash-command registration (replayed via `pi.registerCommand`). */
@@ -377,7 +714,20 @@ export interface HookRegistration {
 /** A recorded tool registration + its enablement gate. */
 export interface ToolRegistration {
 	tool: AnyBrigadeTool;
-	/** Toolset grouping (minimal/coding/messaging/full); informs profile gating. */
+	/**
+	 * Toolset grouping (e.g. `"minimal" | "coding" | "messaging" | "full"`)
+	 * — the registry filters by the active profile when one is set.
+	 *
+	 * Wiring: `BrigadeExtensionRegistry.eligibleTools({ toolset })` and
+	 * `toolNames({ toolset })` / `toPiExtensionFactory({ toolset })` honour
+	 * this field — a tool whose `toolset` differs from the active profile
+	 * is dropped from BOTH the unknown-tool allowlist and the Pi tool
+	 * surface. Tools registered with no `toolset` (or `"*"`) are universal
+	 * and always included, so un-tagged tools never disappear behind a
+	 * profile switch. The active profile is sourced from
+	 * `agents.defaults.toolset` in `brigade.json`; unset / `"full"` means
+	 * "no filter".
+	 */
 	toolset?: string;
 	/** Eligibility gate (skills-style check_fn) — false → tool not offered this run. */
 	eligible?: () => boolean;
@@ -418,6 +768,16 @@ export interface BrigadeExtensionContext {
 	hook(event: string, handler: (...args: unknown[]) => unknown, opts?: { priority?: number }): void;
 	command(name: string, options: unknown): void;
 	modelProvider(name: string, config: unknown): void;
+	/**
+	 * Register a provider auth method (API key / OAuth / CLI token / custom).
+	 * `providerName` is the model provider id the method belongs to (e.g.
+	 * `"anthropic"`); a single provider can register multiple methods
+	 * (Anthropic ships API-key + OAuth + CLI). The onboarding wizard offers
+	 * each method the operator can satisfy; the runtime resolves the first
+	 * viable one at session start. Today this is shape-only — the consumer-
+	 * side resolver lands when the first OAuth provider ships as a plugin.
+	 */
+	providerAuthMethod(providerName: string, method: ProviderAuthMethod): void;
 
 	/* product-level → Brigade capability registries (gateway-level) */
 	channel(adapter: ChannelAdapter): void;
@@ -426,6 +786,17 @@ export interface BrigadeExtensionContext {
 	tts(provider: SpeechProvider): void;
 	stt(provider: TranscriptionProvider): void;
 	mediaGen(provider: MediaGenProvider): void;
+	/** Register an alternative memory backend. Only one is active at a time
+	 *  (picked via `extensions.slots.memory` config knob). */
+	memory(capability: MemoryCapability): void;
+	/** Register a memory embedding provider (for vector backends). */
+	memoryEmbeddingProvider(provider: MemoryEmbeddingProvider): void;
+	/** Register an alternative context engine (`extensions.slots.contextEngine` picks). */
+	contextEngine(engine: ContextEngineCapability): void;
+	/** Register an alternative compaction strategy. */
+	compactionProvider(provider: CompactionProvider): void;
+	/** Register an alternative agent harness shape (Codex / Claude-Code / etc). */
+	agentHarness(harness: AgentHarness): void;
 	integration(integration: Integration): void;
 	/** Register a long-lived background service (started at boot, stopped on shutdown). */
 	service(service: Service): void;
@@ -436,6 +807,39 @@ export interface BrigadeExtensionContext {
 }
 
 /**
+ * Optional declarative manifest a module can ship alongside `register()` to
+ * surface its capability metadata WITHOUT requiring the module to be loaded.
+ * Today the field is informational; the future discovery planner will consume
+ * it to decide which modules to load for a given trigger (saving cold-boot
+ * cost on installs with many modules).
+ */
+export interface BrigadeModuleManifest {
+	id: string;
+	name?: string;
+	description?: string;
+	version?: string;
+	/** Whether bundled-origin modules are active by default (defaults to true). */
+	enabledByDefault?: boolean;
+	/** Capabilities this module CONTRIBUTES — used by the future planner. */
+	provides?: {
+		tools?: string[];
+		hooks?: string[];
+		channels?: string[];
+		providers?: string[];
+		memoryBackends?: string[];
+		contextEngines?: string[];
+		agentHarnesses?: string[];
+	};
+	/** Activation triggers — the planner only loads this module when one fires. */
+	activation?: {
+		onChannels?: string[];
+		onProviders?: string[];
+		onCommands?: string[];
+		onCapabilities?: string[];
+	};
+}
+
+/**
  * A Brigade module — the unit of extension. One module may register any mix of
  * tools/hooks/commands/providers (agent-level) and channels/voice/media/integrations
  * (product-level). Discovered + loaded by the extension loader; gated by `eligible`
@@ -443,6 +847,13 @@ export interface BrigadeExtensionContext {
  */
 export interface BrigadeModule {
 	id: string;
+	/**
+	 * Optional declarative manifest — see `BrigadeModuleManifest`. Surfaces
+	 * what this module provides + when to activate it WITHOUT loading the
+	 * module's full register code. Future discovery planner will consume
+	 * this; today it's informational.
+	 */
+	manifest?: BrigadeModuleManifest;
 	/** Env vars required for this module to load at all. */
 	requiresEnv?: string[];
 	/**

@@ -456,20 +456,32 @@ export function buildProgram(): Command {
       process.exit(await runChannelsAllowRemove({ id, channel: opts.channel }, { json: opts.json }));
     });
 
-  // `channels add` — non-interactive provisioning for token-based channels.
+  // `channels add` — credential-prompt wizard for token-based channels
+  // (Slack/Telegram/Discord shape). Each adapter declares its credential
+  // keys via `setup.credentialKeys`; the wizard prompts for each in turn,
+  // honours env-var pre-fills, and persists into brigade.json. WhatsApp
+  // and other QR/OAuth channels redirect operators to `channels link`.
   channels
     .command("add")
-    .description("Provision a token-based channel non-interactively (Slack/Telegram/Discord shape)")
-    .requiredOption("--channel <id>", "channel id (e.g. slack)")
-    .option("--token <secret>", "auth token / api key")
-    .option("--account <id>", "account id (multi-account channels)")
-    .option("--set <kv...>", "extra key=value pairs (parsed JSON, falls back to string)")
+    .description(
+      "Walk the channel's setup wizard and save credentials to your Brigade config.\n" +
+        "  QR/OAuth channels (e.g. WhatsApp) use `channels link` instead.\n" +
+        "  Examples:\n" +
+        "    brigade channels add --channel slack\n" +
+        "    brigade channels add --channel slack --non-interactive   # env-vars only",
+    )
+    .option("--channel <id>", "channel id (auto-picked when only one is available)")
+    .option(
+      "--non-interactive",
+      "fail unless every credential is provided via its declared env var (CI mode)",
+      false,
+    )
     .option("--json", "emit JSON instead of human-readable text", false)
-    .action(async (opts: { channel: string; token?: string; account?: string; set?: string[]; json?: boolean }) => {
+    .action(async (opts: { channel?: string; nonInteractive?: boolean; json?: boolean }) => {
       const { runChannelsAdd } = await import("../commands/channels.js");
       process.exit(
         await runChannelsAdd(
-          { channel: opts.channel, token: opts.token, account: opts.account, set: opts.set },
+          { channel: opts.channel, nonInteractive: opts.nonInteractive },
           { json: opts.json },
         ),
       );

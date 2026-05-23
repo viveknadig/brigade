@@ -12,33 +12,72 @@
  */
 
 import { BUNDLED_MODULES, loadModules } from "../../agents/extensions/index.js";
+import type { ChannelAdapter } from "../../agents/extensions/types.js";
 import { approvePairingCode, readPendingPairings, revokePairingCode } from "../../agents/channels/access-control/index.js";
 import { DEFAULT_AGENT_ID, resolveAgentWorkspaceDir } from "../../config/paths.js";
 import { loadConfig } from "../../core/config.js";
 
-/** Resolve the channel id; either auto-picked (single channel) or named. */
-async function resolveChannelId(wanted: string | undefined): Promise<{ id: string } | { error: number }> {
-	const config = loadConfig();
-	const workspaceDir = resolveAgentWorkspaceDir(DEFAULT_AGENT_ID);
-	const registry = await loadModules({
-		modules: BUNDLED_MODULES,
-		meta: { agentId: DEFAULT_AGENT_ID, workspaceDir, cwd: workspaceDir, config: config as never },
-	});
-	const ids = registry.channels.map((c) => c.id);
-	if (ids.length === 0) {
+/**
+ * Test injection hook — overrides the channel registry so unit tests can
+ * drive `pairing approve` against a fake adapter (with a spy `notifyApproval`)
+ * without depending on bundled modules. Production callers leave this
+ * `undefined`; tests set it in `beforeEach` and clear it in `afterEach`.
+ */
+let testChannelOverride: ChannelAdapter[] | undefined;
+
+/** @internal — tests only. */
+export function __setPairingChannelsForTests(channels: ChannelAdapter[] | undefined): void {
+	testChannelOverride = channels;
+}
+
+/**
+ * Resolve the channel id; either auto-picked (single channel) or named.
+ * Also returns the adapter so callers that need to invoke per-channel
+ * pairing hooks (`notifyApproval`) don't have to re-load the module
+ * registry a second time.
+ */
+async function resolveChannel(
+	wanted: string | undefined,
+): Promise<{ id: string; adapter: ChannelAdapter } | { error: number }> {
+	let adapters: ChannelAdapter[];
+	if (testChannelOverride) {
+		adapters = testChannelOverride;
+	} else {
+		const config = loadConfig();
+		const workspaceDir = resolveAgentWorkspaceDir(DEFAULT_AGENT_ID);
+		const registry = await loadModules({
+			modules: BUNDLED_MODULES,
+			meta: { agentId: DEFAULT_AGENT_ID, workspaceDir, cwd: workspaceDir, config: config as never },
+		});
+		adapters = registry.channels;
+	}
+	if (adapters.length === 0) {
 		process.stderr.write("No channels are bundled or installed.\n");
 		return { error: 2 };
 	}
 	if (wanted) {
-		if (!ids.includes(wanted)) {
-			process.stderr.write(`Unknown channel "${wanted}" (have: ${ids.join(", ")}).\n`);
+		const found = adapters.find((c) => c.id === wanted);
+		if (!found) {
+			process.stderr.write(`Unknown channel "${wanted}" (have: ${adapters.map((c) => c.id).join(", ")}).\n`);
 			return { error: 2 };
 		}
-		return { id: wanted };
+		return { id: found.id, adapter: found };
 	}
-	if (ids.length === 1) return { id: ids[0] as string };
-	process.stderr.write(`More than one channel is available — pick one with --channel <id> (have: ${ids.join(", ")}).\n`);
+	if (adapters.length === 1) {
+		const sole = adapters[0] as ChannelAdapter;
+		return { id: sole.id, adapter: sole };
+	}
+	process.stderr.write(
+		`More than one channel is available — pick one with --channel <id> (have: ${adapters.map((c) => c.id).join(", ")}).\n`,
+	);
 	return { error: 2 };
+}
+
+/** Back-compat helper for existing call sites that only need the id. */
+async function resolveChannelId(wanted: string | undefined): Promise<{ id: string } | { error: number }> {
+	const r = await resolveChannel(wanted);
+	if ("error" in r) return { error: r.error };
+	return { id: r.id };
 }
 
 /* ─────────────────────────── pairing list ─────────────────────────── */
@@ -73,7 +112,7 @@ export async function runPairingApprove(
 	args: { code: string; channel?: string },
 	opts: { json?: boolean } = {},
 ): Promise<number> {
-	const resolved = await resolveChannelId(args.channel);
+	const resolved = await resolveChannel(args.channel);
 	if ("error" in resolved) return resolved.error;
 	const approved = approvePairingCode(resolved.id, args.code);
 	if (!approved) {
@@ -87,6 +126,21 @@ export async function runPairingApprove(
 	} else {
 		const who = approved.senderName ? `${approved.senderName} (${approved.senderId})` : approved.senderId;
 		process.stdout.write(`Approved ${who} on ${resolved.id}. They can now DM the agent.\n`);
+	}
+	// Best-effort in-channel confirmation — when the channel adapter declares
+	// a `pairing.notifyApproval` hook, fire it so the requester sees a
+	// "you're approved" reply in-channel. Failures here are non-fatal: the
+	// approval already landed in the on-disk allow-list, the operator
+	// already saw the CLI confirmation. WhatsApp currently omits this
+	// hook (no slot wired); Slack/Discord channels will fill it in.
+	const notify = resolved.adapter.pairing?.notifyApproval;
+	if (notify) {
+		try {
+			await notify({ senderId: approved.senderId, senderName: approved.senderName });
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			process.stderr.write(`Warning: failed to notify approved sender in-channel (${msg}).\n`);
+		}
 	}
 	return 0;
 }

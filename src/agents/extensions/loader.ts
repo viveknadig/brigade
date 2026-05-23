@@ -8,6 +8,12 @@
  * and per-module `configSchema` validation of `entries[id].config`. A module
  * that throws (or fails validation) is skipped, never fatal. Bundled modules win
  * id conflicts with user modules (a user module can't shadow a core capability).
+ *
+ * Activation traceability: EVERY module decision (activated / skipped) emits a
+ * structured log line under the `extensions/loader` subsystem. The reason is a
+ * stable enum (`disabled`/`requiresEnv`/`eligible`/`allowlist`/`configSchema`/
+ * `registerFailed`) so an operator running `brigade doctor` or scraping the
+ * JSONL log can answer "why didn't my plugin load" without source-diving.
  */
 
 import { Check, Errors } from "typebox/value";
@@ -16,7 +22,7 @@ import type { BrigadeConfig } from "../../config/io.js";
 import { resolveExtensionsDir } from "../../config/paths.js";
 import { withTimeout } from "../../core/extension-lifecycle.js";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
-import { discoverUserModules } from "./discovery.js";
+import { discoverUserModules, type DiscoveredModule } from "./discovery.js";
 import { BrigadeExtensionRegistry, type RegistryContextMeta } from "./registry.js";
 import type { BrigadeModule } from "./types.js";
 
@@ -65,6 +71,15 @@ export interface LoadModulesArgs {
 	noDiscovery?: boolean;
 }
 
+/** Per-module decision tag the loader emits on every load attempt. */
+type ActivationReason =
+	| "disabled"
+	| "requiresEnv"
+	| "eligible"
+	| "allowlist"
+	| "configSchema"
+	| "registerFailed";
+
 /**
  * Run the eligible modules into a fresh registry. Returns the populated
  * registry; the list of modules that actually registered is on
@@ -85,7 +100,7 @@ export async function loadModules(args: LoadModulesArgs): Promise<BrigadeExtensi
 
 	// Bundled first; then user modules (deduped — a bundled id wins).
 	const bundledIds = new Set(args.modules.map((m) => m.id));
-	const userModules: BrigadeModule[] = [];
+	const userModules: DiscoveredModule[] = [];
 	if (!args.noDiscovery) {
 		const discovered = await discoverUserModules(args.extensionsDir ?? resolveExtensionsDir());
 		for (const d of discovered) {
@@ -96,28 +111,52 @@ export async function loadModules(args: LoadModulesArgs): Promise<BrigadeExtensi
 				});
 				continue;
 			}
-			userModules.push(d.module);
+			userModules.push(d);
 		}
 	}
-	const all = [...args.modules, ...userModules];
 
-	for (const m of all) {
-		if (disabled.has(m.id)) continue;
+	// Pair each module with its origin/source so the activation log can record
+	// provenance for both bundled and user modules.
+	type Decision = { module: BrigadeModule; origin: "bundled" | "user"; source?: string };
+	const all: Decision[] = [
+		...args.modules.map<Decision>((m) => ({ module: m, origin: "bundled" })),
+		...userModules.map<Decision>((d) => ({ module: d.module, origin: "user", source: d.source })),
+	];
+
+	for (const { module: m, origin, source } of all) {
+		if (disabled.has(m.id)) {
+			logSkip(m.id, origin, source, "disabled", "extensions.disabled[] or entries[id].enabled=false");
+			continue;
+		}
 		// Allowlist: when non-empty, only listed modules load.
-		if (allow.length > 0 && !allow.includes(m.id)) continue;
-		if (m.requiresEnv && m.requiresEnv.some((v) => !env[v] || env[v]?.trim() === "")) continue;
-		if (m.eligible && !m.eligible({ config, env })) continue;
+		if (allow.length > 0 && !allow.includes(m.id)) {
+			logSkip(m.id, origin, source, "allowlist", "extensions.allow does not include this id");
+			continue;
+		}
+		if (m.requiresEnv) {
+			const missing = m.requiresEnv.find((v) => !env[v] || env[v]?.trim() === "");
+			if (missing) {
+				logSkip(m.id, origin, source, "requiresEnv", `missing ${missing}`);
+				continue;
+			}
+		}
+		if (m.eligible && !m.eligible({ config, env })) {
+			logSkip(m.id, origin, source, "eligible", "eligible() returned false");
+			continue;
+		}
 
 		// Per-module config-schema validation against entries[id].config.
 		const moduleConfig = entries[m.id]?.config;
 		if (m.configSchema && !Check(m.configSchema, moduleConfig ?? {})) {
 			// Surface the first validation error so the operator knows WHAT to set.
 			const first = Errors(m.configSchema, moduleConfig ?? {})[0] as { path?: string; message?: string } | undefined;
-			log.warn("extension config failed validation — skipping module", {
-				module: m.id,
-				path: first?.path,
-				reason: first?.message,
-			});
+			logSkip(
+				m.id,
+				origin,
+				source,
+				"configSchema",
+				`config invalid at ${first?.path ?? "<root>"}: ${first?.message ?? "validation error"}`,
+			);
 			continue;
 		}
 
@@ -131,12 +170,40 @@ export async function loadModules(args: LoadModulesArgs): Promise<BrigadeExtensi
 				`module ${m.id} register`,
 			);
 			registry.loadedModules.push(m);
+			log.info("extension activated", { id: m.id, origin, source });
 		} catch (err) {
-			log.warn("extension module register failed", {
-				module: m.id,
-				error: err instanceof Error ? err.message : String(err),
-			});
+			logSkip(
+				m.id,
+				origin,
+				source,
+				"registerFailed",
+				err instanceof Error ? err.message : String(err),
+			);
 		}
 	}
 	return registry;
+}
+
+/**
+ * Emit a stable, structured `extension skipped` log line. The shape is
+ * deliberately fixed (`id`/`origin`/`source`/`reason`/`cause`) so a future
+ * `brigade doctor` UI can render skip explanations without source-diving.
+ */
+function logSkip(
+	id: string,
+	origin: "bundled" | "user",
+	source: string | undefined,
+	reason: ActivationReason,
+	cause: string,
+): void {
+	const fields: Record<string, unknown> = { id, origin, reason, cause };
+	if (source) fields.source = source;
+	// `registerFailed` is a real error (the module threw); everything else is a
+	// configured skip and stays at warn so it doesn't drown an operator who's
+	// just running a constrained allowlist.
+	if (reason === "registerFailed") {
+		log.warn("extension register failed", fields);
+	} else {
+		log.info("extension skipped", fields);
+	}
 }

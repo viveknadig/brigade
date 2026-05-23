@@ -15,7 +15,7 @@ import path from "node:path";
 
 import type { BrigadeConfig } from "../../../config/io.js";
 import { ensureDir, resolveChannelStateDir } from "../../../config/paths.js";
-import type { ChannelAdapter, ChannelStartContext } from "../../extensions/types.js";
+import type { ChannelAdapter, ChannelStartContext, OutboundSendOptions } from "../../extensions/types.js";
 import { connectWhatsApp, type WhatsAppConnection } from "./connection.js";
 
 const CHANNEL_ID = "whatsapp";
@@ -108,10 +108,20 @@ export function createWhatsAppAdapter(): ChannelAdapter {
 			connection = null;
 		},
 
-		async sendText(conversationId: string, text: string): Promise<void> {
+		async sendText(conversationId: string, text: string, opts?: OutboundSendOptions): Promise<void> {
 			if (!connection) throw new Error("WhatsApp channel is not started");
+			// WhatsApp has no thread routing — `opts.threadId` is accepted for
+			// signature compatibility with threaded channels (Slack/Discord)
+			// and silently ignored here.
+			void opts;
 			await connection.sendText(conversationId, text);
 		},
+		// Pairing customization — WhatsApp ids are international phone numbers,
+		// so the challenge card uses the "Your number: +X" line. No
+		// `normalizeAllowEntry` (numbers are already in canonical form by the
+		// time they reach the allow store) and no `notifyApproval` (operator
+		// can DM the approved sender manually for now).
+		pairing: { idLabel: "phone" as const },
 		async sendMedia(conversationId, media): Promise<void> {
 			if (!connection) throw new Error("WhatsApp channel is not started");
 			await connection.sendMedia(conversationId, media);

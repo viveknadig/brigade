@@ -32,6 +32,18 @@ describe("WhatsApp adapter", () => {
 		const a = createWhatsAppAdapter();
 		await a.stop(); // must not throw even though nothing was connected
 	});
+
+	it("exposes a pairing adapter with idLabel='phone' (Lane C parity)", () => {
+		// The manager reads `pairing.idLabel` to decide whether the challenge
+		// card says "Your number" / "Your username" / "Your account". WhatsApp
+		// ids are international phone numbers, so the slot is declared with
+		// `idLabel: "phone"`. No `normalizeAllowEntry` / `notifyApproval` for
+		// WhatsApp today — those land per-channel as later channels (Slack,
+		// Discord) ship.
+		const a = createWhatsAppAdapter();
+		assert.ok(a.pairing, "WhatsApp adapter must expose a pairing slot");
+		assert.equal(a.pairing?.idLabel, "phone");
+	});
 });
 
 describe("whatsAppModule", () => {

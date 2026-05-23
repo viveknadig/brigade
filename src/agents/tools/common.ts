@@ -25,6 +25,9 @@
 
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 
+import { emitAgentEvent } from "../agent-event-bus.js";
+import type { AgentToolUpdateCallback, AnyBrigadeTool } from "./types.js";
+
 /**
  * 400-class error for malformed / missing tool arguments. Pi catches
  * thrown errors from `execute` and surfaces them as tool failures to
@@ -287,4 +290,129 @@ export function payloadTextResult<TDetails>(
  */
 export function jsonResult(payload: unknown): AgentToolResult<unknown> {
 	return textResult(JSON.stringify(payload, null, 2), payload);
+}
+
+/* ─────────────────────── streaming tool updates ─────────────────────── */
+
+/**
+ * Correlation context for a `withToolUpdates` wrapper. Held by reference
+ * so the agent loop can populate it as soon as a turn binds to the wrapper
+ * — the wrapper reads `ctxRef.value` lazily at emit-time, never at wrap-
+ * time. All fields are optional: an empty context still emits events
+ * (consumers that don't need correlation can subscribe regardless).
+ */
+export interface BrigadeToolUpdateContextRef {
+	value: {
+		runId?: string;
+		agentId?: string;
+		sessionKey?: string;
+	};
+}
+
+/**
+ * Wrap a Brigade tool so that every `onUpdate(partial)` callback Pi
+ * invokes during `execute` is mirrored to the process-global agent
+ * event bus as a `tool-update` event. The caller's own `onUpdate`
+ * (when Pi or another wrapper supplies one) is invoked too — the
+ * wrapper is a tee, not a sink.
+ *
+ * The returned object preserves the wrapped tool's `name`,
+ * `description`, `parameters`, `label`, and any Brigade extension
+ * fields (`ownerOnly`, `displaySummary`) via prototype-style spread.
+ * Only `execute` is replaced. Thrown errors from the inner `execute`
+ * propagate unchanged so retry / classification logic upstream sees
+ * the original failure.
+ */
+export function withToolUpdates(
+	tool: AnyBrigadeTool,
+	ctxRef: BrigadeToolUpdateContextRef,
+): AnyBrigadeTool {
+	const innerExecute = tool.execute.bind(tool);
+	const wrappedExecute: AnyBrigadeTool["execute"] = (
+		toolCallId,
+		params,
+		signal,
+		onUpdate,
+	) => {
+		const teedUpdate: AgentToolUpdateCallback = (partial) => {
+			// Bus emit first so a throwing downstream consumer can't starve
+			// the original caller. `emitAgentEvent` already catches listener
+			// errors internally; this is belt-and-suspenders.
+			try {
+				const ctx = ctxRef.value;
+				emitAgentEvent({
+					type: "tool-update",
+					runId: ctx.runId,
+					agentId: ctx.agentId,
+					sessionKey: ctx.sessionKey,
+					toolName: tool.name,
+					toolCallId,
+					payload: partial,
+				});
+			} catch {
+				// Defensive: never let bus plumbing break a tool's own
+				// update channel. The bus itself is silent on listener
+				// errors, so reaching here would require a defect in the
+				// bus module — still, swallow so the caller's onUpdate
+				// always runs.
+			}
+			// Forward to the original caller (if any). A throwing caller
+			// is THEIR bug; let it propagate up through Pi the same way
+			// it would without the wrapper.
+			if (onUpdate) onUpdate(partial);
+		};
+		return innerExecute(toolCallId, params, signal, teedUpdate);
+	};
+
+	// Spread first so any future Pi/Brigade tool fields ride along
+	// automatically; override `execute` last.
+	return {
+		...tool,
+		execute: wrappedExecute,
+	};
+}
+
+/* ─────────────────────────── owner-only gating ─────────────────────────── */
+
+/**
+ * Wrap a Brigade tool so that, when the caller is NOT the workspace owner,
+ * `execute` throws a `BrigadeToolAuthorizationError` carrying
+ * `OWNER_ONLY_TOOL_ERROR` BEFORE the inner tool body runs. When the caller
+ * IS the owner, the wrapper short-circuits and returns the tool reference
+ * unchanged so there is zero extra indirection on the hot path.
+ *
+ * The guard is intentionally enforced inside `execute` (not at registration
+ * time) so the same wrapped tool object can be safely passed to Pi's
+ * `customTools` slot regardless of who initiated the turn — the gating
+ * decision is sender-scoped, not tool-scoped. The wrapper is a no-op for
+ * tools that don't declare `ownerOnly: true` so callers can apply it
+ * blindly across the tool list without per-tool branching.
+ *
+ * The thrown error is surfaced to the model the same way any other tool
+ * failure is (Pi catches and forwards `.message`); the model self-corrects
+ * by abandoning the call. The 403 status on the error class is
+ * informational for any UI / log layer that wants to distinguish auth
+ * refusals from generic input failures.
+ */
+export function wrapOwnerOnlyToolExecution(
+	tool: AnyBrigadeTool,
+	senderIsOwner: boolean,
+): AnyBrigadeTool {
+	// Owner OR non-ownerOnly tool: nothing to do. Return the original ref so
+	// the caller's identity tests (===) still match and there's no allocation
+	// for the common case.
+	if (senderIsOwner) return tool;
+	if (!tool.ownerOnly) return tool;
+
+	const refusedExecute: AnyBrigadeTool["execute"] = async () => {
+		throw new BrigadeToolAuthorizationError(OWNER_ONLY_TOOL_ERROR);
+	};
+
+	// Spread first so every Pi/Brigade tool field rides along (label,
+	// description, parameters, ownerOnly, displaySummary, prepareArguments,
+	// executionMode); override `execute` last.
+	return {
+		...tool,
+		execute: refusedExecute,
+	};
 }

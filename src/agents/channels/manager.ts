@@ -147,21 +147,38 @@ function buildOperatorFacingErrorReply(err: unknown): string {
  * in WhatsApp/Slack/Telegram. The code and CLI command sit in monospace blocks
  * so they're visually distinct and copy-pastable.
  *
- * Channel-aware wording: numeric ids (phone numbers) get "Your number: +…";
- * other shapes (Slack `U01ABC`, Discord usernames) get "Your account: …".
+ * Channel-aware wording: when the adapter's `pairing.idLabel` is set, the
+ * label follows it explicitly (`"phone"` → "Your number", `"username"` →
+ * "Your username", `"account"` → "Your account"). When the adapter has no
+ * pairing slot, falls back to the legacy heuristic (mostly-digits → phone,
+ * else account).
  */
-function senderLineFor(senderId: string): string {
-	if (!senderId) return "👤  *Your account:*  (unknown)";
-	// "Mostly digits" → display as a phone number. Operators DM the bot with
-	// formatted numbers (`+1 555-000-0001`) too; only true non-numeric ids
-	// (Slack `U01ABC`, Discord usernames) fall into the account branch.
+type PairingIdLabel = "phone" | "username" | "account";
+
+/** Legacy heuristic — used when the adapter declares no `pairing.idLabel`. */
+function heuristicLabel(senderId: string): PairingIdLabel {
+	if (!senderId) return "account";
 	const digits = senderId.replace(/\D/g, "");
 	const hasLetters = /[A-Za-z]/.test(senderId);
-	if (!hasLetters && digits.length >= 7) return `📞  *Your number:*  +${digits}`;
+	return !hasLetters && digits.length >= 7 ? "phone" : "account";
+}
+
+function senderLineFor(senderId: string, idLabel?: PairingIdLabel): string {
+	if (!senderId) return "👤  *Your account:*  (unknown)";
+	const resolved = idLabel ?? heuristicLabel(senderId);
+	if (resolved === "phone") {
+		// Operators DM the bot with formatted numbers (`+1 555-000-0001`);
+		// strip non-digits and re-prefix with `+` so the line looks like
+		// the canonical international form.
+		const digits = senderId.replace(/\D/g, "");
+		const rendered = digits.length >= 7 ? `+${digits}` : senderId;
+		return `📞  *Your number:*  ${rendered}`;
+	}
+	if (resolved === "username") return `@  *Your username:*  ${senderId}`;
 	return `👤  *Your account:*  ${senderId}`;
 }
 
-function buildChallengeReply(args: { code: string; senderId: string; channelLabel: string }): string {
+function buildChallengeReply(args: { code: string; senderId: string; channelLabel: string; idLabel?: PairingIdLabel }): string {
 	void args.channelLabel; // reserved for future per-channel salutation variants
 	// WhatsApp formatting cheat-sheet used here:
 	//   *Word*       → bold
@@ -176,7 +193,7 @@ function buildChallengeReply(args: { code: string; senderId: string; channelLabe
 		"🦁  *Brigade* — your private AI crew",
 		"╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
 		"👋  *Welcome!*  An admin needs to approve you before we can chat.",
-		senderLineFor(args.senderId),
+		senderLineFor(args.senderId, args.idLabel),
 		"🔐  *Your one-time code*",
 		"```",
 		args.code,
@@ -250,9 +267,13 @@ function buildBundledCommands(adapter: ChannelAdapter): ChannelCommand[] {
 				}
 				const target = parts[1];
 				if (sub === "add" && target) {
-					return addAllowFrom(ctx.channel, target)
-						? `Added "${target}" to the allow-from list.`
-						: `"${target}" was already on the list.`;
+					// Per-channel normalization — adapter may strip an `@` prefix
+					// or `<@U…>` mention syntax before the entry is persisted.
+					// Channels without `pairing.normalizeAllowEntry` see identity.
+					const normalized = adapter.pairing?.normalizeAllowEntry?.(target) ?? target;
+					return addAllowFrom(ctx.channel, normalized)
+						? `Added "${normalized}" to the allow-from list.`
+						: `"${normalized}" was already on the list.`;
 				}
 				if (sub === "remove" && target) {
 					return removeAllowFrom(ctx.channel, target)
@@ -282,7 +303,18 @@ export interface StartChannelsArgs {
 	 * queue, so channel turns interleave safely with TUI turns. Resolves with the
 	 * reply text to send back to the conversation.
 	 */
-	runTurn: (args: { text: string; sessionKey: string; signal?: AbortSignal }) => Promise<ChannelTurnResult>;
+	runTurn: (args: {
+		text: string;
+		sessionKey: string;
+		signal?: AbortSignal;
+		/**
+		 * `true` when the inbound came from the operator's OWN linked-channel
+		 * id (self-chat or — for groups — a self-mention). `false` for every
+		 * approved peer. Used by the agent loop to suppress the operator-
+		 * onboarding bootstrap nudge for non-owners.
+		 */
+		senderIsOwner?: boolean;
+	}) => Promise<ChannelTurnResult>;
 	/** Channel commands (`/name`) handled before the LLM. */
 	commands?: ChannelCommand[];
 	/** Injected env for gating (tests); defaults to process.env. */
@@ -323,6 +355,10 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 		parts: string[];
 		baseMsg: InboundMessage;
 		sessionKey: string;
+		/** Cached `senderIsOwner` from when the slot was opened — carried into
+		 *  the eventual dispatch so the agent loop's bootstrap gate works
+		 *  even across the debounce window. */
+		senderIsOwner: boolean;
 	}
 	const pendingDispatches = new Map<string, PendingDispatch>();
 
@@ -358,9 +394,17 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 		/**
 		 * Run one agent turn, handle the abort-signal lifecycle, and reply.
 		 * Extracted so both the immediate-dispatch path and the debounce
-		 * `flushDispatch` can share identical behavior.
+		 * `flushDispatch` can share identical behavior. `threadId` is the
+		 * Slack/Discord thread routing hint carried through to `sendText`;
+		 * channels without threading silently ignore it.
 		 */
-		const dispatchTurn = async (a: { text: string; sessionKey: string; conversationId: string }): Promise<void> => {
+		const dispatchTurn = async (a: {
+			text: string;
+			sessionKey: string;
+			conversationId: string;
+			threadId?: string;
+			senderIsOwner?: boolean;
+		}): Promise<void> => {
 			const controller = new AbortController();
 			inflight.set(a.conversationId, controller);
 			// Show "typing…" while the LLM thinks — fires HERE (and not earlier)
@@ -375,7 +419,12 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 			}
 			let result: ChannelTurnResult;
 			try {
-				result = await args.runTurn({ text: a.text, sessionKey: a.sessionKey, signal: controller.signal });
+				result = await args.runTurn({
+					text: a.text,
+					sessionKey: a.sessionKey,
+					signal: controller.signal,
+					senderIsOwner: a.senderIsOwner,
+				});
 			} finally {
 				if (inflight.get(a.conversationId) === controller) inflight.delete(a.conversationId);
 				// Clear the typing indicator no matter how the turn ended.
@@ -394,7 +443,18 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 			// TUI handles reasoning in its own folded-panel renderer; channels
 			// see only the final answer.
 			const reply = sanitizeReplyForChannel(result.reply?.trim() ?? "");
-			if (reply) await adapter.sendText(a.conversationId, reply);
+			if (reply) {
+				// Thread-aware outbound: when the inbound carried a `threadId`
+				// (Slack thread_ts, Discord thread id, Telegram topic), pass it
+				// through so the reply lands in the same thread instead of the
+				// channel root. Channels without threading silently ignore
+				// `opts.threadId`.
+				await adapter.sendText(
+					a.conversationId,
+					reply,
+					a.threadId ? { threadId: a.threadId } : undefined,
+				);
+			}
 		};
 
 		/**
@@ -409,8 +469,15 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 			pendingDispatches.delete(dispatchKey);
 			const combined = slot.parts.join("\n\n");
 			const conversationId = slot.baseMsg.conversationId;
+			const threadId = slot.baseMsg.threadId;
 			try {
-				await dispatchTurn({ text: combined, sessionKey: slot.sessionKey, conversationId });
+				await dispatchTurn({
+					text: combined,
+					sessionKey: slot.sessionKey,
+					conversationId,
+					threadId,
+					senderIsOwner: slot.senderIsOwner,
+				});
 			} catch (err) {
 				log.warn("debounced dispatch failed", {
 					channel: adapter.id,
@@ -421,7 +488,11 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 					// Reuse the error-class-aware reply so the recipient sees the
 					// same friendly billing/auth/rate-limit messaging across both
 					// the immediate and the debounced dispatch paths.
-					await adapter.sendText(conversationId, buildOperatorFacingErrorReply(err));
+					await adapter.sendText(
+						conversationId,
+						buildOperatorFacingErrorReply(err),
+						threadId ? { threadId } : undefined,
+					);
 				} catch {
 					/* best-effort */
 				}
@@ -485,6 +556,14 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 					];
 					const selfId = adapter.selfId?.();
 					const mentioned = !!(selfId && msg.mentions?.includes(selfId));
+					// `senderIsOwner` says whether this inbound came from the
+					// operator's own linked-channel id (a self-chat DM, or the
+					// operator typing on a linked device into a group/peer DM
+					// — though `fromMe + !selfChat` is already dropped earlier
+					// in connection.ts). The agent loop uses this to gate the
+					// BOOTSTRAP "who am I / who are you" onboarding nudge: that
+					// ritual is operator-only; approved peers must never see it.
+					const senderIsOwner = !!(selfId && selfId.trim() === msg.from.trim());
 					const decision = evaluateAccess({
 						policy: dmPolicy,
 						groupPolicy,
@@ -552,7 +631,13 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 						if (isHistorical || !isNew) return;
 						await adapter.sendText(
 							msg.conversationId,
-							buildChallengeReply({ code, senderId: challengeSenderId, channelLabel: adapter.label }),
+							buildChallengeReply({
+								code,
+								senderId: challengeSenderId,
+								channelLabel: adapter.label,
+								idLabel: adapter.pairing?.idLabel,
+							}),
+							msg.threadId ? { threadId: msg.threadId } : undefined,
 						);
 						// Mark the stranger's challenge message as read — they've now
 						// seen our reply, so the blue tick is honest. Best-effort.
@@ -592,13 +677,14 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 							pendingDispatches.delete(key);
 							cancelledAny = true;
 						}
+						const threadOpts = msg.threadId ? { threadId: msg.threadId } : undefined;
 						const active = inflight.get(msg.conversationId);
 						if (active || cancelledAny) {
 							active?.abort();
 							if (active) inflight.delete(msg.conversationId);
-							await adapter.sendText(msg.conversationId, "Stopped.");
+							await adapter.sendText(msg.conversationId, "Stopped.", threadOpts);
 						} else {
-							await adapter.sendText(msg.conversationId, "Nothing was running — try again with a fresh message.");
+							await adapter.sendText(msg.conversationId, "Nothing was running — try again with a fresh message.", threadOpts);
 						}
 						return;
 					}
@@ -617,12 +703,13 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 								args: space === -1 ? "" : text.slice(space + 1).trim(),
 								config: args.config,
 							};
+							const threadOpts = msg.threadId ? { threadId: msg.threadId } : undefined;
 							if (command.authorize && !command.authorize(cmdCtx)) {
-								await adapter.sendText(msg.conversationId, "Not authorized to run that command.");
+								await adapter.sendText(msg.conversationId, "Not authorized to run that command.", threadOpts);
 								return;
 							}
 							const out = await command.handler(cmdCtx);
-							if (typeof out === "string" && out.trim()) await adapter.sendText(msg.conversationId, out.trim());
+							if (typeof out === "string" && out.trim()) await adapter.sendText(msg.conversationId, out.trim(), threadOpts);
 							return; // command handled — no turn
 						}
 					}
@@ -651,13 +738,20 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 								parts: [text],
 								baseMsg: msg,
 								sessionKey,
+								senderIsOwner,
 								timer: setTimeout(() => void flushDispatch(dispatchKey), debounceMs),
 							});
 						}
 						return;
 					}
 					// Immediate path: register the abort controller + run.
-					await dispatchTurn({ text, sessionKey, conversationId: msg.conversationId });
+					await dispatchTurn({
+						text,
+						sessionKey,
+						conversationId: msg.conversationId,
+						threadId: msg.threadId,
+						senderIsOwner,
+					});
 				} catch (err) {
 					// An inbound failure must never tear down the listener.
 					const errMsg = err instanceof Error ? err.message : String(err);
@@ -674,6 +768,7 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 						await adapter.sendText(
 							msg.conversationId,
 							buildOperatorFacingErrorReply(err),
+							msg.threadId ? { threadId: msg.threadId } : undefined,
 						);
 					} catch (sendErr) {
 						log.warn("failed to send error reply", {
