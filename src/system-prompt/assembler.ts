@@ -263,6 +263,31 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   lines.push(
     "When a first-class tool exists for an action, use the tool directly instead of asking the user to run equivalent CLI or slash commands.",
   );
+  // Tone-match rule: counter-balance the structured / value-dense bias above.
+  // Without this, models default to terse-technical replies even when the
+  // user is just chatting. The SOUL.md persona in Project Context has the
+  // same idea ("skip filler", "no corporate drone") but it lives BELOW the
+  // always-on rules and gets out-weighed; lifting the gist into the always-
+  // on block keeps casual replies casual.
+  lines.push(
+    "Match the user's tone — casual when they're casual, technical when they ask for technical detail. " +
+    "Default casual. In conversational replies, write plain prose; skip headings, bullet lists, and " +
+    "code blocks unless the content really is code or structured data. Skip filler openers like \"Sure! Here's…\" or \"Great question!\" — just answer.",
+  );
+  // Windows-specific bash hygiene: bash.exe / sh interpret backslashes as
+  // escape characters, so `ls F:\Brigade\src` runs as `ls F:Brigadesrc` and
+  // the operator sees a confusing "no such file" error AFTER they already
+  // approved the (visually correct) command. Single-quoting the path bypasses
+  // the escape interpreter. Always-on for top-level + sub-agent — the rule
+  // is harmless on POSIX (where bash paths don't carry backslashes).
+  if (args.runtime.platform === "win32") {
+    lines.push(
+      "On Windows: when a bash command argument contains a backslash path " +
+      "(e.g. `F:\\Brigade\\src`), single-quote it — `wc -l 'F:\\Brigade\\package.json'` — " +
+      "or bash will interpret `\\B`, `\\s`, etc. as escape sequences and strip them, " +
+      "running the command against a mangled path.",
+    );
+  }
   lines.push("");
 
   // 4. ## Execution Bias.
@@ -438,6 +463,23 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // context the task needs as the first user message).
   if (args.capabilities?.memory && !isSubagentMode) {
     lines.push(MEMORY_GUIDANCE);
+    lines.push("");
+  }
+
+  // 7b'. ## Delegation (conditional on the `spawn_agent` tool being wired).
+  // ONE conservative line, mirroring the reference's heuristic — the default
+  // is "do it yourself in this session" (`## Execution Bias` enforces that
+  // earlier in the prompt). Spawning is the EXCEPTION, reserved for tasks
+  // that are genuinely longer-running or complex. An earlier verbose version
+  // of this block over-encouraged spawning; the model either ignored it (no
+  // change in behaviour) or — worse — would have spawned for trivial work.
+  // Skipped in sub-agent mode since the sub-agent can't spawn further.
+  if (args.capabilities?.subAgents && !isSubagentMode) {
+    lines.push("## Delegation");
+    lines.push(
+      "If a task is more complex or takes longer, spawn a sub-agent with `spawn_agent`. " +
+      "Otherwise, do the work in this session.",
+    );
     lines.push("");
   }
 

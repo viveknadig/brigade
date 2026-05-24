@@ -74,11 +74,29 @@ export function summarizeToolResult(
 		}
 		text = pieces.join("\n");
 	} else if (typeof result === "object") {
-		// Pi's read/grep/etc. return objects. Try common keys before falling
-		// back to JSON. `details` and `content` are Brigade's own AgentTool
-		// shape; `output` and `text` cover Pi's bash + various MCP servers.
+		// Pi's `AgentToolResult` shape — `content: (TextContent | ImageContent)[]` —
+		// is the canonical envelope every Brigade-native tool returns. We have to
+		// peel it FIRST: a previous version of this code only handled `content`
+		// as a plain string, so the array shape fell through to `JSON.stringify`
+		// and the operator saw `{"content":[{"type":"text","text":"..."}]}`
+		// dumped verbatim in the TUI tool-result preview. Iterate the array,
+		// keep only the `type === "text"` blocks, concatenate their `text`.
 		const r = result as Record<string, unknown>;
-		if (typeof r.content === "string") text = r.content;
+		if (Array.isArray(r.content)) {
+			const pieces: string[] = [];
+			for (const block of r.content) {
+				if (block && typeof block === "object") {
+					const b = block as Record<string, unknown>;
+					if (b.type === "text" && typeof b.text === "string") pieces.push(b.text);
+					else if (b.type === "image" && typeof b.mimeType === "string") {
+						pieces.push(`[image ${b.mimeType}]`);
+					}
+				} else if (typeof block === "string") {
+					pieces.push(block);
+				}
+			}
+			text = pieces.join("\n");
+		} else if (typeof r.content === "string") text = r.content;
 		else if (typeof r.output === "string") text = r.output;
 		else if (typeof r.text === "string") text = r.text;
 		else if (typeof r.message === "string") text = r.message;

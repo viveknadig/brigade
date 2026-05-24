@@ -86,6 +86,56 @@ describe("summarizeToolResult — error mode (preserveNewlines)", () => {
 	});
 });
 
+describe("summarizeToolResult — AgentToolResult envelope (Pi shape)", () => {
+	it("peels the {content: [{type:'text',text:'...'}]} envelope and shows just the inner text", () => {
+		// Regression: the TUI used to dump the raw JSON envelope verbatim:
+		//   ✓ bash · {"content":[{"type":"text","text":"DIR\tagents..."}],"details":{}}
+		// because the object branch fell through to `JSON.stringify(result)`.
+		const result = {
+			content: [{ type: "text", text: "DIR\tagents\t156\t8\t1.4 MB" }],
+			details: {},
+		};
+		const r = summarizeToolResult(result);
+		assert.equal(r.preview, "DIR agents 156 8 1.4 MB");
+		assert.equal(r.hasContent, true);
+		assert.equal(r.multiline, false);
+		assert.ok(!r.preview.includes('"content"'));
+		assert.ok(!r.preview.includes('"text"'));
+	});
+
+	it("concatenates multiple text blocks in the envelope", () => {
+		const result = {
+			content: [
+				{ type: "text", text: "first" },
+				{ type: "text", text: "second" },
+			],
+			details: {},
+		};
+		const r = summarizeToolResult(result);
+		assert.equal(r.preview, "first second");
+	});
+
+	it("represents image blocks as `[image <mime>]` placeholders", () => {
+		const result = {
+			content: [
+				{ type: "text", text: "the image is:" },
+				{ type: "image", mimeType: "image/png", data: "base64..." },
+			],
+		};
+		const r = summarizeToolResult(result);
+		assert.equal(r.preview, "the image is: [image image/png]");
+	});
+
+	it("preserves newlines in envelope text when in error mode", () => {
+		const result = {
+			content: [{ type: "text", text: "line one\nline two" }],
+		};
+		const r = summarizeToolResult(result, { preserveNewlines: true });
+		assert.equal(r.preview, "line one\nline two");
+		assert.equal(r.multiline, true);
+	});
+});
+
 describe("summarizeToolResult — opts.maxLength override", () => {
 	it("respects an explicit maxLength in success mode", () => {
 		const r = summarizeToolResult("a".repeat(50), { maxLength: 10 });

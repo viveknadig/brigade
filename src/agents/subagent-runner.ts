@@ -67,14 +67,10 @@ export interface RunSubagentArgs {
 	timeoutSeconds?: number;
 	/** Parent's abort signal — propagates cancellation downward. */
 	parentSignal?: AbortSignal;
-	/**
-	 * Cleanup policy. `"keep"` (default) leaves the child transcript on disk
-	 * so the operator can inspect it via `brigade sessions show <key>`.
-	 * `"delete"` removes the JSONL file once the run settles (success OR
-	 * failure) — useful for short-lived research tasks where the parent's
-	 * tool result is the only meaningful artefact.
-	 */
-	cleanup?: "delete" | "keep";
+	// NOTE: `cleanup` is intentionally NOT an arg here — it's resolved from
+	// `agents.defaults.subagents.cleanup` in config (default `"keep"`). The
+	// model can't reach this knob; only the operator can. See subagent-policy
+	// for the rationale.
 }
 
 export interface RunSubagentResult {
@@ -201,7 +197,9 @@ export async function runSubagent(args: RunSubagentArgs): Promise<RunSubagentRes
 	const limits = resolveSubagentLimits(config);
 	const callerDepth = getSubagentDepthFromSessionKey(args.parentSessionKey);
 	const label = args.label ?? "sub-agent";
-	const cleanup = args.cleanup ?? "keep";
+	// Operator-controlled — the model never gets to set this. Reads from
+	// `agents.defaults.subagents.cleanup` (default `"keep"`).
+	const cleanup = limits.defaultCleanup;
 
 	const childSessionKey = buildChildSessionKey(args.parentSessionKey, randomUUID());
 

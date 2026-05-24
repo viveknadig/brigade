@@ -32,55 +32,33 @@ import type { BrigadeTool } from "./types.js";
 const SpawnAgentParams = Type.Object({
 	task: Type.String({
 		description:
-			"What you want the sub-agent to do. Phrase it as a self-contained instruction — " +
-			"the sub-agent doesn't see this conversation, so include any context it needs " +
-			"(file paths, prior decisions, constraints, success criteria).",
+			"What the sub-agent should do. Self-contained — it can't see this conversation.",
 	}),
 	label: Type.Optional(
 		Type.String({
-			description:
-				"Short label for the sub-agent (3-5 words, e.g. 'audit auth flow'). Shown in " +
-				"TUI logs and approval prompts. Defaults to 'sub-agent'.",
+			description: "Short label (3-5 words) shown in logs and approval prompts.",
 		}),
 	),
 	model: Type.Optional(
-		Type.String({
-			description:
-				"Override the model id for the sub-agent (e.g. 'claude-haiku-4-5'). " +
-				"Defaults to the workspace's resolved default model.",
-		}),
+		Type.String({ description: "Model override. Defaults to the parent's model." }),
 	),
 	thinking: Type.Optional(
 		Type.Union(
 			[Type.Literal("off"), Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")],
-			{
-				description:
-					"Override the thinking level for the sub-agent. Defaults to 'off' so cheap " +
-					"sub-tasks run cheap; raise to 'high' for harder reasoning.",
-			},
+			{ description: "Thinking level. Default 'off'." },
 		),
 	),
 	timeoutSeconds: Type.Optional(
 		Type.Number({
-			description:
-				`Wall-clock timeout in seconds. Defaults to ${DEFAULT_SUBAGENT_TIMEOUT_SECONDS}s. ` +
-				`Use a smaller value (60-120s) for quick lookups, larger (600-1800s) for ` +
-				`heavier research tasks.`,
+			description: `Timeout in seconds. Default ${DEFAULT_SUBAGENT_TIMEOUT_SECONDS}s.`,
 		}),
 	),
-	cleanup: Type.Optional(
-		Type.Union(
-			[Type.Literal("keep"), Type.Literal("delete")],
-			{
-				description:
-					"Transcript-file retention after the sub-agent settles. " +
-					"`keep` (default) leaves the child's transcript on disk so the operator " +
-					"can inspect it later. `delete` removes the transcript once the run " +
-					"completes — use this for short-lived research tasks where the parent's " +
-					"tool result is the only meaningful artefact.",
-			},
-		),
-	),
+	// NOTE: `cleanup` is INTENTIONALLY NOT exposed to the model. A previous
+	// implementation included it in the schema with a description nudging the
+	// model toward "delete" for short tasks; gpt-5.5 read that as permission
+	// and silently destroyed the child's transcript without operator consent.
+	// Retention is now operator-controlled: `agents.defaults.subagents.cleanup`
+	// in `brigade.json` (`"keep"` default) pins the policy for every spawn.
 });
 
 interface SpawnAgentDetails {
@@ -128,14 +106,9 @@ export function makeSpawnAgentTool(
 		label: "spawn sub-agent",
 		displaySummary: "spawning sub-agent",
 		description:
-			"Delegate a self-contained task to a sub-agent. The sub-agent runs its own " +
-			"Brigade session, inherits the workspace persona but starts with a minimal " +
-			"system prompt, and returns its final reply as this tool's result. Use this " +
-			"for bounded subtasks (research a file, summarise a long document, run a " +
-			"focused audit) — NOT for long open-ended conversations that need shared " +
-			"context with the operator. Sub-agents cannot spawn further sub-agents " +
-			"(depth limit 1 in v1). The parent can cancel a running sub-agent via the " +
-			"normal turn-abort path.",
+			"Spawn a focused sub-agent. Use for parallel work, deep dives, or any " +
+			"scoped task you'd rather not fill the main conversation with. The sub-agent " +
+			"runs in its own session and returns its final reply as this tool's result.",
 		parameters: SpawnAgentParams,
 		async execute(
 			_toolCallId,
@@ -154,9 +127,10 @@ export function makeSpawnAgentTool(
 					? thinkingRaw
 					: undefined;
 			const timeoutSeconds = readNumberParam(params, "timeoutSeconds", { integer: true });
-			const cleanupRaw = readStringParam(params, "cleanup");
-			const cleanup =
-				cleanupRaw === "delete" || cleanupRaw === "keep" ? cleanupRaw : undefined;
+			// `cleanup` is operator-controlled — never read from `params`. The
+			// runner resolves it from `agents.defaults.subagents.cleanup` config
+			// (defaults to "keep") so the model has no path to autonomously
+			// delete a child's transcript.
 
 			const combinedSignal = combineSignals(opts.parentSignal, signal);
 
@@ -180,7 +154,8 @@ export function makeSpawnAgentTool(
 					...(thinking !== undefined ? { thinkingLevel: thinking } : {}),
 					...(timeoutSeconds !== undefined ? { timeoutSeconds } : {}),
 					...(combinedSignal !== undefined ? { parentSignal: combinedSignal } : {}),
-					...(cleanup !== undefined ? { cleanup } : {}),
+					// No `cleanup` here — operator-controlled via config; the
+					// runner resolves it from `subagents.defaultCleanup`.
 				});
 				if (result.aborted) {
 					return textResult(result.reply, {

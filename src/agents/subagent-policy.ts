@@ -46,6 +46,16 @@ export const DEFAULT_SUBAGENT_MAX_CHILDREN_PER_PARENT = 5;
 export const DEFAULT_SUBAGENT_TIMEOUT_SECONDS = 300;
 
 /**
+ * Default cleanup policy when neither the operator nor a per-call override
+ * supplies one. `"keep"` is the safe default: the operator never loses a
+ * child's transcript without explicitly opting in.
+ *
+ * The model NEVER sees this — `cleanup` is not in the `spawn_agent` tool
+ * schema. Only operator config can change it.
+ */
+export const DEFAULT_SUBAGENT_CLEANUP: "delete" | "keep" = "keep";
+
+/**
  * The marker we splice into a sub-agent's session key so depth can be derived
  * from the key alone. `agent:main:main` → 0 markers → depth 0 (parent).
  * `agent:main:subagent:abc` → 1 marker → depth 1.
@@ -56,6 +66,16 @@ export interface SubagentLimits {
 	maxDepth: number;
 	maxChildrenPerParent: number;
 	defaultTimeoutSeconds: number;
+	/**
+	 * Operator-pinned cleanup policy. The model can NOT override this —
+	 * `cleanup` is intentionally absent from the `spawn_agent` tool schema
+	 * so the model can never autonomously delete a child's transcript
+	 * (a real bug we hit when a model interpreted a descriptive hint as
+	 * permission to opt in to delete-mode). Operators who genuinely want
+	 * transient sub-agents set `agents.defaults.subagents.cleanup: "delete"`
+	 * in `brigade.json`.
+	 */
+	defaultCleanup: "delete" | "keep";
 }
 
 /**
@@ -82,7 +102,13 @@ export function resolveSubagentLimits(config: BrigadeConfig | undefined): Subage
 		1,
 		readNonNegInt(block?.defaultTimeoutSeconds) ?? DEFAULT_SUBAGENT_TIMEOUT_SECONDS,
 	);
-	return { maxDepth, maxChildrenPerParent, defaultTimeoutSeconds };
+	// Operator-pinned cleanup policy. Validates as the literal enum: anything
+	// other than "delete" or "keep" falls back to the safe "keep" default —
+	// a typo can't accidentally enable autonomous deletion.
+	const rawCleanup = block?.cleanup;
+	const defaultCleanup: "delete" | "keep" =
+		rawCleanup === "delete" || rawCleanup === "keep" ? rawCleanup : DEFAULT_SUBAGENT_CLEANUP;
+	return { maxDepth, maxChildrenPerParent, defaultTimeoutSeconds, defaultCleanup };
 }
 
 function readNonNegInt(v: unknown): number | undefined {

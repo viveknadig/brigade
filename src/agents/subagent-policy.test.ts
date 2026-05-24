@@ -25,6 +25,7 @@ const STANDARD_LIMITS = {
 	maxDepth: 1,
 	maxChildrenPerParent: 5,
 	defaultTimeoutSeconds: 300,
+	defaultCleanup: "keep" as const,
 };
 
 afterEach(() => clearSubagentRegistryForTests());
@@ -74,11 +75,13 @@ describe("resolveSubagentLimits", () => {
 			maxDepth: DEFAULT_SUBAGENT_MAX_DEPTH,
 			maxChildrenPerParent: DEFAULT_SUBAGENT_MAX_CHILDREN_PER_PARENT,
 			defaultTimeoutSeconds: DEFAULT_SUBAGENT_TIMEOUT_SECONDS,
+			defaultCleanup: "keep",
 		});
 		assert.deepEqual(resolveSubagentLimits({} as never), {
 			maxDepth: DEFAULT_SUBAGENT_MAX_DEPTH,
 			maxChildrenPerParent: DEFAULT_SUBAGENT_MAX_CHILDREN_PER_PARENT,
 			defaultTimeoutSeconds: DEFAULT_SUBAGENT_TIMEOUT_SECONDS,
+			defaultCleanup: "keep",
 		});
 	});
 
@@ -90,6 +93,7 @@ describe("resolveSubagentLimits", () => {
 						maxDepth: 2,
 						maxChildrenPerParent: 8,
 						defaultTimeoutSeconds: 600,
+						cleanup: "delete",
 					},
 				},
 			},
@@ -98,6 +102,7 @@ describe("resolveSubagentLimits", () => {
 			maxDepth: 2,
 			maxChildrenPerParent: 8,
 			defaultTimeoutSeconds: 600,
+			defaultCleanup: "delete",
 		});
 	});
 
@@ -109,6 +114,7 @@ describe("resolveSubagentLimits", () => {
 						maxDepth: -1,
 						maxChildrenPerParent: Number.NaN,
 						defaultTimeoutSeconds: "300",
+						cleanup: "destroy", // not a valid enum value
 					},
 				},
 			},
@@ -117,6 +123,7 @@ describe("resolveSubagentLimits", () => {
 			maxDepth: DEFAULT_SUBAGENT_MAX_DEPTH,
 			maxChildrenPerParent: DEFAULT_SUBAGENT_MAX_CHILDREN_PER_PARENT,
 			defaultTimeoutSeconds: DEFAULT_SUBAGENT_TIMEOUT_SECONDS,
+			defaultCleanup: "keep",
 		});
 	});
 
@@ -132,6 +139,7 @@ describe("resolveSubagentLimits", () => {
 			maxDepth: 1,
 			maxChildrenPerParent: 5,
 			defaultTimeoutSeconds: 60,
+			defaultCleanup: "keep",
 		});
 	});
 
@@ -150,7 +158,19 @@ describe("resolveSubagentLimits", () => {
 			maxDepth: 1,
 			maxChildrenPerParent: 1,
 			defaultTimeoutSeconds: 1,
+			defaultCleanup: "keep",
 		});
+	});
+
+	it("typo in cleanup falls back to safe default (operator can't accidentally enable autonomous deletion)", () => {
+		const limits = resolveSubagentLimits({
+			agents: { defaults: { subagents: { cleanup: "DELETE" } } },
+		} as never);
+		assert.equal(limits.defaultCleanup, "keep");
+		const limits2 = resolveSubagentLimits({
+			agents: { defaults: { subagents: { cleanup: 42 } } },
+		} as never);
+		assert.equal(limits2.defaultCleanup, "keep");
 	});
 });
 

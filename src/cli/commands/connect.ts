@@ -396,31 +396,42 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	 *   - Persistent decisions ("allow always", "allow pattern") spell out
 	 *     the file we just wrote to so the operator can `cat` it to audit.
 	 */
-	const decisionConfirmation = (command: string, resolution: ApprovalResolution): string => {
-		const cmd = `    ${brand.dim(command.trim())}`;
+	const decisionConfirmation = (
+		command: string,
+		resolution: ApprovalResolution,
+		subagentDepth?: number,
+	): string => {
+		// When the approval originated from a sub-agent (depth > 0), prefix
+		// every line with the same `"  ".repeat(depth)` indent the tool
+		// indicators use. Otherwise the confirmation lands at top-level indent
+		// while the source `⚡ bash` indicator sits 4 spaces in — visually
+		// jarring and easy to misread as "the parent approved that".
+		const depth = typeof subagentDepth === "number" && subagentDepth > 0 ? subagentDepth : 0;
+		const subIndent = depth > 0 ? "  ".repeat(depth) : "";
+		const cmd = `${subIndent}    ${brand.dim(command.trim())}`;
 		switch (resolution.decision) {
 			case "allow-once":
 				return [
-					`  ${brand.tool("✓")} ${brand.tool("Allowed once")} ${brand.dim("· running now…")}`,
+					`${subIndent}  ${brand.tool("✓")} ${brand.tool("Allowed once")} ${brand.dim("· running now…")}`,
 					cmd,
 				].join("\n");
 			case "allow-always":
 				return [
-					`  ${brand.tool("✓")} ${brand.tool("Allowed always")} ${brand.dim("· running now…")}`,
+					`${subIndent}  ${brand.tool("✓")} ${brand.tool("Allowed always")} ${brand.dim("· running now…")}`,
 					cmd,
-					`    ${brand.dim("Saved to ~/.brigade/exec-approvals.json — future calls will run without asking.")}`,
+					`${subIndent}    ${brand.dim("Saved to ~/.brigade/exec-approvals.json — future calls will run without asking.")}`,
 				].join("\n");
 			case "allow-pattern": {
 				const pat = resolution.pattern?.trim() ?? "";
 				return [
-					`  ${brand.tool("✓")} ${brand.tool("Pattern saved")} ${brand.dim("· running now…")}`,
+					`${subIndent}  ${brand.tool("✓")} ${brand.tool("Pattern saved")} ${brand.dim("· running now…")}`,
 					cmd,
-					`    ${brand.dim(`Pattern /${pat}/ saved to ~/.brigade/exec-approvals.json — any future command matching this regex runs without asking.`)}`,
+					`${subIndent}    ${brand.dim(`Pattern /${pat}/ saved to ~/.brigade/exec-approvals.json — any future command matching this regex runs without asking.`)}`,
 				].join("\n");
 			}
 			case "deny":
 				return [
-					`  ${brand.error("✗")} ${brand.error("Denied")} ${brand.dim("· refused")}`,
+					`${subIndent}  ${brand.error("✗")} ${brand.error("Denied")} ${brand.dim("· refused")}`,
 					cmd,
 				].join("\n");
 		}
@@ -548,7 +559,11 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 					activePrompt = null;
 				}
 				tui.setFocus(editor);
-				const confirmation = decisionConfirmation(req.command, resolution);
+				const confirmation = decisionConfirmation(
+					req.command,
+					resolution,
+					req.subagentDepth,
+				);
 				insertBeforeEditor(new Text(confirmation, 0, 0));
 				tui.requestRender();
 				void client

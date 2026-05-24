@@ -55,7 +55,12 @@ afterEach(() => {
 	}
 });
 
-const LIMITS_DEFAULT = { maxDepth: 1, maxChildrenPerParent: 5, defaultTimeoutSeconds: 300 };
+const LIMITS_DEFAULT = {
+	maxDepth: 1,
+	maxChildrenPerParent: 5,
+	defaultTimeoutSeconds: 300,
+	defaultCleanup: "keep" as const,
+};
 
 /* ─────────────── Slot reservation + session-store interplay ─────────────── */
 
