@@ -20,6 +20,7 @@
  * deliberately "one loop + provider adapters".
  */
 
+import type { ChannelApprovalRoute } from "./channels/approval-router.js";
 import type { MemoryCapability } from "./extensions/types.js";
 import { makeExecGate } from "./exec-gate.js";
 import { type BrigadeBeforeToolCallHook, makeUnknownToolGuard } from "./tool-guard.js";
@@ -147,6 +148,10 @@ export interface GuardContextRef {
 		subagentDepth?: number;
 		subagentLabel?: string;
 		parentRunId?: string;
+		/** Channel routing — when set, exec-gate routes approval prompts into
+		 *  the originating chat. Set per-turn by the agent loop from
+		 *  `RunSingleTurnArgs.channelApprovalRoute`; cleared in `finally`. */
+		channelRoute?: ChannelApprovalRoute;
 	};
 }
 

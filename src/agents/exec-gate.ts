@@ -67,6 +67,7 @@ import {
 	type ApprovalDecisionKind,
 	getActiveApprovalBridge,
 } from "./approval-bridge.js";
+import type { ChannelApprovalRoute } from "./channels/approval-router.js";
 import { type BrigadeBeforeToolCallHook, normalizeToolName } from "./tool-guard.js";
 
 /**
@@ -96,6 +97,12 @@ export interface ExecGateContext {
 	subagentLabel?: string;
 	subagentDepth?: number;
 	parentRunId?: string;
+	/** Channel routing — when set, the approval prompt is delivered into
+	 *  the originating chat (via the per-channel approval-router) instead
+	 *  of only the gateway WS. Channel-routed inbounds populate this; TUI /
+	 *  sub-agent / cron turns leave it undefined and the bridge falls back
+	 *  to the WS-only path. */
+	channelRoute?: ChannelApprovalRoute;
 }
 
 export interface MakeExecGateOptions {
@@ -292,6 +299,7 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 					...(c.subagentLabel !== undefined ? { subagentLabel: c.subagentLabel } : {}),
 					...(c.subagentDepth !== undefined ? { subagentDepth: c.subagentDepth } : {}),
 					...(c.parentRunId !== undefined ? { parentRunId: c.parentRunId } : {}),
+					...(c.channelRoute !== undefined ? { channelRoute: c.channelRoute } : {}),
 				});
 				if (decision.timedOut) {
 					const reason =

@@ -27,6 +27,12 @@ import {
 	upsertPairingRequest,
 } from "./access-control/index.js";
 import { isAbortTrigger } from "./abort-triggers.js";
+import {
+	type ChannelApprovalRoute,
+	registerChannelApprovalDispatcher,
+	removeChannelApprovalDispatcher,
+	tryConsumeChannelApprovalReply,
+} from "./approval-router.js";
 import { channelSessionKey } from "./session-key.js";
 import { sanitizeReplyForChannel } from "./reply-sanitizer.js";
 import { classifyErrorReason, isBrigadeRetryError } from "../error-classifier.js";
@@ -314,6 +320,17 @@ export interface StartChannelsArgs {
 		 * onboarding bootstrap nudge for non-owners.
 		 */
 		senderIsOwner?: boolean;
+		/**
+		 * Channel routing for approval prompts. When set, the exec-gate
+		 * routes "want to run <command>?" prompts INTO this conversation
+		 * instead of (only) the gateway WS — the operator on WhatsApp /
+		 * Slack / Discord sees the prompt where they're already chatting,
+		 * and the next inbound from the same peer ("yes" / "no") resolves
+		 * the approval. Always set for channel-routed inbounds (the channel
+		 * manager populates it from `adapter.id` + `conversationId` +
+		 * `threadId`); never set for TUI / sub-agent / cron turns.
+		 */
+		channelApprovalRoute?: ChannelApprovalRoute;
 	}) => Promise<ChannelTurnResult>;
 	/** Channel commands (`/name`) handled before the LLM. */
 	commands?: ChannelCommand[];
@@ -359,6 +376,10 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 		 *  the eventual dispatch so the agent loop's bootstrap gate works
 		 *  even across the debounce window. */
 		senderIsOwner: boolean;
+		/** Cached channel-approval route — carried through the debounce so a
+		 *  gated tool call inside the eventual turn still routes its prompt
+		 *  back to THIS conversation. */
+		channelApprovalRoute: ChannelApprovalRoute;
 	}
 	const pendingDispatches = new Map<string, PendingDispatch>();
 
@@ -404,6 +425,7 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 			conversationId: string;
 			threadId?: string;
 			senderIsOwner?: boolean;
+			channelApprovalRoute?: ChannelApprovalRoute;
 		}): Promise<void> => {
 			const controller = new AbortController();
 			inflight.set(a.conversationId, controller);
@@ -424,6 +446,9 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 					sessionKey: a.sessionKey,
 					signal: controller.signal,
 					senderIsOwner: a.senderIsOwner,
+					...(a.channelApprovalRoute !== undefined
+						? { channelApprovalRoute: a.channelApprovalRoute }
+						: {}),
 				});
 			} finally {
 				if (inflight.get(a.conversationId) === controller) inflight.delete(a.conversationId);
@@ -477,6 +502,7 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 					conversationId,
 					threadId,
 					senderIsOwner: slot.senderIsOwner,
+					channelApprovalRoute: slot.channelApprovalRoute,
 				});
 			} catch (err) {
 				log.warn("debounced dispatch failed", {
@@ -556,38 +582,14 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 					];
 					const selfId = adapter.selfId?.();
 					const mentioned = !!(selfId && msg.mentions?.includes(selfId));
-					// Channel-routed turns ALWAYS run with `senderIsOwner: false`.
-					//
-					// Why hardcode `false` even when the operator is messaging from
-					// their own linked-channel id? Because owner-only tools (bash,
-					// write, edit) route their approval prompts through the gateway
-					// WebSocket to the connect-mode TUI. The operator sending from
-					// WhatsApp / Slack / Discord isn't watching the TUI — so a bash
-					// call would broadcast an approval-request that nobody can
-					// answer, then hang for the full 5-minute timeout before
-					// auto-denying. The agent ends up looking "stuck" for minutes
-					// on what was a simple "what time is it" question.
-					//
-					// The safe posture, matching the reference architecture: pre-
-					// filter owner-only tools out of the channel surface entirely
-					// (via `wrapOwnerOnlyToolExecution` later in the pipeline). The
-					// model never sees `bash` / `write` / `edit`, never tries to
-					// call them, never triggers an unanswerable approval. It uses
-					// `read` / `grep` / `find` / `recall_memory` / web tools / the
-					// `cron` tool — everything that doesn't need shell exec.
-					//
-					// Operator who genuinely wants shell-from-WhatsApp: open a TUI
-					// session via `brigade connect` and interact there.
-					//
-					// Trade-off: the BOOTSTRAP "who am I" onboarding nudge also
-					// won't fire from channel-first usage. That's fine — the nudge
-					// is designed for TUI first-launch, not for someone DMing a
-					// running bot. Approved peers correctly never see it.
-					const senderIsOwner = false;
-					// Keep `selfId` referenced so the access-control evaluator
-					// below still receives a comparable identity — only the
-					// agent-loop's owner-gate uses the flag we just hardcoded.
-					void selfId;
+					// `senderIsOwner` says whether this inbound came from the
+					// operator's own linked-channel id (a self-chat DM, or the
+					// operator typing on a linked device into a group/peer DM
+					// — though `fromMe + !selfChat` is already dropped earlier
+					// in connection.ts). The agent loop uses this to gate the
+					// BOOTSTRAP "who am I / who are you" onboarding nudge: that
+					// ritual is operator-only; approved peers must never see it.
+					const senderIsOwner = !!(selfId && selfId.trim() === msg.from.trim());
 					const decision = evaluateAccess({
 						policy: dmPolicy,
 						groupPolicy,
@@ -685,6 +687,36 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 							/* cosmetic */
 						}
 					}
+					// Channel-routed approval reply intercept. When the previous
+					// turn raised a gated tool (bash) and the exec-gate routed the
+					// approval prompt INTO this conversation, the next inbound from
+					// the same peer ("yes" / "always" / "no") settles the bridge
+					// here — we never dispatch a fresh turn for that text. Runs
+					// AFTER the access gate (only trusted peers can answer an
+					// approval) and BEFORE the abort-trigger check (the abort
+					// vocabulary overlaps "no"/"stop" — a pending-approval intent
+					// wins because the operator is answering Brigade's question,
+					// not cancelling a turn).
+					const approvalIntercept = tryConsumeChannelApprovalReply({
+						channelId: adapter.id,
+						conversationId: msg.conversationId,
+						text,
+					});
+					if (approvalIntercept.matched) {
+						const ackThreadOpts = msg.threadId ? { threadId: msg.threadId } : undefined;
+						const ack =
+							approvalIntercept.decision === "allow-once"
+								? "Allowed once. 🦁"
+								: approvalIntercept.decision === "allow-always"
+									? "Allowed and saved to the allowlist. 🦁"
+									: "Denied. 🦁";
+						try {
+							await adapter.sendText(msg.conversationId, ack, ackThreadOpts);
+						} catch {
+							/* cosmetic */
+						}
+						return;
+					}
 					// decision.kind === "allow" → continue to channel commands + turn
 					// Abort trigger ("stop" / "cancel" / "/stop" / multilingual variants)
 					// — kill an in-flight turn for this conversation and acknowledge.
@@ -744,6 +776,16 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 						? `${msg.conversationId}#${msg.threadId}`
 						: msg.conversationId;
 					const sessionKey = channelSessionKey(args.agentId, adapter.id, convScope);
+					// Channel routing for approval prompts — exec-gate sends "want
+					// to run <cmd>?" prompts into THIS conversation instead of
+					// (only) the gateway WS, and the next inbound from the same
+					// peer ("yes" / "no") resolves the approval. Built once here
+					// and threaded through both the debounce + immediate paths.
+					const channelApprovalRoute: ChannelApprovalRoute = {
+						channelId: adapter.id,
+						conversationId: msg.conversationId,
+						...(msg.threadId !== undefined ? { threadId: msg.threadId } : {}),
+					};
 					// Optional debounce — coalesce rapid-fire messages into a single
 					// turn. Off by default (`channels.<id>.debounceMs <= 0` ⇒
 					// immediate). For groups we key per-speaker so different
@@ -763,6 +805,7 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 								baseMsg: msg,
 								sessionKey,
 								senderIsOwner,
+								channelApprovalRoute,
 								timer: setTimeout(() => void flushDispatch(dispatchKey), debounceMs),
 							});
 						}
@@ -775,6 +818,7 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 						conversationId: msg.conversationId,
 						threadId: msg.threadId,
 						senderIsOwner,
+						channelApprovalRoute,
 					});
 				} catch (err) {
 					// An inbound failure must never tear down the listener.
@@ -808,6 +852,17 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 		try {
 			await adapter.start(ctx);
 			started.push({ id: adapter.id, adapter });
+			// Register the adapter's outbound surface with the approval
+			// router so a gated tool call inside a channel-routed turn can
+			// surface its approval prompt INTO this conversation (instead
+			// of vanishing into the gateway WS the operator isn't watching).
+			// `sendText` is bound so the router doesn't need to capture
+			// `adapter` itself (no leak if the adapter is later replaced).
+			registerChannelApprovalDispatcher(adapter.id, {
+				sendText: (conversationId, text, opts) =>
+					adapter.sendText(conversationId, text, opts),
+				prettyName: adapter.label,
+			});
 			log.info("channel started", { channel: adapter.id, label: adapter.label });
 		} catch (err) {
 			log.warn("channel failed to start — skipping", {
@@ -828,6 +883,12 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 			pendingDispatches.clear();
 			abort.abort();
 			for (const { id, adapter } of started) {
+				// Drop the approval router's dispatcher BEFORE adapter.stop()
+				// so an in-flight bridge can't ask a torn-down channel to send
+				// a prompt mid-shutdown. The router also denies any pending
+				// channel-routed approvals so callers don't wait the full
+				// 5-minute timeout against a dead adapter.
+				removeChannelApprovalDispatcher(id);
 				try {
 					await adapter.stop();
 				} catch (err) {

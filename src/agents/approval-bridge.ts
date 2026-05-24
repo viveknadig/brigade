@@ -25,8 +25,14 @@ import * as crypto from "node:crypto";
 
 import { recordApproval } from "../core/exec-approvals.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
+import {
+	type ChannelApprovalRoute,
+	dispatchChannelApproval,
+} from "./channels/approval-router.js";
 
 const log = createSubsystemLogger("brigade/approvals");
+
+export type { ChannelApprovalRoute } from "./channels/approval-router.js";
 
 /** Decisions the operator can pick. Aligned with protocol.ts. */
 export type ApprovalDecisionKind = "allow-once" | "allow-always" | "allow-pattern" | "deny";
@@ -56,6 +62,15 @@ export interface ApprovalRequest {
 	subagentLabel?: string;
 	subagentDepth?: number;
 	parentRunId?: string;
+	/**
+	 * Channel routing — when set, the bridge sends the approval prompt to
+	 * the channel conversation (via the per-channel approval-router
+	 * dispatcher) AND broadcasts on WS for diagnostics. The channel inbound
+	 * intercepts the operator's yes/no reply and resolves the bridge. When
+	 * unset, only the WS broadcast path runs — the legacy connect-mode TUI
+	 * flow. Both paths share the same 5-minute deny-on-timeout safety net.
+	 */
+	channelRoute?: ChannelApprovalRoute;
 }
 
 /** Broadcaster the bridge calls when a new request lands. */
@@ -111,6 +126,7 @@ export class InMemoryApprovalBridge implements ApprovalBridge {
 			...(req.subagentLabel !== undefined ? { subagentLabel: req.subagentLabel } : {}),
 			...(req.subagentDepth !== undefined ? { subagentDepth: req.subagentDepth } : {}),
 			...(req.parentRunId !== undefined ? { parentRunId: req.parentRunId } : {}),
+			...(req.channelRoute !== undefined ? { channelRoute: req.channelRoute } : {}),
 		};
 		return new Promise<ApprovalDecision>((resolve) => {
 			const timer = setTimeout(() => {
@@ -122,6 +138,11 @@ export class InMemoryApprovalBridge implements ApprovalBridge {
 			}, request.timeoutMs);
 			if (typeof timer.unref === "function") timer.unref();
 			this.pending.set(id, { request, resolve, timer });
+			// WS broadcast ALWAYS fires — even on the channel-routed path,
+			// because a connect-mode TUI watching the gateway should still
+			// see the prompt (diagnostic + a power user might prefer to
+			// answer it there). The channel dispatch path adds the
+			// in-conversation prompt on top.
 			try {
 				this.broadcast(request);
 			} catch (err) {
@@ -131,6 +152,22 @@ export class InMemoryApprovalBridge implements ApprovalBridge {
 				log.warn("approval broadcast failed", {
 					id,
 					err: err instanceof Error ? err.message : String(err),
+				});
+			}
+			// Channel routing — send the prompt INTO the originating chat so
+			// the operator (who is on WhatsApp / Slack / Discord, NOT the
+			// TUI) sees it where they're actually looking. Fire-and-forget
+			// from the bridge's perspective: the router handles its own
+			// errors + falls back silently when no dispatcher is registered
+			// (in which case the WS broadcast above is the only path, same
+			// as legacy behaviour).
+			if (request.channelRoute) {
+				void dispatchChannelApproval({
+					request,
+					route: request.channelRoute,
+					resolveOnBridge: (decision) => {
+						this.resolveApproval(id, decision);
+					},
 				});
 			}
 		});

@@ -851,6 +851,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		 * callers are always the operator).
 		 */
 		senderIsOwner?: boolean;
+		/**
+		 * Channel routing for exec-gate approval prompts. When set, a gated
+		 * tool call inside this turn surfaces its prompt INTO the channel
+		 * conversation (via the per-channel approval-router dispatcher)
+		 * instead of (only) the gateway WS — so an operator on WhatsApp /
+		 * Slack / Discord sees + answers the prompt where they're chatting.
+		 * Always undefined for TUI / direct-RPC callers (they fall back to
+		 * the legacy WS broadcast path the connect-mode TUI watches).
+		 */
+		channelApprovalRoute?: import("../agents/channels/approval-router.js").ChannelApprovalRoute;
 	}): Promise<RunSingleTurnResult> =>
 		runQueued(async () => {
 			isAgentRunning = true;
@@ -891,6 +901,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					// Forward the channel's senderIsOwner verdict (defaults to true
 					// when undefined — TUI / direct RPC calls are always operator).
 					senderIsOwner: turn.senderIsOwner,
+					// Forward the channel approval route (set ONLY for channel-
+					// routed inbounds) so exec-gate surfaces approval prompts
+					// in the originating chat instead of (only) the WS feed.
+					...(turn.channelApprovalRoute !== undefined
+						? { channelApprovalRoute: turn.channelApprovalRoute }
+						: {}),
 					onSessionReady: (session) => {
 						// A fallback candidate builds a fresh session; tear down the
 						// previous candidate's wiring before attaching the new one.

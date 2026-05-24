@@ -246,6 +246,17 @@ export interface RunSingleTurnArgs {
   cronMode?: boolean;
   lightContext?: boolean;
   toolsAllow?: string[];
+  /**
+   * Channel routing for approval prompts. When set, the exec-gate sends the
+   * "want to run <command>?" prompt INTO the originating channel
+   * conversation (via the per-channel approval-router dispatcher) instead
+   * of only the gateway WS — so a WhatsApp / Slack / Discord-initiated
+   * turn that hits a gated tool asks the operator IN that chat, and the
+   * next inbound from the same peer ("yes" / "always" / "no") resolves
+   * the approval. TUI / cron / sub-agent turns leave this undefined and
+   * fall back to the WS-only broadcast (legacy behaviour).
+   */
+  channelApprovalRoute?: import("./channels/approval-router.js").ChannelApprovalRoute;
 }
 
 export interface RunSingleTurnResult {
@@ -988,6 +999,13 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     ...(callerSubagentDepth > 0 ? { subagentDepth: callerSubagentDepth } : {}),
     ...(args.subagentLabel !== undefined ? { subagentLabel: args.subagentLabel } : {}),
     ...(args.parentRunId !== undefined ? { parentRunId: args.parentRunId } : {}),
+    // Channel routing — exec-gate uses this to send approval prompts into
+    // the originating chat instead of (only) the gateway WS. Channel-routed
+    // inbounds populate it via runGatewayTurn; TUI / sub-agent / cron turns
+    // leave it unset and fall back to the legacy WS-only broadcast.
+    ...(args.channelApprovalRoute !== undefined
+      ? { channelRoute: args.channelApprovalRoute }
+      : {}),
   };
   // Duck-typed Pi session subscription. We assert the SHAPE we want
   // rather than coupling to a specific Pi version's exported type. If
