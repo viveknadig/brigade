@@ -556,14 +556,38 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 					];
 					const selfId = adapter.selfId?.();
 					const mentioned = !!(selfId && msg.mentions?.includes(selfId));
-					// `senderIsOwner` says whether this inbound came from the
-					// operator's own linked-channel id (a self-chat DM, or the
-					// operator typing on a linked device into a group/peer DM
-					// — though `fromMe + !selfChat` is already dropped earlier
-					// in connection.ts). The agent loop uses this to gate the
-					// BOOTSTRAP "who am I / who are you" onboarding nudge: that
-					// ritual is operator-only; approved peers must never see it.
-					const senderIsOwner = !!(selfId && selfId.trim() === msg.from.trim());
+					// Channel-routed turns ALWAYS run with `senderIsOwner: false`.
+					//
+					// Why hardcode `false` even when the operator is messaging from
+					// their own linked-channel id? Because owner-only tools (bash,
+					// write, edit) route their approval prompts through the gateway
+					// WebSocket to the connect-mode TUI. The operator sending from
+					// WhatsApp / Slack / Discord isn't watching the TUI — so a bash
+					// call would broadcast an approval-request that nobody can
+					// answer, then hang for the full 5-minute timeout before
+					// auto-denying. The agent ends up looking "stuck" for minutes
+					// on what was a simple "what time is it" question.
+					//
+					// The safe posture, matching the reference architecture: pre-
+					// filter owner-only tools out of the channel surface entirely
+					// (via `wrapOwnerOnlyToolExecution` later in the pipeline). The
+					// model never sees `bash` / `write` / `edit`, never tries to
+					// call them, never triggers an unanswerable approval. It uses
+					// `read` / `grep` / `find` / `recall_memory` / web tools / the
+					// `cron` tool — everything that doesn't need shell exec.
+					//
+					// Operator who genuinely wants shell-from-WhatsApp: open a TUI
+					// session via `brigade connect` and interact there.
+					//
+					// Trade-off: the BOOTSTRAP "who am I" onboarding nudge also
+					// won't fire from channel-first usage. That's fine — the nudge
+					// is designed for TUI first-launch, not for someone DMing a
+					// running bot. Approved peers correctly never see it.
+					const senderIsOwner = false;
+					// Keep `selfId` referenced so the access-control evaluator
+					// below still receives a comparable identity — only the
+					// agent-loop's owner-gate uses the flag we just hardcoded.
+					void selfId;
 					const decision = evaluateAccess({
 						policy: dmPolicy,
 						groupPolicy,
