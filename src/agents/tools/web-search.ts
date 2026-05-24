@@ -28,6 +28,7 @@ import {
 	resolveCacheTtlMs,
 	writeCache,
 } from "./web-shared.js";
+import { buildUnsupportedSearchFilterResponse } from "../extensions/modules/web-search-filters.js";
 import type { AgentToolResult, AgentToolUpdateCallback, AnyBrigadeTool, BrigadeTool } from "./types.js";
 import type { WebProviderContext, WebSearchProvider } from "../extensions/types.js";
 
@@ -54,6 +55,51 @@ const WebSearchSchema = Type.Object({
 			minLength: 1,
 		}),
 	),
+	country: Type.Optional(
+		Type.String({
+			description:
+				"2-letter country code for region-specific results (e.g., 'DE', 'US', 'ALL'). Only Brave + Perplexity honour this.",
+			minLength: 1,
+		}),
+	),
+	language: Type.Optional(
+		Type.String({
+			description:
+				"Language code (e.g., 'en', 'de', 'pt-br'). Only Brave + Perplexity honour this.",
+			minLength: 1,
+		}),
+	),
+	search_lang: Type.Optional(
+		Type.String({
+			description: "Brave-specific: language for search results (e.g., 'en', 'zh-hans').",
+			minLength: 1,
+		}),
+	),
+	ui_lang: Type.Optional(
+		Type.String({
+			description: "Brave-specific: UI locale (e.g., 'en-US', 'de-DE').",
+			minLength: 1,
+		}),
+	),
+	freshness: Type.Optional(
+		Type.String({
+			description:
+				"Recency filter. Brave: 'pd'/'pw'/'pm'/'py' or 'YYYY-MM-DDtoYYYY-MM-DD'. Perplexity: 'day'/'week'/'month'/'year'.",
+			minLength: 1,
+		}),
+	),
+	date_after: Type.Optional(
+		Type.String({
+			description: "Only results published on or after this date (YYYY-MM-DD).",
+			minLength: 1,
+		}),
+	),
+	date_before: Type.Optional(
+		Type.String({
+			description: "Only results published on or before this date (YYYY-MM-DD).",
+			minLength: 1,
+		}),
+	),
 });
 
 /** One result row in the normalized envelope. Drift between providers
@@ -75,6 +121,12 @@ export interface WebSearchDetails {
 	results: WebSearchHit[];
 	answer?: string;
 	citations?: string[];
+	/** Typed error from the provider (invalid filter / unsupported filter). */
+	error?: string;
+	/** Human-readable explanation; pairs with `error`. */
+	message?: string;
+	/** Docs URL for the surfaced error. */
+	docs?: string;
 	externalContent: { untrusted: true; source: "web_search"; provider?: string; wrapped: boolean };
 	cached?: true;
 }
@@ -145,7 +197,53 @@ export function makeWebSearchTool(opts: MakeWebSearchToolOptions): AnyBrigadeToo
 				}
 			}
 
-			const cacheKey = buildSearchCacheKey([activeProvider.id, query, count]);
+			// Collect optional filter args. Brave + Perplexity honour these
+			// directly; for any other provider we short-circuit with a typed
+			// `unsupported_*` error BEFORE making the upstream call so the
+			// agent gets predictable feedback rather than a silently dropped
+			// filter.
+			const filterArgs: Record<string, unknown> = {};
+			if (args.country) filterArgs.country = args.country;
+			if (args.language) filterArgs.language = args.language;
+			if (args.search_lang) filterArgs.search_lang = args.search_lang;
+			if (args.ui_lang) filterArgs.ui_lang = args.ui_lang;
+			if (args.freshness) filterArgs.freshness = args.freshness;
+			if (args.date_after) filterArgs.date_after = args.date_after;
+			if (args.date_before) filterArgs.date_before = args.date_before;
+
+			if (!activeProvider.supportsFilters && Object.keys(filterArgs).length > 0) {
+				const unsupported = buildUnsupportedSearchFilterResponse(
+					filterArgs,
+					activeProvider.id,
+				);
+				if (unsupported) {
+					const errorPayload: WebSearchDetails = {
+						query,
+						provider: activeProvider.id,
+						count,
+						tookMs: Date.now() - startedAt,
+						results: [],
+						error: unsupported.error,
+						message: unsupported.message,
+						docs: unsupported.docs,
+						externalContent: buildExternalContentMeta({
+							source: "web_search",
+							provider: activeProvider.id,
+							wrapped: true,
+						}),
+					};
+					return jsonResult(errorPayload);
+				}
+			}
+
+			const cacheKey = buildSearchCacheKey([
+				activeProvider.id,
+				query,
+				count,
+				...Object.entries(filterArgs)
+					.sort(([a], [b]) => a.localeCompare(b))
+					.map(([k, v]) => `${k}=${String(v)}`),
+			]);
 			const cached = readCache(SEARCH_CACHE, cacheKey);
 			if (cached) {
 				log.debug("web_search cache hit", { provider: activeProvider.id, query });
@@ -157,7 +255,33 @@ export function makeWebSearchTool(opts: MakeWebSearchToolOptions): AnyBrigadeToo
 				details: {} as WebSearchDetails,
 			});
 
-			const raw = await activeProviderTool.execute({ query, count }, signal);
+			const raw = await activeProviderTool.execute(
+				{ query, count, ...filterArgs },
+				signal,
+			);
+
+			// Provider can short-circuit with a typed error response — surface
+			// it 1:1 without trying to normalise it as a result set.
+			if (raw && typeof raw === "object" && typeof (raw as { error?: unknown }).error === "string") {
+				const errorRaw = raw as { error: string; message?: string; docs?: string };
+				const errorPayload: WebSearchDetails = {
+					query,
+					provider: activeProvider.id,
+					count,
+					tookMs: Date.now() - startedAt,
+					results: [],
+					error: errorRaw.error,
+					message: typeof errorRaw.message === "string" ? errorRaw.message : undefined,
+					docs: typeof errorRaw.docs === "string" ? errorRaw.docs : undefined,
+					externalContent: buildExternalContentMeta({
+						source: "web_search",
+						provider: activeProvider.id,
+						wrapped: true,
+					}),
+				};
+				return jsonResult(errorPayload);
+			}
+
 			const payload = normalizeProviderPayload({
 				raw,
 				provider: activeProvider.id,

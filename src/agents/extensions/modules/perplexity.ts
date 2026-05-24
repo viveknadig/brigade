@@ -28,6 +28,11 @@ import {
 	wrapSearchHit,
 	mergeSignals,
 } from "./web-provider-helpers.js";
+import {
+	normalizeFreshness,
+	parseIsoDateRange,
+	WEB_DOCS_URL,
+} from "./web-search-filters.js";
 
 // re-import to keep helper visibility in runSonarChat below the top-level
 // import block (some bundlers need this when the function is declared at
@@ -91,6 +96,7 @@ function createPerplexitySearchProvider(): WebSearchProvider {
 		docsUrl: "https://docs.perplexity.ai/api-reference/search-post",
 		placeholder: "pplx-…",
 		autoDetectOrder: 45,
+		supportsFilters: true,
 		isConfigured(cfg, env) {
 			return (
 				resolveProviderApiKey({
@@ -118,22 +124,78 @@ function createPerplexitySearchProvider(): WebSearchProvider {
 			});
 			const timeoutMs = (ctx.runtime?.timeoutMs ?? DEFAULT_TIMEOUT_SECONDS * 1_000) | 0;
 			return {
-				description: "Perplexity Search — research-mode ranked results with date metadata.",
+				description:
+					"Perplexity Search — research-mode ranked results with date metadata. Supports country, language, recency (day/week/month/year), and ISO date ranges.",
 				parameters: {
 					type: "object",
 					properties: {
 						query: { type: "string" },
 						count: { type: "integer", minimum: 1, maximum: 10 },
+						country: {
+							type: "string",
+							description: "2-letter country code (e.g. 'US', 'DE').",
+						},
+						language: {
+							type: "string",
+							description: "ISO 639-1 language code (e.g., 'en', 'de').",
+						},
+						freshness: {
+							type: "string",
+							description: "Recency: 'day' / 'week' / 'month' / 'year'.",
+						},
+						date_after: {
+							type: "string",
+							description: "Only results on or after this date (YYYY-MM-DD).",
+						},
+						date_before: {
+							type: "string",
+							description: "Only results on or before this date (YYYY-MM-DD).",
+						},
 					},
 					required: ["query"],
 				},
 				async execute(args, signal) {
-					const query = String((args as { query?: unknown }).query ?? "").trim();
+					const a = (args ?? {}) as Record<string, unknown>;
+					const readStr = (v: unknown) =>
+						typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
+					const query = String(a.query ?? "").trim();
 					if (!query) throw new Error("perplexity: missing query");
 					const max_results = Math.min(
-						Math.max(Number((args as { count?: unknown }).count ?? 10) | 0, 1),
+						Math.max(Number(a.count ?? 10) | 0, 1),
 						10,
 					);
+					const argCountry = readStr(a.country);
+					const argFreshnessRaw = readStr(a.freshness);
+					const argDateAfter = readStr(a.date_after);
+					const argDateBefore = readStr(a.date_before);
+					const argLanguage = readStr(a.language);
+					let perCallFreshness: string | undefined;
+					if (argFreshnessRaw) {
+						perCallFreshness = normalizeFreshness(argFreshnessRaw, "perplexity");
+						if (!perCallFreshness) {
+							return {
+								provider: "perplexity",
+								error: "invalid_freshness",
+								message: `Invalid freshness \"${argFreshnessRaw}\". Use day, week, month, or year.`,
+								docs: WEB_DOCS_URL,
+							};
+						}
+					}
+					let perCallAfter: string | undefined;
+					let perCallBefore: string | undefined;
+					if (argDateAfter || argDateBefore) {
+						const range = parseIsoDateRange({
+							rawDateAfter: argDateAfter,
+							rawDateBefore: argDateBefore,
+							invalidDateAfterMessage: `Invalid date_after \"${argDateAfter}\". Use YYYY-MM-DD.`,
+							invalidDateBeforeMessage: `Invalid date_before \"${argDateBefore}\". Use YYYY-MM-DD.`,
+							invalidDateRangeMessage: "date_after must be on or before date_before.",
+							docs: WEB_DOCS_URL,
+						});
+						if ("error" in range) return { provider: "perplexity", ...range };
+						perCallAfter = range.dateAfter;
+						perCallBefore = range.dateBefore;
+					}
 					const transport: PerplexityTransport = cfgSlot.transport === "sonar" ? "sonar" : "search";
 					if (transport === "sonar") {
 						return await runSonarChat({
@@ -146,22 +208,29 @@ function createPerplexitySearchProvider(): WebSearchProvider {
 						});
 					}
 					const body: Record<string, unknown> = { query, max_results };
-					if (cfgSlot.country) body.country = cfgSlot.country;
-					if (cfgSlot.searchRecencyFilter) body.search_recency_filter = cfgSlot.searchRecencyFilter;
+					const effCountry = argCountry ?? cfgSlot.country;
+					if (effCountry) body.country = effCountry;
+					const effRecency =
+						perCallFreshness ?? cfgSlot.searchRecencyFilter;
+					if (effRecency) body.search_recency_filter = effRecency;
 					if (cfgSlot.searchDomainFilter?.length) {
 						body.search_domain_filter = cfgSlot.searchDomainFilter.slice(0, 20);
 					}
+					const langs: string[] = [];
+					if (argLanguage && /^[a-z]{2}$/i.test(argLanguage)) langs.push(argLanguage.toLowerCase());
 					if (cfgSlot.searchLanguageFilter?.length) {
-						body.search_language_filter = cfgSlot.searchLanguageFilter
-							.filter((l) => /^[a-z]{2}$/i.test(l))
-							.map((l) => l.toLowerCase());
+						for (const l of cfgSlot.searchLanguageFilter) {
+							if (/^[a-z]{2}$/i.test(l)) {
+								const lower = l.toLowerCase();
+								if (!langs.includes(lower)) langs.push(lower);
+							}
+						}
 					}
-					if (isValidIsoDate(cfgSlot.searchAfterDate)) {
-						body.search_after_date = cfgSlot.searchAfterDate;
-					}
-					if (isValidIsoDate(cfgSlot.searchBeforeDate)) {
-						body.search_before_date = cfgSlot.searchBeforeDate;
-					}
+					if (langs.length) body.search_language_filter = langs;
+					const effAfter = perCallAfter ?? cfgSlot.searchAfterDate;
+					const effBefore = perCallBefore ?? cfgSlot.searchBeforeDate;
+					if (effAfter && isValidIsoDate(effAfter)) body.search_after_date = effAfter;
+					if (effBefore && isValidIsoDate(effBefore)) body.search_before_date = effBefore;
 					if (typeof cfgSlot.maxTokens === "number" && cfgSlot.maxTokens > 0) {
 						body.max_tokens = cfgSlot.maxTokens | 0;
 					}

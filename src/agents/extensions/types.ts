@@ -491,6 +491,14 @@ export interface WebSearchProvider {
 	signupUrl?: string;
 	docsUrl?: string;
 	autoDetectOrder?: number;
+	/**
+	 * Provider honors per-call filter args (country, language, freshness,
+	 * date_after, date_before). When omitted/false, `web_search` returns a
+	 * typed `unsupported_*` error BEFORE invoking the provider so the agent
+	 * gets predictable feedback instead of silent drop. Brave + Perplexity
+	 * are the only first-party providers that set this true.
+	 */
+	supportsFilters?: boolean;
 	isConfigured(cfg: BrigadeConfig, env?: NodeJS.ProcessEnv): boolean;
 	createTool(ctx: WebProviderContext): WebProviderToolDefinition | null;
 	/**
