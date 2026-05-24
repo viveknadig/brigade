@@ -547,21 +547,23 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
           extensionRegistry.lookupWebSearchProviderById(id, turnConfig as never),
       })
     : null;
-  // Browser tool — opt-in via the operator dropping `playwright` into the
-  // workspace's node_modules. We try a require.resolve at this point;
-  // if it works we surface the tool, otherwise the agent won't see it.
-  // Lazy because Playwright is heavy and most turns don't need it.
+  // Browser tool — ALWAYS registered (matches the upstream reference's
+  // behaviour). `playwright-core` is a hard dependency that ships the
+  // runtime engine WITHOUT a bundled Chromium binary (~30 MB). When the
+  // model actually calls the tool, the execute path probes for a system
+  // Chrome/Chromium/Edge/Brave and surfaces a clear "install Chrome or
+  // configure browser.executablePath" error if none is found.
+  //
+  // Opt-out: set `BRIGADE_DISABLE_BROWSER_TOOL=1` in the gateway env.
   const browserTool = await (async () => {
     if (process.env.BRIGADE_DISABLE_BROWSER_TOOL === "1") return null;
     try {
-      // `await import` would force-load Chromium binding at startup; resolve
-      // the manifest path instead so we only confirm presence.
-      const { createRequire } = await import("node:module");
-      const requireFn = createRequire(import.meta.url);
-      requireFn.resolve("playwright");
       const { makeBrowserTool } = await import("./tools/browser.js");
       return makeBrowserTool({});
     } catch {
+      // Fatal import error (browser.ts itself broken) — silently drop the
+      // tool rather than crash the whole agent loop. Should never happen
+      // in a healthy build.
       return null;
     }
   })();

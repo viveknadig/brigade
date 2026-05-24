@@ -146,11 +146,16 @@ export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promi
 			authStorage,
 		});
 
+		// Web-tools setup is now Step 4 of the Pi-TUI wizard above — runs
+		// inside `runOnboarding` against the same TUI, so its look matches
+		// the provider picker exactly. No post-wizard prompt here.
+
 		console.error(
 			chalk.dim(
 				`\n✓ onboarded — provider: ${chalk.bold(result.provider)} · model: ${chalk.bold(result.modelId)}\n` +
 					`Next: run ${chalk.bold("brigade gateway")} (then ${chalk.bold("brigade connect")} in a second terminal),\n` +
 					`      or ${chalk.bold("brigade")} for the in-process TUI.\n` +
+					`Web tools:   ${chalk.bold("brigade onboard web")} to (re-)pick a search backend.\n` +
 					`Shell access: ${chalk.bold("bash is gated")} — agents must ask before running commands.\n` +
 					`              Approve with ${chalk.bold('brigade exec allow "<cmd>"')} ` +
 					`(${chalk.bold("brigade exec list")} to see what's approved).\n` +
@@ -265,12 +270,31 @@ async function bridgeOnboardingResultToBrigadeNative(args: {
  * wizard) out of the cold-start path for unrelated commands.
  */
 export function registerOnboardCommand(program: Command): void {
-	program
+	const onboardCmd = program
 		.command("onboard")
 		.description("Pick a provider and model — interactive Pi-TUI wizard")
 		.option("--no-env-detect", "ignore API keys from the shell environment", false)
 		.action(async (opts: { envDetect?: boolean }) => {
 			const code = await runOnboardCommand({ noEnvDetect: opts.envDetect === false });
 			process.exit(code);
+		});
+
+	// Sub-command: `brigade onboard web` — re-run JUST the web-tools section
+	// of the wizard. Useful when the operator already configured provider/
+	// model but skipped web setup, or wants to swap the default search backend.
+	onboardCmd
+		.command("web")
+		.description("Pick a default web-search provider (re-runnable Pi-TUI wizard step)")
+		.option("--secret-input-mode <mode>", "plaintext (default) or ref (store env-var pointer)", "plaintext")
+		.action(async (opts: { secretInputMode?: string }) => {
+			try {
+				const { runWebSetupStandalone } = await import("../flows/web-setup.js");
+				const mode = opts.secretInputMode === "ref" ? "ref" : "plaintext";
+				const code = await runWebSetupStandalone({ secretInputMode: mode });
+				process.exit(code);
+			} catch (err) {
+				console.error(chalk.red(`Web setup failed: ${err instanceof Error ? err.message : String(err)}`));
+				process.exit(1);
+			}
 		});
 }

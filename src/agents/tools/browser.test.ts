@@ -16,9 +16,12 @@ describe("makeBrowserTool — identity + schema", () => {
 		assert.equal(tool.name, "browser");
 	});
 
-	it("description mentions Playwright + install instruction", () => {
-		assert.match(tool.description, /Playwright/);
-		assert.match(tool.description, /npm install playwright/);
+	it("description mentions system-browser auto-detect", () => {
+		// `playwright-core` is a Brigade hard dep, so no install step in
+		// the description any more. Operator just needs a system Chrome /
+		// Chromium / Edge / Brave.
+		assert.match(tool.description, /Chrome|Chromium|Edge|Brave/);
+		assert.match(tool.description, /auto-detected/);
 	});
 
 	it("schema requires `action` and exposes the 13 supported actions", () => {
@@ -58,14 +61,11 @@ describe("makeBrowserTool — identity + schema", () => {
 	});
 });
 
-describe("makeBrowserTool — error surface when Playwright absent", () => {
-	it("returns a clear actionable error when playwright load fails", async () => {
-		// We can't easily simulate the missing-module path without mocking
-		// `import()`, but we can confirm the runtime guard exists by
-		// inspecting the dispatcher's error-translation regex.
+describe("makeBrowserTool — system-browser discovery + error surface", () => {
+	it("tool description points at host-installed browsers, not npm install", () => {
 		const desc = makeBrowserTool().description;
-		// The description tells the operator how to install — the same
-		// message the runtime emits if Playwright load fails.
-		assert.match(desc, /npx playwright install chromium/);
+		// `playwright-core` is a hard dep — operator doesn't run npm install.
+		assert.doesNotMatch(desc, /npm install playwright/);
+		assert.doesNotMatch(desc, /npx playwright install/);
 	});
 });

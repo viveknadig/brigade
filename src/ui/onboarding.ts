@@ -117,7 +117,7 @@ export async function runOnboarding(
 
 	while (true) {
 		if (step === "provider") {
-			renderScreen(tui, "Step 1 of 3 · Pick a provider");
+			renderScreen(tui, "Step 1 of 4 · Pick a provider");
 			provider = await pickProvider(tui); // throws "onboarding-cancelled" on Esc
 			step = "key";
 			continue;
@@ -152,7 +152,7 @@ export async function runOnboarding(
 		}
 
 		// step === "model"
-		renderScreen(tui, "Step 3 of 3 · Default model");
+		renderScreen(tui, "Step 3 of 4 · Default model");
 		const result = await pickModel(tui, modelRegistry, provider);
 		if (result === "back") {
 			step = "provider"; // go all the way back so they can change provider too
@@ -167,6 +167,19 @@ export async function runOnboarding(
 	// BOOTSTRAP.md on first turn. Workspace scaffolding still happens at
 	// agent boot via `buildAgent → seedDefaultPrompts`.
 	await saveConfig({ defaultProvider: provider, defaultModelId: modelId });
+
+	// Step 4 of 4 — web-search backend. Same Pi-TUI components, same brand
+	// header. Re-runnable via `brigade onboard web`.
+	try {
+		const { runWebSetupStep } = await import("../cli/flows/web-setup.js");
+		await runWebSetupStep(tui, {
+			stepLabel: "Step 4 of 4 · Web search",
+			secretInputMode: opts.secretInputMode,
+		});
+	} catch {
+		// Don't gate onboarding success on web-setup tripping — the user
+		// can always run `brigade onboard web` later.
+	}
 
 	renderScreen(tui, ""); // brand-only frame for the "Ready." moment
 	renderDone(tui, provider, modelId);
@@ -297,7 +310,7 @@ export async function ensureApiKey(
 		// OPENROUTER_API_KEY, sk-o…52b5)?`. Single line, default = Yes.
 		// No explanatory paragraphs.
 		const envVar = provider.envVar ?? "the env var";
-		renderScreen(tui, `Step 2 of 3 · ${provider.name}`);
+		renderScreen(tui, `Step 2 of 4 · ${provider.name}`);
 		tui.addChild(
 			new Text(
 				`  ${brand.amber("?")} Use existing ${envVar} (env: ${envVar}, ${formatApiKeyPreview(envKey)})?`,
@@ -338,7 +351,7 @@ export async function ensureApiKey(
 			// and let them paste their own. The typed-key loop below treats
 			// `lastError === null` as a clean first iteration, so no stale
 			// error text leaks in.
-			renderScreen(tui, `Step 2 of 3 · ${provider.name}`);
+			renderScreen(tui, `Step 2 of 4 · ${provider.name}`);
 			// Fall through to typed-key loop without `lastError` set.
 			// (Variable declared just below the env block.)
 			return await promptTypedKey(tui, authStorage, provider, providerId, null);
@@ -458,7 +471,7 @@ async function promptTypedKey(
 	let lastError: string | null = seedError;
 
 	while (true) {
-		renderScreen(tui, `Step 2 of 3 · ${provider.name}`);
+		renderScreen(tui, `Step 2 of 4 · ${provider.name}`);
 
 		if (lastError) {
 			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
@@ -595,7 +608,7 @@ async function ensureLocalOllama(
 	let lastError: string | null = null;
 
 	while (true) {
-		renderScreen(tui, "Step 2 of 3 · Connect Ollama");
+		renderScreen(tui, "Step 2 of 4 · Connect Ollama");
 
 		if (lastError) {
 			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));

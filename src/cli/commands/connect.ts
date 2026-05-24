@@ -515,6 +515,15 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 					removeChild(activeLoader);
 					activeLoader = null;
 				}
+				// Close the current assistant text block when a tool starts —
+				// otherwise the assistant block's position is locked at first
+				// stream-chunk, and a long final answer flowing in AFTER the
+				// tools end ends up rendered ABOVE them (the upstream bug we
+				// saw with multi-search turns). Mirroring the reference TUI:
+				// strictly chronological order — clearing the pointer lets the
+				// NEXT `message_update` create a fresh block that lands below
+				// the most recent tool.
+				activeAssistant = null;
 				const indicator = new Text(`  ${brand.tool("⚡")} ${brand.tool(event.toolName)}`, 0, 0);
 				pendingTools.set(event.toolCallId, indicator);
 				insertBeforeEditor(indicator);

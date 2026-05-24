@@ -117,6 +117,7 @@
     "commander": "^12.1.0",
     "json5": "^2.2.3",
     "linkedom": "^0.18.12",
+    "playwright-core": "^1.59.0",
     "prompts": "^2.4.2",
     "proper-lockfile": "^4.1.2",
     "qrcode-terminal": "^0.12.0",
@@ -142,13 +143,5 @@
     "cli",
     "brigade"
   ],
-  "license": "MIT",
-  "peerDependencies": {
-    "playwright": "^1.49.0"
-  },
-  "peerDependenciesMeta": {
-    "playwright": {
-      "optional": "true"
-    }
-  }
+  "license": "MIT"
 }
