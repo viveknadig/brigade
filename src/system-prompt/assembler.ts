@@ -199,6 +199,12 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // docs…") — quoting the bad pattern gave the model permission to emit
   // it, which is the opposite of what we want. Phrased as a rule now,
   // not a quote-list.
+  //
+  // Tone lines (default-short / no preamble / skip-recap-on-approval)
+  // are lifted from the reference's per-provider OPENAI overlay — the
+  // model that needs them most. Promoting to a universal block because
+  // every model benefits from "no walls of text" and the cost is just
+  // four prompt lines.
   lines.push("## Execution Bias");
   lines.push(
     "If the user asks you to do the work, start doing it in the same turn.",
@@ -211,6 +217,12 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   );
   lines.push(
     "If the work will take multiple steps or a while to finish, send one short progress update before or while acting.",
+  );
+  lines.push(
+    "Default to short natural replies unless the user asks for depth. Avoid walls of text, long preambles, and repetitive restatement. Friendly does not mean verbose.",
+  );
+  lines.push(
+    "If the latest user message is a short approval like \"ok do it\" or \"go ahead\", skip the recap and start acting.",
   );
   lines.push("");
 
@@ -314,11 +326,13 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   }
 
   // 7d. ## Web (conditional on web tools being wired this turn).
-  // Emitted whenever `fetch_url` / `web_search` are in the agent's tool
-  // surface. Teaches when to use which, citation expectations, and the
-  // untrusted-content posture so the model treats fetched bodies as data
-  // rather than instructions. Pairs with the in-tool `<<<EXTERNAL_…>>>`
-  // envelope the fetcher already wraps every body in.
+  // Three-layer steering: rich per-tool `description:` fields carry the
+  // bulk of the decision tree (visible every turn in the tool-use
+  // schema); the universal `## Tool Call Style` rule reinforces
+  // "use first-class tools directly"; this block adds the loop budget,
+  // untrusted-content posture, and skip patterns. The combination is
+  // belt-and-suspenders — caught a real "model picks web_search instead
+  // of browser" regression we saw on the Coimbatore / Srikakulam runs.
   if (args.capabilities?.web) {
     lines.push(WEB_TOOLS_GUIDANCE);
     lines.push("");

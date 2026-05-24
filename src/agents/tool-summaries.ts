@@ -24,6 +24,14 @@ export const BRIGADE_TOOL_SUMMARIES: Record<string, string> = {
   // dedicated low-level tool.
   recall_memory: "Search your durable memory (MEMORY.md + memory/*.md) before answering.",
   read_memory: "Read a bounded excerpt of a memory file found via recall_memory.",
+  // Web surface. Catalog summaries are intentionally terse — the model
+  // sees the full per-tool `description:` field at every tool-use
+  // decision; the catalog is just the menu. Lifted shape from the
+  // upstream reference's tool-catalog 1-liners.
+  web_search: "Search the web.",
+  fetch_url: "Fetch and extract readable content from a URL.",
+  web_extract: "Extract content from multiple URLs in one call.",
+  browser: "Control a real Chromium browser (JS-heavy pages, screenshots, UI automation).",
   // Reserved for future Brigade additions — keep them documented even when
   // not yet wired so a single source-of-truth covers any tool name Pi
   // might surface via getActiveToolNames().

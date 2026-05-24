@@ -122,15 +122,27 @@ After completing a complex task or solving a tricky problem in a way that could 
  */
 export const WEB_TOOLS_GUIDANCE = `## Web
 
-You can reach the open web through two tools:
+You have THREE tools for the open web. They escalate in cost + capability — pick the cheapest one that can answer the question, escalate when it can't.
 
-- \`fetch_url(url)\` — fetch a known URL and return its content as markdown. Use this when you already have the link.
-- \`web_search(query)\` — search the web for URLs. Use this to DISCOVER links, then \`fetch_url\` on the most relevant result.
+- \`web_search(query)\` — search the web for URLs. **DISCOVERY only.** Use when you DON'T have a link and need to find one. Returns ranked title+url+snippet hits. Don't summarise from snippets alone if the user asked for verified facts — open the top hit.
 
-When to use which:
-- Have a URL? Go straight to \`fetch_url\`.
-- Need to find something? \`web_search\` first, then optionally \`fetch_url\` on the top hit(s).
-- Don't loop. Two or three fetches per turn is normal; ten is a smell — narrow the query instead.
+- \`fetch_url(url)\` — plain HTTP GET + readable-content extraction (HTML → markdown). **Cheap, fast.** Use when you have a URL AND the page is mostly static / server-rendered (news articles, docs, blog posts, GitHub READMEs).
+
+- \`browser(...)\` — real Chromium with cookies + JS. **Heavy, but capable.** Use when:
+  - \`fetch_url\` returns garbage / a near-empty body (JS-rendered SPA: Justdial, IndiaMART, LinkedIn, most modern e-commerce, Cloudflare-protected sites).
+  - You need to VERIFY a live page (does this URL load? does it actually contain X?).
+  - You need a screenshot, PDF render, or to read content that only appears after scroll/click.
+  - You need to interact (click, fill, navigate through a flow).
+
+Decision rule of thumb:
+1. No URL → \`web_search\` first.
+2. Have a URL → try \`fetch_url\`. If the response is short, has \`status >= 400\`, looks like a Cloudflare interstitial, or extractor was \`basic-html\` (Readability bailed) → escalate to \`browser\`.
+3. Need to interact, screenshot, or run JS → go straight to \`browser\`.
+
+Tips:
+- For bot-protected sites (Justdial, Cloudflare-fronted) pass \`waitUntil: "commit"\` to \`browser.navigate\` so the navigation doesn't hang waiting for an event that never fires. Then \`snapshot\` to read the rendered body.
+- Don't loop. 2-3 fetches per turn is normal; 8-10 is a smell — narrow the query, escalate to browser, or ask the user.
+- The browser is the same tab across calls. \`open\` once, then \`navigate\` / \`snapshot\` / \`evaluate\` on that tab.
 
 Citations:
 - When you summarise or quote web content, name the source URL. Operators want to verify.

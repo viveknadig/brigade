@@ -90,7 +90,7 @@ describe("composeBrigadeBeforeToolCall — chain order + behavior", () => {
 		const chain = makeChain();
 		const r = await chain({ toolCall: { name: "bash", arguments: { command: "ls -la" } } } as never);
 		assert.equal(r?.block, true);
-		assert.match(r?.reason ?? "", /exec-approvals allowlist/);
+		assert.match(r?.reason ?? "", /is not pre-approved/);
 	});
 
 	it("exec-gate allows an approved bash command", async () => {

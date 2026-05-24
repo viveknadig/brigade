@@ -255,17 +255,37 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 		}
 
 		// "prompt" — operator hasn't allowlisted this command yet. v1 has
-		// no mid-turn TUI prompt UI, so we refuse and tell the model how
-		// the operator can approve it.
-		const preview = cmd.slice(0, 200) || "(empty command)";
+		// no mid-turn TUI prompt UI, so we refuse and give the model a
+		// short, readable explanation + a redirect to tools that don't
+		// need approval. The OPERATOR sees the full command + approval
+		// flow in their CLI via `brigade exec list-blocked`; the MODEL
+		// just sees the leading 80 chars so the error message doesn't
+		// turn into a wall of escaped quotes.
+		const preview = previewCommand(cmd);
 		const reason =
-			`Tool "${name}" was blocked: command "${preview}" is not on the ` +
-			`exec-approvals allowlist. The operator must run\n` +
-			`  brigade exec allow ${JSON.stringify(cmd || "<command>")}\n` +
-			`(or \`brigade exec allow-pattern <regex>\` for a family of commands) ` +
-			`before this command can execute. Until then, prefer ` +
-			`"read", "grep", "find", or "ls" — those tools never need approval.`;
+			`Bash refused: command starting "${preview}" is not pre-approved.\n` +
+			`Do NOT retry with shell variants (powershell / python -c / different quoting / heredoc) — ` +
+			`they all hit the same gate. Tell the user what you wanted to run and ask them to approve, ` +
+			`OR use one of these tools that don't need approval:\n` +
+			`  • read / grep / find / ls — file ops are always open.\n` +
+			`  • fetch_url / web_search / web_extract — for web content.\n` +
+			`  • browser — for JS-driven pages or screenshots.\n` +
+			`  • write / edit — for file writes inside the workspace.`;
 		emitBlocked(name, reason);
 		return { block: true, reason };
 	};
+}
+
+/**
+ * Build a short, single-line preview of the offending command for the
+ * blocked-tool error message. Strips newlines + control chars (so a
+ * multi-line heredoc doesn't blow up the rendering), collapses runs of
+ * whitespace, and truncates at 80 chars with an ellipsis. Output is
+ * SAFE to embed in an arbitrary error string — no shell escaping needed.
+ */
+function previewCommand(cmd: string): string {
+	if (!cmd) return "(empty command)";
+	const flat = cmd.replace(/[\r\n]+/g, " ").replace(/[\x00-\x1f\x7f]/g, " ").replace(/\s+/g, " ").trim();
+	if (flat.length <= 80) return flat;
+	return `${flat.slice(0, 77)}…`;
 }

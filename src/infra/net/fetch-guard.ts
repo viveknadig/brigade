@@ -23,7 +23,7 @@ import { promises as dnsPromises } from "node:dns";
 
 import { DEFAULT_TIMEOUT_SECONDS } from "../../agents/tools/web-shared.js";
 import { fetchWithRetry } from "../../agents/tools/web-retry.js";
-import { buildPinnedDispatcherForHostname } from "./dns-pinning.js";
+import { buildPinnedDispatcherForHostname, undiciFetch } from "./dns-pinning.js";
 
 /** Default redirect cap — matches the upstream reference. */
 export const DEFAULT_MAX_REDIRECTS = 3;
@@ -286,12 +286,16 @@ export async function guardedFetch(
 			const ssrfReason = await classifyUrlForSsrf(currentUrl);
 			if (ssrfReason) throw new SsrfBlockedError(currentUrl, ssrfReason);
 
-			// DNS pinning: pre-resolve the hostname ourselves, pick the first
-			// SSRF-safe address, and force undici to connect to THAT exact
-			// IP via a per-call dispatcher. Stops the rebinding TOCTOU where
-			// DNS flips between our `classifyUrlForSsrf` check and the socket
-			// connect. When the hostname is already an IP literal, we skip
-			// pinning (no DNS, nothing to rebind).
+			// DNS pinning: pre-resolve + classify every A/AAAA record;
+			// build a per-hop undici Agent whose `connect.lookup` only
+			// returns the addresses that passed. This closes the TOCTOU
+			// window where a hostile DNS server flips records between
+			// our `classifyUrlForSsrf` check and the socket connect.
+			//
+			// Skip when the URL already names an IP literal (nothing to
+			// rebind). On DNS failure that's NOT an SSRF rejection, fall
+			// through to plain fetch so the model sees the natural
+			// "could not resolve" error.
 			let pinnedDispatcher: import("undici").Dispatcher | undefined;
 			const parsedNow = new URL(currentUrl);
 			if (isIP(parsedNow.hostname) === 0) {
@@ -307,8 +311,6 @@ export async function guardedFetch(
 					pinnedDispatcher = pinned.dispatcher;
 				} catch (err) {
 					if (err instanceof SsrfBlockedError) throw err;
-					// DNS resolution failed — let the plain fetch surface the
-					// natural network error so the model sees "could not resolve".
 					pinnedDispatcher = undefined;
 				}
 			}
@@ -316,16 +318,34 @@ export async function guardedFetch(
 			// When the caller opts in, retry transient 429/5xx with exp-backoff.
 			// We retry the SAME hop (no re-classify of redirect chain) — the
 			// SSRF check already passed at this URL.
-			const doFetch = (): Promise<Response> =>
-				fetch(currentUrl, {
+			//
+			// Dispatcher path: must use undici's OWN `fetch` (not Node's
+			// bundled `globalThis.fetch`), because the interceptor protocol
+			// drifts between bundled-undici and externally-imported undici
+			// — that mismatch surfaces as "invalid onRequestStart method"
+			// when an external Agent is passed to the global fetch.
+			const doFetch = (): Promise<Response> => {
+				const init: RequestInit = {
 					method: currentMethod,
 					headers: currentHeaders,
 					body: currentBody ?? undefined,
 					redirect: "manual",
 					signal,
-					// Undici's `dispatcher` is accepted by Node's built-in fetch.
-					...(pinnedDispatcher ? { dispatcher: pinnedDispatcher } : {}),
-				} as RequestInit);
+				};
+				if (pinnedDispatcher) {
+					// Cast through `unknown` then a permissive `RequestInit` —
+					// Node-bundled `undici-types` and the externally-imported
+					// `undici` ship near-identical but not-quite-compatible
+					// `Dispatcher` types (FormData / Readable variance). We
+					// treat dispatcher opaquely at the type level; the runtime
+					// contract is exercised by tests.
+					return undiciFetch(currentUrl, {
+						...init,
+						dispatcher: pinnedDispatcher,
+					} as unknown as RequestInit);
+				}
+				return fetch(currentUrl, init);
+			};
 			const response = opts.retry
 				? await fetchWithRetry(doFetch, { ...opts.retry, signal })
 				: await doFetch();

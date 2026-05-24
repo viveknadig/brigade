@@ -64,8 +64,8 @@ describe("makeExecGate — basic bash decisions", () => {
 		const gate = makeExecGate();
 		const r = await gate({ toolCall: { name: "bash", arguments: { command: "ls" } } } as never);
 		assert.equal(r?.block, true);
-		assert.match(r?.reason ?? "", /not on the exec-approvals allowlist/);
-		assert.match(r?.reason ?? "", /brigade exec allow/);
+		assert.match(r?.reason ?? "", /is not pre-approved/);
+		assert.match(r?.reason ?? "", /Do NOT retry with shell variants/);
 	});
 
 	it('BLOCKS bash with a "deny" decision (hard-deny pattern)', async () => {
@@ -99,7 +99,7 @@ describe("makeExecGate — basic bash decisions", () => {
 		const gate = makeExecGate();
 		const r = await gate({ toolCall: { name: "bash", arguments: { command: "" } } } as never);
 		assert.equal(r?.block, true);
-		assert.match(r?.reason ?? "", /not on the exec-approvals allowlist/);
+		assert.match(r?.reason ?? "", /is not pre-approved/);
 	});
 
 	it("accepts bash command under 'cmd' or 'script' fallback arg key (provider variation)", async () => {
@@ -117,7 +117,7 @@ describe("makeExecGate — basic bash decisions", () => {
 			toolCall: { name: "  bash  ", arguments: { command: "ls" } },
 		} as never);
 		assert.equal(r?.block, true);
-		assert.match(r?.reason ?? "", /not on the exec-approvals allowlist/);
+		assert.match(r?.reason ?? "", /is not pre-approved/);
 	});
 });
 
@@ -129,7 +129,7 @@ describe("makeExecGate — exec-gated tool name aliases", () => {
 				toolCall: { name: toolName, arguments: { command: "ls" } },
 			} as never);
 			assert.equal(r?.block, true, `${toolName} should be gated`);
-			assert.match(r?.reason ?? "", /exec-approvals allowlist/);
+			assert.match(r?.reason ?? "", /is not pre-approved/);
 		}
 	});
 
@@ -301,7 +301,7 @@ describe("makeExecGate — tool-blocked bus events", () => {
 		assert.equal(observed[0]?.toolName, "bash");
 		assert.equal(observed[0]?.runId, "turn-42");
 		assert.equal(observed[0]?.agentId, "main");
-		assert.match(observed[0]?.reason ?? "", /exec-approvals/);
+		assert.match(observed[0]?.reason ?? "", /is not pre-approved/);
 	});
 
 	it("emits tool-blocked for hard-deny", async () => {
@@ -377,7 +377,7 @@ describe("makeExecGate — tool-blocked bus events", () => {
 				toolCall: { name: "bash", arguments: { command: "ls" } },
 			} as never);
 			assert.equal(r?.block, true);
-			assert.match(r?.reason ?? "", /exec-approvals allowlist/);
+			assert.match(r?.reason ?? "", /is not pre-approved/);
 		} finally {
 			process.emitWarning = originalWarning;
 		}
