@@ -660,8 +660,8 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 						//            the operator messaging Mom from their phone. Brigade
 						//            MUST NOT engage with this — otherwise we'd send
 						//            Mom a pairing-challenge card from the operator's
-						//            own account. Drop silently. Matches OpenClaw's
-						//            access-control.ts:136-144 "Skipping outbound DM".
+						//            own account. Drop silently. Matches the upstream
+						//            reference's access-control.ts:136-144 "Skipping outbound DM".
 						//
 						//       (b2) SELF-CHAT (chat jid == operator's own phone): the
 						//            "notes-to-self" use case. Flow through as normal

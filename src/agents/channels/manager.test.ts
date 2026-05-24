@@ -763,7 +763,7 @@ describe("startChannels", () => {
 		// This is the bug from the user's WhatsApp screenshot: every reply
 		// from an unapproved stranger triggered a new identical "your one-
 		// time code" card, turning their normal chat into a wall of duplicate
-		// challenge cards. Fix mirrors OpenClaw's `issuePairingChallenge` —
+		// challenge cards. Fix mirrors the upstream reference's `issuePairingChallenge` —
 		// only emit the reply when the upsert reports a newly-created entry.
 		// Isolate the pairing store to a tempdir so we don't see entries
 		// left over from earlier tests in this file.

@@ -635,6 +635,11 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 					removeChild(activeLoader);
 					activeLoader = null;
 				}
+				// Clear any tool indicators that never received a matching
+				// `tool_execution_end` — a long session can accumulate these
+				// when a model aborts mid-tool and they otherwise pin a Text
+				// node in the children list per orphaned tool.
+				pendingTools.clear();
 				updateHeader();
 				break;
 			}
@@ -924,6 +929,15 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 				removeChild(activeLoader);
 				activeLoader = null;
 			}
+			// Hygiene on abort: clear any in-flight tool indicators (they'll
+			// never get a tool_execution_end now) and drop the assistant-
+			// block pointer so the NEXT turn opens a fresh block instead of
+			// appending to the aborted one's stale Markdown component.
+			for (const indicator of pendingTools.values()) {
+				removeChild(indicator);
+			}
+			pendingTools.clear();
+			activeAssistant = null;
 			insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.dim("aborted")}`, 0, 0));
 			updateHeader();
 			return true;

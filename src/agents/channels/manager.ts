@@ -623,8 +623,8 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 						// pending code (isNew=false) every subsequent message would
 						// otherwise re-send the same challenge card — turning a
 						// stranger's normal chat into a wall of identical "your
-						// one-time code" replies. Same shape as OpenClaw's
-						// `issuePairingChallenge` (bails when `!created`). The
+						// one-time code" replies. Same shape as the upstream reference's
+						// upstream `issuePairingChallenge` (bails when `!created`). The
 						// upsertPairingRequest above already RECORDED the request
 						// so the operator can still approve via the CLI; we're just
 						// not spamming the stranger with duplicates.

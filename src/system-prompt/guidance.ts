@@ -115,10 +115,10 @@ After completing a complex task or solving a tricky problem in a way that could 
  * input. Brigade wraps every fetched body in an external-content
  * envelope; this guidance is the behavioural pairing.
  *
- * Mirrors OpenClaw's untrusted-content posture but adds explicit
- * when-to-use, budget, and skip-pattern guidance that OpenClaw left
- * implicit (the upstream reference taught the model almost nothing
- * about web tools beyond the per-tool description).
+ * Mirrors the upstream reference's untrusted-content posture but adds
+ * explicit when-to-use, budget, and skip-pattern guidance the upstream
+ * left implicit (it taught the model almost nothing about web tools
+ * beyond the per-tool description).
  */
 export const WEB_TOOLS_GUIDANCE = `## Web
 

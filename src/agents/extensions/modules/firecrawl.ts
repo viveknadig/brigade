@@ -189,8 +189,8 @@ function createFirecrawlFetchProvider(): WebFetchProvider {
 					if (!url) throw new Error("firecrawl: missing url");
 
 					// Build the request body with operator-configurable knobs.
-					// Default `onlyMainContent: true` matches OpenClaw's posture
-					// for one-shot model consumption.
+					// Default `onlyMainContent: true` — best fit for one-shot model
+					// consumption.
 					const body: Record<string, unknown> = {
 						url,
 						formats: ["markdown"],

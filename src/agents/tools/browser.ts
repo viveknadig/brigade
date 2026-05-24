@@ -39,10 +39,11 @@ const log = createSubsystemLogger("brigade/browser");
 
 /* ─────────────────────────── lazy Playwright loader ─────────────────────────── */
 
-// Playwright is an OPTIONAL peer dep — we type it loosely so the project
-// typechecks even when the package isn't installed. The structural types
-// below cover the surface we actually use; the real Playwright runtime
-// satisfies them transparently at execute time.
+// `playwright-core` is a Brigade hard dep (~30 MB engine, no bundled
+// Chromium). We type the surface loosely with structural interfaces
+// instead of `typeof import("playwright-core")` so typechecking stays
+// resilient against minor breaking changes in upstream type defs across
+// versions. The real runtime satisfies these shapes transparently.
 interface BrowserContextLike { close(): Promise<void> }
 interface PageLike {
 	goto(url: string, opts?: { waitUntil?: string; timeout?: number }): Promise<{ status(): number; headers(): Record<string, string> } | null>;

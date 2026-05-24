@@ -21,6 +21,7 @@ import type {
 import { guardedFetch } from "../../../infra/net/fetch-guard.js";
 import { decodeHtmlEntities } from "../../tools/web-fetch-utils.js";
 import { DEFAULT_TIMEOUT_SECONDS, readResponseText } from "../../tools/web-shared.js";
+import { resolveSiteName, wrapSearchHit } from "./web-provider-helpers.js";
 
 const DDG_ENDPOINT = "https://html.duckduckgo.com/html/";
 const DDG_USER_AGENT =
@@ -253,7 +254,7 @@ function createDuckDuckGoProvider(): WebSearchProvider {
 					const htmlResults = parseDdgResults(html, instantHit ? count - 1 : count);
 					// Prepend the Instant Answer when we got one — it's almost
 					// always the top-quality result for factual queries.
-					const results = instantHit
+					const merged = instantHit
 						? [
 							{
 								title: instantHit.title,
@@ -263,6 +264,26 @@ function createDuckDuckGoProvider(): WebSearchProvider {
 							...htmlResults,
 						]
 						: htmlResults;
+					// Route every hit through `wrapSearchHit` so DDG's HTML-scraped
+					// title + snippet land inside the untrusted-content envelope.
+					// Previously these strings were returned raw, which let a
+					// poisoned page title escape the envelope (same security
+					// gap we closed for Firecrawl). Every other provider does
+					// this — DDG was the outlier.
+					const results = merged
+						.map((h) => {
+							const title = h.title?.trim() ?? "";
+							const url = h.url?.trim() ?? "";
+							if (!title || !url) return null;
+							const snippet = h.snippet?.trim();
+							return wrapSearchHit({
+								title,
+								url,
+								snippet: snippet && snippet.length > 0 ? snippet : undefined,
+								siteName: resolveSiteName(url),
+							});
+						})
+						.filter((r): r is NonNullable<typeof r> => r !== null);
 					return { provider: "duckduckgo", query, count: results.length, results };
 				},
 			};
