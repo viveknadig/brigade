@@ -182,9 +182,14 @@ const BRAVE_SEARCH_LANG_ALIASES: Record<string, string> = {
 const BRAVE_UI_LANG_LOCALE = /^([a-z]{2})-([a-z]{2})$/i;
 const MAX_BRAVE_SEARCH_COUNT = 25;
 
-function normalizeBraveCountry(raw: string | undefined): string {
-	if (!raw) return "ALL";
-	const upper = raw.trim().toUpperCase();
+function normalizeBraveCountry(raw: string | undefined): string | undefined {
+	if (!raw) return undefined;
+	const trimmed = raw.trim();
+	if (!trimmed) return undefined;
+	const upper = trimmed.toUpperCase();
+	// Invalid codes coerce to "ALL" (Brave's wildcard) rather than fail
+	// the request; undefined/empty input stays undefined so callers can
+	// decide whether to omit the parameter entirely.
 	return BRAVE_COUNTRY_CODES.has(upper) ? upper : "ALL";
 }
 
@@ -359,6 +364,27 @@ function createBraveSearchProvider(): WebSearchProvider {
 					);
 
 					const mode: BraveMode = cfgSlot.mode === "llm-context" ? "llm-context" : "web";
+
+					// llm-context endpoint is grounded-RAG only — freshness +
+					// date_after/before are silently ignored by Brave. Surface
+					// a typed error so the agent learns which mode to pick
+					// instead of getting unfiltered results back.
+					if (mode === "llm-context") {
+						for (const field of ["freshness", "date_after", "date_before"] as const) {
+							const value = readStringArg(a[field]);
+							if (value) {
+								return {
+									provider: "brave",
+									error:
+										field === "freshness"
+											? "unsupported_freshness"
+											: "unsupported_date_filter",
+									message: `${field === "freshness" ? "freshness" : "date_after/date_before"} is not supported by Brave's llm-context mode. Switch the provider config to mode=\"web\" to enable date filtering.`,
+									docs: WEB_DOCS_URL,
+								};
+							}
+						}
+					}
 					const endpoint =
 						mode === "llm-context" ? BRAVE_LLM_CONTEXT_ENDPOINT : BRAVE_SEARCH_ENDPOINT;
 					const url = new URL(endpoint);

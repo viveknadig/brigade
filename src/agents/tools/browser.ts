@@ -547,6 +547,25 @@ function buildTabHandle(state: BrowserState, page: Page): TabHandle {
 	return handle;
 }
 
+/**
+ * Detach the console/dialog/pageerror listeners we attached in
+ * `buildTabHandle`. Playwright's `Page.off` removes a specific listener
+ * by reference — we kept the bound functions on the handle so we can
+ * pass them back here. Best-effort: `off()` may not exist on every
+ * Playwright minor version, in which case we leave the listeners
+ * attached (the page is about to close anyway, so GC reclaims them).
+ */
+function detachTabListeners(handle: TabHandle): void {
+	const page = handle.page;
+	try {
+		page.off?.("console", handle.consoleListener as unknown as (...args: unknown[]) => void);
+		page.off?.("pageerror", handle.pageErrorListener as unknown as (...args: unknown[]) => void);
+		page.off?.("dialog", handle.dialogListener as unknown as (...args: unknown[]) => void);
+	} catch {
+		/* off() unavailable — close-time GC handles it */
+	}
+}
+
 function isStaleError(err: unknown): boolean {
 	const msg = err instanceof Error ? err.message : String(err);
 	return /has been closed|browser has crashed|Target page, context or browser|Target closed|Page closed/i.test(
@@ -870,14 +889,6 @@ export function makeBrowserTool(opts: MakeBrowserToolOptions = {}): AnyBrigadeTo
 		name: "browser",
 		label: "browser",
 		description: [
-			// Verbatim from the upstream reference's browser-tool.ts:381-389,
-			// minus three architecture-specific sentences Brigade doesn't have
-			// (`OpenClaw-managed browser` profile system, node-hosted browser
-			// proxy, refs="aria"/"role" ref styles, sandbox|host|node target).
-			// Brigade-specific edits: replaces "OpenClaw's browser control
-			// server" with "Playwright + your system Chromium"; adds the
-			// persistent-profile sentence + the `waitUntil: \"commit\"` hint
-			// for bot-protected pages (real-world Justdial/Cloudflare fix).
 			"Control the browser via Playwright + your system Chromium (status/start/stop/profiles/attach/tabs/open/focus/close/navigate/snapshot/screenshot/pdf/click/type/press/hover/drag/select/fill/resize/scrollIntoView/evaluate/wait/console/dialog/upload).",
 			"Auto-detects Chrome / Chromium / Edge / Brave (a supported Chromium-based browser must be installed).",
 			"Use only when existing logins/cookies matter, the page is JS-rendered, or you need UI automation / screenshots / PDF render.",
@@ -904,7 +915,7 @@ export function makeBrowserTool(opts: MakeBrowserToolOptions = {}): AnyBrigadeTo
 
 			// Lifecycle/introspection actions that don't need a live browser.
 			if (args.action === "profiles") {
-				return jsonResult(buildProfilesSnapshot());
+				return jsonResult(await buildProfilesSnapshot());
 			}
 			if (args.action === "stop") {
 				return jsonResult(await stopProfile(profile));
@@ -1038,6 +1049,7 @@ async function dispatchAction(
 			if (args.targetId) {
 				const handle = state.tabs.get(args.targetId);
 				if (!handle) throw new Error(`browser close: unknown targetId "${args.targetId}"`);
+				detachTabListeners(handle);
 				try {
 					await handle.page.close();
 				} catch {
@@ -1053,6 +1065,7 @@ async function dispatchAction(
 				};
 			}
 			// No targetId — close all tabs + the browser itself for this profile.
+			for (const handle of state.tabs.values()) detachTabListeners(handle);
 			try {
 				if (state.source === "launched") {
 					await state.browser.close();
@@ -1159,7 +1172,11 @@ async function dispatchAction(
 			const { handle, targetId } = await getActivePage(state, args.targetId);
 			// Chromium-only API. Errors get bubbled up by Playwright with a
 			// clear "PDF only supported in headless Chromium" message.
-			const buf = await handle.page.pdf();
+			// Playwright's pdf() accepts a `timeout` option; pass our budget
+			// so a stalled render aborts on the same clock as everything else.
+			const buf = await (
+				handle.page as unknown as { pdf(opts?: { timeout?: number }): Promise<Buffer> }
+			).pdf({ timeout: timeoutMs });
 			return {
 				action: "pdf",
 				profile: state.profile,
@@ -1467,35 +1484,27 @@ async function runWithStaleRetry(
 
 /* ─────────────────────────── profile lifecycle helpers ─────────────────────────── */
 
-function buildProfilesSnapshot(): BrowserDetails {
+async function buildProfilesSnapshot(): Promise<BrowserDetails> {
 	const meta = buildExternalContentMeta({ source: "web_fetch", provider: "browser", wrapped: true });
 	const profiles: NonNullable<BrowserDetails["profiles"]> = [];
 	for (const [name, statePromise] of PROFILE_STATE.entries()) {
-		// We can't await here — buildProfilesSnapshot must stay sync from
-		// the caller's perspective. Inspect the resolved state via `then`
-		// optimistically; for in-flight launches we surface the profile
-		// name without tab counts.
+		const attached = isAttachedProfile(name);
 		let tabCount = 0;
-		let source: "launched" | "attached" = "launched";
-		let dir: string | undefined;
-		statePromise
-			.then((s) => {
-				tabCount = s.tabs.size;
-				source = s.source;
-				dir = isAttachedProfile(name) ? undefined : profileUserDataDir(name);
-			})
-			.catch(() => {
-				/* ignore — profile is in error state */
-			});
+		let source: "launched" | "attached" = attached ? "attached" : "launched";
+		try {
+			const state = await statePromise;
+			tabCount = state.tabs.size;
+			source = state.source;
+		} catch {
+			// Profile launch failed — surface the row with 0 tabs so the
+			// agent can see it tried + failed.
+		}
 		profiles.push({
 			name,
-			dir: isAttachedProfile(name) ? undefined : profileUserDataDir(name),
+			dir: attached ? undefined : profileUserDataDir(name),
 			source,
 			tabCount,
 		});
-		void dir;
-		void source;
-		void tabCount;
 	}
 	// Always include the default profile in the catalogue so the agent
 	// knows it can pick it without configuring anything.
@@ -1522,6 +1531,7 @@ async function stopProfile(profile: string): Promise<BrowserDetails> {
 	}
 	try {
 		const state = await cached;
+		for (const handle of state.tabs.values()) detachTabListeners(handle);
 		if (state.source === "launched") {
 			await state.browser.close().catch(() => {});
 		} else {
@@ -1589,21 +1599,26 @@ async function buildInteractiveSnapshot(page: Page): Promise<{
 		}
 		return { items };
 	}`;
-	let payload: { items: Array<{ ref: string; tag: string; role?: string; type?: string; name?: string }> };
+	type PayloadItem = { ref: string; tag: string; role?: string; type?: string; name?: string };
+	let payload: { items: PayloadItem[] } | undefined;
 	try {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		payload = (await (page as any).evaluate(SCRIPT)) as typeof payload;
 	} catch {
 		payload = { items: [] };
 	}
-	const refs: NonNullable<BrowserDetails["refs"]> = payload.items.map((item) => ({
+	// Defensive: evaluate can return `undefined` on hostile pages with
+	// broken CSP / closed contexts, even though our SCRIPT always returns
+	// an object. Coerce to `[]` so the downstream `.map` never crashes.
+	const items: PayloadItem[] = Array.isArray(payload?.items) ? payload.items : [];
+	const refs: NonNullable<BrowserDetails["refs"]> = items.map((item) => ({
 		ref: item.ref,
 		tag: item.tag,
 		role: item.role,
 		name: item.name,
 		selector: `[data-brigade-ref="${item.ref}"]`,
 	}));
-	const lines = payload.items.map((item) => {
+	const lines = items.map((item) => {
 		const role = item.role ? ` role=${item.role}` : "";
 		const type = item.type ? ` type=${item.type}` : "";
 		const name = item.name ? ` — ${item.name}` : "";
