@@ -27,7 +27,7 @@ import type {
 } from "../types.js";
 import { DEFAULT_TIMEOUT_SECONDS, readResponseText } from "../../tools/web-shared.js";
 import {
-	makeProviderCacheKey,
+	mergeSignals,
 	normalizeFreshnessPreset,
 	readProviderConfigSlot,
 	resolveProviderApiKey,
@@ -275,13 +275,6 @@ function createBraveSearchProvider(): WebSearchProvider {
 								// Surface Brave's `sources[]` block separately — useful
 								// for downstream citation rendering.
 								sources: data.sources,
-								_cacheKey: makeProviderCacheKey([
-									"brave",
-									mode,
-									query,
-									country,
-									searchLang,
-								]),
 							};
 						}
 
@@ -311,18 +304,6 @@ function createBraveSearchProvider(): WebSearchProvider {
 							provider: "brave",
 							mode,
 							results,
-							_cacheKey: makeProviderCacheKey([
-								"brave",
-								mode,
-								query,
-								count,
-								country,
-								searchLang,
-								uiLang,
-								freshness,
-								cfgSlot.dateAfter,
-								cfgSlot.dateBefore,
-							]),
 						};
 					} finally {
 						clearTimeout(timer);
@@ -331,23 +312,6 @@ function createBraveSearchProvider(): WebSearchProvider {
 			};
 		},
 	};
-}
-
-function mergeSignals(signals: ReadonlyArray<AbortSignal | undefined>): AbortSignal | undefined {
-	const real = signals.filter((s): s is AbortSignal => s !== undefined);
-	if (real.length === 0) return undefined;
-	if (real.length === 1) return real[0];
-	const anyFn = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any;
-	if (typeof anyFn === "function") return anyFn.call(AbortSignal, real);
-	const ctl = new AbortController();
-	for (const s of real) {
-		if (s.aborted) {
-			ctl.abort(s.reason);
-			break;
-		}
-		s.addEventListener("abort", () => ctl.abort(s.reason), { once: true });
-	}
-	return ctl.signal;
 }
 
 export const braveModule = defineModule({

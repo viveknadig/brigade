@@ -20,6 +20,7 @@ import { DEFAULT_TIMEOUT_SECONDS, readResponseText } from "../../tools/web-share
 import {
 	readProviderConfigSlot,
 	wrapSearchHit,
+	mergeSignals,
 } from "./web-provider-helpers.js";
 
 interface NpmConfig {
@@ -146,23 +147,6 @@ function createNpmSearchProvider(): WebSearchProvider {
 			};
 		},
 	};
-}
-
-function mergeSignals(signals: ReadonlyArray<AbortSignal | undefined>): AbortSignal | undefined {
-	const real = signals.filter((s): s is AbortSignal => s !== undefined);
-	if (real.length === 0) return undefined;
-	if (real.length === 1) return real[0];
-	const anyFn = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any;
-	if (typeof anyFn === "function") return anyFn.call(AbortSignal, real);
-	const ctl = new AbortController();
-	for (const s of real) {
-		if (s.aborted) {
-			ctl.abort(s.reason);
-			break;
-		}
-		s.addEventListener("abort", () => ctl.abort(s.reason), { once: true });
-	}
-	return ctl.signal;
 }
 
 export const npmSearchModule = defineModule({

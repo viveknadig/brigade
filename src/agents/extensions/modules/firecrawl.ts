@@ -35,21 +35,17 @@ import type {
 } from "../types.js";
 import type { BrigadeConfig } from "../../../config/io.js";
 import { DEFAULT_TIMEOUT_SECONDS, readResponseText } from "../../tools/web-shared.js";
+import {
+	mergeSignals,
+	resolveSiteName,
+	sanitizeHeaderToken,
+	wrapSearchHit,
+} from "./web-provider-helpers.js";
 
 const FIRECRAWL_SCRAPE_ENDPOINT = "https://api.firecrawl.dev/v2/scrape";
 const FIRECRAWL_SEARCH_ENDPOINT = "https://api.firecrawl.dev/v2/search";
 
 /* ─────────────────────────── shared key resolver ─────────────────────────── */
-
-/**
- * Strip any character that would let an attacker break out of an HTTP
- * header. CR/LF/NUL inside a Bearer token can forge new headers
- * (response/request splitting). Also rejects characters outside the
- * printable ASCII range that HTTP headers permit.
- */
-function sanitizeHeaderToken(raw: string): string {
-	return raw.replace(/[\r\n\0\t\v\f]/g, "").replace(/[^\x20-\x7e]/g, "");
-}
 
 /** Pull the Firecrawl API key from config OR env. Sanitized for safe header use. */
 function resolveFirecrawlApiKey(cfg: BrigadeConfig, env?: NodeJS.ProcessEnv): string | undefined {
@@ -305,40 +301,34 @@ function createFirecrawlSearchProvider(): WebSearchProvider {
 					const hits: Array<Record<string, unknown>> = Array.isArray(rawData)
 						? rawData.filter((h): h is Record<string, unknown> => !!h && typeof h === "object")
 						: [];
-					const results = hits.map((hit) => ({
-						title: typeof hit.title === "string" ? hit.title : "",
-						url: typeof hit.url === "string" ? hit.url : "",
-						snippet: typeof hit.description === "string"
-							? hit.description
-							: typeof hit.snippet === "string"
-								? hit.snippet
-								: undefined,
-					})).filter((h) => h.title && h.url);
+					// Every other web-search provider routes through
+					// `wrapSearchHit` so attacker-controllable title /
+					// snippet / siteName fields can't escape the untrusted-
+					// content envelope. Firecrawl was the outlier — fix it.
+					const results = hits
+						.map((hit) => {
+							const title = typeof hit.title === "string" ? hit.title.trim() : "";
+							const url = typeof hit.url === "string" ? hit.url.trim() : "";
+							if (!title || !url) return null;
+							const rawSnippet = typeof hit.description === "string"
+								? hit.description
+								: typeof hit.snippet === "string"
+									? hit.snippet
+									: "";
+							const snippet = rawSnippet.trim();
+							return wrapSearchHit({
+								title,
+								url,
+								snippet: snippet.length > 0 ? snippet : undefined,
+								siteName: resolveSiteName(url),
+							});
+						})
+						.filter((r): r is NonNullable<typeof r> => r !== null);
 					return { provider: "firecrawl", results };
 				},
 			};
 		},
 	};
-}
-
-/* ─────────────────────────── misc helpers ─────────────────────────── */
-
-/** Merge multiple `AbortSignal`s into one that aborts when ANY input aborts. */
-function mergeSignals(signals: ReadonlyArray<AbortSignal | undefined>): AbortSignal | undefined {
-	const real = signals.filter((s): s is AbortSignal => s !== undefined);
-	if (real.length === 0) return undefined;
-	if (real.length === 1) return real[0];
-	const anyFn = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any;
-	if (typeof anyFn === "function") return anyFn.call(AbortSignal, real);
-	const ctl = new AbortController();
-	for (const s of real) {
-		if (s.aborted) {
-			ctl.abort(s.reason);
-			break;
-		}
-		s.addEventListener("abort", () => ctl.abort(s.reason), { once: true });
-	}
-	return ctl.signal;
 }
 
 export const firecrawlModule = defineModule({

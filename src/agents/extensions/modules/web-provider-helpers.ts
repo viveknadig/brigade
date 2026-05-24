@@ -13,12 +13,41 @@ import { wrapWebContent } from "../../../security/external-content.js";
 import type { BrigadeConfig } from "../../../config/io.js";
 
 /**
- * Strip CR/LF/NUL/non-printable bytes from anything we put in an HTTP header
- * — guards against header injection via a poisoned token. Matches the
- * Firecrawl key sanitizer; keep them identical.
+ * Strip CR/LF/NUL/non-printable bytes from anything we put in an HTTP
+ * header — guards against header injection via a poisoned token. Single
+ * source of truth; every provider that sets `Authorization` or similar
+ * MUST route raw key material through this before concatenation.
  */
 export function sanitizeHeaderToken(raw: string): string {
 	return raw.replace(/[\r\n\0\t\v\f]/g, "").replace(/[^\x20-\x7e]/g, "");
+}
+
+/**
+ * Merge multiple `AbortSignal`s into one that aborts when ANY input
+ * aborts. Returns `undefined` when all inputs are undefined (no signal).
+ *
+ * Single source of truth for the keyless providers + the SSRF guard —
+ * previously copy-pasted into 12 modules, which made bug-fixing a
+ * minefield. Use `AbortSignal.any()` when the runtime supports it
+ * (Node 22+), fall back to manual wiring otherwise.
+ */
+export function mergeSignals(
+	signals: ReadonlyArray<AbortSignal | undefined>,
+): AbortSignal | undefined {
+	const real = signals.filter((s): s is AbortSignal => s !== undefined);
+	if (real.length === 0) return undefined;
+	if (real.length === 1) return real[0];
+	const anyFn = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any;
+	if (typeof anyFn === "function") return anyFn.call(AbortSignal, real);
+	const ctl = new AbortController();
+	for (const s of real) {
+		if (s.aborted) {
+			ctl.abort(s.reason);
+			break;
+		}
+		s.addEventListener("abort", () => ctl.abort(s.reason), { once: true });
+	}
+	return ctl.signal;
 }
 
 /**
