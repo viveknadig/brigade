@@ -26,12 +26,14 @@ export const BRIGADE_TOOL_SUMMARIES: Record<string, string> = {
   read_memory: "Read a bounded excerpt of a memory file found via recall_memory.",
   // Web surface. Catalog summaries are intentionally terse — the model
   // sees the full per-tool `description:` field at every tool-use
-  // decision; the catalog is just the menu. Lifted shape from the
-  // upstream reference's tool-catalog 1-liners.
-  web_search: "Search the web.",
-  fetch_url: "Fetch and extract readable content from a URL.",
-  web_extract: "Extract content from multiple URLs in one call.",
-  browser: "Control a real Chromium browser (JS-heavy pages, screenshots, UI automation).",
+  // decision; the catalog is just the menu. Lifted verbatim from the
+  // upstream reference's tool-catalog 1-liners (`Search the web` /
+  // `Fetch and extract readable content from a URL` / `Control web
+  // browser`).
+  web_search: "Search the web",
+  fetch_url: "Fetch and extract readable content from a URL",
+  web_extract: "Extract content from a batch of URLs in one call",
+  browser: "Control web browser",
   // Reserved for future Brigade additions — keep them documented even when
   // not yet wired so a single source-of-truth covers any tool name Pi
   // might surface via getActiveToolNames().

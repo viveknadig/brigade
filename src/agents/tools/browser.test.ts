@@ -16,12 +16,12 @@ describe("makeBrowserTool — identity + schema", () => {
 		assert.equal(tool.name, "browser");
 	});
 
-	it("description mentions system-browser auto-detect", () => {
+	it("description mentions system-browser auto-detection", () => {
 		// `playwright-core` is a Brigade hard dep, so no install step in
 		// the description any more. Operator just needs a system Chrome /
 		// Chromium / Edge / Brave.
 		assert.match(tool.description, /Chrome|Chromium|Edge|Brave/);
-		assert.match(tool.description, /auto-detected/);
+		assert.match(tool.description, /[Aa]uto-detects/);
 	});
 
 	it("schema requires `action` and exposes the 13 supported actions", () => {

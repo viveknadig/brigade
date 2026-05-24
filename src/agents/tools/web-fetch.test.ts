@@ -25,8 +25,13 @@ describe("makeFetchUrlTool — schema + tool identity", () => {
 		assert.ok(props.maxChars, "maxChars is optional");
 	});
 
-	it("description names the untrusted-content envelope", () => {
-		assert.match(tool.description, /untrusted-content envelope/i);
+	it("description signals the browser-tool escalation path", () => {
+		// OC-style terseness: the half-clause "without browser automation"
+		// implicitly tells the model that `browser` is the heavier
+		// alternative. The full untrusted-content posture lives in the
+		// `## Web` system-prompt block + the envelope markers inside
+		// every returned body — not in the tool description.
+		assert.match(tool.description, /without browser automation/i);
 	});
 });
 
