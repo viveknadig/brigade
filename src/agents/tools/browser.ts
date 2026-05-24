@@ -27,8 +27,8 @@
  * content is wrapped in the untrusted-content envelope.
  */
 
-import { existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve as pathResolve, sep } from "node:path";
 
 import { Type, type Static } from "typebox";
 
@@ -770,6 +770,12 @@ const BrowserSchema = Type.Object({
 			description: "For `screenshot`: capture entire scrollable page instead of viewport.",
 		}),
 	),
+	outputPath: Type.Optional(
+		Type.String({
+			description:
+				"For `screenshot`/`pdf`: absolute path to write to (must be under `~/.brigade/` or the current workspace). When omitted, Brigade auto-generates a path under `~/.brigade/captures/`.",
+		}),
+	),
 	timeoutMs: Type.Optional(
 		Type.Integer({
 			description: "Per-action timeout. Default 45 s; max 120 s.",
@@ -857,6 +863,10 @@ export interface BrowserDetails {
 	text?: string;
 	screenshotBase64?: string;
 	pdfBase64?: string;
+	/** Absolute path on disk where the screenshot/PDF was written. */
+	path?: string;
+	/** Bytes written to disk (matches the decoded blob size). */
+	bytes?: number;
 	tabs?: Array<{ targetId: string; url: string; title: string; profile?: string }>;
 	profiles?: Array<{ name: string; dir?: string; source: "launched" | "attached"; tabCount: number }>;
 	consoleEvents?: ConsoleEvent[];
@@ -893,6 +903,7 @@ export function makeBrowserTool(opts: MakeBrowserToolOptions = {}): AnyBrigadeTo
 			"Auto-detects Chrome / Chromium / Edge / Brave (a supported Chromium-based browser must be installed).",
 			"Use only when existing logins/cookies matter, the page is JS-rendered, or you need UI automation / screenshots / PDF render.",
 			"The browser keeps a persistent profile under `~/.brigade/browser/default/` — cookies and Cloudflare passes survive across turns.",
+			"Screenshots + PDFs auto-save to `~/.brigade/captures/<timestamp>-<host>.<ext>` and the path is returned in details.path — point users at that path directly. Pass `outputPath` to override.",
 			"When using refs from snapshot (e.g. e12), keep the same tab: prefer passing targetId from the snapshot response into subsequent actions (click/type/wait/etc).",
 			"Use snapshot for UI automation. Avoid wait by default; use only in exceptional cases when no reliable UI state exists.",
 			"For bot-protected pages pass `waitUntil: \"commit\"` so navigation doesn't hang.",
@@ -1158,12 +1169,20 @@ async function dispatchAction(
 				fullPage: args.fullPage === true,
 				timeout: timeoutMs,
 			});
+			const saved = persistCapture({
+				bytes: buf,
+				kind: "png",
+				url: handle.page.url(),
+				outputPath: args.outputPath,
+			});
 			return {
 				action: "screenshot",
 				profile: state.profile,
 				targetId,
 				url: handle.page.url(),
 				screenshotBase64: buf.toString("base64"),
+				path: saved.path,
+				bytes: saved.bytes,
 				externalContent: meta,
 			};
 		}
@@ -1177,12 +1196,20 @@ async function dispatchAction(
 			const buf = await (
 				handle.page as unknown as { pdf(opts?: { timeout?: number }): Promise<Buffer> }
 			).pdf({ timeout: timeoutMs });
+			const saved = persistCapture({
+				bytes: buf,
+				kind: "pdf",
+				url: handle.page.url(),
+				outputPath: args.outputPath,
+			});
 			return {
 				action: "pdf",
 				profile: state.profile,
 				targetId,
 				url: handle.page.url(),
 				pdfBase64: buf.toString("base64"),
+				path: saved.path,
+				bytes: saved.bytes,
 				externalContent: meta,
 			};
 		}
@@ -1631,6 +1658,73 @@ async function buildInteractiveSnapshot(page: Page): Promise<{
 	return { markdown, refs };
 }
 
+/**
+ * Persist a captured PDF/screenshot to disk and return the absolute path.
+ *
+ * Auto-generated path: `~/.brigade/captures/<iso-timestamp>-<safe-host>.<ext>`.
+ * The timestamp + URL host combo means two captures of the same page never
+ * clobber each other and the operator can `ls` the dir to find the latest.
+ *
+ * Operator-supplied path: validated to live under `~/.brigade/` OR under the
+ * current working directory. Refuses absolute paths anywhere else so a
+ * compromised agent can't drop a PDF into `/etc/cron.d/` or `~/Downloads/`.
+ *
+ * Always written 0o600 (owner-only) — captures of authed pages contain
+ * cookies/session data the operator probably doesn't want world-readable.
+ */
+function persistCapture(args: {
+	bytes: Buffer;
+	kind: "pdf" | "png";
+	url: string;
+	outputPath?: string;
+}): { path: string; bytes: number } {
+	const captureDir = join(BRIGADE_DIR, "captures");
+	try {
+		mkdirSync(captureDir, { recursive: true });
+	} catch {
+		/* best-effort — writeFileSync below will surface the real error */
+	}
+	let target: string;
+	if (args.outputPath) {
+		const resolved = pathResolve(args.outputPath);
+		const brigadeRoot = pathResolve(BRIGADE_DIR);
+		const cwdRoot = pathResolve(process.cwd());
+		const underBrigade =
+			resolved === brigadeRoot ||
+			resolved.startsWith(brigadeRoot + sep) ||
+			resolved.startsWith(brigadeRoot + "/");
+		const underCwd =
+			resolved === cwdRoot ||
+			resolved.startsWith(cwdRoot + sep) ||
+			resolved.startsWith(cwdRoot + "/");
+		if (!underBrigade && !underCwd) {
+			throw new Error(
+				`browser: refused to write capture outside trusted dirs. outputPath="${args.outputPath}" resolves to "${resolved}" which is neither under "${BRIGADE_DIR}" nor under "${process.cwd()}".`,
+			);
+		}
+		target = resolved;
+	} else {
+		const stamp = new Date()
+			.toISOString()
+			.replace(/[:.]/g, "-")
+			.replace(/Z$/, "");
+		let host = "page";
+		try {
+			host = new URL(args.url).hostname.replace(/[^a-z0-9.-]/gi, "_") || "page";
+		} catch {
+			/* invalid URL — fall through with default "page" */
+		}
+		target = join(captureDir, `${stamp}-${host}.${args.kind}`);
+	}
+	try {
+		mkdirSync(dirname(target), { recursive: true });
+	} catch {
+		/* best-effort */
+	}
+	writeFileSync(target, args.bytes, { mode: 0o600 });
+	return { path: target, bytes: args.bytes.length };
+}
+
 function truncateHeadTail(body: string, maxChars: number): string {
 	if (body.length <= maxChars) return body;
 	const headBudget = Math.floor(maxChars * 0.7);
@@ -1668,15 +1762,22 @@ function listTabs(
 
 function jsonResult(payload: BrowserDetails): AgentToolResult<BrowserDetails> {
 	// Strip large base64 blobs from the `content` text sent to the model —
-	// the model gets a summary; the full bytes ride in `details` for the
-	// runtime to surface elsewhere (UI, save-to-disk, etc.).
+	// the model sees the saved-to-disk path (concrete and actionable); the
+	// full base64 bytes ride in `details` for the runtime/UI to consume
+	// (preview render, save-as, share, etc.).
+	const summarize = (base64: string, kind: "PNG" | "PDF", path?: string): string => {
+		const bytes = Math.round((base64.length * 3) / 4);
+		return path
+			? `Saved ${bytes}-byte ${kind} to ${path}`
+			: `<${bytes} bytes ${kind}, in details>`;
+	};
 	const forModel: BrowserDetails = {
 		...payload,
 		screenshotBase64: payload.screenshotBase64
-			? `<${Math.round((payload.screenshotBase64.length * 3) / 4)} bytes PNG, in details>`
+			? summarize(payload.screenshotBase64, "PNG", payload.path)
 			: undefined,
 		pdfBase64: payload.pdfBase64
-			? `<${Math.round((payload.pdfBase64.length * 3) / 4)} bytes PDF, in details>`
+			? summarize(payload.pdfBase64, "PDF", payload.path)
 			: undefined,
 	};
 	return {

@@ -73,6 +73,18 @@ export type RequestMethod =
 	| "set-thinking"
 	/** Manual compaction trigger. Reply: void. */
 	| "compact"
+	/**
+	 * Resolve a pending tool-approval request. The gateway broadcasts an
+	 * `approval-request` event when a shell command needs operator consent;
+	 * the TUI sends this back with the operator's choice.
+	 *
+	 * Decisions:
+	 *   - `"allow-once"`     → this call only; nothing persisted
+	 *   - `"allow-always"`   → write the exact command to `~/.brigade/exec-approvals.json`
+	 *   - `"allow-pattern"`  → write a regex pattern (`params.pattern` required)
+	 *   - `"deny"`           → this call refused; nothing persisted
+	 */
+	| "approval-resolve"
 	/** List configured models. Reply: ModelSummary[]. */
 	| "list-models"
 	/** Reload the model registry from disk. Reply: void. */
@@ -106,7 +118,13 @@ export type EventName =
 	/** Server-side error (not a Pi error). One-off display. */
 	| "error"
 	/** Mirrored from event-logger writes — useful for debug clients. */
-	| "log";
+	| "log"
+	/**
+	 * The gateway needs operator consent to run a gated tool call (today:
+	 * `bash`). The TUI renders an inline approval prompt and resolves via
+	 * the `approval-resolve` request.
+	 */
+	| "approval-request";
 
 /* ─────────────────────────── payload types ─────────────────────────── */
 
@@ -119,6 +137,14 @@ export interface RequestParams {
 	"switch-model-mid-turn": { provider: string; modelId: string; replayMessage: string };
 	"set-thinking": { level: string };
 	compact: void;
+	"approval-resolve": {
+		/** Matches the `approval-request` event's `id`. */
+		id: string;
+		/** Operator's choice. */
+		decision: "allow-once" | "allow-always" | "allow-pattern" | "deny";
+		/** Required when `decision === "allow-pattern"`. Regex string. */
+		pattern?: string;
+	};
 	"list-models": void;
 	"refresh-models": void;
 	"get-state": void;
@@ -134,6 +160,7 @@ export interface ResponseFor {
 	"switch-model-mid-turn": void;
 	"set-thinking": void;
 	compact: void;
+	"approval-resolve": void;
 	"list-models": ModelSummary[];
 	"refresh-models": void;
 	"get-state": SessionStateSnapshot;
@@ -146,6 +173,20 @@ export interface EventPayload {
 	state: SessionStateSnapshot;
 	error: { message: string };
 	log: { level: "info" | "warn" | "error"; message: string; at: number };
+	"approval-request": {
+		/** Opaque server-side id; echo back in `approval-resolve`. */
+		id: string;
+		/** The shell command the agent wants to run. */
+		command: string;
+		/** Tool that triggered the prompt (today always `"bash"`). */
+		toolName: string;
+		/** Working directory the command would run in (display only). */
+		cwd?: string;
+		/** Wall-clock millis the gateway will wait before auto-denying. */
+		timeoutMs: number;
+		/** Subset of decisions the operator is allowed to pick. */
+		decisions: ReadonlyArray<"allow-once" | "allow-always" | "allow-pattern" | "deny">;
+	};
 }
 
 /* ─────────────────────────── domain types ─────────────────────────── */

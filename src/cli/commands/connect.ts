@@ -45,6 +45,7 @@ import { markTuiActive, restoreTerminal } from "../../ui/terminal-cleanup.js";
 import { brand, editorTheme, markdownTheme } from "../../ui/theme.js";
 import { summarizeToolResult } from "../../ui/tool-result.js";
 import { BrigadeClient } from "../../tui/client.js";
+import { ApprovalPrompt, type ApprovalResolution } from "../../tui/approval-prompt.js";
 import type { ModelSummary, SessionStateSnapshot } from "../../protocol.js";
 
 // Commander wrapper — `brigade connect` is the thin TUI client that
@@ -356,7 +357,7 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		),
 	);
 
-	type AnyChild = Text | Markdown | CancellableLoader | BrigadeEditor;
+	type AnyChild = Text | Markdown | CancellableLoader | BrigadeEditor | ApprovalPrompt;
 	const insertBeforeEditor = (component: AnyChild): void => {
 		const children = tui.children;
 		const editorIdx = children.indexOf(editor);
@@ -372,6 +373,48 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 			tui.removeChild(component);
 		} catch {
 			/* ignore */
+		}
+	};
+
+	/**
+	 * Format the operator's approval choice as a multi-line confirmation
+	 * stamped above the editor — replaces the inline card so the chat
+	 * history shows BOTH the decision AND the command + persistence target
+	 * even after the prompt itself is gone.
+	 *
+	 * Visual language:
+	 *   - Green ✓ on allow (`brand.tool`)
+	 *   - Red ✗ on deny (`brand.error`)
+	 *   - Persistent decisions ("allow always", "allow pattern") spell out
+	 *     the file we just wrote to so the operator can `cat` it to audit.
+	 */
+	const decisionConfirmation = (command: string, resolution: ApprovalResolution): string => {
+		const cmd = `    ${brand.dim(command.trim())}`;
+		switch (resolution.decision) {
+			case "allow-once":
+				return [
+					`  ${brand.tool("✓")} ${brand.tool("Allowed once")} ${brand.dim("· running now…")}`,
+					cmd,
+				].join("\n");
+			case "allow-always":
+				return [
+					`  ${brand.tool("✓")} ${brand.tool("Allowed always")} ${brand.dim("· running now…")}`,
+					cmd,
+					`    ${brand.dim("Saved to ~/.brigade/exec-approvals.json — future calls will run without asking.")}`,
+				].join("\n");
+			case "allow-pattern": {
+				const pat = resolution.pattern?.trim() ?? "";
+				return [
+					`  ${brand.tool("✓")} ${brand.tool("Pattern saved")} ${brand.dim("· running now…")}`,
+					cmd,
+					`    ${brand.dim(`Pattern /${pat}/ saved to ~/.brigade/exec-approvals.json — any future command matching this regex runs without asking.`)}`,
+				].join("\n");
+			}
+			case "deny":
+				return [
+					`  ${brand.error("✗")} ${brand.error("Denied")} ${brand.dim("· refused")}`,
+					cmd,
+				].join("\n");
 		}
 	};
 
@@ -451,6 +494,65 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		lastSnapshot = snap;
 		isAgentRunning = snap.isAgentRunning;
 		updateHeader();
+	});
+
+	// Tool-approval prompt — the gateway broadcasts an `approval-request`
+	// event when a gated tool (today: `bash`) needs operator consent. We
+	// render the inline Y/A/P/N prompt above the editor and resolve via
+	// the `approval-resolve` request. Persistence ("allow always" / "allow
+	// pattern") is handled SERVER-side in exec-gate's `applyApprovalDecision`,
+	// which calls `recordApproval()` and writes `~/.brigade/exec-approvals.json`
+	// atomically with 0o600 perms.
+	let activePrompt: ApprovalPrompt | null = null;
+	client.on("approval-request", (req) => {
+		// If another prompt is somehow already showing (shouldn't happen
+		// because exec-gate is serial per-turn), tear it down first so we
+		// don't stack prompts on the screen.
+		if (activePrompt) {
+			try {
+				tui.removeChild(activePrompt);
+			} catch {
+				/* ignore */
+			}
+			activePrompt = null;
+		}
+		const prompt = new ApprovalPrompt({
+			tui,
+			request: { id: req.id, command: req.command, toolName: req.toolName, cwd: req.cwd },
+			onResolve: (resolution: ApprovalResolution) => {
+				// Clear the prompt and hand focus back to the editor BEFORE
+				// firing the resolve — so the next agent_start event (which
+				// will follow on allow) doesn't fight the prompt for focus.
+				if (activePrompt) {
+					try {
+						tui.removeChild(activePrompt);
+					} catch {
+						/* ignore */
+					}
+					activePrompt = null;
+				}
+				tui.setFocus(editor);
+				const confirmation = decisionConfirmation(req.command, resolution);
+				insertBeforeEditor(new Text(confirmation, 0, 0));
+				tui.requestRender();
+				void client
+					.request("approval-resolve", {
+						id: req.id,
+						decision: resolution.decision,
+						pattern: resolution.pattern,
+					})
+					.catch((err: unknown) => {
+						const msg = err instanceof Error ? err.message : String(err);
+						insertBeforeEditor(
+							new Text(`  ${brand.error("✗")} ${brand.error(`approval send failed: ${msg}`)}`, 0, 0),
+						);
+					});
+			},
+		});
+		activePrompt = prompt;
+		insertBeforeEditor(prompt);
+		tui.setFocus(prompt);
+		tui.requestRender();
 	});
 
 	// Server-side warnings/info (e.g. "primary failed, trying fallback") — the

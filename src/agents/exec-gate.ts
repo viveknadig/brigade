@@ -62,6 +62,11 @@ import type { BeforeToolCallContext, BeforeToolCallResult } from "@mariozechner/
 
 import { BrigadeApprovalFileVersionError, decideApproval } from "../core/exec-approvals.js";
 import { emitAgentEvent } from "./agent-event-bus.js";
+import {
+	applyApprovalDecision,
+	type ApprovalDecisionKind,
+	getActiveApprovalBridge,
+} from "./approval-bridge.js";
 import { type BrigadeBeforeToolCallHook, normalizeToolName } from "./tool-guard.js";
 
 /**
@@ -254,13 +259,57 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 			return { block: true, reason };
 		}
 
-		// "prompt" — operator hasn't allowlisted this command yet. v1 has
-		// no mid-turn TUI prompt UI, so we refuse and give the model a
-		// short, readable explanation + a redirect to tools that don't
-		// need approval. The OPERATOR sees the full command + approval
-		// flow in their CLI via `brigade exec list-blocked`; the MODEL
-		// just sees the leading 80 chars so the error message doesn't
-		// turn into a wall of escaped quotes.
+		// "prompt" — operator hasn't allowlisted this command yet. If a
+		// gateway client is online (the WS bridge is registered), surface
+		// an inline approval prompt and route the operator's choice
+		// through `applyApprovalDecision` — which persists "allow-always"
+		// or "allow-pattern" decisions to `~/.brigade/exec-approvals.json`
+		// before letting the call proceed.
+		const bridge = getActiveApprovalBridge();
+		if (bridge) {
+			const preview = previewCommand(cmd);
+			const decisions: ReadonlyArray<ApprovalDecisionKind> = [
+				"allow-once",
+				"allow-always",
+				"allow-pattern",
+				"deny",
+			];
+			try {
+				const decision = await bridge.requestApproval({
+					command: cmd,
+					toolName: name,
+					cwd: displayCwd,
+					timeoutMs: 5 * 60 * 1000,
+					decisions,
+				});
+				if (decision.timedOut) {
+					const reason =
+						`Bash refused: approval timed out (no operator reply within 5 minutes). Command was "${preview}". ` +
+						`Tell the user what you wanted to run and ask again when they're back.`;
+					emitBlocked(name, reason);
+					return { block: true, reason };
+				}
+				const outcome = applyApprovalDecision({ command: cmd, decision });
+				if (outcome === "allow") return undefined;
+				// Deny → refuse with a short, agent-friendly reason.
+				const reason = `Bash refused by operator: "${preview}" was explicitly denied. Don't retry the same command — ask the user what they want instead.`;
+				emitBlocked(name, reason);
+				return { block: true, reason };
+			} catch (err) {
+				// recordApproval can throw on hard-deny / symlink violation.
+				// Surface a clear refusal so the agent doesn't loop on the
+				// same command thinking the operator hasn't seen it yet.
+				const detail = err instanceof Error ? err.message : String(err);
+				const reason =
+					`Bash refused: couldn't persist the operator's approval — ${detail}. ` +
+					`The command was "${preview}". Tell the user the file at ~/.brigade/exec-approvals.json may need attention.`;
+				emitBlocked(name, reason);
+				return { block: true, reason };
+			}
+		}
+
+		// No bridge attached (CLI `brigade agent`, unit tests). Refuse with
+		// the legacy message so the model knows to ask the operator out-of-band.
 		const preview = previewCommand(cmd);
 		const reason =
 			`Bash refused: command starting "${preview}" is not pre-approved.\n` +

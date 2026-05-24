@@ -35,15 +35,16 @@ import type { BootstrapPhase } from "../workspace/state.js";
 //    2. ## Tooling
 //    3. ## Tool Call Style
 //    4. ## Execution Bias
-//    5. ## Safety
-//    6. ## Brigade CLI Quick Reference
-//    7. ## Workspace
-//    8. ## Reasoning Format            (conditional: thinking-on + non-native-reasoning model)
-//    9. # Project Context              (persona files, sorted: agents, soul, identity, user, tools, bootstrap, memory)
-//   10. <!-- CACHE BOUNDARY -->
-//   11. # Dynamic Project Context      (HEARTBEAT.md)
-//   12. # Per-turn Notes                (ephemeral suffix, when supplied)
-//   13. ## Runtime                      (host / shell / model / channel / time)
+//    5. ## Output Formatting           (markdown / fenced-code-block discipline)
+//    6. ## Safety
+//    7. ## Brigade CLI Quick Reference
+//    8. ## Workspace
+//    9. ## Reasoning Format            (conditional: thinking-on + non-native-reasoning model)
+//   10. # Project Context              (persona files, sorted: agents, soul, identity, user, tools, bootstrap, memory)
+//   11. <!-- CACHE BOUNDARY -->
+//   12. # Dynamic Project Context      (HEARTBEAT.md)
+//   13. # Per-turn Notes                (ephemeral suffix, when supplied)
+//   14. ## Runtime                      (host / shell / model / channel / time)
 
 export interface AssembleArgs {
   // Resolved per-turn runtime context (host, tz, model, channel, …).
@@ -226,7 +227,36 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   );
   lines.push("");
 
-  // 5. ## Safety.
+  // 5. ## Output Formatting.
+  // Markdown formatting rules — load-bearing for TUI rendering quality.
+  // The TUI parses fenced blocks with a `highlightCode` hook that
+  // syntax-colours bash / json / typescript / etc. The model gets the
+  // nice rendering for free IF it emits proper fences (lang tag on its
+  // own line, body on subsequent lines, closing fence). Compact single-
+  // line emit like ` ```json {…} ``` ` is parsed as inline code and
+  // renders flat — same content, ugly UX.
+  lines.push("## Output Formatting");
+  lines.push(
+    "For any code, JSON, shell command, configuration, or tool output longer than ~20 chars, use a fenced Markdown code block with a language tag.",
+  );
+  lines.push(
+    "The opening fence + language tag goes on its own line; the body goes on the next line(s); the closing fence goes on its own line. NEVER put the opening fence, language, body, and closing fence on the same line.",
+  );
+  lines.push(
+    "Use these language tags: `bash` (shell), `json`, `typescript` / `ts`, `javascript` / `js`, `python`, `sql`, `yaml`, `html`, `css`, `diff`, `text` (plain). Default to `text` when uncertain.",
+  );
+  lines.push(
+    "Pretty-print JSON across multiple lines with 2-space indent unless the user asks for compact output — single-line `{\"a\":1,\"b\":2}` is harder to read in a chat UI.",
+  );
+  lines.push(
+    "Inline backticks (` `x` `) are for short identifiers / file names / single-word references INSIDE a sentence — never for multi-token data like a full JSON object, a multi-flag command, or a path with a value.",
+  );
+  lines.push(
+    "Example, correct:\n```json\n{\n  \"name\": \"…\",\n  \"value\": 42\n}\n```\nExample, wrong: `json {\"name\":\"…\",\"value\":42}`.",
+  );
+  lines.push("");
+
+  // 6. ## Safety.
   // Constitution-style anti-self-preservation rules. The previous
   // Brigade-shape three bullets (credentials, destructive ops, untrusted
   // content) were operator-protection rules that overlap with the
@@ -261,7 +291,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     lines.push("");
   }
 
-  // 6. ## Brigade CLI Quick Reference.
+  // 7. ## Brigade CLI Quick Reference.
   // Gateway-lifecycle only, plus a fallback line pointing at `brigade
   // help`. The earlier version enumerated eight subcommands, which
   // trained the model to suggest `brigade <foo>` in conversational
@@ -279,7 +309,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   lines.push("If unsure, ask the user to run `brigade --help` (or `brigade gateway --help`) and paste the output.");
   lines.push("");
 
-  // 7. ## Workspace.
+  // 8. ## Workspace.
   // Deliberately terse: a long section here teaches the model to PARROT
   // the word "workspace" back at the operator in conversational replies
   // ("running inside your Brigade workspace…", "beyond the workspace
@@ -338,7 +368,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     lines.push("");
   }
 
-  // 8. ## Reasoning Format.
+  // 9. ## Reasoning Format.
   // ONLY emitted when `thinkingLevel` is on AND the model isn't a
   // native-reasoning family (Claude w/ extended thinking, o1/o3 — those
   // manage reasoning natively and adding tag rules would conflict).
@@ -347,7 +377,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     lines.push("");
   }
 
-  // 9. # Project Context — STABLE persona files (above the cache boundary).
+  // 10. # Project Context — STABLE persona files (above the cache boundary).
   // The previous Brigade version ("...canonical description of the
   // agent's identity, values, and ways of working.") taught the model to
   // echo those four nouns in replies; the current preamble is bland on

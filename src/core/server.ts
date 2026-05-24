@@ -68,6 +68,10 @@ import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
 import { switchModelMidTurn as piSwitchModelMidTurn } from "../agents/mid-turn-switch.js";
 import { onAgentEvent } from "../agents/agent-event-bus.js";
+import {
+	InMemoryApprovalBridge,
+	setActiveApprovalBridge,
+} from "../agents/approval-bridge.js";
 import { DEFAULT_AGENT_ID, resolveAgentDir, resolveAgentWorkspaceDir } from "../config/paths.js";
 import { defaultSessionKey } from "../sessions/session-store.js";
 import { makeExtractionLlm, runExtractionSweep } from "../agents/memory/extract.js";
@@ -586,6 +590,24 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		}
 	};
 
+	// Approval bridge — the seam between the per-turn exec-gate (which
+	// runs in-process) and connected TUI clients (which render the
+	// inline Y/A/P/N prompt). Set up before the agent loop spins so
+	// any tool-approval prompt from the very first turn is bridged
+	// through the WS instead of bouncing back to the legacy "ask the
+	// operator out-of-band" refusal.
+	const approvalBridge = new InMemoryApprovalBridge((request) => {
+		broadcast("approval-request", {
+			id: request.id,
+			command: request.command,
+			toolName: request.toolName,
+			cwd: request.cwd,
+			timeoutMs: request.timeoutMs,
+			decisions: request.decisions,
+		});
+	});
+	setActiveApprovalBridge(approvalBridge);
+
 	/* ──────────────── per-turn pi event forwarding ──────────────── */
 
 	// Wire a fresh per-turn Pi session into the gateway's broadcast +
@@ -965,6 +987,22 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				}
 				await (inFlightSession as AgentSession & { compact?: () => Promise<unknown> }).compact?.();
 				broadcast("state", buildSnapshot());
+				return undefined as ResponseFor[M];
+			}
+			case "approval-resolve": {
+				const p = params as RequestParams["approval-resolve"];
+				if (!p?.id) throw new Error("approval-resolve: missing id");
+				const resolved = approvalBridge.resolveApproval(p.id, {
+					kind: p.decision,
+					pattern: p.pattern,
+				});
+				if (!resolved) {
+					// Two common causes: stale id (operator clicked twice) or
+					// already-timed-out request. Either way it's not an error
+					// the operator needs to see — the result is the same: the
+					// next call will surface a fresh prompt if still needed.
+					return undefined as ResponseFor[M];
+				}
 				return undefined as ResponseFor[M];
 			}
 			case "list-models": {
@@ -1521,6 +1559,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			clearInterval(tickTimer);
 			if (extractTimer) clearTimeout(extractTimer);
 			pendingExtracts.clear();
+			// Detach the approval bridge so a late-arriving exec-gate call
+			// after stop() doesn't broadcast to dead clients.
+			setActiveApprovalBridge(null);
 			// Stop all product capabilities (channels + services) first so no new
 			// inbound turn is enqueued during teardown. Routed through the lifecycle
 			// queue so it can't race an in-flight `system.reload`.
