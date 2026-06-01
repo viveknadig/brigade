@@ -306,6 +306,38 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     lines.push("");
   }
 
+  // 1a. ## Voice — the BASELINE tone block. Lands here, immediately after the
+  // identity opener and BEFORE the technical sections (Tooling, Tool Call
+  // Style, Execution Bias, Safety, …), so the model absorbs the voice
+  // before it sees pages of imperative instructions. Persona files in
+  // `# Project Context` below refine + override this; the baseline ensures
+  // a sane default even when SOUL.md / IDENTITY.md are empty or operator-
+  // edited templates the model has never seen.
+  //
+  // Kept SHORT on purpose. Long tone blocks paradoxically make the model
+  // sound MORE robotic because it treats them as content to acknowledge.
+  // Six lines, each cuts one specific failure mode:
+  //   1. Human voice    — anti-corporate, anti-marketing
+  //   2. Brief default  — anti-wall-of-text
+  //   3. No filler      — anti "Sure! Here's…" / "Great question!"
+  //   4. No plumbing    — anti JID/sessionKey/conversation-id leakage
+  //   5. Outcome first  — anti "the trick was X" recovery diaries
+  //   6. Match the user — anti rigid-corporate when user is casual
+  //
+  // Skipped in sub-agent / cron mode — those have their own focused output
+  // contracts (return a tool result, not a chat reply); a chatty-voice block
+  // would conflict.
+  if (!isMinimalMode) {
+    lines.push("## Voice");
+    lines.push("Talk like a person. Direct, casual, sometimes warm — never corporate, marketing-speak, or robotic.");
+    lines.push("Brief by default. A short prose sentence beats a section with headings and bullets. Save structure for code, tables, or genuinely structured data the user asked for.");
+    lines.push("No filler openers (`Sure!`, `Of course!`, `Great question!`, `Happy to help!`). No filler closers (`Hope this helps!`, `Let me know if…`). Just answer.");
+    lines.push("Don't expose internal plumbing in replies: JIDs (`917…@s.whatsapp.net`), sessionKeys, conversation ids, tool argument shapes, adapter / channel / module / hash internals. The operator wants the outcome (\"Sent! 👋\"), not the mechanism.");
+    lines.push("After a tool succeeds, confirm the outcome in human language. Don't narrate \"the trick was X\" or replay debugging steps the operator didn't see — they just want to know it worked.");
+    lines.push("Match the user's tone. Casual when they're casual (\"hey send hi to mom\" → \"Sent! 👋\"). Technical when they ask for technical detail (\"explain why that failed\" → walk through it).");
+    lines.push("");
+  }
+
   // No first-turn synthetic guidance — first-turn behaviour comes from
   // BOOTSTRAP.md content alone. The earlier `**First turn: ... verbatim**`
   // nudge regressed both gpt-5.4 (over-literal bullet dumps) and Claude
@@ -359,25 +391,10 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   lines.push(
     "When a first-class tool exists for an action, use the tool directly instead of asking the user to run equivalent CLI or slash commands.",
   );
-  // Tone-match rule: counter-balance the structured / value-dense bias above.
-  // Without this, models default to terse-technical replies even when the
-  // user is just chatting. The SOUL.md persona in Project Context has the
-  // same idea ("skip filler", "no corporate drone") but it lives BELOW the
-  // always-on rules and gets out-weighed; lifting the gist into the always-
-  // on block keeps casual replies casual.
-  lines.push(
-    "Match the user's tone — casual when they're casual, technical when they ask for technical detail. " +
-    "Default casual. In conversational replies, write plain prose; skip headings, bullet lists, and " +
-    "code blocks unless the content really is code or structured data. Skip filler openers like \"Sure! Here's…\" or \"Great question!\" — just answer.",
-  );
-  lines.push(
-    "Don't expose internal plumbing in user-facing replies. After a successful tool call, " +
-    "confirm the OUTCOME in human language — \"Sent! 👋\" or \"Reminder set for 7:13 PM IST\" — " +
-    "not the mechanism (`917702616808@s.whatsapp.net`, sessionKeys, conversation ids, JID format, " +
-    "tool-arg shapes, hash suffixes, internal channel adapter names). If a tool failed once and " +
-    "retried, don't narrate \"the trick was X\" — just deliver the result. The operator wants the " +
-    "outcome, not the implementation diary.",
-  );
+  // Tone rules (voice / casual default / no internal plumbing / outcome-not-
+  // mechanism) live in the `## Voice` block above, not here. `## Tool Call
+  // Style` is scoped to NARRATION discipline only — when and how to talk
+  // about a tool call, not the broader voice rules.
   // Windows-specific bash hygiene: bash.exe / sh interpret backslashes as
   // escape characters, so `ls F:\Brigade\src` runs as `ls F:Brigadesrc` and
   // the operator sees a confusing "no such file" error AFTER they already
@@ -411,6 +428,12 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // Skipped in sub-agent mode: the sub-agent has a single-shot task; it
   // doesn't field operator approvals or send "progress updates", and the
   // banner already sets the "return a focused reply" bias.
+  // Lifted verbatim from the reference implementation — 4 lines, no
+  // additions. Brigade previously had two extra lines ("default to short
+  // natural replies", "skip the recap on `ok do it`") that overlap with
+  // the new `## Voice` block above; the duplication trained the model
+  // toward MORE rigid responses, not less. Trusting the reference's
+  // tighter shape.
   if (!isMinimalMode) {
     lines.push("## Execution Bias");
     lines.push(
@@ -424,12 +447,6 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     );
     lines.push(
       "If the work will take multiple steps or a while to finish, send one short progress update before or while acting.",
-    );
-    lines.push(
-      "Default to short natural replies unless the user asks for depth. Avoid walls of text, long preambles, and repetitive restatement. Friendly does not mean verbose.",
-    );
-    lines.push(
-      "If the latest user message is a short approval like \"ok do it\" or \"go ahead\", skip the recap and start acting.",
     );
     lines.push("");
   }
@@ -447,28 +464,14 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // result the parent receives as plain text, so fence discipline isn't
   // load-bearing there. The parent's prompt still carries the rules and
   // the parent decides how to render the final answer.
-  if (!isMinimalMode) {
-    lines.push("## Output Formatting");
-    lines.push(
-      "For any code, JSON, shell command, configuration, or tool output longer than ~20 chars, use a fenced Markdown code block with a language tag.",
-    );
-    lines.push(
-      "The opening fence + language tag goes on its own line; the body goes on the next line(s); the closing fence goes on its own line. NEVER put the opening fence, language, body, and closing fence on the same line.",
-    );
-    lines.push(
-      "Use these language tags: `bash` (shell), `json`, `typescript` / `ts`, `javascript` / `js`, `python`, `sql`, `yaml`, `html`, `css`, `diff`, `text` (plain). Default to `text` when uncertain.",
-    );
-    lines.push(
-      "Pretty-print JSON across multiple lines with 2-space indent unless the user asks for compact output — single-line `{\"a\":1,\"b\":2}` is harder to read in a chat UI.",
-    );
-    lines.push(
-      "Inline backticks (` `x` `) are for short identifiers / file names / single-word references INSIDE a sentence — never for multi-token data like a full JSON object, a multi-flag command, or a path with a value.",
-    );
-    lines.push(
-      "Example, correct:\n```json\n{\n  \"name\": \"…\",\n  \"value\": 42\n}\n```\nExample, wrong: `json {\"name\":\"…\",\"value\":42}`.",
-    );
-    lines.push("");
-  }
+  // Output Formatting section REMOVED to mirror the reference implementation,
+  // which doesn't carry an always-on fence-discipline block. The reference
+  // ships fence guidance only via per-provider overlays for models that
+  // need it (e.g. OpenAI prompt extras). Trusting Claude / Sonnet to fence
+  // code correctly without an explicit always-on rule keeps the prompt
+  // leaner. If a specific model regresses on fence formatting, add
+  // targeted per-family guidance in `guidance.ts` rather than restoring
+  // the always-on block.
 
   // 6. ## Safety.
   // Constitution-style anti-self-preservation rules. The previous
@@ -636,65 +639,32 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     args.channels &&
     args.channels.started.length > 0
   ) {
-    const channelList = args.channels.started.join("|");
+    const channelList = args.channels.started.join(", ");
     lines.push("## Messaging");
     lines.push(
-      "- Reply to the current channel-routed turn → `send_message` with just " +
-        "`{text}` auto-routes back to the same chat.",
+      `You can message the operator (or anyone they ask you to) on: ${channelList}.`,
     );
-    lines.push(
-      "- Proactive send / cross-channel send → `send_message({channel, to, text})` " +
-        "with explicit target.",
-    );
-    lines.push(
-      "- Scheduled / delayed send (in N minutes, daily at 9am, …) → use the " +
-        "`cron` tool with an `agentTurn` payload — the announce delivery " +
-        "routes through the same channel adapters at fire time.",
-    );
-    lines.push(
-      "- Never use `bash` / curl / a provider API CLI to send messages; " +
-        "Brigade routes ALL channel sends through `send_message`. Going around " +
-        "it bypasses authentication, retry, dedup, and audit logging.",
-    );
-    lines.push("");
-    lines.push("### send_message tool");
-    lines.push(
-      `- Available \`channel\` values: ${channelList}` +
-        (args.channels.started.length > 1
-          ? " (pass exactly one when targeting a specific channel)."
-          : "."),
-    );
+    lines.push("- To send now: `send_message`. From a channel-routed turn, just pass `{text}` — it replies in place. Otherwise pass `{channel, to, text}`.");
+    lines.push("- To send later (\"in 2 minutes\", \"daily at 9am\"): `cron` with a future `at` / cron schedule — it routes through the same channel at fire time.");
+    lines.push("- Never use `bash` / curl to send messages. Always go through `send_message` or `cron`.");
     // Surface degraded adapters so the model warns the operator BEFORE
-    // attempting a send that will fail. Each line carries the reason +
-    // remediation; the model is expected to relay both verbatim when the
-    // operator asks for an unhealthy channel.
+    // attempting a send that will fail. Phrased in human language —
+    // "WhatsApp is offline" not "channel adapter is in a degraded state".
     if (args.channels.degraded && args.channels.degraded.length > 0) {
       lines.push("");
-      lines.push("**⚠️  Channels currently unable to send:**");
+      lines.push("**Right now, these aren't working:**");
       for (const d of args.channels.degraded) {
-        const fix = d.remediation ? `  Fix: ${d.remediation}` : "";
-        lines.push(`  - \`${d.channelId}\` — ${d.reason}${fix ? `\n${fix}` : ""}`);
+        const fix = d.remediation ? ` Fix: ${d.remediation}` : "";
+        lines.push(`- ${d.channelId} — ${d.reason}${fix}`);
       }
       lines.push(
-        "If the operator asks to send via one of these, DO NOT call " +
-          "`send_message` — explain the issue + the remediation step verbatim.",
+        "If the operator asks you to send via one of these, tell them what's wrong + the fix command. Don't try to send — it will fail.",
       );
     }
-    lines.push(
-      "- For an explicit target: `{channel, to, text}` — `to` is the " +
-        "conversation/peer id (WhatsApp number, Slack channel id, Telegram " +
-        "chat id, …).",
-    );
     if (args.channels.currentChannel) {
-      const cur = args.channels.currentChannel;
-      const where = cur.conversationId
-        ? `${cur.channelId} (peer: ${cur.conversationId})`
-        : cur.channelId;
+      lines.push("");
       lines.push(
-        `- **This turn came in via \`${where}\`** — \`send_message({text})\` ` +
-          "without explicit channel/to auto-routes back to this same chat. " +
-          "Use this for in-place replies; only pass explicit channel/to when " +
-          "targeting a DIFFERENT chat.",
+        `This turn came in from ${args.channels.currentChannel.channelId}. \`send_message({text})\` (no other args) replies right back here.`,
       );
     }
     lines.push("");
