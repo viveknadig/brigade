@@ -43,7 +43,13 @@ describe("parseEligibility", () => {
 	});
 	it("ignores unrelated keys, comments, and blank lines", () => {
 		const meta = parseEligibility("# c\nname: x\n\ndescription: y\nrandom: 1");
-		assert.deepEqual(meta, { os: [], requiresBins: [], requiresAnyBins: [], requiresEnv: [] });
+		assert.deepEqual(meta, {
+			os: [],
+			requiresBins: [],
+			requiresAnyBins: [],
+			requiresEnv: [],
+			requiresConfig: [],
+		});
 	});
 	it("treats a truly empty key (no inline value, no block items) as absent", () => {
 		const meta = parseEligibility("os:\nname: x\nrequires-bins:\ndescription: y");
@@ -101,11 +107,23 @@ describe("parseEligibility", () => {
 
 	it("malformed frontmatter → no constraints (eligible), never throws", () => {
 		const meta = parseEligibility("os: [unterminated\n  : : :");
-		assert.deepEqual(meta, { os: [], requiresBins: [], requiresAnyBins: [], requiresEnv: [] });
+		assert.deepEqual(meta, {
+			os: [],
+			requiresBins: [],
+			requiresAnyBins: [],
+			requiresEnv: [],
+			requiresConfig: [],
+		});
 	});
 });
 
-const NONE: SkillEligibility = { os: [], requiresBins: [], requiresAnyBins: [], requiresEnv: [] };
+const NONE: SkillEligibility = {
+	os: [],
+	requiresBins: [],
+	requiresAnyBins: [],
+	requiresEnv: [],
+	requiresConfig: [],
+};
 
 describe("isSkillEligible", () => {
 	const env = { PATH: "" } as NodeJS.ProcessEnv;

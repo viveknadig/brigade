@@ -67,5 +67,16 @@ export function discoverEligibleSkills(args: DiscoverEligibleSkillsArgs): SkillD
 		bundledSkillsDir: resolveBundledSkillsDir(),
 		extraPaths: args.config.skills?.paths ?? [],
 		disabledNames: resolveDisabledNames(args.config),
+		// Pass the active config so `requires.config` paths actually gate
+		// channel-specific skills (e.g. a bluebubbles skill is hidden when
+		// the operator has no `channels.bluebubbles` section). Without this
+		// the eligibility evaluator conservatively allows every skill that
+		// passes os/bins/env — exactly the case that surfaced when the model
+		// tried to invoke the bluebubbles skill to send a WhatsApp message.
+		eligibilityCtx: {
+			platform: process.platform,
+			env: process.env,
+			config: args.config,
+		},
 	});
 }

@@ -62,6 +62,10 @@ export interface CronSystemEventArgs {
 	text: string;
 	agentId?: string;
 	sessionKey?: string;
+	/** Cron job id whose announce text this carries (display only). */
+	jobId?: string;
+	/** Cron job name whose announce text this carries (display only). */
+	jobName?: string;
 }
 
 /** Args the cron service hands to its failure-alert sender. */
@@ -76,12 +80,32 @@ export interface CronFailureAlertSendArgs {
 }
 
 /**
+ * Args the cron service hands to its announce-delivery dispatcher when a
+ * successful run's reply should be surfaced to the operator.
+ *
+ *   - `channel` + `to` set → send via the named channel adapter's outbound
+ *     (e.g. WhatsApp `sendText(to, text)`).
+ *   - both unset → caller's responsibility to fall back to a default
+ *     surface (typically `enqueueSystemEvent` into the operator's main
+ *     session) so the user sees the result somewhere.
+ */
+export interface CronAnnounceDeliverArgs {
+	job: CronJob;
+	text: string;
+	channel?: string;
+	to?: string;
+	accountId?: string;
+	threadId?: string;
+}
+
+/**
  * Everything the scheduler needs from the OUTSIDE — time, logging, event
- * emission, and the four big delegation points (run an agent, inject a
- * system event, send a failure alert, request a heartbeat). All five
- * dependencies are optional: missing → the scheduler logs a warning and
- * degrades gracefully (e.g., no failure alert sent if the callback isn't
- * wired). Test harnesses supply fakes; production wires reals.
+ * emission, and the five big delegation points (run an agent, inject a
+ * system event, send a failure alert, request a heartbeat, deliver a
+ * successful run's announce). All are optional: missing → the scheduler
+ * logs a warning and degrades gracefully (e.g., no failure alert sent if
+ * the callback isn't wired). Test harnesses supply fakes; production wires
+ * reals.
  */
 export interface CronServiceDeps {
 	/** Wall-clock time provider. Defaults to `Date.now`. */
@@ -98,6 +122,24 @@ export interface CronServiceDeps {
 	requestHeartbeatNow?: (opts?: { reason?: string }) => void;
 	/** Send a failure-alert message via the configured channel/webhook. */
 	sendCronFailureAlert?: (args: CronFailureAlertSendArgs) => Promise<void>;
+	/**
+	 * Deliver the SUCCESSFUL run's reply to the operator when the job's
+	 * `delivery.mode === "announce"`. Receives the resolved channel/to
+	 * tuple (which may be unset — caller decides whether to fall back to
+	 * the system-event injector for the operator's main session). Returns
+	 * `true` when delivery actually went somewhere; `false` when neither a
+	 * channel target nor a fallback was usable (the scheduler logs).
+	 */
+	deliverCronAnnounce?: (args: CronAnnounceDeliverArgs) => Promise<boolean>;
+	/**
+	 * Return the ids of channels currently STARTED (configured + env-present
+	 * + adapter.start() didn't throw). Used by `assertSupportedJobSpec` to
+	 * fail-fast on a typoed `delivery.channel` at `cron add` time rather
+	 * than silently persisting a job that would error every fire. Returning
+	 * `undefined` (or an empty array) disables the check — useful for tests
+	 * + standalone CLI invocations where no channel manager is wired.
+	 */
+	listKnownChannelIds?: () => readonly string[];
 }
 
 /** Tunable knobs the operator can set in `brigade.json`. */

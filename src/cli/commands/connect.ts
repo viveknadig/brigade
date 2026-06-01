@@ -599,6 +599,17 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		insertBeforeEditor(new Text(`  ${tone}`, 0, 0));
 	});
 
+	// `system-event` — out-of-band notification the operator MUST see (today
+	// only emitted by the cron service's announce path). Rendered as a
+	// visible Brigade-side chat line, NOT in the dim log lane, so a cron
+	// reminder firing while the operator is connected actually surfaces.
+	client.on("system-event", (event) => {
+		const label = event.jobName ? `cron "${event.jobName}"` : "cron";
+		const heading = brand.amber(`🦁 [${label}]`);
+		insertBeforeEditor(new Text(`${heading} ${event.text}`, 0, 0));
+		tui.requestRender();
+	});
+
 	// Pi events are forwarded as `{ event: <pi event>, subagentDepth? }`.
 	// Same render logic as src/ui/chat.ts but stripped of in-process state
 	// mutations. Primitive #6: when `subagentDepth > 0`, indent child events
@@ -800,8 +811,47 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 
 	// Reconnect notifications — let the user know what just happened so a
 	// dropped/restored gateway doesn't look like phantom output.
+	//
+	// CRITICAL: on reconnect, request a fresh state snapshot AND aggressively
+	// clear any "↯ tool" indicators that were waiting on a `tool_execution_end`
+	// event we likely missed while the WS was disconnected. Without this, a
+	// reconnect mid-tool leaves the TUI showing `↯ cron` (or any other tool)
+	// forever even though the gateway has long since finished — the user sees
+	// a "stuck" indicator that's purely a TUI state-staleness bug, not an
+	// actual hang.
 	client.on("reconnected" as any, () => {
 		insertBeforeEditor(new Text(`  ${brand.dim("↻ reconnected to gateway")}`, 0, 0));
+		// Fire-and-forget: ask the gateway for the current snapshot so the
+		// `state` handler above updates `isAgentRunning` + the header. Errors
+		// are swallowed — the next state push (any tool call / turn start)
+		// will refresh anyway.
+		client.request("get-state").then(
+			(snap) => {
+				if (!snap) return;
+				lastSnapshot = snap;
+				isAgentRunning = snap.isAgentRunning;
+				// If the gateway says no turn is in flight, then any tool
+				// indicators we still hold are stale (their `tool_execution_end`
+				// landed while we were disconnected). Mark each one as
+				// completed-with-no-known-outcome so the TUI stops spinning.
+				if (!snap.isAgentRunning && pendingTools.size > 0) {
+					// Reconcile orphaned tool indicators by marking each as
+					// completed-with-unknown-outcome. We don't know which tool's
+					// `tool_execution_end` was missed during the disconnect, so we
+					// can't infer the exit status; the dim ⋯ glyph signals "this
+					// tool finished, but the TUI didn't see how" and stops the spin.
+					for (const [, indicator] of pendingTools) {
+						indicator.setText(`  ${brand.dim("⋯ tool completed during disconnect")}`);
+					}
+					pendingTools.clear();
+				}
+				updateHeader();
+				tui.requestRender();
+			},
+			() => {
+				/* best-effort — silently ignore */
+			},
+		);
 	});
 
 	// Slash command + send wiring.

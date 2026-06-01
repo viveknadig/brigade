@@ -185,6 +185,34 @@ export interface OutboundSendOptions {
 }
 
 /**
+ * Per-adapter health status. Returned synchronously by `ChannelAdapter.health()`
+ * and consumed by every code path that's about to attempt an outbound send:
+ * the cron timer's announce dispatch, the `send_message` agent tool's
+ * pre-flight check, and the system-prompt assembler's `## Messaging` block
+ * (which highlights degraded channels so the model warns the operator
+ * BEFORE choosing them).
+ *
+ * Convention: `kind` is a stable enum for programmatic dispatch (e.g.
+ * "logged-out" → re-link prompt UX); `reason` is one human-readable line
+ * suitable for inline display; `remediation` is the CLI/UX action the
+ * operator runs to recover. All three are operator-facing.
+ */
+export type ChannelHealth =
+	| { ok: true }
+	| {
+			ok: false;
+			/** Stable, programmatic state. `logged-out` is the headline case (WhatsApp
+			 *  socket terminated by the phone, Slack token revoked, …). `disconnected`
+			 *  covers transient socket drops where reconnect is in flight.
+			 *  `degraded` is a catch-all for rate-limit / partial-availability states. */
+			kind: "logged-out" | "disconnected" | "starting" | "degraded";
+			/** One-liner the model / TUI / cron failure path surfaces verbatim. */
+			reason: string;
+			/** Optional CLI command the operator can run to recover. */
+			remediation?: string;
+	  };
+
+/**
  * Per-channel pairing customization. Today the manager hard-codes a phone-
  * vs-account heuristic + `🦁 Brigade` copy in the challenge card. As soon as
  * a second channel ships, the operator-visible idLabel ("Your number" vs
@@ -317,6 +345,24 @@ export interface ChannelAdapter {
 	 * indicator. Best-effort — channels without presence omit this slot.
 	 */
 	setComposing?(conversationId: string, state: "composing" | "paused"): Promise<void>;
+	/**
+	 * Optional: live health probe for this adapter. Distinguishes "started but
+	 * actually unable to send right now" (e.g. WhatsApp logged out on the
+	 * phone, Slack token expired, Discord rate-limited) from "started + ready".
+	 * Cheap + synchronous-shape: must read CACHED connection state, NEVER
+	 * round-trip the provider — the cron timer, `send_message` tool, and
+	 * system-prompt assembler all call it on the hot path.
+	 *
+	 * Returns:
+	 *   - `{ ok: true }` — adapter is healthy, sends should succeed.
+	 *   - `{ ok: false, reason, remediation? }` — adapter is degraded; the
+	 *     caller surfaces `reason` (one-line operator-facing string) + an
+	 *     optional `remediation` CLI hint (`brigade channels link ...`).
+	 *
+	 * Channels without their own health concept omit this slot entirely;
+	 * callers treat that as `{ ok: true }` (no information to gate on).
+	 */
+	health?(): ChannelHealth;
 	/**
 	 * Optional: per-channel pairing customization. When present, the manager
 	 * uses this adapter's `idLabel` for the challenge card's "Your X" line

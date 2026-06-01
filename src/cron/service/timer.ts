@@ -33,6 +33,7 @@ import {
 	shouldRunSweep,
 } from "../session-reaper.js";
 import { DEFAULT_AGENT_ID } from "../../config/paths.js";
+import { getLastChannelForAgent } from "../../agents/channels/last-channel.js";
 import { ensureLoaded, persist } from "./store.js";
 import {
 	applyJobResult,
@@ -61,8 +62,17 @@ export const MAX_TIMER_DELAY_MS = 60_000;
 export const MIN_REFIRE_GAP_MS = 2_000;
 /** How long to wait between watchdog-driven rearms during execution. */
 const RUNNING_RECHECK_INTERVAL_MS = 60_000;
-/** Per-execution wall-clock cap when the job didn't specify one. */
-const DEFAULT_EXECUTION_TIMEOUT_MS = 15 * 60_000;
+/**
+ * Per-execution wall-clock cap when the job didn't specify
+ * `payload.timeoutSeconds`. 60 seconds matches OC's default and is well
+ * above the slow-path tail of every realistic cron run (a reminder "say
+ * hi" turn is sub-5s; even a research cron firing a web-search + reply
+ * sits under 30s). Long-running crons MUST opt in by setting
+ * `payload.timeoutSeconds` explicitly — that way a typo'd or runaway run
+ * doesn't pin the per-instance lock for fifteen minutes the way it used
+ * to.
+ */
+const DEFAULT_EXECUTION_TIMEOUT_MS = 60_000;
 
 /** Compute the minimum next-fire across all enabled jobs. `undefined` = no work pending. */
 export function nextWakeAtMs(state: CronServiceState): number | undefined {
@@ -141,11 +151,19 @@ export async function onTimer(state: CronServiceState): Promise<void> {
 	state.running = true;
 	armRunningRecheckTimer(state);
 	try {
+		const now = state.deps.nowMs!();
+		// Phase A — under the lock: ensureLoaded + maintenance + collect
+		// runnables + mark-running + persist. SHORT and CPU-bound — does NOT
+		// touch the model or any I/O slower than a JSON write. Releasing the
+		// lock between phases is critical so concurrent `cron add` /
+		// `cron list` / `cron update` calls don't queue behind a long
+		// isolated-turn model call (which can take 15 minutes per the
+		// timeout default). The lock is for STORE consistency, not for
+		// serialising the actual run.
+		let runnable: CronJob[] = [];
 		await withPerInstanceLock(state.op, async () => {
 			await ensureLoaded(state);
-			const now = state.deps.nowMs!();
 			let storeMutated = false;
-
 			// Maintenance pass: clear stuck runningAtMs, refresh stale nextRunAtMs.
 			for (let i = 0; i < state.store.jobs.length; i++) {
 				const job = state.store.jobs[i]!;
@@ -155,13 +173,11 @@ export async function onTimer(state: CronServiceState): Promise<void> {
 					storeMutated = true;
 				}
 			}
-
-			const runnable = collectRunnableJobs(state, now);
+			runnable = collectRunnableJobs(state, now);
 			if (runnable.length === 0) {
 				if (storeMutated) await persist(state);
 				return;
 			}
-
 			// Mark every job-we're-about-to-run as `running` + persist BEFORE
 			// dispatching. If we crash mid-dispatch, the next startup will
 			// see the marker, treat it as stuck (after STUCK_RUN_MS), and
@@ -175,11 +191,17 @@ export async function onTimer(state: CronServiceState): Promise<void> {
 				};
 			}
 			await persist(state);
-
-			// Spawn the runs in parallel — `runDueJob` is fully self-contained
-			// (it locks again internally for its persist call).
-			await Promise.all(runnable.map((job) => runDueJob(state, job, now)));
 		});
+		// Phase B — OUTSIDE the lock: spawn the runs in parallel. Each
+		// `runDueJob` re-acquires its own per-instance lock for the brief
+		// result-apply persist after the run finishes — the SHORT critical
+		// section that needs serialisation. The 30-second-to-15-minute model
+		// call in between is NOT under the lock, so a `cron add` arriving
+		// mid-fire completes within milliseconds instead of blocking until
+		// the run finishes.
+		if (runnable.length > 0) {
+			await Promise.all(runnable.map((job) => runDueJob(state, job, now)));
+		}
 	} finally {
 		// Session-reaper sweep — throttled to once per MIN_SWEEP_INTERVAL_MS
 		// (5 minutes) so the tick loop doesn't hammer the filesystem on
@@ -326,11 +348,207 @@ async function runDueJob(
 		// Fire-and-forget — appendCronRunLog has its own internal error log.
 		void appendCronRunLog(logEntry, state.config.runLog);
 
+		// Announce delivery — surface the successful run's reply to the
+		// operator. Falls through silently for `mode !== "announce"` and for
+		// failures (those go through the failure-alert path below). Writes
+		// `lastDelivered` / `lastDeliveryStatus` / `lastDeliveryError` onto
+		// the job state under the same lock so a partially-failed delivery
+		// leaves an audit trail the operator can `cron list` to inspect.
+		if (outcome.status === "ok" && !deleteAfterApply) {
+			const deliveryResult = await maybeDeliverAnnounce(state, applied, outcome);
+			if (deliveryResult) {
+				const idx2 = state.store.jobs.findIndex((j) => j.id === job.id);
+				if (idx2 >= 0) {
+					state.store.jobs[idx2] = {
+						...state.store.jobs[idx2]!,
+						state: {
+							...state.store.jobs[idx2]!.state,
+							...(deliveryResult.delivered !== undefined
+								? { lastDelivered: deliveryResult.delivered }
+								: {}),
+							lastDeliveryStatus: deliveryResult.status,
+							...(deliveryResult.error !== undefined
+								? { lastDeliveryError: deliveryResult.error }
+								: { lastDeliveryError: undefined }),
+						},
+					};
+					await persist(state);
+				}
+			}
+		}
+
 		// Failure-alert check
 		if (outcome.status === "error" && !deleteAfterApply) {
 			await maybeSendFailureAlert(state, applied, outcome.error ?? "unknown error", endedAtMs);
 		}
 	});
+}
+
+/** Resolved status the timer writes onto the job's `state.lastDeliveryStatus`. */
+interface CronAnnounceDeliveryResult {
+	status: "delivered" | "not-delivered" | "not-requested";
+	delivered?: boolean;
+	error?: string;
+}
+
+/**
+ * Deliver the run outcome's summary text to the operator if the job's
+ * `delivery.mode === "announce"`. Routes via the `deliverCronAnnounce`
+ * dep when wired (typically a channel adapter's outbound) and falls back
+ * to `enqueueSystemEvent` so a cron without an explicit channel target
+ * still surfaces somewhere the operator will see it.
+ *
+ * Returns a result describing what actually happened so the caller can
+ * persist `lastDelivered` / `lastDeliveryStatus` / `lastDeliveryError`
+ * on the job state — the operator's `cron list` then shows whether the
+ * most recent successful run's reply actually reached its target or hit
+ * a snag (e.g. the WhatsApp adapter was disconnected when the cron
+ * fired). Returns `null` when delivery wasn't requested at all (mode
+ * !== announce / empty summary), so the caller skips the state write.
+ *
+ * Best-effort by design: a delivery failure logs but does NOT change
+ * the job's `lastStatus`. The cron RAN — the bookkeeping that matters
+ * most is "did the agent complete its turn" — delivery is the soft
+ * suffix. When `delivery.bestEffort === true`, delivery errors are
+ * additionally muted from the diagnostic log (the operator opted in to
+ * "fire and forget" semantics; don't spam the log).
+ */
+async function maybeDeliverAnnounce(
+	state: CronServiceState,
+	job: CronJob,
+	outcome: CronIsolatedRunOutcome,
+): Promise<CronAnnounceDeliveryResult | null> {
+	const delivery = job.delivery;
+	if (!delivery || delivery.mode !== "announce") return null;
+	const summary = outcome.summary?.trim();
+	if (!summary) {
+		state.deps.log.info("cron announce skipped — empty reply summary", {
+			jobId: job.id,
+		});
+		return { status: "not-delivered", delivered: false, error: "empty reply summary" };
+	}
+	const text = formatAnnounceText(job, summary);
+	// Last-channel fallback. When the operator (or the model) didn't set an
+	// explicit `delivery.channel/to` AND the turn that scheduled this cron
+	// had no channelContext (typical pure-TUI scheduling), the job lands
+	// with `{mode: "announce"}` and no target. Before falling all the way
+	// through to `enqueueSystemEvent`, look up the agent's most recently
+	// active channel — if WhatsApp / Slack / Telegram was the last surface
+	// the operator was on, the cron announces THERE. Without this the
+	// announce would land only in the TUI bubble + the next-prompt
+	// drain, and the operator on their phone would silently miss it.
+	let resolvedChannel = delivery.channel?.trim() || undefined;
+	let resolvedTo = delivery.to?.trim() || undefined;
+	let resolvedThreadId = delivery.threadId;
+	let resolvedAccountId = delivery.accountId;
+	if (!resolvedChannel || !resolvedTo) {
+		const agentId = job.agentId ?? DEFAULT_AGENT_ID;
+		const last = getLastChannelForAgent(agentId);
+		if (last) {
+			resolvedChannel ??= last.channelId;
+			resolvedTo ??= last.conversationId;
+			resolvedThreadId ??= last.threadId;
+			resolvedAccountId ??= last.accountId;
+		}
+	}
+	const channel = resolvedChannel;
+	const to = resolvedTo;
+	const dispatcher = state.deps.deliverCronAnnounce;
+	const bestEffort = delivery.bestEffort === true;
+	let delivered = false;
+	let lastError: string | undefined;
+	if (dispatcher && channel && to) {
+		try {
+			delivered = await dispatcher({
+				job,
+				text,
+				channel,
+				to,
+				...(resolvedAccountId ? { accountId: resolvedAccountId } : {}),
+				...(resolvedThreadId ? { threadId: resolvedThreadId } : {}),
+			});
+			if (!delivered) {
+				lastError = `channel "${channel}" dispatcher refused delivery (adapter not started, or recipient rejected)`;
+				if (!bestEffort) {
+					state.deps.log.warn("cron announce dispatcher returned false", {
+						jobId: job.id,
+						channel,
+						to,
+					});
+				}
+			}
+		} catch (err) {
+			lastError = err instanceof Error ? err.message : String(err);
+			if (!bestEffort) {
+				state.deps.log.warn("cron announce dispatch threw", {
+					jobId: job.id,
+					channel,
+					to,
+					error: lastError,
+				});
+			}
+		}
+	}
+	if (delivered) {
+		return { status: "delivered", delivered: true };
+	}
+	// Channel dispatch didn't land — fall back to the operator's main
+	// session so the reply STILL lands somewhere visible. Skipped when no
+	// `enqueueSystemEvent` dep is wired (at which point we've genuinely
+	// run out of surfaces and log).
+	const enqueue = state.deps.enqueueSystemEvent;
+	if (!enqueue) {
+		if (!bestEffort) {
+			state.deps.log.warn(
+				"cron announce had no usable delivery target (no channel + no enqueueSystemEvent dep)",
+				{ jobId: job.id, mode: delivery.mode, channel, to },
+			);
+		}
+		return {
+			status: "not-delivered",
+			delivered: false,
+			error: lastError ?? "no delivery surface available",
+		};
+	}
+	try {
+		enqueue({
+			text,
+			jobId: job.id,
+			jobName: job.name,
+			...(job.agentId !== undefined ? { agentId: job.agentId } : {}),
+			...(job.sessionKey !== undefined ? { sessionKey: job.sessionKey } : {}),
+		});
+		// Fallback IS still a delivery — the operator's TUI / connect client
+		// will see the system event. Mark delivered so the operator's
+		// `cron list` doesn't flash "not-delivered" red on what actually
+		// reached them.
+		return { status: "delivered", delivered: true };
+	} catch (err) {
+		const enqueueErr = err instanceof Error ? err.message : String(err);
+		if (!bestEffort) {
+			state.deps.log.warn("cron announce fallback enqueueSystemEvent threw", {
+				jobId: job.id,
+				error: enqueueErr,
+			});
+		}
+		return {
+			status: "not-delivered",
+			delivered: false,
+			error: lastError ?? enqueueErr,
+		};
+	}
+}
+
+/**
+ * Build the operator-facing announce text. Prefixes the cron's name so the
+ * operator can tell announce messages from their own ongoing turn output
+ * (otherwise a system event injected mid-conversation reads like the
+ * assistant's own line).
+ */
+function formatAnnounceText(job: CronJob, summary: string): string {
+	const flat = summary.replace(/\s+/g, " ").trim();
+	const trimmed = flat.length <= 600 ? flat : `${flat.slice(0, 597)}…`;
+	return `[cron "${job.name}"] ${trimmed}`;
 }
 
 /**

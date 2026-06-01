@@ -33,6 +33,7 @@ import {
 	removeChannelApprovalDispatcher,
 	tryConsumeChannelApprovalReply,
 } from "./approval-router.js";
+import { recordLastChannelForAgent } from "./last-channel.js";
 import { channelSessionKey } from "./session-key.js";
 import { sanitizeReplyForChannel } from "./reply-sanitizer.js";
 import { classifyErrorReason, isBrigadeRetryError } from "../error-classifier.js";
@@ -345,6 +346,13 @@ export interface ChannelManager {
 	readonly started: string[];
 	/** Stop every started channel + abort their listeners. Idempotent. */
 	stop(): Promise<void>;
+	/**
+	 * Look up a started channel adapter by id. Returns `undefined` when the
+	 * channel never started (config disabled, env missing, start threw).
+	 * Used by the cron service to fan out announce deliveries through the
+	 * channel that originally took the add-cron message.
+	 */
+	adapter(id: string): ChannelAdapter | undefined;
 }
 
 /**
@@ -786,6 +794,12 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 						conversationId: msg.conversationId,
 						...(msg.threadId !== undefined ? { threadId: msg.threadId } : {}),
 					};
+					// Pin THIS channel as the operator's most-recently-active so
+					// a future cron firing with `delivery.mode:"announce"` but no
+					// explicit channel target falls back to this peer. Only fires
+					// for access-allowed inbounds (we're past the policy gate) so
+					// a stranger DM can't accidentally redirect future crons.
+					recordLastChannelForAgent(args.agentId, channelApprovalRoute);
 					// Optional debounce — coalesce rapid-fire messages into a single
 					// turn. Off by default (`channels.<id>.debounceMs <= 0` ⇒
 					// immediate). For groups we key per-speaker so different
@@ -875,6 +889,10 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 	let stopped = false;
 	return {
 		started: started.map((s) => s.id),
+		adapter(id: string): ChannelAdapter | undefined {
+			const entry = started.find((s) => s.id === id);
+			return entry?.adapter;
+		},
 		async stop(): Promise<void> {
 			if (stopped) return;
 			stopped = true;

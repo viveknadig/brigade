@@ -112,6 +112,12 @@ export interface CronJobState {
 	consecutiveErrorCount?: number;
 	/** Last failure-alert send time (drives cooldown). */
 	lastFailureAlertAtMs?: number;
+	/** Did the most recent successful run's announce delivery land? */
+	lastDelivered?: boolean;
+	/** Resolved delivery status for the most recent run — `delivered` / `not-delivered` / `unknown` / `not-requested`. */
+	lastDeliveryStatus?: "delivered" | "not-delivered" | "unknown" | "not-requested";
+	/** Error string from the most recent failed delivery attempt. */
+	lastDeliveryError?: string;
 }
 
 export interface CronJob {

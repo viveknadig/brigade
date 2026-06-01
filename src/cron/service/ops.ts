@@ -188,6 +188,13 @@ export async function add(
 	input: CronJobCreate,
 ): Promise<CronJob> {
 	const defaulted = defaultCronJobCreate(input);
+	// Channel-target validation. When the operator (or the model on their
+	// behalf) sets `delivery.channel`, refuse the add if that channel id
+	// doesn't match a started adapter — typos like "whatapp" / "slak" would
+	// otherwise silently persist and fail every fire. Skipped when the
+	// channel registry isn't wired (tests / standalone CLI) so unit tests
+	// don't need to mock a manager just to add a cron.
+	assertDeliveryChannelIsKnown(state, defaulted.delivery);
 	const created = await withPerInstanceLock(state.op, async () => {
 		await ensureLoaded(state);
 		const now = state.deps.nowMs!();
@@ -214,6 +221,12 @@ export async function update(
 	jobId: string,
 	patch: CronJobPatch,
 ): Promise<CronJob> {
+	// Same channel-target validation as `add` — applies to update too so an
+	// operator can't rename a job's delivery.channel to a typo'd value via
+	// the update path either.
+	if (patch.delivery !== undefined) {
+		assertDeliveryChannelIsKnown(state, patch.delivery);
+	}
 	const updated = await withPerInstanceLock(state.op, async () => {
 		await ensureLoaded(state);
 		const now = state.deps.nowMs!();
@@ -398,4 +411,36 @@ function emit(state: CronServiceState, event: CronEvent): void {
 			error: err instanceof Error ? err.message : String(err),
 		});
 	}
+}
+
+/**
+ * Refuse a `cron add`/`update` whose `delivery.channel` doesn't correspond
+ * to a started channel adapter. Catches typos ("whatapp", "slak") that
+ * would otherwise silently persist and produce a "channel not started"
+ * warning every fire — the operator never seeing the cron's reply and
+ * never understanding why.
+ *
+ * Skipped when:
+ *   - No `listKnownChannelIds` dep is wired (tests / standalone CLI).
+ *   - The returned list is empty (no channels active yet — don't block
+ *     adding a cron BEFORE the first channel adapter starts).
+ *   - `delivery` is unset / `delivery.channel` is unset / `delivery.mode`
+ *     isn't `"announce"`.
+ */
+function assertDeliveryChannelIsKnown(
+	state: CronServiceState,
+	delivery: CronJob["delivery"] | undefined,
+): void {
+	if (!delivery) return;
+	if (delivery.mode !== "announce") return;
+	const channelRaw = delivery.channel?.trim();
+	if (!channelRaw) return;
+	const list = state.deps.listKnownChannelIds?.();
+	if (!list || list.length === 0) return;
+	if (list.includes(channelRaw)) return;
+	throw new Error(
+		`cron delivery.channel "${channelRaw}" is not a started channel adapter — ` +
+			`available channels: ${list.join(", ") || "(none)"}. ` +
+			`Either start the adapter first or change the channel id.`,
+	);
 }

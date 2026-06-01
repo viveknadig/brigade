@@ -150,6 +150,41 @@ export function canonicalWhatsAppId(raw: string | null | undefined): string {
 	return beforeColon.replace(/\D/g, "");
 }
 
+/**
+ * Coerce ANY operator-shaped target into a sendable WhatsApp JID. Accepts:
+ *
+ *   - `"+91 77026 16808"` / `"+917702616808"` / `"917702616808"` → strips
+ *     formatting, treats as a personal phone number, returns
+ *     `"917702616808@s.whatsapp.net"`.
+ *   - `"917702616808@s.whatsapp.net"` → returned unchanged (already canonical).
+ *   - `"123-456-789@g.us"` → returned unchanged (group jid).
+ *   - `"260451430568126@lid"` → returned unchanged (LID alias — Baileys handles
+ *     the lookup internally during send).
+ *
+ * Returns `""` when the input has no recoverable digits AND no `@`.
+ *
+ * The Baileys `sendMessage` API parses the recipient via `jidDecode` and
+ * crashes with `"Cannot destructure property 'user' of 'jidDecode(...)' as
+ * it is undefined"` when the input is a bare `"+phonenumber"` — `jidDecode`
+ * returns undefined because there's no `@`. Normalising at the adapter
+ * boundary means the operator (and the model) can address peers by phone
+ * number in the natural shape and never has to know about JID syntax.
+ */
+export function toWhatsAppJid(raw: string | null | undefined): string {
+	if (!raw) return "";
+	const trimmed = raw.trim();
+	if (!trimmed) return "";
+	// Already a jid → pass through unchanged. Covers @s.whatsapp.net (personal),
+	// @g.us (group), @lid / @hosted.lid (LID alias), @broadcast (status).
+	if (trimmed.includes("@")) return trimmed;
+	// Bare phone — strip formatting (`+`, spaces, hyphens, parens) and append
+	// the personal-jid suffix. We DO NOT validate the number's country-code
+	// shape; Baileys will reject with a clear error if the number is invalid.
+	const digits = trimmed.replace(/\D/g, "");
+	if (!digits) return "";
+	return `${digits}@s.whatsapp.net`;
+}
+
 // Regular phone-number jid (with optional device suffix). The capture is the
 // raw E.164 digits — no leading `+`, callers add it when displaying.
 const WA_PHONE_JID_RE = /^(\d+)(?::\d+)?@(s\.whatsapp\.net|hosted)$/;

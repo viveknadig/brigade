@@ -42,7 +42,9 @@ import {
 } from "../sessions/session-store.js";
 import { readConfigOrInit, type BrigadeConfig } from "../config/io.js";
 import { discoverEligibleSkills } from "./skills/index.js";
-import { BUNDLED_MODULES, loadModules } from "./extensions/index.js";
+import { BUNDLED_MODULES } from "./extensions/index.js";
+import { getActiveChannelManager } from "./channels/active-manager.js";
+import { getOrLoadExtensionRegistry } from "./extensions/registry-cache.js";
 import { assembleSystemPrompt } from "../system-prompt/assembler.js";
 import {
   loadHeartbeatFile,
@@ -69,6 +71,10 @@ import { resolveModelNeverMiss } from "./model-resolution.js";
 import { buildAutoRecallBlock } from "./memory/auto-recall.js";
 import { resolveActiveMemoryCapability } from "./memory/plugin-runtime.js";
 import { buildBrigadeTransformContext } from "./payload-mutators.js";
+import {
+  drainPendingSystemEvents,
+  formatPendingEventsPrefix,
+} from "./pending-system-events.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
 import type { BrigadeBeforeToolCallHook } from "./tool-guard.js";
@@ -484,7 +490,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // registered backend has to be in `registry.memoryCapabilities` before we
   // build the memory tools so `recall_memory` / `write_memory` route through
   // it on this very turn.
-  const extensionRegistry = await loadModules({
+  const extensionRegistry = await getOrLoadExtensionRegistry({
     modules: BUNDLED_MODULES,
     meta: { agentId, workspaceDir, cwd, config: turnConfig },
   });
@@ -532,6 +538,13 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // Undefined for non-cron turns, an array for cron-fired turns whose
     // payload sets a tool allowlist.
     ...(args.toolsAllow !== undefined ? { toolsAllow: args.toolsAllow } : {}),
+    // Channel context — set when the inbound came from a channel adapter.
+    // The cron tool reads it to auto-fill `delivery.channel/to/threadId` so
+    // a `cron add` mid-chat replies back to the same chat by default. The
+    // model can still override by passing explicit delivery params.
+    ...(args.channelApprovalRoute !== undefined
+      ? { channelContext: args.channelApprovalRoute }
+      : {}),
   });
   const brigadeCustomTools = toolset.customTools;
   const enabledToolNames = toolset.enabledToolNames;
@@ -905,6 +918,52 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // #5). Lands in the cached prefix under `## Skills`; the model reads a
     // skill's body on demand via the read tool.
     skillsPromptBlock: skillDiscovery.promptBlock,
+    // Channel surface for the `## Messaging` section. Reads from the
+    // process-wide channel-manager singleton — when the gateway has
+    // started adapters, the model sees the directory + (when this turn
+    // came from a channel inbound) the in-place-reply hint. Skipped in
+    // standalone CLI runs where no manager is mounted.
+    channels: (() => {
+      const manager = getActiveChannelManager();
+      if (!manager || manager.started.length === 0) return undefined;
+      const route = args.channelApprovalRoute;
+      // Probe each started adapter's health (sync, cheap — reads a cached
+      // bool) so the assembler can surface a `⚠️ degraded` block when any
+      // adapter is logged-out / disconnected / starting. Without this the
+      // model recommends a channel that will refuse the send.
+      const degraded: Array<{
+        channelId: string;
+        reason: string;
+        remediation?: string;
+      }> = [];
+      for (const id of manager.started) {
+        const adapter = manager.adapter(id);
+        if (!adapter || typeof adapter.health !== "function") continue;
+        const status = adapter.health();
+        if (!status.ok) {
+          degraded.push({
+            channelId: id,
+            reason: status.reason,
+            ...(status.remediation !== undefined ? { remediation: status.remediation } : {}),
+          });
+        }
+      }
+      return {
+        started: manager.started,
+        ...(degraded.length > 0 ? { degraded } : {}),
+        ...(route
+          ? {
+              currentChannel: {
+                channelId: route.channelId,
+                ...(route.conversationId !== undefined
+                  ? { conversationId: route.conversationId }
+                  : {}),
+                ...(route.threadId !== undefined ? { threadId: route.threadId } : {}),
+              },
+            }
+          : {}),
+      };
+    })(),
     config: turnConfig,
     // Auto-recall: lexically surface the top relevant structured facts for THIS
     // user message as an ephemeral (per-turn, below-cache-boundary) suffix, so
@@ -971,7 +1030,22 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // The user message is scrubbed of the Anthropic refusal-trigger magic
   // string before Pi sees it; otherwise a paste-through of that literal
   // would coerce Claude into refusing the next turn.
-  const scrubbedMessage = scrubAnthropicRefusalSentinel(args.message);
+  // Drain any pending system events queued for THIS session (today: cron's
+  // announce text when its delivery had no channel target, fallback path
+  // in `cron/service/timer.ts:maybeDeliverAnnounce`). Each pending event
+  // becomes a `<system_event>` block prepended to the user's text so the
+  // model sees the cron's reminder fired BEFORE it answers the new
+  // message. Without this the model would be answering the operator's
+  // next "did the cron fire?" question blind. Cron's gateway wiring
+  // dual-writes: a `system-event` WS frame for live TUI visibility AND
+  // the per-session queue this drain consumes — see `src/core/server.ts`
+  // `enqueueSystemEvent` for the writer + `src/agents/pending-system-events.ts`
+  // for the queue itself.
+  const pendingEvents = drainPendingSystemEvents(resolved.sessionKey);
+  const pendingPrefix = formatPendingEventsPrefix(pendingEvents);
+  const scrubbedMessage = scrubAnthropicRefusalSentinel(
+    pendingPrefix ? `${pendingPrefix}${args.message}` : args.message,
+  );
   // Process-level event bus wiring. A short-lived run id correlates
   // every event from this turn so multi-consumer subscribers (TUI,
   // gateway WebSocket broadcast, debug logs) can group them. The
@@ -1378,6 +1452,26 @@ async function buildPersonaPrompt(args: {
    * its task message; persona context is overhead).
    */
   lightContext?: boolean;
+  /**
+   * Channel surface for the `## Messaging` section. Patterned on the
+   * reference implementation's messaging-block — lists every started
+   * channel so the model can pick the right `channel` value AND, when
+   * `currentChannel` is set, knows the in-place-reply path. Undefined
+   * (or empty `started`) skips the section.
+   */
+  channels?: {
+    started: readonly string[];
+    degraded?: ReadonlyArray<{
+      channelId: string;
+      reason: string;
+      remediation?: string;
+    }>;
+    currentChannel?: {
+      channelId: string;
+      conversationId?: string;
+      threadId?: string;
+    };
+  };
 }): Promise<string> {
   const config = args.config ?? readConfigOrInit();
   const override = resolveSystemPromptOverride({ config, agentId: args.agentId });
@@ -1426,6 +1520,7 @@ async function buildPersonaPrompt(args: {
     capabilities: args.capabilities,
     skillsPromptBlock: args.skillsPromptBlock,
     ephemeralSuffix: args.ephemeralSuffix,
+    ...(args.channels !== undefined ? { channels: args.channels } : {}),
   });
   return assembled.text;
 }

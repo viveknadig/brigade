@@ -120,6 +120,18 @@ export type EventName =
 	/** Mirrored from event-logger writes — useful for debug clients. */
 	| "log"
 	/**
+	 * Out-of-band notification the connect-mode TUI must render as a visible
+	 * chat line — distinct from `log` which scrolls in a debug panel. Today
+	 * the only producer is the cron service's announce path: when a job's
+	 * `delivery.mode === "announce"` fires and there's no channel target (or
+	 * the channel dispatcher refuses), the gateway broadcasts a
+	 * `system-event` so the operator's connected TUI surfaces the reply as
+	 * a Brigade-side bubble (e.g. `[cron "X"] hi`). Without this the
+	 * announce would be silently buried in the log panel + the operator
+	 * would never see their reminder fire.
+	 */
+	| "system-event"
+	/**
 	 * The gateway needs operator consent to run a gated tool call (today:
 	 * `bash`). The TUI renders an inline approval prompt and resolves via
 	 * the `approval-resolve` request.
@@ -179,6 +191,22 @@ export interface EventPayload {
 	state: SessionStateSnapshot;
 	error: { message: string };
 	log: { level: "info" | "warn" | "error"; message: string; at: number };
+	"system-event": {
+		/** Text the TUI renders as a Brigade-side chat line. */
+		text: string;
+		/** Wall-clock ms the event was queued (display + ordering). */
+		at: number;
+		/**
+		 * Source label so the TUI can prefix or colour the bubble. Today only
+		 * the cron service emits these (`source: "cron"`); future system-event
+		 * producers (alerts, notifications) get their own discriminator.
+		 */
+		source: "cron";
+		/** Optional id of the cron job that fired — display only. */
+		jobId?: string;
+		/** Optional human-readable name of the cron job that fired. */
+		jobName?: string;
+	};
 	"approval-request": {
 		/** Opaque server-side id; echo back in `approval-resolve`. */
 		id: string;

@@ -15,8 +15,13 @@ import path from "node:path";
 
 import type { BrigadeConfig } from "../../../config/io.js";
 import { ensureDir, resolveChannelStateDir } from "../../../config/paths.js";
-import type { ChannelAdapter, ChannelStartContext, OutboundSendOptions } from "../../extensions/types.js";
-import { connectWhatsApp, type WhatsAppConnection } from "./connection.js";
+import type {
+	ChannelAdapter,
+	ChannelHealth,
+	ChannelStartContext,
+	OutboundSendOptions,
+} from "../../extensions/types.js";
+import { connectWhatsApp, toWhatsAppJid, type WhatsAppConnection } from "./connection.js";
 
 const CHANNEL_ID = "whatsapp";
 
@@ -43,6 +48,22 @@ async function printQr(qr: string): Promise<void> {
 
 export function createWhatsAppAdapter(): ChannelAdapter {
 	let connection: WhatsAppConnection | null = null;
+	// Health state captured from the connection's lifecycle callbacks. The
+	// adapter is otherwise stateless about session liveness — Baileys owns
+	// the socket — so we mirror just enough into these flags for the
+	// `health()` method (and every caller that depends on it) to refuse a
+	// send against a dead session without dialling Baileys on the hot path.
+	//
+	//   - `connected` flips true when the WS handshakes + flips false again
+	//     on any close (network drop, server kick, logout).
+	//   - `loggedOut` is a STICKY terminal: once the phone or the platform
+	//     terminates the link, reconnect is no longer attempted (per the
+	//     connection layer's "dead creds — never reconnect" path) and the
+	//     ONLY recovery is `brigade channels link`. The flag stays true
+	//     until the next successful `onConnected` from a freshly-paired
+	//     adapter (after the operator runs the unlink + link CLI flow).
+	let connected = false;
+	let loggedOut = false;
 
 	return {
 		id: CHANNEL_ID,
@@ -70,10 +91,16 @@ export function createWhatsAppAdapter(): ChannelAdapter {
 					void printQr(qr);
 				},
 				onConnected: () => {
+					connected = true;
+					// A fresh `onConnected` clears a prior sticky logged-out state —
+					// the operator must have re-linked via the CLI flow.
+					loggedOut = false;
 					ctx.log("WhatsApp ready");
 					ctx.onConnected?.();
 				},
 				onLoggedOut: () => {
+					connected = false;
+					loggedOut = true;
 					// Recipient-friendly wording — no on-disk paths, no "delete X then …"
 					// instructions. The operator gets a clean recovery flow via the CLI
 					// (`brigade channels unlink` wipes the local credentials; then
@@ -106,15 +133,81 @@ export function createWhatsAppAdapter(): ChannelAdapter {
 		async stop(): Promise<void> {
 			await connection?.close();
 			connection = null;
+			connected = false;
+		},
+
+		/**
+		 * Synchronous read of the cached session state. Returns:
+		 *   - `{ ok: true }` once Baileys has signalled a successful handshake
+		 *     AND the session hasn't been terminated since.
+		 *   - `{ ok: false, kind: "logged-out" }` after the phone / platform
+		 *     unlinks the session. Sticky — the only recovery is the operator
+		 *     re-pairing via `brigade channels link`.
+		 *   - `{ ok: false, kind: "starting" }` between `start()` and the first
+		 *     `onConnected` callback (incl. during QR-scan link flow).
+		 *   - `{ ok: false, kind: "disconnected" }` for transient drops where
+		 *     reconnect is in-flight but the socket isn't ready yet.
+		 *
+		 * Cheap — reads two booleans. Safe to call from cron timer / send tool
+		 * pre-flights without any I/O.
+		 */
+		health(): ChannelHealth {
+			if (loggedOut) {
+				return {
+					ok: false,
+					kind: "logged-out",
+					reason:
+						"WhatsApp was unlinked from the operator's phone — Brigade can't send until it's paired again.",
+					remediation:
+						"Run `brigade channels unlink --channel whatsapp` then `brigade channels link --channel whatsapp` and scan the new QR.",
+				};
+			}
+			if (!connection) {
+				return {
+					ok: false,
+					kind: "starting",
+					reason: "WhatsApp adapter is not started yet.",
+				};
+			}
+			if (!connected) {
+				return {
+					ok: false,
+					kind: "disconnected",
+					reason: "WhatsApp socket is reconnecting — sends will fail until the link comes back up.",
+				};
+			}
+			return { ok: true };
 		},
 
 		async sendText(conversationId: string, text: string, opts?: OutboundSendOptions): Promise<void> {
 			if (!connection) throw new Error("WhatsApp channel is not started");
+			if (loggedOut) {
+				throw new Error(
+					"WhatsApp is unlinked — run `brigade channels link --channel whatsapp` to re-pair, then retry.",
+				);
+			}
+			if (!connected) {
+				throw new Error("WhatsApp socket is reconnecting — try again in a moment.");
+			}
+			// Normalise to a JID — accept human-shaped phone numbers like
+			// "+91 77026 16808" / "+917702616808" / "917702616808" by stripping
+			// formatting and appending `@s.whatsapp.net`. Without this Baileys'
+			// `jidDecode` returns undefined for a bare-phone input and the send
+			// crashes with the opaque "Cannot destructure property 'user' of
+			// 'jidDecode(...)' as it is undefined" — exactly what the operator
+			// hit when telling the model "send hi to +91...". JIDs / group ids /
+			// LID aliases pass through unchanged.
+			const jid = toWhatsAppJid(conversationId);
+			if (!jid) {
+				throw new Error(
+					`WhatsApp: couldn't normalise recipient "${conversationId}" — pass a phone number (e.g. +917702616808) or a WhatsApp JID.`,
+				);
+			}
 			// WhatsApp has no thread routing — `opts.threadId` is accepted for
 			// signature compatibility with threaded channels (Slack/Discord)
 			// and silently ignored here.
 			void opts;
-			await connection.sendText(conversationId, text);
+			await connection.sendText(jid, text);
 		},
 		// Pairing customization — WhatsApp ids are international phone numbers,
 		// so the challenge card uses the "Your number: +X" line. No
@@ -124,17 +217,27 @@ export function createWhatsAppAdapter(): ChannelAdapter {
 		pairing: { idLabel: "phone" as const },
 		async sendMedia(conversationId, media): Promise<void> {
 			if (!connection) throw new Error("WhatsApp channel is not started");
-			await connection.sendMedia(conversationId, media);
+			const jid = toWhatsAppJid(conversationId);
+			if (!jid) {
+				throw new Error(
+					`WhatsApp: couldn't normalise recipient "${conversationId}" — pass a phone number or a WhatsApp JID.`,
+				);
+			}
+			await connection.sendMedia(jid, media);
 		},
 		async react(conversationId, messageId, emoji): Promise<void> {
 			if (!connection) throw new Error("WhatsApp channel is not started");
-			await connection.react(conversationId, messageId, emoji);
+			const jid = toWhatsAppJid(conversationId);
+			if (!jid) return; // Cosmetic — refuse silently rather than throw on a reaction.
+			await connection.react(jid, messageId, emoji);
 		},
 		async markRead(conversationId, messageId, participant): Promise<void> {
 			// No-op when the socket isn't up — read receipts are cosmetic and the
 			// manager calls this best-effort post-gate.
 			if (!connection) return;
-			await connection.markRead(conversationId, messageId, participant);
+			const jid = toWhatsAppJid(conversationId);
+			if (!jid) return;
+			await connection.markRead(jid, messageId, participant);
 		},
 		async setComposing(conversationId, state): Promise<void> {
 			if (!connection) return;

@@ -416,3 +416,77 @@ export function wrapOwnerOnlyToolExecution(
 		execute: refusedExecute,
 	};
 }
+
+/**
+ * Default per-tool execution timeout. The cron tool's `add` action runs in
+ * tens of milliseconds; recall_memory / read_memory in single-digit
+ * seconds; spawn_agent in tens-of-seconds at worst. 60 seconds is a generous
+ * cap — well above the slow-path tail of every Brigade-native tool and
+ * below the threshold at which a stuck tool starts to look like a
+ * gateway hang to the operator.
+ *
+ * Pi's built-in tools (bash, read, write, edit, grep, find, ls) are NOT
+ * wrapped here — their `execute` is owned by Pi and timeouts there go
+ * through the bash gate / Pi's own controls.
+ */
+const DEFAULT_TOOL_EXECUTION_TIMEOUT_MS = 60 * 1000;
+
+/**
+ * Wrap a Brigade-native tool's `execute` with a hard timeout. If the
+ * underlying tool's promise doesn't settle within `timeoutMs`, the wrapped
+ * call rejects with a `BrigadeToolTimeoutError` — Pi surfaces the
+ * message to the model as a tool failure, which is FAR better than the
+ * model (and the operator's TUI) sitting on a spinning `↯` indicator
+ * forever while the tool quietly hangs.
+ *
+ * Note this is BEST-EFFORT cancellation: the underlying tool's promise
+ * may still be running in the background (we can't kill JS promises).
+ * What the timeout DOES guarantee is that the agent loop gets unblocked
+ * and the model can continue (e.g. tell the user "the tool timed out,
+ * please try again"). The orphaned promise's eventual resolution is
+ * ignored.
+ */
+export function wrapToolExecutionTimeout(
+	tool: AnyBrigadeTool,
+	timeoutMs: number = DEFAULT_TOOL_EXECUTION_TIMEOUT_MS,
+): AnyBrigadeTool {
+	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return tool;
+	const originalExecute = tool.execute.bind(tool);
+	const timedExecute: AnyBrigadeTool["execute"] = async (...args) => {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			return await Promise.race([
+				originalExecute(...args),
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(() => {
+						reject(
+							new BrigadeToolTimeoutError(
+								`tool "${tool.name}" did not return within ${Math.round(
+									timeoutMs / 1000,
+								)}s — ` +
+									`assume the call hung. Tell the operator and ask them ` +
+									`what they want to do; do NOT retry the same call back-to-back.`,
+							),
+						);
+					}, timeoutMs);
+					if (typeof timer.unref === "function") timer.unref();
+				}),
+			]);
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	};
+	return {
+		...tool,
+		execute: timedExecute,
+	};
+}
+
+/** 504-class — surfaced to the model so it stops waiting on the tool result. */
+export class BrigadeToolTimeoutError extends Error {
+	readonly status: number = 504;
+	constructor(message: string) {
+		super(message);
+		this.name = "BrigadeToolTimeoutError";
+	}
+}

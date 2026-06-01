@@ -105,6 +105,46 @@ export interface AssembleArgs {
   // places it under `## Skills` when `capabilities.skills` is true. Lives in
   // the cached prefix — the skill list is stable within a session.
   skillsPromptBlock?: string;
+  /**
+   * Active channel surface for this turn. When the gateway has started
+   * channel adapters (WhatsApp, Slack, Telegram, …), the agent needs to
+   * SEE that list in the system prompt — otherwise asked "send a WhatsApp
+   * to +91…" it falls back to bash-probing `brigade doctor` like the user
+   * caught it doing. The assembler emits a `## Channels` block listing
+   * each started channel by id; the `send_message` tool's `channel` enum
+   * is what the model actually invokes from there.
+   *
+   * `currentChannel` (when set) marks "this turn came IN through this
+   * channel" so the model knows what reply-in-place means (and `send_message`
+   * auto-fills accordingly).
+   *
+   * Empty list / undefined → no `## Channels` section emitted (cron-mode
+   * and sub-agent-mode also skip this section regardless — they get a
+   * scoped tool surface, not the operator's full channel directory).
+   */
+  channels?: {
+    /** Channel ids currently started + ready to send. */
+    started: readonly string[];
+    /** Channels that started but are currently in a degraded state (logged-
+     *  out, disconnected, etc.). Surfaced in the `## Messaging` block so
+     *  the model warns the operator BEFORE picking one — without this, the
+     *  model picks WhatsApp confidently, `send_message` refuses with an
+     *  opaque error, and the operator wonders why nothing arrived. Each
+     *  entry carries the operator-facing reason + an optional remediation
+     *  CLI hint. */
+    degraded?: ReadonlyArray<{
+      channelId: string;
+      reason: string;
+      remediation?: string;
+    }>;
+    /** When the inbound came from a channel, which channel + peer. Used
+     *  to phrase the per-turn "you are responding to <channel>" context. */
+    currentChannel?: {
+      channelId: string;
+      conversationId?: string;
+      threadId?: string;
+    };
+  };
 }
 
 export interface ToolDescription {
@@ -329,6 +369,14 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     "Match the user's tone — casual when they're casual, technical when they ask for technical detail. " +
     "Default casual. In conversational replies, write plain prose; skip headings, bullet lists, and " +
     "code blocks unless the content really is code or structured data. Skip filler openers like \"Sure! Here's…\" or \"Great question!\" — just answer.",
+  );
+  lines.push(
+    "Don't expose internal plumbing in user-facing replies. After a successful tool call, " +
+    "confirm the OUTCOME in human language — \"Sent! 👋\" or \"Reminder set for 7:13 PM IST\" — " +
+    "not the mechanism (`917702616808@s.whatsapp.net`, sessionKeys, conversation ids, JID format, " +
+    "tool-arg shapes, hash suffixes, internal channel adapter names). If a tool failed once and " +
+    "retried, don't narrate \"the trick was X\" — just deliver the result. The operator wants the " +
+    "outcome, not the implementation diary.",
   );
   // Windows-specific bash hygiene: bash.exe / sh interpret backslashes as
   // escape characters, so `ls F:\Brigade\src` runs as `ls F:Brigadesrc` and
@@ -571,6 +619,84 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // of browser" regression we saw on the Coimbatore / Srikakulam runs.
   if (args.capabilities?.web) {
     lines.push(WEB_TOOLS_GUIDANCE);
+    lines.push("");
+  }
+
+  // 7e. ## Messaging (conditional on at least one started channel adapter).
+  // Patterned on the reference implementation's `## Messaging` block —
+  // tells the model what channels are connected, when to use `send_message`,
+  // and the anti-pattern of shelling out to a curl / API CLI for channel
+  // messaging. Without this section the model has no idea WhatsApp is
+  // connected and bash-probes `brigade doctor` to find out. Skipped in
+  // minimal mode (cron / sub-agent runs) — those get a scoped tool
+  // surface that already tells them what they can use without needing
+  // the directory.
+  if (
+    !isMinimalMode &&
+    args.channels &&
+    args.channels.started.length > 0
+  ) {
+    const channelList = args.channels.started.join("|");
+    lines.push("## Messaging");
+    lines.push(
+      "- Reply to the current channel-routed turn → `send_message` with just " +
+        "`{text}` auto-routes back to the same chat.",
+    );
+    lines.push(
+      "- Proactive send / cross-channel send → `send_message({channel, to, text})` " +
+        "with explicit target.",
+    );
+    lines.push(
+      "- Scheduled / delayed send (in N minutes, daily at 9am, …) → use the " +
+        "`cron` tool with an `agentTurn` payload — the announce delivery " +
+        "routes through the same channel adapters at fire time.",
+    );
+    lines.push(
+      "- Never use `bash` / curl / a provider API CLI to send messages; " +
+        "Brigade routes ALL channel sends through `send_message`. Going around " +
+        "it bypasses authentication, retry, dedup, and audit logging.",
+    );
+    lines.push("");
+    lines.push("### send_message tool");
+    lines.push(
+      `- Available \`channel\` values: ${channelList}` +
+        (args.channels.started.length > 1
+          ? " (pass exactly one when targeting a specific channel)."
+          : "."),
+    );
+    // Surface degraded adapters so the model warns the operator BEFORE
+    // attempting a send that will fail. Each line carries the reason +
+    // remediation; the model is expected to relay both verbatim when the
+    // operator asks for an unhealthy channel.
+    if (args.channels.degraded && args.channels.degraded.length > 0) {
+      lines.push("");
+      lines.push("**⚠️  Channels currently unable to send:**");
+      for (const d of args.channels.degraded) {
+        const fix = d.remediation ? `  Fix: ${d.remediation}` : "";
+        lines.push(`  - \`${d.channelId}\` — ${d.reason}${fix ? `\n${fix}` : ""}`);
+      }
+      lines.push(
+        "If the operator asks to send via one of these, DO NOT call " +
+          "`send_message` — explain the issue + the remediation step verbatim.",
+      );
+    }
+    lines.push(
+      "- For an explicit target: `{channel, to, text}` — `to` is the " +
+        "conversation/peer id (WhatsApp number, Slack channel id, Telegram " +
+        "chat id, …).",
+    );
+    if (args.channels.currentChannel) {
+      const cur = args.channels.currentChannel;
+      const where = cur.conversationId
+        ? `${cur.channelId} (peer: ${cur.conversationId})`
+        : cur.channelId;
+      lines.push(
+        `- **This turn came in via \`${where}\`** — \`send_message({text})\` ` +
+          "without explicit channel/to auto-routes back to this same chat. " +
+          "Use this for in-place replies; only pass explicit channel/to when " +
+          "targeting a DIFFERENT chat.",
+      );
+    }
     lines.push("");
   }
 

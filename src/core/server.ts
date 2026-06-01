@@ -63,6 +63,7 @@ import { runResilientTurn, type RunSingleTurnResult } from "../agents/agent-loop
 import { BrigadeExtensionRegistry, BUNDLED_MODULES, clearDiscoveryCache, loadModules } from "../agents/extensions/index.js";
 import type { GatewayCaller, GatewayMethodHandler, HttpRoute, Service } from "../agents/extensions/index.js";
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_MS, readBodyWithLimit } from "./webhook-guards.js";
+import { setActiveChannelManager } from "../agents/channels/active-manager.js";
 import { type ChannelManager, startChannels } from "../agents/channels/manager.js";
 import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
@@ -78,6 +79,15 @@ import { createCronServiceState } from "../cron/service/state.js";
 import { start as cronStart, stop as cronStop } from "../cron/service/ops.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { DEFAULT_AGENT_ID, resolveAgentDir, resolveAgentWorkspaceDir } from "../config/paths.js";
+import { runHeartbeatNow } from "../agents/heartbeat.js";
+import { enqueuePendingSystemEvent } from "../agents/pending-system-events.js";
+import {
+	CommandLane,
+	type CommandLaneId,
+	enqueueInLane,
+	getLaneQueueSize,
+	sessionLane,
+} from "../process/lanes.js";
 import { defaultSessionKey } from "../sessions/session-store.js";
 import { makeExtractionLlm, runExtractionSweep } from "../agents/memory/extract.js";
 import { runDecayGc } from "../agents/memory/decay.js";
@@ -638,6 +648,183 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					at: Date.now(),
 				});
 			},
+			/**
+			 * System-event injector — used by:
+			 *   (a) crons with `sessionTarget: "main"` to drop a message into
+			 *       the operator's session at fire time, and
+			 *   (b) the announce-delivery fallback when a cron's `delivery.mode
+			 *       === "announce"` has no explicit channel target — the
+			 *       summary becomes a system event in the operator's main
+			 *       session so they STILL see the reply somewhere.
+			 *
+			 * Broadcasts a `system-event` (NOT a `log`) so the connect-mode TUI
+			 * renders it as a visible Brigade-side chat line, distinct from the
+			 * scrolling debug-log panel. The TUI handler at `src/tui/chat.ts`
+			 * subscribes to `system-event` and renders each one inline. Without
+			 * this distinction the cron's announce would silently land in the
+			 * log panel + the operator would never see their reminder fire.
+			 */
+			enqueueSystemEvent: (args) => {
+				const at = Date.now();
+				// TRACK 1 — live visibility. Broadcast the system-event WS frame
+				// so any connected connect-mode TUI client renders the announce
+				// IMMEDIATELY as a Brigade-side bubble (see
+				// `cli/commands/connect.ts`). This is what makes the operator
+				// see "🦁 [cron \"X\"] <reply>" the moment the cron fires
+				// instead of waiting for their next prompt.
+				broadcast("system-event", {
+					text: args.text,
+					at,
+					source: "cron",
+					...(args.jobId !== undefined ? { jobId: args.jobId } : {}),
+					...(args.jobName !== undefined ? { jobName: args.jobName } : {}),
+				});
+				// TRACK 2 — model awareness. ALSO queue the text per-session so
+				// the NEXT agent turn for that session picks it up via
+				// `drainPendingSystemEvents` and prepends a `<system_event>`
+				// block to the user message. Without this the model would be
+				// answering the operator's next "did the cron fire?" question
+				// blind and might bullshit "any moment now" while the actual
+				// fire happened minutes ago. The operator's main session is
+				// the default target — a cron without a channel target is
+				// announcing into "wherever the operator is", which on a
+				// TUI / connect-mode setup is the main session.
+				const targetSessionKey = args.sessionKey ?? defaultSessionKey(args.agentId ?? agentId);
+				enqueuePendingSystemEvent(targetSessionKey, {
+					text: args.text,
+					queuedAtMs: at,
+					...(args.jobId !== undefined ? { jobId: args.jobId } : {}),
+					...(args.jobName !== undefined ? { jobName: args.jobName } : {}),
+				});
+			},
+			/**
+			 * Announce-delivery dispatcher — when a cron job carries
+			 * `delivery: {mode: "announce", channel, to}`, the timer hands
+			 * the summary text here so we can fan it out to the channel
+			 * adapter that originally took the operator's add-cron message
+			 * (e.g. WhatsApp `sendText(to, text)`). Returns false when no
+			 * channel manager is wired so the timer falls back to the
+			 * system-event injector above.
+			 */
+			/**
+			 * List the channel ids the operator can target in
+			 * `delivery.channel` — used by `cron add`/`update` to fail-fast on
+			 * a typo (e.g. "whatapp" instead of "whatsapp") rather than
+			 * silently persisting a job that would error every fire. Returns
+			 * `[]` when no channel manager has been wired yet (boot order /
+			 * fresh install) so the validator falls through to "no list, no
+			 * check" rather than blocking ALL cron adds.
+			 */
+			listKnownChannelIds: () => channelManager?.started ?? [],
+			/**
+			 * Heartbeat trigger for `wakeMode: "now"` crons. Fires a synthetic
+			 * agent turn on the operator's main session that drains any
+			 * pending system events (including the cron's own announce text)
+			 * and produces a model reply — so the operator gets a "live"
+			 * response when the cron fires even if they're not actively
+			 * typing. Skipped when the main lane is busy (the in-flight
+			 * turn will drain naturally) or when there's nothing queued.
+			 */
+			requestHeartbeatNow: (opts) => {
+				void runHeartbeatNow({
+					agentId,
+					sessionKey: defaultSessionKey(agentId),
+					provider,
+					modelId,
+					thinkingLevel: thinkingLevel as "off" | "low" | "medium" | "high",
+					...(opts?.reason !== undefined ? { reason: opts.reason } : {}),
+				}).catch(() => {
+					/* runHeartbeatNow logs its own failures */
+				});
+			},
+			deliverCronAnnounce: async (args) => {
+				if (!channelManager || !args.channel || !args.to) return false;
+				const adapter = channelManager.adapter(args.channel);
+				if (!adapter) {
+					createSubsystemLogger("cron").warn(
+						"announce target channel not started",
+						{ channel: args.channel, jobId: args.job.id },
+					);
+					return false;
+				}
+				// Pre-flight health check. A logged-out / disconnected adapter
+				// is "started" (we called start() at boot) but its underlying
+				// socket is dead and sendText will either silently drop or
+				// throw an opaque error. Refuse here, log a clear warning,
+				// AND queue a `system-event` so the operator's TUI / next
+				// channel inbound sees "your reminder X failed because
+				// WhatsApp is unlinked — here's how to re-pair". Without
+				// this, scheduled reminders to a dead channel just vanish.
+				if (typeof adapter.health === "function") {
+					const status = adapter.health();
+					if (!status.ok) {
+						createSubsystemLogger("cron").warn(
+							"announce target channel unhealthy — refusing delivery",
+							{
+								channel: args.channel,
+								jobId: args.job.id,
+								kind: status.kind,
+								reason: status.reason,
+							},
+						);
+						const failureText = [
+							`🦁 Cron "${args.job.name}" couldn't deliver via ${args.channel} — ${status.reason}`,
+							status.remediation ? `Fix: ${status.remediation}` : undefined,
+						]
+							.filter(Boolean)
+							.join("\n");
+						const at = Date.now();
+						broadcast("system-event", {
+							text: failureText,
+							at,
+							source: "cron",
+							jobId: args.job.id,
+							jobName: args.job.name,
+						});
+						enqueuePendingSystemEvent(defaultSessionKey(agentId), {
+							text: failureText,
+							queuedAtMs: at,
+							jobId: args.job.id,
+							jobName: args.job.name,
+						});
+						return false;
+					}
+				}
+				try {
+					await adapter.sendText(
+						args.to,
+						args.text,
+						args.threadId ? { threadId: args.threadId } : undefined,
+					);
+					return true;
+				} catch (err) {
+					const errMsg = err instanceof Error ? err.message : String(err);
+					createSubsystemLogger("cron").warn("announce sendText threw", {
+						channel: args.channel,
+						to: args.to,
+						jobId: args.job.id,
+						error: errMsg,
+					});
+					// Surface the failure so the operator finds out IMMEDIATELY
+					// instead of wondering why their reminder never arrived.
+					const failureText = `🦁 Cron "${args.job.name}" couldn't deliver via ${args.channel}: ${errMsg}`;
+					const at = Date.now();
+					broadcast("system-event", {
+						text: failureText,
+						at,
+						source: "cron",
+						jobId: args.job.id,
+						jobName: args.job.name,
+					});
+					enqueuePendingSystemEvent(defaultSessionKey(agentId), {
+						text: failureText,
+						queuedAtMs: at,
+						jobId: args.job.id,
+						jobName: args.job.name,
+					});
+					return false;
+				}
+			},
 		},
 	});
 	setActiveCronService(cronState);
@@ -815,17 +1002,28 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	/* ──────────────── serialized turn executor ──────────────── */
 
 	// Every agent turn — whether from a TUI `prompt` RPC or an inbound channel
-	// message — runs through this single FIFO queue. There is exactly one brain
-	// in this phase: turns never overlap, so the per-turn session plumbing
-	// (inFlightSession / broadcast snapshot / extraction debounce) stays
-	// single-writer. Phase 2 (multi-user) will shard the queue per crew; the
-	// `runGatewayTurn` seam is what they'll plug into.
-	let turnChain: Promise<unknown> = Promise.resolve();
-	const runQueued = <T>(fn: () => Promise<T>): Promise<T> => {
-		// Chain onto the previous turn regardless of how it settled, so one
-		// turn's failure never wedges the queue.
-		const run = turnChain.then(fn, fn);
-		turnChain = run.then(
+	// message — flows through the lane registry (`src/process/lanes.ts`):
+	//
+	//   - TUI / direct-RPC turns       → `CommandLane.Main`
+	//   - Channel-routed inbounds      → `sessionLane(sessionKey)` so two
+	//                                    different peers (WhatsApp A and B)
+	//                                    run in parallel, never blocking each
+	//                                    other on a single global chain.
+	//
+	// Within a lane, work is strictly FIFO — message 1 from a peer finishes
+	// before message 2 starts. Across lanes, work is concurrent. This shape
+	// matches OC's `enqueueCommandInLane` model and is what unblocks the
+	// "two peers DM Brigade at the same time" case Brigade used to serialise.
+	//
+	// The per-turn singleton plumbing (`inFlightSession`, broadcast snapshot,
+	// `currentTurnCleanup`) IS still single-writer — but that's enforced
+	// by `runGatewayTurn`'s own try/finally + a state.isAgentRunning gate,
+	// NOT by a global lock. Each lane's runs are serialised; per-lane state
+	// observations (the snapshot) reflect the in-flight turn for that lane.
+	let turnChainTail = Promise.resolve(); // kept ONLY for graceful-shutdown wait
+	const runOnLane = <T>(lane: CommandLaneId, fn: () => Promise<T>): Promise<T> => {
+		const run = enqueueInLane(lane, fn);
+		turnChainTail = run.then(
 			() => undefined,
 			() => undefined,
 		);
@@ -861,8 +1059,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		 * the legacy WS broadcast path the connect-mode TUI watches).
 		 */
 		channelApprovalRoute?: import("../agents/channels/approval-router.js").ChannelApprovalRoute;
-	}): Promise<RunSingleTurnResult> =>
-		runQueued(async () => {
+	}): Promise<RunSingleTurnResult> => {
+		// Pick the lane: channel-routed turns get their own per-session lane
+		// (so multiple peers run concurrently); TUI / direct-RPC turns share
+		// the single Main lane (a TUI user can only type one prompt at a time
+		// anyway, and direct-RPC callers are the operator).
+		const lane = turn.channelApprovalRoute
+			? sessionLane(turn.sessionKey)
+			: CommandLane.Main;
+		return runOnLane(lane, async () => {
 			isAgentRunning = true;
 			broadcast("state", buildSnapshot());
 			// Hoist the abort listener so the finally can detach it without a
@@ -929,6 +1134,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				broadcast("state", buildSnapshot());
 			}
 		});
+	};
 
 	/* ──────────────── request handler ──────────────── */
 
@@ -1452,6 +1658,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		if (channelManager) {
 			await channelManager.stop().catch(() => {});
 			channelManager = undefined;
+			// Drop the process-wide singleton so the `send_message` tool
+			// hides itself again and a future restart starts clean.
+			setActiveChannelManager(null);
 		}
 		if (serviceAbort) {
 			serviceAbort.abort();
@@ -1563,6 +1772,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					broadcast("log", { level: "info", message: line, at: Date.now() });
 				},
 			});
+			// Mount the channel manager as a process-wide singleton so the
+			// `send_message` agent tool (+ future channel-action tools) can
+			// reach the started adapters. Without this the tool registry's
+			// `getActiveChannelManager()` returns null and `send_message`
+			// quietly stays out of the surface.
+			setActiveChannelManager(channelManager);
 			if (channelManager.started.length > 0) bootLog(`channels: ${channelManager.started.join(", ")}`);
 		}
 
@@ -1655,7 +1870,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// cleanup, broadcast, scheduleExtraction — can't run against a
 			// torn-down server after stop() returns.
 			if (inFlightSession) await inFlightSession.abort().catch(() => {});
-			await turnChain.catch(() => {});
+			await turnChainTail.catch(() => {});
 			// Tear down any in-flight turn's Pi subscription + JSONL logger.
 			// Between turns there's nothing attached, so this is a no-op then.
 			if (currentTurnCleanup) {

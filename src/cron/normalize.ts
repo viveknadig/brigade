@@ -44,8 +44,111 @@ function defaultDeliveryModeForPayload(payload: CronPayload): CronDelivery["mode
 }
 
 /**
+ * Coerce a permissive caller-supplied schedule into a canonical `CronSchedule`.
+ *
+ * The agent tool's TypeBox shape is `Type.Any()` so the LLM can pass any of:
+ *   - a bare string  → `"0 9 * * *"` (treated as a cron expression)
+ *   - a record missing `kind` but carrying `expr` / `cron` / `everyMs` / `at`
+ *   - the canonical `{kind: "cron", expr: "..."}` shape
+ *
+ * Without this coercion a string slipped past `normalizeSchedule` unchanged,
+ * landed on disk with no `kind`, and `computeNextRunAtMs`'s switch returned
+ * `undefined` forever — the job never fired. Migration of already-stored
+ * bad-shape schedules happens in `store.ts:ensureLoaded` using this same
+ * helper, so an operator who hit the bug on an older build doesn't have to
+ * hand-edit `~/.brigade/cron.json`.
+ */
+export function coerceScheduleInput(raw: unknown): CronSchedule {
+	if (typeof raw === "string") {
+		const expr = raw.trim();
+		if (!expr) throw new Error("cron schedule string is empty");
+		return { kind: "cron", expr };
+	}
+	if (raw === null || typeof raw !== "object") {
+		throw new Error(
+			"cron schedule must be a string (cron expr) or an object — got " + typeof raw,
+		);
+	}
+	const rec = raw as Record<string, unknown>;
+	const rawKind = typeof rec.kind === "string" ? rec.kind.toLowerCase() : undefined;
+	const validKinds = new Set(["at", "every", "cron"]);
+	const kind = rawKind && validKinds.has(rawKind) ? rawKind : undefined;
+	// Pull expression out of either `expr` or the legacy `cron` alias.
+	const rawExpr =
+		typeof rec.expr === "string"
+			? rec.expr
+			: typeof rec.cron === "string"
+				? rec.cron
+				: undefined;
+	const expr = rawExpr?.trim() || undefined;
+	const everyMs = typeof rec.everyMs === "number" ? rec.everyMs : undefined;
+	// Accept `at` OR `atMs` as the absolute timestamp field. Some models (and
+	// the older Brigade schema) used `atMs`; the canonical field is `at`. We
+	// quietly merge so a model writing either shape lands the same job.
+	const at =
+		typeof rec.at === "number"
+			? rec.at
+			: typeof rec.atMs === "number"
+				? rec.atMs
+				: undefined;
+	// Infer kind from whichever discriminator field is present.
+	const inferredKind =
+		kind ??
+		(at !== undefined
+			? "at"
+			: everyMs !== undefined
+				? "every"
+				: expr
+					? "cron"
+					: undefined);
+	if (!inferredKind) {
+		throw new Error(
+			"cron schedule object needs at least one of: kind, expr, everyMs, at",
+		);
+	}
+	switch (inferredKind) {
+		case "at": {
+			if (at === undefined) {
+				throw new Error('cron schedule kind "at" requires a numeric `at` (ms since epoch)');
+			}
+			return { kind: "at", at };
+		}
+		case "every": {
+			if (everyMs === undefined) {
+				throw new Error('cron schedule kind "every" requires a numeric `everyMs`');
+			}
+			const anchorMs = typeof rec.anchorMs === "number" ? rec.anchorMs : undefined;
+			return {
+				kind: "every",
+				everyMs,
+				...(anchorMs !== undefined ? { anchorMs } : {}),
+			};
+		}
+		case "cron": {
+			if (!expr) {
+				throw new Error('cron schedule kind "cron" requires `expr` (a cron expression)');
+			}
+			const tz = typeof rec.tz === "string" ? rec.tz : undefined;
+			const staggerMs = typeof rec.staggerMs === "number" ? rec.staggerMs : undefined;
+			return {
+				kind: "cron",
+				expr,
+				...(tz !== undefined ? { tz } : {}),
+				...(staggerMs !== undefined ? { staggerMs } : {}),
+			};
+		}
+	}
+	throw new Error(`cron schedule has unsupported kind: ${inferredKind}`);
+}
+
+/**
  * Fill in a schedule's optional fields. For `cron` kind, applies the
  * top-of-hour stagger default. Other kinds pass through unchanged.
+ *
+ * Always run AFTER `coerceScheduleInput` — accepts only canonical-shape
+ * schedules. Stale callers that pass a bare string slip past here unchanged
+ * (the type-guard `schedule.kind !== "cron"` is true for `undefined`), so
+ * make sure the entry point calls coerce first.
  */
 export function normalizeSchedule(schedule: CronSchedule): CronSchedule {
 	if (schedule.kind !== "cron") return schedule;
@@ -102,7 +205,11 @@ export function resolveDeleteAfterRun(
 export function defaultCronJobCreate(input: CronJobCreate): Required<
 	Pick<CronJobCreate, "enabled" | "sessionTarget" | "wakeMode">
 > & CronJobCreate {
-	const schedule = normalizeSchedule(input.schedule);
+	// Coerce permissive caller input (bare string / object-without-kind) into
+	// the canonical CronSchedule shape BEFORE we touch staggerMs etc. — see
+	// `coerceScheduleInput` for the supported shapes.
+	const coerced = coerceScheduleInput(input.schedule);
+	const schedule = normalizeSchedule(coerced);
 	const sessionTarget = input.sessionTarget ?? defaultSessionTargetForPayload(input.payload);
 	const wakeMode = input.wakeMode ?? defaultWakeMode();
 	const delivery = normalizeDelivery(input.delivery, input.payload);

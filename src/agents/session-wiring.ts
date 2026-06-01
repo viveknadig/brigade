@@ -25,7 +25,7 @@ import type { MemoryCapability } from "./extensions/types.js";
 import { makeExecGate } from "./exec-gate.js";
 import { type BrigadeBeforeToolCallHook, makeUnknownToolGuard } from "./tool-guard.js";
 import { makeToolLoopDetector } from "./tool-loop-detector.js";
-import { wrapOwnerOnlyToolExecution } from "./tools/common.js";
+import { wrapOwnerOnlyToolExecution, wrapToolExecutionTimeout } from "./tools/common.js";
 import { createBrigadeTools } from "./tools/registry.js";
 import type { AnyBrigadeTool } from "./tools/types.js";
 
@@ -101,6 +101,14 @@ export function assembleBrigadeToolset(opts: {
 	 * undefined means "no filter, full surface".
 	 */
 	toolsAllow?: string[];
+	/**
+	 * Active channel context for this turn — set when the inbound came from
+	 * a channel adapter. Threaded into the cron tool so a `cron add` from
+	 * mid-chat auto-routes the eventual announce back to the same chat.
+	 * Undefined for TUI / direct-RPC turns (the cron's announce falls back
+	 * to the operator's main session via `enqueueSystemEvent`).
+	 */
+	channelContext?: ChannelApprovalRoute;
 }): BrigadeToolset {
 	const rawCustomTools = createBrigadeTools({
 		workspaceDir: opts.workspaceDir,
@@ -108,12 +116,17 @@ export function assembleBrigadeToolset(opts: {
 		cwd: opts.cwd,
 		...(opts.memoryCapability ? { memoryCapability: opts.memoryCapability } : {}),
 		...(opts.subagentContext ? { subagentContext: opts.subagentContext } : {}),
+		...(opts.channelContext ? { channelContext: opts.channelContext } : {}),
 	});
 	const senderIsOwner = opts.senderIsOwner ?? true;
 	// Wrap every tool — `wrapOwnerOnlyToolExecution` is a no-op for the owner
 	// AND for non-ownerOnly tools, so the cost is one identity-check per tool.
+	// Then ALSO wrap with `wrapToolExecutionTimeout` so a tool whose promise
+	// never resolves (e.g. a runaway file lock, a hung dependency) can't
+	// wedge the agent loop forever — the model gets a `BrigadeToolTimeoutError`
+	// after ~60s and can tell the operator instead of spinning indefinitely.
 	const wrappedCustomTools = rawCustomTools.map((t) =>
-		wrapOwnerOnlyToolExecution(t, senderIsOwner),
+		wrapToolExecutionTimeout(wrapOwnerOnlyToolExecution(t, senderIsOwner)),
 	);
 	// Per-job toolsAllow filter (cron). When omitted, every tool flows
 	// through. When supplied, only the named tools survive — both for the

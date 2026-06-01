@@ -17,6 +17,8 @@
  * narrow scope (no plugins, no channels, no MCP).
  */
 
+import { getActiveChannelManager } from "../channels/active-manager.js";
+import type { ChannelApprovalRoute } from "../channels/approval-router.js";
 import type { MemoryCapability } from "../extensions/types.js";
 import { FileMemoryStore } from "../memory/storage.js";
 import {
@@ -30,6 +32,7 @@ import {
 import { getActiveCronService } from "../../cron/active-service.js";
 import { makeCronTool } from "./cron-tool.js";
 import { makeReadMemoryTool, makeRecallMemoryTool, makeWriteMemoryTool } from "./memory-tools.js";
+import { makeSendMessageTool } from "./send-message-tool.js";
 import { makeSpawnAgentTool } from "./spawn-agent-tool.js";
 import type { AnyBrigadeTool } from "./types.js";
 
@@ -90,6 +93,20 @@ export interface CreateBrigadeToolsOptions {
 	};
 	/** Max sub-agent depth — defaults to `DEFAULT_SUBAGENT_MAX_DEPTH` (1). */
 	subagentMaxDepth?: number;
+	/**
+	 * Active channel context for this turn — set when the inbound came from a
+	 * channel adapter (WhatsApp / Slack / Telegram / …). Lets cron-tool's
+	 * `add` auto-fill `delivery.channel`/`delivery.to`/`delivery.threadId`
+	 * so a scheduled job created mid-chat replies back to the SAME chat by
+	 * default. The model can still override by passing explicit `delivery`
+	 * params (e.g. "schedule X to message me on Slack instead").
+	 *
+	 * Undefined for TUI / direct-RPC turns — those have no originating
+	 * channel; a cron added from the TUI without explicit channel/to
+	 * announces into the operator's main session via the
+	 * `enqueueSystemEvent` fallback (see `cron/service/timer.ts`).
+	 */
+	channelContext?: ChannelApprovalRoute;
 }
 
 /**
@@ -164,7 +181,27 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 	// their calls before they reach the action handler.
 	const cronService = getActiveCronService();
 	if (cronService) {
-		tools.push(makeCronTool());
+		// Pass channel context so `cron add` from a channel-routed turn can
+		// auto-fill `delivery.channel/to/threadId` and the eventual announce
+		// lands back in the SAME chat the operator created the job from.
+		tools.push(
+			makeCronTool(
+				opts.channelContext !== undefined ? { channelContext: opts.channelContext } : {},
+			),
+		);
+	}
+	// `send_message` — register only when a channel manager is mounted AND
+	// at least one adapter actually started. Without that the tool would
+	// surface to the model but every call would fail validation; better to
+	// hide it until the operator has a working channel (per OC's pattern
+	// of "no message tool when no channels are configured").
+	const channelManager = getActiveChannelManager();
+	if (channelManager && channelManager.started.length > 0) {
+		tools.push(
+			makeSendMessageTool(
+				opts.channelContext !== undefined ? { channelContext: opts.channelContext } : {},
+			),
+		);
 	}
 	return tools;
 }

@@ -140,7 +140,8 @@ describe("startChannels", () => {
 		});
 		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "hi" }); // must not reject
 		assert.equal(f.sent.length, 1, "should reply with an error message instead of going silent");
-		assert.match(f.sent[0]?.text ?? "", /error|try again/i);
+		// Current generic-fallback copy: "⚠️ Hit a snag replying to that. Give it another try …"
+		assert.match(f.sent[0]?.text ?? "", /snag|another try|let the owner/i);
 		await mgr.stop();
 	});
 
@@ -469,7 +470,14 @@ describe("startChannels", () => {
 		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "hi" });
 		assert.equal(f.sent.length, 1);
 		const reply = f.sent[0]?.text ?? "";
-		assert.match(reply, /credits/i, "billing reply must mention credits");
+		// Lion-mascot copy phrases billing as "tapped out — model provider account just ran dry"
+		// + "owner needs to top it up". Neither mentions the literal word "credits" — match the
+		// current shape via "tapped out" / "top it up" / "provider account" instead.
+		assert.match(
+			reply,
+			/tapped out|top it up|provider account/i,
+			"billing reply must use the out-of-funds wording",
+		);
 		assert.doesNotMatch(reply, /402|max_tokens|openrouter|claude|gpt/i, "must not leak status code or model id");
 		await mgr.stop();
 	});
@@ -488,7 +496,8 @@ describe("startChannels", () => {
 		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "hi" });
 		assert.equal(f.sent.length, 1);
 		const reply = f.sent[0]?.text ?? "";
-		assert.match(reply, /capacity|moment/i);
+		// Current copy: "⏳ Catching my breath — give me 30 seconds and send that again."
+		assert.match(reply, /catching my breath|seconds|breath/i);
 		assert.doesNotMatch(reply, /429/);
 		await mgr.stop();
 	});
@@ -506,7 +515,12 @@ describe("startChannels", () => {
 		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "hi" });
 		assert.equal(f.sent.length, 1);
 		const reply = f.sent[0]?.text ?? "";
-		assert.match(reply, /sorry|error|try again/i, "generic reply must read as an apology");
+		// Current copy: "⚠️ Hit a snag replying to that. Give it another try …"
+		assert.match(
+			reply,
+			/snag|another try|let the owner/i,
+			"generic reply must read as a friendly recovery prompt",
+		);
 		assert.ok(reply.length < 300, "generic reply should stay short");
 		await mgr.stop();
 	});
@@ -543,7 +557,13 @@ describe("startChannels", () => {
 		await f.ctx().onInbound({ channel: "fake", conversationId: "c1", from: "u", text: "hi" });
 		assert.equal(f.sent.length, 1);
 		const reply = f.sent[0]?.text ?? "";
-		assert.match(reply, /credits/i, "wrapped billing reason must surface as 'credits' reply");
+		// Wrapped billing must still resolve to the billing-class copy — check the same
+		// "tapped out / top it up / provider account" phrases as the direct billing case.
+		assert.match(
+			reply,
+			/tapped out|top it up|provider account/i,
+			"wrapped billing reason must surface as the billing-class reply",
+		);
 		assert.doesNotMatch(reply, /402|retry|exhausted/i, "must not leak the wrapper internals");
 		await mgr.stop();
 	});
