@@ -1,22 +1,20 @@
 /**
  * Command lanes — cooperative parallelism for the Brigade gateway.
  *
- * Before lanes, every gateway turn serialised through a single global
- * `turnChain` Promise in `server.ts`. A long-running channel turn from
- * one peer (WhatsApp DM A) would block a turn from another peer
- * (WhatsApp DM B), and the cron service's own work would either fight
- * for the same chain or run completely outside it (creating coordination
- * bugs). The single-chain shape is correct for "one operator's turns
- * never interleave" but wrong for "different peers can run in parallel"
- * and "the cron service shouldn't wait behind the operator's main turn".
+ * Public surface every Brigade caller imports from. Internally the actual
+ * FIFO + generation-counter + drain-helpers implementation lives in
+ * `./command-queue.ts` — this module is a thin re-export + naming-stable
+ * adapter so the upstream lift could land without renaming every Brigade
+ * caller (`enqueueInLane`, `getLaneQueueSize`, `resetLanesForTests`,
+ * `CommandLane.{Main,Cron,Subagent,Nested}`).
  *
- * The lane model splits work into named lanes:
+ * Lane model:
  *
  *   - `Main`      — the operator's primary turn lane. TUI / connect-mode
  *                   prompts + direct-RPC calls land here. Strictly FIFO.
  *   - `Cron`      — manual cron-fire work (operator clicking "run now").
  *                   Timer-driven fires bypass this lane and run directly
- *                   in their own per-instance lock — same shape as OC.
+ *                   in their own per-instance lock.
  *   - `Subagent`  — sub-agent spawns. Parent's `Main` lane keeps moving
  *                   while a sub-agent runs.
  *   - `Nested`    — sub-agents OF sub-agents, or work spawned from inside
@@ -28,36 +26,38 @@
  *                   peer's lane work is still FIFO so messages 1, 2, 3
  *                   process in order.
  *
- * Same-lane tasks queue and run one at a time. Different-lane tasks
- * run concurrently. The lane is a string for extensibility — adding a
- * new well-known lane is a string-literal addition; per-session lanes
- * use `session:<sessionKey>` keys built on the fly.
+ * Same-lane tasks queue and run one at a time. Different-lane tasks run
+ * concurrently. The lane is a string for extensibility — adding a new
+ * well-known lane is a string-literal addition; per-session lanes use
+ * `session:<sessionKey>` keys built on the fly.
  *
- * No worker pool, no max-concurrent budget per lane today (every lane
- * defaults to single-threaded). The OC reference uses
- * `maxConcurrent: 1` everywhere too; we'll add a knob if a future use
- * case needs it. The simpler shape is much easier to reason about than
- * a worker pool, and the perf win we needed (cross-lane parallelism)
- * is already there with FIFO chains.
+ * Concurrency budget: every lane defaults to `maxConcurrent: 1`. Use
+ * `setCommandLaneConcurrency(lane, n)` from `./command-queue.js` to lift
+ * the cap (e.g. for parallel-account inbound processing on a channel).
  */
 
-/** Well-known lane ids. String-literal so extensibility is cheap. */
+import {
+	clearCommandLane,
+	enqueueCommandInLane,
+	getQueueSize,
+	resetCommandQueueStateForTest,
+} from "./command-queue.js";
+
+/** Well-known lane ids. */
 export const CommandLane = {
 	Main: "main",
 	Cron: "cron",
 	Subagent: "subagent",
 	Nested: "nested",
 } as const;
+export type CommandLane = (typeof CommandLane)[keyof typeof CommandLane];
 export type CommandLaneId = (typeof CommandLane)[keyof typeof CommandLane] | string;
 
-/** Per-lane FIFO chain. Tail is the most-recently-enqueued promise. */
-interface LaneState {
-	tail: Promise<unknown>;
-	/** In-flight count — diagnostic only; `getLaneQueueSize` reads this. */
-	pending: number;
-}
-
-const lanes = new Map<string, LaneState>();
+/** Upstream-parity aliases for lift-and-paste compatibility. */
+export const AGENT_LANE_MAIN = CommandLane.Main;
+export const AGENT_LANE_CRON = CommandLane.Cron;
+export const AGENT_LANE_SUBAGENT = CommandLane.Subagent;
+export const AGENT_LANE_NESTED = CommandLane.Nested;
 
 /**
  * Compute the per-session lane id for a session key. Channel-routed turns
@@ -69,53 +69,55 @@ export function sessionLane(sessionKey: string): string {
 }
 
 /**
- * Run `work` on the named lane. Resolves with the work's result. If the
- * previous work on this lane rejected, this work still runs — the chain
- * never poisons because we catch the previous tail's rejection.
+ * Run `work` on the named lane. Resolves with the work's result. Backed
+ * by the generation-aware engine in `./command-queue.js` — same FIFO
+ * semantics as before, but a `resetAllLanes()` call (e.g. from a config
+ * reload) no longer leaks stale active-task IDs that would block future
+ * pumps.
  *
  * Concurrency:
  *   - Two `enqueueInLane(lane, ...)` calls on the SAME lane: the second
- *     awaits the first.
+ *     awaits the first (when `maxConcurrent: 1`, the default).
  *   - Two calls on DIFFERENT lanes: run concurrently.
- *
- * Idempotence:
- *   - Each call gets its own lane state allocated lazily on first use.
- *   - The lane's tail advances atomically with synchronous map writes.
  */
-export function enqueueInLane<T>(
-	lane: CommandLaneId,
-	work: () => Promise<T>,
-): Promise<T> {
-	const state = lanes.get(lane) ?? { tail: Promise.resolve(), pending: 0 };
-	const previous = state.tail.catch(() => undefined);
-	state.pending += 1;
-	const next = previous.then(() => work());
-	state.tail = next.catch(() => undefined);
-	lanes.set(lane, state);
-	// Decrement the pending counter when this work settles — whichever way.
-	const settle = (): void => {
-		const s = lanes.get(lane);
-		if (s) s.pending = Math.max(0, s.pending - 1);
-	};
-	next.then(settle, settle);
-	return next;
+export function enqueueInLane<T>(lane: CommandLaneId, work: () => Promise<T>): Promise<T> {
+	return enqueueCommandInLane(lane, work);
 }
 
 /**
- * How many tasks are queued or in-flight on this lane. Used by the
- * heartbeat to decide whether to fire a drain turn — if Main has
- * pending work, skip the heartbeat and let it run naturally.
+ * Combined depth (queued + active) of a lane. Used by the heartbeat
+ * runner: if `Main` has pending work, skip the heartbeat and let it run
+ * naturally. Returns 0 when the lane has never been used.
  */
 export function getLaneQueueSize(lane: CommandLaneId): number {
-	return lanes.get(lane)?.pending ?? 0;
+	return getQueueSize(lane);
 }
 
-/** Diagnostic — every lane that's seen at least one task. */
-export function listKnownLanes(): readonly string[] {
-	return [...lanes.keys()];
+/**
+ * Cancel every queued (not yet active) entry on a lane. Used by `/stop`
+ * + by graceful-shutdown to refuse pending work. Active tasks keep
+ * running. Returns the number of entries removed.
+ */
+export function clearLane(lane: CommandLaneId): number {
+	return clearCommandLane(lane);
 }
 
-/** Test-only — clear every lane state. */
+/** Test-only — hard reset of every lane's state. */
 export function resetLanesForTests(): void {
-	lanes.clear();
+	resetCommandQueueStateForTest();
 }
+
+/** Re-export the lower-level engine for callers that need maxConcurrent /
+ *  drain-await / draining-flag control. */
+export {
+	CommandLaneClearedError,
+	GatewayDrainingError,
+	enqueueCommand,
+	enqueueCommandInLane,
+	getActiveTaskCount,
+	getTotalQueueSize,
+	markGatewayDraining,
+	resetAllLanes,
+	setCommandLaneConcurrency,
+	waitForActiveTasks,
+} from "./command-queue.js";

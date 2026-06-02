@@ -268,6 +268,22 @@ export interface SessionStateSnapshot {
 	 * model misbehaves and produces a generic-coding-assistant reply.
 	 */
 	agentName?: string;
+	/**
+	 * Canonical agent id this TUI is bound to (e.g. `"main"`, `"ops"`,
+	 * `"work"`). Multi-agent gateways set this so the operator can see
+	 * which persona/workspace/model is loaded for their session. Defaults
+	 * to the gateway's boot-time default agent id.
+	 */
+	agentId?: string;
+	/**
+	 * Canonical session key the TUI's `prompt` requests land on. Format
+	 * is `agent:<id>:<rest>` — typically `agent:main:main` for the TUI's
+	 * default session. Surfaced so the operator can see which session
+	 * key their turns target (useful when troubleshooting cross-channel
+	 * vs. operator sessions, or when the gateway routes inbound for a
+	 * non-default agent).
+	 */
+	sessionKey?: string;
 }
 
 /**
@@ -333,3 +349,16 @@ export function isFrame(value: unknown): value is Frame {
 	const t = (value as any).type;
 	return t === "req" || t === "res" || t === "event";
 }
+
+/* ─────────────────────── Step 24 protocol barrel re-export ─────────────────────── */
+/**
+ * The Step 24 lift split the protocol surface across `protocol/messages.ts`,
+ * `protocol/methods.ts`, `protocol/handshake.ts`, `protocol/errors.ts`.
+ * Re-export those modules here so callers can import from a single
+ * canonical path (`from "./protocol.js"`). The legacy exports above
+ * (`Frame`, `RequestMethod`, `EventPayload`, …) stay unchanged.
+ */
+export * from "./protocol/messages.js";
+export * from "./protocol/methods.js";
+export * from "./protocol/handshake.js";
+export * from "./protocol/errors.js";

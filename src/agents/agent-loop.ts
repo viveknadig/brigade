@@ -75,6 +75,7 @@ import {
   drainPendingSystemEvents,
   formatPendingEventsPrefix,
 } from "./pending-system-events.js";
+import { drainFormattedSessionEvents } from "./session-event-prompt.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
 import type { BrigadeBeforeToolCallHook } from "./tool-guard.js";
@@ -1043,8 +1044,16 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // for the queue itself.
   const pendingEvents = drainPendingSystemEvents(resolved.sessionKey);
   const pendingPrefix = formatPendingEventsPrefix(pendingEvents);
+  // SessionInbox drain (Step 12). A2A messages (`sessions_send`), sub-agent
+  // completion announces, heartbeat-fired wakes, exec-event surfaces all
+  // land in the broader SessionInbox queue (`session-inbox.ts`). Drain +
+  // format them here so they prefix the user message alongside the cron-
+  // specific Track-2 events drained above. Returns `undefined` when no
+  // surface-able events are pending; the prompt body stays unchanged.
+  const inboxBlock = drainFormattedSessionEvents({ sessionKey: resolved.sessionKey });
+  const combinedPrefix = [inboxBlock, pendingPrefix].filter(Boolean).join("\n\n");
   const scrubbedMessage = scrubAnthropicRefusalSentinel(
-    pendingPrefix ? `${pendingPrefix}${args.message}` : args.message,
+    combinedPrefix ? `${combinedPrefix}\n${args.message}` : args.message,
   );
   // Process-level event bus wiring. A short-lived run id correlates
   // every event from this turn so multi-consumer subscribers (TUI,

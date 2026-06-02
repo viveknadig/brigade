@@ -1,0 +1,180 @@
+/**
+ * Sessions tools bundle — public entry point (Step 26).
+ *
+ * Wires Steps 19-23's tool factories with Step 11's `SessionContext` so
+ * the per-turn dispatcher (Step 25) can construct the right tool surface
+ * for the caller. Replaces the alternative of every dispatcher hand-
+ * threading agentSessionKey/agentChannel/etc. through four factory calls.
+ *
+ * Usage from the dispatcher:
+ *
+ *   ```ts
+ *   import { createSessionsToolsBundle } from "./tools/sessions/index.js";
+ *   const tools = createSessionsToolsBundle({
+ *     sessionContext: buildSessionContext({ sessionKey }),
+ *     callerDepth: resolveCallerDepth({ sessionKey }),
+ *   });
+ *   // tools is `{ send, spawn, list, history }` — each factory output
+ *   // is already wired with the caller's context.
+ *   ```
+ *
+ * The bundle is plain factory output — caller is expected to spread it
+ * into Pi's `customTools` array (or whatever the host runtime accepts).
+ *
+ * Naming note: this file is the SOLE re-export surface for the four
+ * sessions tools — `import { createSessionsSendTool } from "..."` etc.
+ * still works, but new code should prefer the bundle factory.
+ */
+
+import type { TSchema } from "typebox";
+
+import type { AnyBrigadeTool } from "../types.js";
+import type { SessionContext } from "../../session-context.js";
+import { createSessionsHistoryTool } from "./history.js";
+import { createSessionsListTool } from "./list.js";
+import { createSessionsSendTool } from "./send.js";
+import { createSessionsSpawnTool } from "./spawn.js";
+import type { ToolResultEnvelope } from "./shared.js";
+
+export {
+	createSessionsHistoryTool,
+	createSessionsListTool,
+	createSessionsSendTool,
+	createSessionsSpawnTool,
+};
+export type { SessionsHistoryToolArgs, SessionsHistoryToolDescriptor } from "./history.js";
+export type { SessionsListToolArgs, SessionsListToolDescriptor } from "./list.js";
+export type { SessionsSendToolArgs, SessionsSendToolDescriptor } from "./send.js";
+export type { SessionsSpawnToolArgs, SessionsSpawnToolDescriptor } from "./spawn.js";
+export {
+	jsonToolResult,
+	SESSIONS_HISTORY_MAX_BYTES,
+	SESSIONS_HISTORY_TEXT_MAX_CHARS,
+	ToolAuthorizationError,
+	ToolInputError,
+} from "./shared.js";
+
+export interface CreateSessionsToolsBundleParams {
+	/** Per-turn context produced by Step 11's `buildSessionContext`. */
+	sessionContext?: SessionContext;
+	/** Caller's resolved spawn depth (from session store). Defaults to 0. */
+	callerDepth?: number;
+	/** Optional cap overrides; defaults to 3 / 5 from Step 20. */
+	maxSpawnDepth?: number;
+	maxChildrenPerAgent?: number;
+	/** Caller's workspace dir (sub-agents inherit it). */
+	workspaceDir?: string;
+	/** Sandbox flag — tightens `sessions_list` visibility to spawned-only. */
+	sandboxed?: boolean;
+}
+
+export interface SessionsToolsBundle {
+	send: ReturnType<typeof createSessionsSendTool>;
+	spawn: ReturnType<typeof createSessionsSpawnTool>;
+	list: ReturnType<typeof createSessionsListTool>;
+	history: ReturnType<typeof createSessionsHistoryTool>;
+}
+
+/**
+ * Build the four-tool bundle the gateway dispatcher (Step 25) installs
+ * for one agent turn. Every tool in the bundle is pre-wired with the
+ * caller's session context — no further hand-threading needed.
+ *
+ * The bundle returns descriptor objects (NOT Pi `AgentTool`s yet). The
+ * dispatcher wraps each descriptor in Brigade's `BrigadeTool` shape at
+ * the seam where Pi's runtime is set up. Keeping the bundle in
+ * descriptor form means tests can exercise the `execute` body directly
+ * without depending on Pi's tool-loop.
+ */
+export function createSessionsToolsBundle(
+	params: CreateSessionsToolsBundleParams = {},
+): SessionsToolsBundle {
+	const ctx = params.sessionContext;
+	const sharedOpts = {
+		agentSessionKey: ctx?.key,
+		agentChannel: undefined,
+		agentAccountId: ctx?.requesterAccountId,
+		agentTo: ctx?.requesterSenderId,
+		sandboxed: params.sandboxed,
+	};
+	const send = createSessionsSendTool({
+		agentSessionKey: sharedOpts.agentSessionKey,
+		agentChannel: sharedOpts.agentChannel,
+	});
+	const spawn = createSessionsSpawnTool({
+		agentSessionKey: sharedOpts.agentSessionKey,
+		agentChannel: sharedOpts.agentChannel,
+		agentAccountId: sharedOpts.agentAccountId,
+		agentTo: sharedOpts.agentTo,
+		requesterAgentIdOverride: ctx?.agentId,
+		workspaceDir: params.workspaceDir,
+		callerDepth: params.callerDepth,
+		maxSpawnDepth: params.maxSpawnDepth,
+		maxChildrenPerAgent: params.maxChildrenPerAgent,
+	});
+	const list = createSessionsListTool({
+		agentSessionKey: sharedOpts.agentSessionKey,
+		sandboxed: params.sandboxed,
+	});
+	const history = createSessionsHistoryTool({
+		agentSessionKey: sharedOpts.agentSessionKey,
+	});
+	return { send, spawn, list, history };
+}
+
+/**
+ * Shape descriptor → Brigade Pi `AgentTool` adapter.
+ *
+ * The sessions tools (Steps 19-23) declare a lean descriptor with a
+ * plain JSON-schema `parameters` + a simple `execute(args) → Promise<{content, details}>`.
+ * Pi's `AgentTool` wants TypeBox `TSchema` + `execute(toolCallId, params, signal?, onUpdate?)`.
+ *
+ * The runtime difference is zero: Pi's TypeBox emits JSON-schema for
+ * AJV at validation time, and our descriptor's parameter object IS
+ * JSON-schema. We cast at the boundary and adapt the execute signature.
+ */
+interface DescriptorShape<TArgs> {
+	name: string;
+	description: string;
+	displaySummary: string;
+	parameters: Record<string, unknown>;
+	execute: (args: TArgs) => Promise<ToolResultEnvelope>;
+}
+
+function toBrigadeTool<TArgs>(descriptor: DescriptorShape<TArgs>): AnyBrigadeTool {
+	return {
+		name: descriptor.name,
+		label: descriptor.displaySummary,
+		description: descriptor.description,
+		displaySummary: descriptor.displaySummary,
+		parameters: descriptor.parameters as unknown as TSchema,
+		execute: async (_toolCallId: string, args: unknown) => {
+			const result = await descriptor.execute(args as TArgs);
+			// Pi expects `content` as an array of content blocks (TextContent
+			// | ImageContent). The sessions tools return a single string; wrap
+			// it in one `{type: "text", text}` block.
+			return {
+				content: [{ type: "text", text: result.content }],
+				details: result.details ?? {},
+			};
+		},
+	} as unknown as AnyBrigadeTool;
+}
+
+/**
+ * Build the sessions-tools bundle and adapt every descriptor into a
+ * Brigade `AnyBrigadeTool` for `createBrigadeTools`'s `customTools` slot.
+ * Returned in registry order so `assembleBrigadeToolset` can spread it
+ * directly into the tool array.
+ */
+export function createSessionsBrigadeTools(
+	params: CreateSessionsToolsBundleParams = {},
+): AnyBrigadeTool[] {
+	const bundle = createSessionsToolsBundle(params);
+	return [
+		toBrigadeTool(bundle.send),
+		toBrigadeTool(bundle.spawn),
+		toBrigadeTool(bundle.list),
+		toBrigadeTool(bundle.history),
+	];
+}

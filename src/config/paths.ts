@@ -68,18 +68,35 @@ export function resolveSessionTranscriptPath(agentId: string, sessionId: string)
   return path.join(resolveSessionsDir(agentId), `${sessionId}.jsonl`);
 }
 
-// Workspace lives at the state-dir level (NOT under <agentDir>/) so personas
-// are shared across agents. This matches the reference's layout — one set of
-// IDENTITY/SOUL/AGENTS/USER/TOOLS/HEARTBEAT/BOOTSTRAP files per host, not
-// per-agent. The `agentId` parameter is kept on the signature for forward
-// compatibility (a future per-agent override could honour it) but ignored
-// today; the optional `override` and `BRIGADE_PROFILE` env var are the only
-// paths that diverge from the canonical `<stateDir>/workspace/`.
-export function resolveAgentWorkspaceDir(_agentId: string, override?: string): string {
+// Per-agent workspace dir resolver. The DEFAULT agent ("main") uses the
+// shared `<stateDir>/workspace/` so v1 single-agent installs keep their
+// existing layout. Non-default agents get their own per-agent workspace at
+// `<stateDir>/agents/<id>/workspace/` so each agent has isolated SOUL.md /
+// IDENTITY.md / AGENTS.md / TOOLS.md / USER.md / BOOTSTRAP.md / HEARTBEAT.md
+// + skills + memory state.
+//
+// Resolution order:
+//
+//   1. Explicit `override` argument (caller pinned it)
+//   2. `BRIGADE_PROFILE` env var override (named profile)
+//   3. Non-default agent → `<stateDir>/agents/<id>/workspace/`
+//   4. Default agent → `<stateDir>/workspace/` (shared, v1-compatible)
+//
+// Config-driven per-agent override (`cfg.agents.<id>.workspace`) is read by
+// the gateway boot path (server.ts) and passed through as `override` to
+// this function. Keeping cfg out of this signature lets the helper stay
+// config-agnostic.
+export function resolveAgentWorkspaceDir(agentId: string, override?: string): string {
   if (override && override.length > 0) return path.resolve(override);
   const profile = process.env.BRIGADE_PROFILE?.trim();
   if (profile && profile.toLowerCase() !== "default") {
     return path.join(resolveStateDir(), `workspace-${profile}`);
+  }
+  const normalizedId = (agentId ?? "").trim().toLowerCase();
+  if (normalizedId && normalizedId !== DEFAULT_AGENT_ID) {
+    // Per-agent isolated workspace. Created lazily on first turn by the
+    // bootstrap path; agent-loop.ts:bootstrapWorkspace seeds the .md files.
+    return path.join(resolveStateDir(), "agents", normalizedId, "workspace");
   }
   return path.join(resolveStateDir(), "workspace");
 }

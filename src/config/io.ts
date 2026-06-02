@@ -41,6 +41,13 @@ export interface BrigadeConfig {
   skills?: BrigadeSkillsConfig;
   wizard?: BrigadeWizardMetaConfig;
   meta?: BrigadeConfigMeta;
+  // ── Multi-routing / multi-channel additions (Step 2 of the SessionContext
+  // refactor). Optional; absent on legacy configs. The 8-tier route
+  // resolver (`agents/routing/resolve-route.ts`, added in Step 6) reads
+  // `bindings.entries[]` to pick the agent for an inbound peer / guild /
+  // channel / account; the channel manager pre-evaluates user-authored
+  // bindings into this shape at boot so the hot routing path stays O(n).
+  bindings?: BrigadeBindings;
   [key: string]: unknown;
 }
 
@@ -95,10 +102,76 @@ export interface BrigadeGatewayConfig {
   [key: string]: unknown;
 }
 
+// `dmScope` controls per-conversation session-key uniqueness. Extended to
+// include `"per-peer"` (collapses the same peer across channels into one
+// session — used together with `identityLinks` for cross-channel personas).
+//
+//   - `"main"`                      → every DM lands in the agent's main session
+//   - `"per-peer"`                  → one session per peer-id regardless of channel
+//   - `"per-channel-peer"`          → one session per (channel, peer-id)
+//   - `"per-account-channel-peer"`  → one session per (channel, account, peer-id)
+export type DmScope = "main" | "per-peer" | "per-channel-peer" | "per-account-channel-peer";
+
+/** Visibility level for cross-session tools (`sessions_list` / `sessions_history`).
+ *  `off` hides the tool; `self` shows only the caller's own sessions; `agent`
+ *  shows every session of the same agent; `all` shows every session globally. */
+export type SessionToolsVisibility = "off" | "self" | "agent" | "all";
+
+/** Agent-to-agent (A2A) ping-pong policy used by `sessions_send`. When
+ *  `enabled === true`, a sender can wait for the target session's reply
+ *  inline (capped by `maxPingPongTurns`). The `allow` matrix gates which
+ *  (from, to) agent pairs may use A2A — empty means no restriction. */
+export type AgentToAgentPolicy = {
+  enabled?: boolean;
+  allow?: Array<{ from: string; to: string }>;
+  maxPingPongTurns?: number;
+};
+
 export interface BrigadeSessionConfig {
-  dmScope?: "main" | "per-channel-peer" | "per-account-channel-peer";
+  dmScope?: DmScope;
+  /** Cross-channel canonical peer aliases. The session-key builder uses this
+   *  to collapse e.g. `{ kartheek: ["telegram:111", "whatsapp:+91…"] }` into
+   *  one canonical peer id, so the same person on two surfaces shares the
+   *  same session under `dmScope: "per-peer"`. */
+  identityLinks?: Record<string, string[]>;
+  /** Agent-to-agent messaging policy (used by `sessions_send` A2A flow). */
+  agentToAgent?: AgentToAgentPolicy;
+  /** Visibility gate for the `sessions_list` / `sessions_history` tools. */
+  sessionTools?: { visibility?: SessionToolsVisibility };
   [key: string]: unknown;
 }
+
+/** One raw route binding the operator authored in `brigade.json`. The
+ *  8-tier route resolver (`agents/routing/resolve-route.ts`) normalises +
+ *  indexes these per (channel, accountId) and walks them in waterfall
+ *  order — peer > peer.parent > peer.wildcard > guild+roles > guild >
+ *  team > account > channel — returning the first match's `agentId` for
+ *  the inbound message. The "evaluated" form lives internal to the
+ *  resolver; this is the config-level shape operators read + write. */
+export type BindingEntry = {
+  agentId: string;
+  match?: {
+    /** Channel id (e.g. "whatsapp", "slack"). Required for the binding
+     *  to participate in any tier. */
+    channel?: string;
+    /** Account-id constraint. Either an exact account id, or `"*"` for
+     *  any-account, or omitted (falls back to `"*"`). */
+    accountId?: string;
+    /** Peer constraint. `kind` is `"direct" | "group" | "channel"`;
+     *  `id === "*"` is a wildcard for the kind. */
+    peer?: { kind?: string; id?: string };
+    /** Discord guild constraint. */
+    guildId?: string;
+    /** Slack team constraint. */
+    teamId?: string;
+    /** Role-id allowlist (Discord). Matches if member has ANY of these. */
+    roles?: string[];
+  };
+};
+
+/** Brigade bindings block. Indexed once per config-load by the resolver
+ *  so the hot routing path is a flat array walk, not a per-request scan. */
+export type BrigadeBindings = { entries?: BindingEntry[] };
 
 export interface BrigadeToolsConfig {
   profile?: "minimal" | "coding" | "messaging" | "full";

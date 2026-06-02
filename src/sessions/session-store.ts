@@ -183,6 +183,74 @@ export function deleteSessionEntry(agentId: string, sessionKey: string): boolean
 }
 
 /**
+ * Patch fields on an existing session entry. Used by the `sessions.patch`
+ * gateway method (Step 20 sub-agent spawn calls it to write
+ * `subagent` metadata + `spawnedWorkspaceDir` BEFORE the first turn so
+ * post-crash forensics can reconstruct the spawn tree).
+ *
+ * The patch is a shallow merge — top-level keys in `patch` overwrite the
+ * existing entry's keys. To update nested fields (e.g. `subagent.label`),
+ * pass the full `subagent` block. `lastUsedAt` is always touched.
+ *
+ * Returns the merged entry on success, `null` if the entry was missing.
+ * Refuses to overwrite the `sessionId` (immutable post-creation).
+ */
+export function updateSessionEntry(
+  agentId: string,
+  sessionKey: string,
+  patch: Partial<SessionEntry>,
+): SessionEntry | null {
+  const store = readSessionStore(agentId);
+  const entry = store.sessions[sessionKey];
+  if (!entry) return null;
+  const { sessionId: _ignored, ...rest } = patch;
+  const next: SessionEntry = {
+    ...entry,
+    ...rest,
+    lastUsedAt: new Date().toISOString(),
+  };
+  store.sessions[sessionKey] = next;
+  writeSessionStore(agentId, store);
+  return next;
+}
+
+/**
+ * Create OR patch a session entry in one call. If the entry doesn't exist
+ * yet, the function mints a `sessionId` and writes the supplied fields.
+ * If it exists, the function applies the patch (same shallow-merge rules
+ * as `updateSessionEntry`).
+ *
+ * Used by the `sessions.patch` gateway handler — operators expect the
+ * call to succeed even if the session hasn't had its first turn yet
+ * (e.g. spawn-engine patches the child entry BEFORE handing off).
+ */
+export function upsertSessionEntry(
+  agentId: string,
+  sessionKey: string,
+  patch: Partial<SessionEntry>,
+): SessionEntry {
+  const store = readSessionStore(agentId);
+  const now = new Date().toISOString();
+  const { sessionId: incomingSessionId, ...rest } = patch;
+  let entry = store.sessions[sessionKey];
+  if (!entry) {
+    entry = {
+      sessionId: incomingSessionId ?? randomUUID(),
+      createdAt: now,
+      lastUsedAt: now,
+      ...rest,
+    };
+    store.sessions[sessionKey] = entry;
+  } else {
+    entry = { ...entry, ...rest, lastUsedAt: now };
+    store.sessions[sessionKey] = entry;
+  }
+  writeSessionStore(agentId, store);
+  ensureDir(resolveSessionsDir(agentId));
+  return entry;
+}
+
+/**
  * Read the sub-agent metadata persisted on a session (Primitive #6).
  * Returns `undefined` when the session doesn't exist OR is a top-level
  * (non-sub-agent) session. Reads through the existing store JSON without

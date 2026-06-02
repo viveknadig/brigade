@@ -35,6 +35,9 @@ import {
 } from "./approval-router.js";
 import { recordLastChannelForAgent } from "./last-channel.js";
 import { channelSessionKey } from "./session-key.js";
+import { resolveAgentRoute } from "../routing/resolve-route.js";
+import { normalizeAccountId } from "../routing/account-id.js";
+import { resolveLinkedPeerIdFromConfig } from "../identity-links.js";
 import { sanitizeReplyForChannel } from "./reply-sanitizer.js";
 import { classifyErrorReason, isBrigadeRetryError } from "../error-classifier.js";
 import { isRetryExhaustedError } from "../retry-policy.js";
@@ -313,6 +316,15 @@ export interface StartChannelsArgs {
 	runTurn: (args: {
 		text: string;
 		sessionKey: string;
+		/**
+		 * Agent id this turn routes to. Multi-agent gateways resolve this
+		 * per-inbound via the 8-tier route resolver; single-agent gateways
+		 * supply `args.agentId` (the fallback default). Channels that want
+		 * the inbound to run as a specific agent — e.g. operator binds
+		 * `whatsapp:+91…` to `agent:ops` — let the resolver pick `"ops"`
+		 * here so the agent-loop loads ops's workspace + model + persona.
+		 */
+		agentId: string;
 		signal?: AbortSignal;
 		/**
 		 * `true` when the inbound came from the operator's OWN linked-channel
@@ -380,6 +392,10 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 		parts: string[];
 		baseMsg: InboundMessage;
 		sessionKey: string;
+		/** Resolved agent id for this inbound (route-resolver output, falls
+		 *  back to `args.agentId` when no binding matches). Carried through
+		 *  the debounce so the eventual turn uses the same agent. */
+		agentId: string;
 		/** Cached `senderIsOwner` from when the slot was opened — carried into
 		 *  the eventual dispatch so the agent loop's bootstrap gate works
 		 *  even across the debounce window. */
@@ -430,6 +446,7 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 		const dispatchTurn = async (a: {
 			text: string;
 			sessionKey: string;
+			agentId: string;
 			conversationId: string;
 			threadId?: string;
 			senderIsOwner?: boolean;
@@ -452,6 +469,7 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 				result = await args.runTurn({
 					text: a.text,
 					sessionKey: a.sessionKey,
+					agentId: a.agentId,
 					signal: controller.signal,
 					senderIsOwner: a.senderIsOwner,
 					...(a.channelApprovalRoute !== undefined
@@ -507,6 +525,7 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 				await dispatchTurn({
 					text: combined,
 					sessionKey: slot.sessionKey,
+					agentId: slot.agentId,
 					conversationId,
 					threadId,
 					senderIsOwner: slot.senderIsOwner,
@@ -777,13 +796,48 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 							return; // command handled — no turn
 						}
 					}
+					// Route the inbound through the 8-tier resolver to pick the
+					// right agent. The resolver consults `cfg.bindings.entries[]`
+					// in waterfall order (peer → peer-parent → guild+roles →
+					// guild → team → account → channel → default) and falls back
+					// to `args.agentId` if no binding matches. Multi-agent gateways
+					// rely on this to dispatch e.g. WhatsApp DMs from `+919876…`
+					// to `agent:ops` while Slack messages to `#engineering` go to
+					// `agent:work`. Single-agent installs simply land on
+					// `args.agentId` via the default tier.
+					const normalizedAccountId = normalizeAccountId(msg.conversationId);
+					const peerKind = isGroup ? "group" : "direct";
+					// Cross-channel peer alias resolution (Step 5). If the operator
+					// configured `session.identityLinks: { kartheek: ["whatsapp:+91…",
+					// "telegram:111"] }`, the same human DMing from either channel
+					// collapses to one canonical peer id (and therefore one
+					// session). When no link matches, the raw `msg.from` is used.
+					const canonicalPeerId =
+						resolveLinkedPeerIdFromConfig({
+							config: args.config,
+							channel: adapter.id,
+							peerId: msg.from,
+						}) ?? msg.from;
+					const route = resolveAgentRoute({
+						cfg: args.config,
+						channel: adapter.id,
+						accountId: normalizedAccountId,
+						peer: canonicalPeerId
+							? { id: canonicalPeerId, kind: peerKind }
+							: undefined,
+					});
+					const resolvedAgentId = route.agentId || args.agentId;
 					// Thread-aware session key: when a channel carries a thread id
 					// (Slack/Discord), scope the session per thread so a busy room
 					// doesn't pool every thread's history into one transcript.
+					// Brigade keeps its per-conversation session-key shape
+					// (channelSessionKey) rather than the OC `dmScope`-driven key,
+					// so existing conversation isolation isn't broken by the
+					// routing migration. Only the agent id changes per-inbound.
 					const convScope = msg.threadId
 						? `${msg.conversationId}#${msg.threadId}`
 						: msg.conversationId;
-					const sessionKey = channelSessionKey(args.agentId, adapter.id, convScope);
+					const sessionKey = channelSessionKey(resolvedAgentId, adapter.id, convScope);
 					// Channel routing for approval prompts — exec-gate sends "want
 					// to run <cmd>?" prompts into THIS conversation instead of
 					// (only) the gateway WS, and the next inbound from the same
@@ -799,7 +853,10 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 					// explicit channel target falls back to this peer. Only fires
 					// for access-allowed inbounds (we're past the policy gate) so
 					// a stranger DM can't accidentally redirect future crons.
-					recordLastChannelForAgent(args.agentId, channelApprovalRoute);
+					// Uses the RESOLVED agent id so multi-agent gateways pin the
+					// last-channel per-agent (e.g. ops's last channel separately
+					// from work's).
+					recordLastChannelForAgent(resolvedAgentId, channelApprovalRoute);
 					// Optional debounce — coalesce rapid-fire messages into a single
 					// turn. Off by default (`channels.<id>.debounceMs <= 0` ⇒
 					// immediate). For groups we key per-speaker so different
@@ -818,6 +875,7 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 								parts: [text],
 								baseMsg: msg,
 								sessionKey,
+								agentId: resolvedAgentId,
 								senderIsOwner,
 								channelApprovalRoute,
 								timer: setTimeout(() => void flushDispatch(dispatchKey), debounceMs),
@@ -829,6 +887,7 @@ export async function startChannels(args: StartChannelsArgs): Promise<ChannelMan
 					await dispatchTurn({
 						text,
 						sessionKey,
+						agentId: resolvedAgentId,
 						conversationId: msg.conversationId,
 						threadId: msg.threadId,
 						senderIsOwner,

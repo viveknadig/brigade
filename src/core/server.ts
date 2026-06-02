@@ -81,6 +81,35 @@ import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { DEFAULT_AGENT_ID, resolveAgentDir, resolveAgentWorkspaceDir } from "../config/paths.js";
 import { runHeartbeatNow } from "../agents/heartbeat.js";
 import { enqueuePendingSystemEvent } from "../agents/pending-system-events.js";
+// Multi-routing wiring (Step 1-27 lift): in-process gateway-call dispatcher,
+// per-method handlers (sessions.*, health), agent-events bridge, heartbeat
+// runner + wake flag, lane drain helpers. All exported but never called
+// pre-wiring; the boot path below installs them once.
+import {
+	installInProcessGatewayCaller,
+	registerGatewayHandler,
+} from "./gateway-caller-impl.js";
+import { handleHealthMethod } from "./server-methods/health.js";
+import {
+	handleSessionsHistory,
+	handleSessionsList,
+	handleSessionsPatch,
+	handleSessionsSend,
+	handleSessionsSpawn,
+} from "./server-methods/sessions.js";
+import { wireAgentEventsBridge } from "../agents/agent-events.js";
+import { requestHeartbeatNow, setHeartbeatsEnabled } from "../agents/heartbeat-wake.js";
+import {
+	setHeartbeatFiredHook,
+	startHeartbeatRunner,
+	type HeartbeatRunnerHandle,
+} from "../agents/heartbeat-runner.js";
+import {
+	createHeartbeatScheduler,
+	type HeartbeatScheduler,
+} from "../agents/heartbeat-scheduler.js";
+import { markGatewayDraining, waitForActiveTasks } from "../process/lanes.js";
+import { ensureDir } from "../config/paths.js";
 import {
 	CommandLane,
 	type CommandLaneId,
@@ -570,6 +599,14 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			messageCount: lastMessageCount,
 			firstRunBootstrap: computeFirstRunBootstrap(),
 			agentName: computeAgentName(),
+			// Multi-agent visibility: surface the agent id + session key the
+			// TUI is bound to so the operator sees `agent main · agent:main:main`
+			// next to the model in the header. Multi-agent gateways with
+			// per-binding routing show the gateway's BOOT agentId here; the
+			// per-inbound routed agent (for channels) lives on each turn's
+			// own dispatcher state, not on this gateway-level snapshot.
+			agentId,
+			sessionKey,
 		};
 	};
 
@@ -1040,6 +1077,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	const runGatewayTurn = (turn: {
 		text: string;
 		sessionKey: string;
+		/**
+		 * Routed agent id for this turn (output of the 8-tier route resolver
+		 * inside the channel manager). When omitted, falls back to the
+		 * gateway's boot-time `agentId` — preserving single-agent behaviour
+		 * for TUI / cron / direct-RPC paths. Multi-agent inbounds (e.g. a
+		 * WhatsApp DM bound to `agent:ops` via `cfg.bindings.entries`) supply
+		 * the resolved id here so the turn loads ops's workspace + model +
+		 * persona instead of the default agent's.
+		 */
+		agentId?: string;
 		signal?: AbortSignal;
 		/**
 		 * Channel-supplied owner flag. `true` for self-chat / TUI-equivalent
@@ -1091,13 +1138,40 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const fallbacks =
 					fallbackProvider && fallbackModelId ? [{ provider: fallbackProvider, modelId: fallbackModelId }] : [];
 
+				// Per-agent dispatch: the channel manager hands us a routed
+				// agentId via the 8-tier resolver; we honour it here so the
+				// turn loads the right workspace + model + persona. Single-
+				// agent gateways (TUI, cron, direct-RPC) leave `turn.agentId`
+				// undefined and fall back to the boot-time default. When the
+				// routed agent has a per-agent provider/model in
+				// `cfg.agents.<id>`, those override the boot defaults so e.g.
+				// `agent:ops` can run on a different model than `agent:main`.
+				const targetAgentId = turn.agentId ?? agentId;
+				const agentOverride = (() => {
+					if (!targetAgentId || targetAgentId === agentId) return undefined;
+					const map = cfgNow.agents as
+						| { [id: string]: { provider?: string; model?: { primary?: string } } }
+						| undefined;
+					const entry = map?.[targetAgentId];
+					if (!entry || typeof entry !== "object") return undefined;
+					return {
+						provider: typeof entry.provider === "string" ? entry.provider : undefined,
+						modelId:
+							typeof entry.model === "object" && entry.model && typeof entry.model.primary === "string"
+								? entry.model.primary
+								: undefined,
+					};
+				})();
+				const turnProvider = agentOverride?.provider ?? provider;
+				const turnModelId = agentOverride?.modelId ?? modelId;
+
 				// If a channel inbound passed an AbortSignal, abort the in-flight Pi
 				// session when it fires (so `/stop` from the chat actually cancels).
 				turn.signal?.addEventListener("abort", onAbort, { once: true });
 				const result = await runResilientTurn({
-					agentId,
-					provider,
-					modelId,
+					agentId: targetAgentId,
+					provider: turnProvider,
+					modelId: turnModelId,
 					message: turn.text,
 					sessionKey: turn.sessionKey,
 					thinkingLevel: thinkingLevel as "off" | "low" | "medium" | "high",
@@ -1465,6 +1539,184 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		broadcast("state", buildSnapshot());
 	}, TICK_INTERVAL_MS);
 	tickTimer.unref(); // don't block process exit on timer
+
+	/* ──────────────── multi-routing spine wiring (Step 1-27) ──────────────── */
+
+	// Install the in-process gateway caller. Every `callGateway(...)` from
+	// a tool (sessions_send, sessions_spawn, sessions_history, sessions_list)
+	// resolves to a local handler via the registry below. WebSocket clients
+	// also dispatch through the same registry once the connection handler
+	// routes their request frame here (in `handleRequest`).
+	const disposeGatewayCaller = installInProcessGatewayCaller();
+
+	// Register the five sessions handlers + health. Bound `agentId` is the
+	// boot-time default; the dispatcher's per-turn route resolver overrides
+	// this for channel-routed inbounds. `runAgentTurn` adapter calls the
+	// already-defined `runGatewayTurn` so each method dispatches through the
+	// existing serialized turn queue.
+	const disposeHandlers: Array<() => void> = [];
+	disposeHandlers.push(
+		registerGatewayHandler("health", (params: unknown) =>
+			handleHealthMethod(params as { probe?: boolean } | undefined, {
+				getBrigadeVersion: () => getBuildInfo().head ?? "dev",
+			}),
+		),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("sessions.list", (params: unknown) =>
+			handleSessionsList(
+				params as Parameters<typeof handleSessionsList>[0],
+				{},
+			),
+		),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("sessions.history", (params: unknown) =>
+			handleSessionsHistory(
+				params as Parameters<typeof handleSessionsHistory>[0],
+				// `readMessages` reads from Pi's transcript JSONL. Brigade's
+				// existing transcript reader is exposed via Pi's SessionManager
+				// in the agent-loop layer — for this milestone we return an
+				// empty array so the tool resolves without throwing. Step 27+
+				// will wire the actual JSONL reader.
+				{ readMessages: async () => [] },
+			),
+		),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("sessions.send", (params: unknown) =>
+			handleSessionsSend(
+				params as Parameters<typeof handleSessionsSend>[0],
+				{
+					// Adapt the existing per-turn dispatcher to the
+					// `DispatchAgentRunDeps.runAgentTurn` shape so a tool's
+					// `sessions.send` call lands on the same path a channel
+					// inbound would.
+					runAgentTurn: async (turn) => {
+						try {
+							await runGatewayTurn({
+								text: turn.message,
+								sessionKey: turn.sessionKey,
+							});
+							return { ok: true };
+						} catch (err) {
+							return {
+								ok: false,
+								error: err instanceof Error ? err.message : String(err),
+							};
+						}
+					},
+				},
+			),
+		),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("sessions.spawn", (params: unknown) =>
+			handleSessionsSpawn(params as Parameters<typeof handleSessionsSpawn>[0], {}),
+		),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("sessions.patch", (params: unknown) =>
+			handleSessionsPatch(params as Parameters<typeof handleSessionsPatch>[0]),
+		),
+	);
+
+	// Wire the agent-events bridge. Subagent-ended hooks (Step 10) +
+	// heartbeat-fired hooks (Step 14) + session-state listeners (Step 11)
+	// all now flow into the unified `agent-events.ts` bus where Step 25's
+	// event-stream broadcaster can fan out to WebSocket subscribers.
+	const disposeAgentEventsBridge = wireAgentEventsBridge();
+
+	// Enable heartbeats globally (read from env override if set; tests can
+	// disable via BRIGADE_DISABLE_HEARTBEAT=1).
+	setHeartbeatsEnabled(process.env.BRIGADE_DISABLE_HEARTBEAT !== "1");
+
+	// Install the heartbeat-fired hook BEFORE starting the runner so the
+	// runner can dispatch a synthetic turn the first time it fires. The
+	// hook formats the consumed events as the user message and routes
+	// through `runGatewayTurn` (same path as a channel inbound).
+	setHeartbeatFiredHook(async (params) => {
+		if (!params.consumedEvents.length && params.reason !== "interval") return;
+		const text =
+			params.consumedEvents.length > 0
+				? params.consumedEvents.map((e) => e.text).join("\n")
+				: "Heartbeat tick.";
+		try {
+			await runGatewayTurn({
+				text,
+				sessionKey: params.sessionKey,
+				agentId: params.agentId,
+				senderIsOwner: true,
+			});
+		} catch {
+			// Heartbeat turns are best-effort; failures already log via the runner.
+		}
+	});
+
+	// Start the heartbeat runner. Returns a handle whose `.stop()` is
+	// called in `handle.stop()` below to unregister the wake handler.
+	let heartbeatRunnerHandle: HeartbeatRunnerHandle | undefined;
+	try {
+		heartbeatRunnerHandle = startHeartbeatRunner();
+	} catch (err) {
+		bootLog(
+			`heartbeat runner failed to start: ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+
+	// Wall-clock heartbeat scheduler. Reads per-agent `heartbeat.intervalMs`
+	// from `cfg.agents.<id>.heartbeat` (with `cfg.agents.defaults.heartbeat`
+	// as fallback) and fires `requestHeartbeatNow({reason: "interval",
+	// agentId})` on each agent's configured cadence. Pre-wires the on-
+	// interval callback to the wake layer Brigade already has.
+	let heartbeatScheduler: HeartbeatScheduler | undefined;
+	try {
+		heartbeatScheduler = createHeartbeatScheduler({
+			onInterval: ({ agentId: scheduledAgentId, sessionKey: scheduledSessionKey }) => {
+				try {
+					requestHeartbeatNow({
+						reason: "interval",
+						agentId: scheduledAgentId,
+						...(scheduledSessionKey ? { sessionKey: scheduledSessionKey } : {}),
+					});
+				} catch {
+					// best-effort tick fire
+				}
+			},
+		});
+		const bootCfg = await loadConfig();
+		heartbeatScheduler.updateConfig(bootCfg as never);
+		heartbeatScheduler.start();
+	} catch (err) {
+		bootLog(
+			`heartbeat scheduler failed to start: ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+
+	// Multi-agent boot: iterate `cfg.agents.*` and pre-warm each agent's
+	// workspace directory. Lazy bootstrap still happens on the first turn
+	// (via agent-loop's `bootstrapWorkspace`) but ensuring the dir exists
+	// here prevents the first inbound for `agent:ops` from racing against
+	// a missing `~/.brigade/agents/ops/workspace/` parent.
+	try {
+		const bootCfg = await loadConfig();
+		const agentsBlock = (bootCfg as { agents?: Record<string, unknown> }).agents;
+		if (agentsBlock && typeof agentsBlock === "object") {
+			for (const id of Object.keys(agentsBlock)) {
+				if (id === "defaults") continue;
+				if (!id.trim()) continue;
+				try {
+					ensureDir(resolveAgentDir(id.trim()));
+					ensureDir(resolveAgentWorkspaceDir(id.trim()));
+				} catch {
+					// per-agent dir creation is best-effort; the first turn for
+					// the agent will create what's still missing.
+				}
+			}
+		}
+	} catch {
+		// non-fatal — single-agent gateways have no `cfg.agents.*` entries
+	}
 
 	/* ──────────────── start listening ──────────────── */
 
@@ -1845,6 +2097,50 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		host,
 		async stop() {
 			serverStopped = true; // freeze background memory work
+			// Signal the lane engine to reject new enqueues. Channel inbounds
+			// that arrive during shutdown get a clean `GatewayDrainingError`
+			// instead of being silently queued against a tearing-down server.
+			try {
+				markGatewayDraining();
+			} catch {
+				/* best-effort */
+			}
+			// Stop the heartbeat runner first so its wake handler unregisters
+			// before the rest of the wires unwire — prevents a late wake
+			// from firing through a half-torn-down dispatcher.
+			try {
+				heartbeatRunnerHandle?.stop();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				heartbeatScheduler?.stop();
+			} catch {
+				/* best-effort */
+			}
+			// Dispose the agent-events bridge + every registered handler +
+			// the in-process gateway caller. Order: bridge → handlers →
+			// caller so a late `callGateway()` after shutdown gets a clean
+			// "dispatcher not registered" error rather than racing into a
+			// half-disposed bridge.
+			try {
+				disposeAgentEventsBridge();
+			} catch {
+				/* best-effort */
+			}
+			for (const dispose of disposeHandlers) {
+				try {
+					dispose();
+				} catch {
+					/* best-effort */
+				}
+			}
+			disposeHandlers.length = 0;
+			try {
+				disposeGatewayCaller();
+			} catch {
+				/* best-effort */
+			}
 			clearInterval(tickTimer);
 			if (extractTimer) clearTimeout(extractTimer);
 			pendingExtracts.clear();
@@ -1870,6 +2166,14 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// cleanup, broadcast, scheduleExtraction — can't run against a
 			// torn-down server after stop() returns.
 			if (inFlightSession) await inFlightSession.abort().catch(() => {});
+			// Serialize the per-lane drain. `markGatewayDraining()` above
+			// already rejected new enqueues; this waits up to 10s for the
+			// in-flight tasks in every lane to settle.
+			try {
+				await waitForActiveTasks(10_000);
+			} catch {
+				/* best-effort drain */
+			}
 			await turnChainTail.catch(() => {});
 			// Tear down any in-flight turn's Pi subscription + JSONL logger.
 			// Between turns there's nothing attached, so this is a no-op then.

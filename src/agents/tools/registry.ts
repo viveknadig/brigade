@@ -20,6 +20,7 @@
 import { getActiveChannelManager } from "../channels/active-manager.js";
 import type { ChannelApprovalRoute } from "../channels/approval-router.js";
 import type { MemoryCapability } from "../extensions/types.js";
+import type { SessionContext } from "../session-context.js";
 import { FileMemoryStore } from "../memory/storage.js";
 import {
 	createDefaultMemoryCapability,
@@ -34,6 +35,7 @@ import { makeCronTool } from "./cron-tool.js";
 import { makeReadMemoryTool, makeRecallMemoryTool, makeWriteMemoryTool } from "./memory-tools.js";
 import { makeSendMessageTool } from "./send-message-tool.js";
 import { makeSpawnAgentTool } from "./spawn-agent-tool.js";
+import { createSessionsBrigadeTools } from "./sessions/index.js";
 import type { AnyBrigadeTool } from "./types.js";
 
 /**
@@ -107,6 +109,21 @@ export interface CreateBrigadeToolsOptions {
 	 * `enqueueSystemEvent` fallback (see `cron/service/timer.ts`).
 	 */
 	channelContext?: ChannelApprovalRoute;
+	/**
+	 * Per-turn session metadata (Step 11's `SessionContext`). When supplied,
+	 * `createBrigadeTools` includes the four sessions tools
+	 * (`sessions_send` / `sessions_spawn` / `sessions_list` / `sessions_history`)
+	 * pre-wired with the caller's session key, agent id, channel context,
+	 * etc. Omit the field on TUI / cron / unit-test paths that don't need
+	 * cross-session coordination — the four tools simply aren't surfaced.
+	 */
+	sessionContext?: SessionContext;
+	/**
+	 * Sandbox flag for the sessions tools — when true, `sessions_list`
+	 * clamps visibility to spawned-tree only. Defers to the caller (the
+	 * dispatcher) to compute.
+	 */
+	sandboxedSessionTools?: boolean;
 }
 
 /**
@@ -202,6 +219,21 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 				opts.channelContext !== undefined ? { channelContext: opts.channelContext } : {},
 			),
 		);
+	}
+	// Sessions tools (Steps 19-23) — register only when the caller passed
+	// a `sessionContext`. TUI / cron / unit-test paths skip these because
+	// they don't need cross-session coordination; channel-routed agent
+	// turns + sub-agent runs always pass a context so the four sessions
+	// tools surface there.
+	if (opts.sessionContext) {
+		const sessionsTools = createSessionsBrigadeTools({
+			sessionContext: opts.sessionContext,
+			callerDepth: opts.subagentContext?.callerDepth ?? 0,
+			maxSpawnDepth: opts.subagentMaxDepth,
+			workspaceDir: opts.workspaceDir,
+			sandboxed: opts.sandboxedSessionTools,
+		});
+		tools.push(...sessionsTools);
 	}
 	return tools;
 }

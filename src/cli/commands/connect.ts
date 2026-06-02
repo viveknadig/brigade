@@ -41,6 +41,7 @@ import chalk from "chalk";
 // of leaking literal underscores. Same shape as Pi-TUI's `Markdown` — drop-in.
 import { Markdown } from "../../ui/markdown.js";
 import { renderBrandHeader } from "../../ui/brand.js";
+import { formatCrewLabel, formatSessionLabel } from "../../ui/format-session.js";
 import { markTuiActive, restoreTerminal } from "../../ui/terminal-cleanup.js";
 import { brand, editorTheme, markdownTheme } from "../../ui/theme.js";
 import { summarizeToolResult } from "../../ui/tool-result.js";
@@ -266,8 +267,29 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		}
 		const tail = extra ? ` · ${extra}` : "";
 		const dot = isAgentRunning ? brand.amber("●") : brand.dim("○");
+		// Brand mark — the 🦁 mascot always rides ahead of the persona name
+		// so the header reads as Brigade-branded at a glance. When the
+		// operator has set a `Name` in IDENTITY.md (e.g. "felix"/"molty"),
+		// that name takes the persona slot; otherwise fall back to the
+		// "Brigade" wordmark.
+		const personaName = lastSnapshot?.agentName?.trim();
+		const personaLabel = personaName || "Brigade";
+		// "crew <id>" badge — surfaced only when meaningful (non-default
+		// agent OR no persona name yet). Hides on a single-agent install
+		// with a persona name set so the header stays calm.
+		const crewLabel = formatCrewLabel({
+			agentId: lastSnapshot?.agentId,
+			personaName,
+		});
+		const crewSegment = crewLabel ? ` ${brand.dim(`· ${crewLabel}`)}` : "";
+		// Human-readable session label — `main` / `WhatsApp · DM` /
+		// `Slack · group · thread` / `sub-agent abc` instead of the raw
+		// `agent:<id>:<rest>` key. Falls back to the raw string when the
+		// key is unparseable so we never lose information.
+		const sessionLabel = formatSessionLabel(lastSnapshot?.sessionKey);
+		const sessionSegment = sessionLabel ? ` ${brand.dim(`· ${sessionLabel}`)}` : "";
 		header.setText(
-			`  ${dot} ${brand.white("Brigade")}  ${brand.dim(`${provider} · ${modelId}${tokens}${cost}`)}${usageStr}${brand.dim(elapsed)}${brand.dim(tail)}`,
+			`  ${dot} 🦁 ${brand.white(personaLabel)}${crewSegment}${sessionSegment}  ${brand.dim(`${provider} · ${modelId}${tokens}${cost}`)}${usageStr}${brand.dim(elapsed)}${brand.dim(tail)}`,
 		);
 	};
 
