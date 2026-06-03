@@ -1,15 +1,24 @@
 /**
- * `agents_list` tool — read-only enumeration of agents the caller can target.
+ * `agents_list` tool — read-only enumeration of agents the caller may target
+ * with `sessions_spawn` (subagent runtime), scoped to the subagent allowlist.
  *
- * Brand-scrubbed port of the reference codebase's `src/agents/tools/agents-list-tool.ts`.
- * Same shape (empty params, `{requester, allowAny, agents[]}` return) adapted
- * to Brigade's keyed-map `cfg.agents` (vs the reference's array `cfg.agents.list`).
+ * Brand-scrubbed port of the reference codebase's
+ * `src/agents/tools/agents-list-tool.ts`, adapted to Brigade's keyed-map
+ * `cfg.agents` (vs the reference's array `cfg.agents.list`).
  *
- * Posture (mirrors the reference): the model can READ the agent catalog but
- * CANNOT create / delete / mutate agents. Mutation is operator-only via
- * `brigade agents add/delete/...` CLI. The tool's existence + description
- * steer the model toward "ask the operator" instead of hand-editing
- * brigade.json (which produces orphan dirs + missing persona files every time).
+ * Contract:
+ *
+ *   {
+ *     requester: string,
+ *     allowAny: boolean,                       // true when allowAgents contains "*"
+ *     agents: [{ id, name?, configured }, ...] // requester ALWAYS first;
+ *                                              // peers added only when in
+ *                                              // subagents.allowAgents (or `*`)
+ *   }
+ *
+ * Population is ALLOWLIST-SCOPED — the model learns the catalog by calling
+ * this tool, not from a system-prompt block. With `[main, math]` configured
+ * and an empty `subagents.allowAgents`, this returns only the requester.
  */
 
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
@@ -47,7 +56,7 @@ export function makeAgentsListTool(
 		name: "agents_list",
 		label: "Agents",
 		description:
-			"List Brigade agents you can target with `sessions_send({agentId, message})` or `sessions_spawn({runtime:\"subagent\"})`. Returns {requester, allowAny, agents[{id, name?, configured}]}. Read-only — to CREATE or DELETE agents, ask the operator to run `brigade agents add <name>` / `brigade agents delete <id> --force`. Do NOT hand-edit brigade.json — the CLI does this atomically with proper rollback.",
+			'List Brigade agent ids you can target with `sessions_spawn` when `runtime="subagent"` (based on subagent allowlists).',
 		parameters: AgentsListParams,
 		execute: async (_toolCallId: string): Promise<AgentToolResult<AgentsListResult>> => {
 			const cfg = loadConfig();
@@ -63,50 +72,69 @@ export function makeAgentsListTool(
 				if (name) nameMap.set(normalizeAgentId(id), name);
 			}
 
-			// Subagent allowlist — mirror the reference's
-			// `subagents.allowAgents` shape. Present on a per-agent entry
-			// or on `cfg.agents.defaults.subagents.allowAgents`. Absent =
-			// allow only the requester (self).
-			const allowAgents = resolveAllowAgents(cfg, requesterAgentId);
-			const allowAny = allowAgents.some((v) => v.trim() === "*");
-			const allowSet = new Set(
-				allowAgents
+			// Spawn-allowlist resolution (subagents.allowAgents). Per-agent
+			// entry → defaults → empty. `*` is the wildcard.
+			const spawnAllow = resolveSpawnAllowAgents(cfg, requesterAgentId);
+			const allowAny = spawnAllow.some((v) => v.trim() === "*");
+			const spawnAllowSet = new Set(
+				spawnAllow
 					.filter((v) => v.trim() && v.trim() !== "*")
 					.map((v) => normalizeAgentId(v)),
 			);
 
-			const allowed = new Set<string>();
-			allowed.add(requesterAgentId);
-			if (allowAny) {
-				for (const id of configuredIds) allowed.add(id);
-			} else {
-				for (const id of allowSet) allowed.add(id);
+			// Requester ALWAYS first; peers added only when they are in the
+			// spawn allowlist (or `*`). With an empty allowlist this returns
+			// just the requester — exactly OC's contract.
+			const isRequesterConfigured =
+				configuredIds.includes(requesterAgentId) || requesterAgentId === DEFAULT_AGENT_ID;
+			const requesterEntry: AgentsListEntry = {
+				id: requesterAgentId,
+				configured: isRequesterConfigured,
+			};
+			const requesterName = nameMap.get(requesterAgentId);
+			if (requesterName) requesterEntry.name = requesterName;
+
+			const peers: AgentsListEntry[] = [];
+			if (allowAny || spawnAllowSet.size > 0) {
+				const sortedConfigured = [...configuredIds]
+					.filter((id) => id !== requesterAgentId)
+					.sort((a, b) => a.localeCompare(b));
+				for (const id of sortedConfigured) {
+					if (!(allowAny || spawnAllowSet.has(id))) continue;
+					const entry: AgentsListEntry = { id, configured: true };
+					const name = nameMap.get(id);
+					if (name) entry.name = name;
+					peers.push(entry);
+				}
+				// Allowlist entries that are NOT in cfg.agents — include with
+				// configured:false so the model can see what the operator
+				// listed even when the underlying agent isn't materialised yet.
+				if (!allowAny) {
+					for (const id of spawnAllowSet) {
+						if (id === requesterAgentId) continue;
+						if (configuredIds.includes(id)) continue;
+						const entry: AgentsListEntry = { id, configured: false };
+						const name = nameMap.get(id);
+						if (name) entry.name = name;
+						peers.push(entry);
+					}
+				}
 			}
 
-			const rest = Array.from(allowed)
-				.filter((id) => id !== requesterAgentId)
-				.sort((a, b) => a.localeCompare(b));
-			const ordered = [requesterAgentId, ...rest];
-
-			const agents: AgentsListEntry[] = ordered.map((id) => {
-				const name = nameMap.get(id);
-				const configured = configuredIds.includes(id) || id === DEFAULT_AGENT_ID;
-				const entry: AgentsListEntry = { id, configured };
-				if (name) entry.name = name;
-				return entry;
-			});
-
-			return jsonResult({ requester: requesterAgentId, allowAny, agents }) as AgentToolResult<AgentsListResult>;
+			return jsonResult({
+				requester: requesterAgentId,
+				allowAny,
+				agents: [requesterEntry, ...peers],
+			}) as AgentToolResult<AgentsListResult>;
 		},
 	};
 }
 
 /**
  * Resolve `subagents.allowAgents` with per-agent override → defaults fallback.
- * Returns `[]` (no peers) when neither is configured. Matches the reference's
- * resolution order.
+ * Returns `[]` (no peers) when neither is configured.
  */
-function resolveAllowAgents(cfg: unknown, agentId: string): string[] {
+function resolveSpawnAllowAgents(cfg: unknown, agentId: string): string[] {
 	const agents = (cfg as { agents?: Record<string, unknown> } | undefined)?.agents;
 	if (!agents || typeof agents !== "object") return [];
 	const entry = agents[agentId] as { subagents?: { allowAgents?: string[] } } | undefined;

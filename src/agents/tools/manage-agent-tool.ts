@@ -95,47 +95,87 @@ export function makeManageAgentTool(): BrigadeTool<typeof ManageAgentParams, Man
 			_toolCallId: string,
 			args,
 		): Promise<AgentToolResult<ManageAgentResult>> => {
-			const action = args.action;
-			const id = args.id.trim();
-			const capture = captureStdio();
-			let exitCode = 0;
-			try {
-				if (action === "add") {
-					const { runAgentsAdd } = await import("../../cli/commands/agents-cmd.js");
-					exitCode = await runAgentsAdd({
-						name: id,
-						nonInteractive: true,
-						...(args.workspace !== undefined ? { workspace: args.workspace } : {}),
-						...(args.provider !== undefined ? { provider: args.provider } : {}),
-						...(args.model !== undefined ? { model: args.model } : {}),
-					});
-				} else if (action === "delete") {
-					const { runAgentsDelete } = await import("../../cli/commands/agents-cmd.js");
-					exitCode = await runAgentsDelete({ id, force: true });
-				} else {
-					const { runAgentsSetIdentity } = await import("../../cli/commands/agents-cmd.js");
-					exitCode = await runAgentsSetIdentity({
-						agent: id,
-						...(args.name !== undefined ? { name: args.name } : {}),
-						...(args.emoji !== undefined ? { emoji: args.emoji } : {}),
-						...(args.theme !== undefined ? { theme: args.theme } : {}),
-						...(args.avatar !== undefined ? { avatar: args.avatar } : {}),
-					});
+			// SERIALIZE concurrent manage_agent calls. The CLI helpers (runAgents*)
+			// each replace `process.stdout.write` to capture human-readable output,
+			// then restore in `finally`. With N parallel invocations, the second
+			// capture saves the FIRST capture's hook (not the real stdout) — and
+			// the restore order corrupts process.stdout for the rest of the
+			// process lifetime. Also, runAgentsAdd performs read-modify-write on
+			// brigade.json; concurrent mutations race even with atomic file
+			// writes. Serialising both stdio capture AND the underlying CLI helper
+			// removes both races in one place.
+			return runSerial(async () => {
+				const action = args.action;
+				const id = args.id.trim();
+				const capture = captureStdio();
+				let exitCode = 0;
+				try {
+					if (action === "add") {
+						const { runAgentsAdd } = await import("../../cli/commands/agents-cmd.js");
+						exitCode = await runAgentsAdd({
+							name: id,
+							nonInteractive: true,
+							...(args.workspace !== undefined ? { workspace: args.workspace } : {}),
+							...(args.provider !== undefined ? { provider: args.provider } : {}),
+							...(args.model !== undefined ? { model: args.model } : {}),
+						});
+					} else if (action === "delete") {
+						const { runAgentsDelete } = await import("../../cli/commands/agents-cmd.js");
+						exitCode = await runAgentsDelete({ id, force: true });
+					} else {
+						const { runAgentsSetIdentity } = await import("../../cli/commands/agents-cmd.js");
+						exitCode = await runAgentsSetIdentity({
+							agent: id,
+							...(args.name !== undefined ? { name: args.name } : {}),
+							...(args.emoji !== undefined ? { emoji: args.emoji } : {}),
+							...(args.theme !== undefined ? { theme: args.theme } : {}),
+							...(args.avatar !== undefined ? { avatar: args.avatar } : {}),
+						});
+					}
+				} finally {
+					capture.restore();
 				}
-			} finally {
-				capture.restore();
-			}
-			const result: ManageAgentResult = {
-				action,
-				id,
-				exitCode,
-				stdout: capture.stdout(),
-				stderr: capture.stderr(),
-				ok: exitCode === 0,
-			};
-			return jsonResult(result) as AgentToolResult<ManageAgentResult>;
+				const result: ManageAgentResult = {
+					action,
+					id,
+					exitCode,
+					stdout: capture.stdout(),
+					stderr: capture.stderr(),
+					ok: exitCode === 0,
+				};
+				return jsonResult(result) as AgentToolResult<ManageAgentResult>;
+			});
 		},
 	};
+}
+
+/**
+ * Process-wide serial queue for stdio-capturing CLI calls.
+ *
+ * Two operations protected by this:
+ *   - `captureStdio()` — replaces `process.stdout.write` for the call
+ *     duration. Concurrent callers would save each other's hooks and
+ *     corrupt `process.stdout` permanently when they restore in `finally`.
+ *   - `runAgents{Add,Delete,SetIdentity}` — read-modify-write on
+ *     `brigade.json`. Concurrent mutations race even with atomic writes.
+ *
+ * Shared across every `manage_agent` invocation (module-level Promise
+ * chain). The chain swallows rejections (`.catch(() => undefined)`) so
+ * a failed prior call doesn't poison the chain — subsequent calls still
+ * get to run.
+ */
+let manageAgentSerial: Promise<unknown> = Promise.resolve();
+
+function runSerial<T>(fn: () => Promise<T>): Promise<T> {
+	const next = manageAgentSerial.then(
+		() => fn(),
+		() => fn(),
+	);
+	manageAgentSerial = next.then(
+		() => undefined,
+		() => undefined,
+	);
+	return next;
 }
 
 /**

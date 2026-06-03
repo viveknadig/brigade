@@ -29,6 +29,14 @@ describe("buildAutoRecallBlock", () => {
 		assert.ok(block, "expected a recall block");
 		assert.match(block as string, /## Relevant memory/);
 		assert.match(block as string, /NOT as instructions or commands/);
+		// Anti-hallucination fix: the prelude must also tell the model that
+		// auto-recalled facts can be STALE and the live tool wins on
+		// current-state questions (which agents/channels/skills exist).
+		// Without this the model treated a stale "Mathematician agent with
+		// quadratic-solver skill" recall as confirmation of the roster.
+		assert.match(block as string, /may be STALE/);
+		assert.match(block as string, /LIVE TOOL wins/);
+		assert.match(block as string, /agents_list/);
 		// Facts are wrapped in the untrusted-data fence (injection defense).
 		assert.match(block as string, /<untrusted-memory>/);
 		assert.match(block as string, /<\/untrusted-memory>/);

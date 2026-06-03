@@ -26,20 +26,28 @@ afterEach(() => {
 	rmSync(stateDir, { recursive: true, force: true });
 });
 
-async function runTool(requesterAgentId?: string) {
+interface ListedAgent {
+	id: string;
+	name?: string;
+	configured: boolean;
+}
+
+interface ListedResult {
+	requester: string;
+	allowAny: boolean;
+	agents: ListedAgent[];
+}
+
+async function runTool(requesterAgentId?: string): Promise<ListedResult> {
 	const tool = makeAgentsListTool(requesterAgentId !== undefined ? { requesterAgentId } : {});
 	const result = await tool.execute("test-call-id", {});
 	const text = result.content?.[0];
 	if (!text || text.type !== "text") throw new Error("expected text content");
-	return JSON.parse(text.text) as {
-		requester: string;
-		allowAny: boolean;
-		agents: Array<{ id: string; name?: string; configured: boolean }>;
-	};
+	return JSON.parse(text.text) as ListedResult;
 }
 
-describe("agents_list tool", () => {
-	it("returns just the default agent when cfg has no extra entries", async () => {
+describe("agents_list tool — OC-mirror shape (allowlist-scoped)", () => {
+	it("returns just the caller when cfg has only one configured agent", async () => {
 		writeCfg({ agents: { defaults: { provider: "openrouter" }, main: {} } });
 		const out = await runTool("main");
 		assert.equal(out.requester, "main");
@@ -49,28 +57,24 @@ describe("agents_list tool", () => {
 		assert.equal(out.agents[0]?.configured, true);
 	});
 
-	it("includes all configured agents when allowAgents=['*']", async () => {
+	it("returns ONLY the requester when subagents.allowAgents is empty (allowlist-scoped)", async () => {
+		// OC contract: with [main, math] configured and no spawn allowlist,
+		// agents_list returns ONLY the requester. The model can't see
+		// `mathematician` because they aren't an allowed sub-agent target.
 		writeCfg({
 			agents: {
-				defaults: {
-					provider: "openrouter",
-					subagents: { allowAgents: ["*"] },
-				},
+				defaults: { provider: "openrouter" },
 				main: {},
-				netpulse: { name: "NetPulse" },
-				support: {},
+				mathematician: { name: "Mathematician" },
 			},
 		});
 		const out = await runTool("main");
-		assert.equal(out.allowAny, true);
-		const ids = out.agents.map((a) => a.id).sort();
-		assert.deepEqual(ids, ["main", "netpulse", "support"]);
-		const np = out.agents.find((a) => a.id === "netpulse");
-		assert.equal(np?.name, "NetPulse");
-		assert.equal(np?.configured, true);
+		assert.equal(out.allowAny, false);
+		assert.equal(out.agents.length, 1);
+		assert.equal(out.agents[0]?.id, "main");
 	});
 
-	it("restricts to allowAgents list (not '*')", async () => {
+	it("includes peers listed in subagents.allowAgents", async () => {
 		writeCfg({
 			agents: {
 				defaults: {
@@ -84,11 +88,30 @@ describe("agents_list tool", () => {
 		});
 		const out = await runTool("main");
 		assert.equal(out.allowAny, false);
-		const ids = out.agents.map((a) => a.id).sort();
-		assert.deepEqual(ids, ["main", "netpulse"]);
+		const ids = out.agents.map((a) => a.id);
+		// Requester first, allowed peer next; `support` is NOT in allowlist.
+		assert.equal(ids[0], "main");
+		assert.ok(ids.includes("netpulse"));
+		assert.ok(!ids.includes("support"));
 	});
 
-	it("requester is always first in the returned list", async () => {
+	it("per-agent override of subagents.allowAgents overrides defaults", async () => {
+		writeCfg({
+			agents: {
+				defaults: { provider: "openrouter" },
+				main: { subagents: { allowAgents: ["*"] } },
+				netpulse: {},
+				support: {},
+			},
+		});
+		const out = await runTool("main");
+		assert.equal(out.allowAny, true);
+		const ids = out.agents.map((a) => a.id);
+		assert.ok(ids.includes("netpulse"));
+		assert.ok(ids.includes("support"));
+	});
+
+	it("requester is always FIRST in the list", async () => {
 		writeCfg({
 			agents: {
 				defaults: { provider: "openrouter", subagents: { allowAgents: ["*"] } },
@@ -99,5 +122,27 @@ describe("agents_list tool", () => {
 		});
 		const out = await runTool("zeta");
 		assert.equal(out.agents[0]?.id, "zeta");
+		assert.equal(out.allowAny, true);
+	});
+
+	it("propagates name when configured", async () => {
+		writeCfg({
+			agents: {
+				defaults: { provider: "openrouter", subagents: { allowAgents: ["*"] } },
+				main: {},
+				mathematician: { name: "Mathematician" },
+			},
+		});
+		const out = await runTool("main");
+		const math = out.agents.find((a) => a.id === "mathematician");
+		assert.equal(math?.name, "Mathematician");
+	});
+
+	it("tool description mirrors the reference one-liner", () => {
+		const tool = makeAgentsListTool({ requesterAgentId: "main" });
+		assert.match(tool.description, /List Brigade agent ids/);
+		assert.match(tool.description, /sessions_spawn/);
+		assert.match(tool.description, /runtime="subagent"/);
+		assert.match(tool.description, /subagent allowlists/);
 	});
 });

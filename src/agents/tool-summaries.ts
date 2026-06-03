@@ -20,10 +20,36 @@ export const BRIGADE_TOOL_SUMMARIES: Record<string, string> = {
   find: "Find files by name or glob pattern.",
   ls: "List the contents of a directory.",
   // Primitive #4 (Memory). Recall = search; read = bounded excerpt.
-  // Writing memory uses the `write` tool (memory/<today>.md), not a
-  // dedicated low-level tool.
-  recall_memory: "Search your durable memory (MEMORY.md + memory/*.md) before answering.",
+  // Writing memory uses `write_memory` for the structured fact store
+  // (declarative facts, segmented + decay-aware); free-form long notes
+  // append to `memory/<today>.md` via the regular `write`/`edit` tools.
+  // Wording for `recall_memory` is deliberately scoped to remembered
+  // CONTENT (preferences/decisions/people/dates/todos) — NOT live state
+  // like which agents/channels/skills currently exist. Live state comes
+  // from the corresponding inventory tools below; recall_memory is for
+  // remembered facts about the past.
+  recall_memory: "Search your durable memory for remembered preferences, decisions, people, dates, or todos. NOT for live inventory (use agents_list / skills / etc. for what currently exists).",
   read_memory: "Read a bounded excerpt of a memory file found via recall_memory.",
+  write_memory: "Save a durable, declarative fact (preference, identity, correction) into structured memory.",
+  // Agent + skill catalog tools. Summaries mirror the reference
+  // implementation's terse one-liners — the structured behaviour (no
+  // inline catalog → must call the tool) does the steering work; the
+  // catalog is just the menu.
+  agents_list: 'List Brigade agent ids allowed for sessions_spawn when runtime="subagent"',
+  manage_agent: "Owner-only: create, delete, or update an agent's identity. Use this for any agent-catalog mutation — never hand-edit brigade.json.",
+  manage_skill: "Owner-only: create or delete a skill (agent-scoped or shared). Never write SKILL.md by hand; this tool handles the catalog atomically.",
+  // Session / sub-agent surface — terse summaries mirroring the
+  // reference codebase.
+  sessions_list: "List other sessions (incl. sub-agents) with filters/last",
+  sessions_send: "Send a message to another session/sub-agent",
+  sessions_history: "Fetch history for another session/sub-agent",
+  sessions_spawn: "Spawn an isolated sub-agent session",
+  subagents: "List, steer, or kill sub-agent runs for this requester session",
+  spawn_agent: "Spawn a one-shot sub-agent for an independent, parallelisable subtask. Returns its final reply synchronously.",
+  spawn_agents: "Spawn multiple independent sub-agents in parallel (one task each); returns their replies.",
+  // Channel + cron surface.
+  send_message: "Send a message on a connected channel (WhatsApp, Slack, …). From a channel-routed turn just pass {text}; otherwise pass {channel, to, text}.",
+  cron: "Schedule a task to run later — `at`/cron schedule routed through the same channel at fire time.",
   // Web surface. Catalog summaries are intentionally terse — the model
   // sees the full per-tool `description:` field at every tool-use
   // decision; the catalog is just the menu. Lifted verbatim from the

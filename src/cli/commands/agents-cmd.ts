@@ -203,6 +203,55 @@ function formatSummary(summary: AgentSummary): string {
 	return lines.join("\n");
 }
 
+/**
+ * UX-bridge helper: extend `cfg.agents.defaults.subagents.allowAgents` with
+ * the newly created agent id so it surfaces in the allowlist-scoped
+ * `agents_list` tool (and becomes spawn-targetable) without the operator
+ * having to know the second config key exists.
+ *
+ * Skipped when:
+ *   - `cfg.agents.defaults.subagents.autoAllowOnCreate === false`
+ *     (operator-driven strict allowlist mode — mirrors the reference's
+ *     stock posture)
+ *   - The list already contains `"*"` (wildcard already covers it)
+ *   - The id is already in the list (idempotent re-runs)
+ *
+ * The companion `pruneAgentConfig` (in agents-config.ts) strips the id on
+ * delete so add+delete are symmetric without a separate code path.
+ */
+export function applyAutoAllowOnCreate(cfg: BrigadeConfig, agentId: string): BrigadeConfig {
+	const id = normalizeAgentId(agentId);
+	const agentsRaw = (cfg.agents as Record<string, unknown> | undefined) ?? {};
+	const defaultsRaw = agentsRaw["defaults"];
+	const defaults =
+		defaultsRaw && typeof defaultsRaw === "object" && !Array.isArray(defaultsRaw)
+			? (defaultsRaw as Record<string, unknown>)
+			: {};
+	const subagentsRaw = defaults["subagents"];
+	const subagents =
+		subagentsRaw && typeof subagentsRaw === "object" && !Array.isArray(subagentsRaw)
+			? (subagentsRaw as Record<string, unknown>)
+			: {};
+
+	// Operator opted out — leave the allowlist alone.
+	if (subagents["autoAllowOnCreate"] === false) return cfg;
+
+	const allowRaw = subagents["allowAgents"];
+	const existing = Array.isArray(allowRaw)
+		? allowRaw.filter((v): v is string => typeof v === "string")
+		: [];
+	// Wildcard already covers everything — skip.
+	if (existing.some((v) => v.trim() === "*")) return cfg;
+	// Already present (idempotent) — skip.
+	if (existing.some((v) => normalizeAgentId(v) === id)) return cfg;
+
+	const nextAllow = [...existing, id];
+	const nextSubagents: Record<string, unknown> = { ...subagents, allowAgents: nextAllow };
+	const nextDefaults: Record<string, unknown> = { ...defaults, subagents: nextSubagents };
+	const nextAgents: Record<string, unknown> = { ...agentsRaw, defaults: nextDefaults };
+	return { ...cfg, agents: nextAgents as BrigadeConfig["agents"] };
+}
+
 /* ───────────────────────── 1. agents list ───────────────────────── */
 
 export async function runAgentsList(
@@ -646,6 +695,20 @@ export async function runAgentsAdd(
 				const reapplied = applyAgentBindings(staged, parsed.bindings);
 				staged = reapplied.config;
 			}
+			// UX-bridge: auto-extend `cfg.agents.defaults.subagents.allowAgents`
+			// so the newly added agent is immediately spawn-targetable + visible
+			// to peers via `agents_list` (which is allowlist-scoped). Without
+			// this, a fresh `manage_agent({action:"add"})` creates an entry the
+			// operator can SEE in `brigade agents list` but the model cannot
+			// see in `agents_list` until the operator hand-edits the allowlist.
+			//
+			// Opt-out: `cfg.agents.defaults.subagents.autoAllowOnCreate = false`
+			// disables the seed for operators who manage the allowlist by hand
+			// (strict-allowlist mode mirroring the reference's stock posture).
+			//
+			// Idempotent: skipped when the list already contains `"*"` (wildcard
+			// already covers it) or the agent id is already present.
+			staged = applyAutoAllowOnCreate(staged, agentId);
 			return staged as unknown as typeof cur;
 		});
 		await bootstrapWorkspace(workspaceDir);

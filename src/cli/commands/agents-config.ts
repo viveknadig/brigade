@@ -270,6 +270,13 @@ export function applyAgentConfig(
  * Remove one agent entry plus every `cfg.bindings.entries[]` that targets it
  * and every `cfg.session.agentToAgent.allow[]` pair that names it on either
  * side. Returns a NEW config plus the counts of removed bindings / pairs.
+ *
+ * Also strips the id from every `subagents.allowAgents` list — the
+ * `defaults.subagents.allowAgents` shared roster AND any per-agent
+ * `cfg.agents.<other>.subagents.allowAgents` override. This is the
+ * symmetric cleanup for `runAgentsAdd`'s `applyAutoAllowOnCreate` seed:
+ * without it, deleting an agent leaves a dangling reference in the
+ * allowlist that `agents_list` would render as `configured:false`.
  */
 export function pruneAgentConfig(
 	cfg: BrigadeConfig,
@@ -277,12 +284,13 @@ export function pruneAgentConfig(
 ): { config: BrigadeConfig; removedBindings: number; removedAllow: number } {
 	const id = normalizeAgentId(agentId);
 
-	// Strip the entry from the keyed agents map.
+	// Strip the entry from the keyed agents map AND strip the id from any
+	// `subagents.allowAgents` list that names it (defaults + per-agent).
 	const existingAgents = (cfg.agents as Record<string, unknown> | undefined) ?? {};
 	const nextAgents: Record<string, unknown> = {};
 	for (const key of Object.keys(existingAgents)) {
 		if (normalizeAgentId(key) === id && key !== "defaults") continue;
-		nextAgents[key] = existingAgents[key];
+		nextAgents[key] = stripAllowAgentsId(existingAgents[key], id);
 	}
 
 	// Strip every binding that targets the removed agent.
@@ -319,6 +327,34 @@ export function pruneAgentConfig(
 	}
 
 	return { config: nextConfig, removedBindings, removedAllow };
+}
+
+/**
+ * Return a shallow-cloned `agents.<key>` entry with the deleted agent id
+ * removed from its `subagents.allowAgents` list (if present). Used by
+ * `pruneAgentConfig` to keep the allowlist symmetric with
+ * `applyAutoAllowOnCreate`. The `"*"` wildcard is left untouched.
+ *
+ * Non-object entries pass through unchanged so the `defaults` key (which
+ * carries the shared `subagents.allowAgents`) and any peer agent entries
+ * are both swept by the same code path.
+ */
+function stripAllowAgentsId(entry: unknown, id: string): unknown {
+	if (!entry || typeof entry !== "object" || Array.isArray(entry)) return entry;
+	const obj = entry as Record<string, unknown>;
+	const subagentsRaw = obj["subagents"];
+	if (!subagentsRaw || typeof subagentsRaw !== "object" || Array.isArray(subagentsRaw)) {
+		return entry;
+	}
+	const subagents = subagentsRaw as Record<string, unknown>;
+	const allowRaw = subagents["allowAgents"];
+	if (!Array.isArray(allowRaw)) return entry;
+	const filtered = allowRaw.filter(
+		(v) => typeof v !== "string" || normalizeAgentId(v) !== id,
+	);
+	if (filtered.length === allowRaw.length) return entry;
+	const nextSubagents: Record<string, unknown> = { ...subagents, allowAgents: filtered };
+	return { ...obj, subagents: nextSubagents };
 }
 
 /** Re-export the canonical default agent id so call sites don't need a second import. */

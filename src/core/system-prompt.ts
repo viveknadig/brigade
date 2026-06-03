@@ -150,6 +150,9 @@ export async function refreshSessionSystemPrompt(
     // an absent list when every eligible skill is model-invocation-disabled.
     skills: skillDiscovery.promptBlock !== undefined,
   };
+  // Note: OC mirror — the assembler does NOT carry a `## Agents` block.
+  // The model learns agent identity exclusively via the `agents_list` tool
+  // (allowlist-scoped) + the Runtime line's `agent=<id>` field.
   const assembled = assembleSystemPrompt({
     runtime,
     personaFiles,

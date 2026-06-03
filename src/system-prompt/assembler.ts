@@ -9,6 +9,7 @@ import {
   REASONING_FORMAT_GUIDANCE,
   SKILLS_GUIDANCE,
   shouldUseReasoningFormat,
+  SUB_AGENTS_GUIDANCE,
   TIME_GROUNDING_GUIDANCE,
   WEB_TOOLS_GUIDANCE,
 } from "./guidance.js";
@@ -106,22 +107,6 @@ export interface AssembleArgs {
   // places it under `## Skills` when `capabilities.skills` is true. Lives in
   // the cached prefix — the skill list is stable within a session.
   skillsPromptBlock?: string;
-  /**
-   * Peer agents the operator has configured (excluding the caller itself).
-   * Resolved upstream in agent-loop from `cfg.agents` so the assembler
-   * stays config-agnostic. Renders as a `## Agents` section listing each
-   * peer by id + one-line role so the model can delegate via
-   * `sessions_send({agentId, message})` without first calling `agents_list`.
-   *
-   * Empty array / undefined → no `## Agents` section emitted. Skipped in
-   * sub-agent / cron mode regardless (those get a scoped tool surface).
-   */
-  peerAgents?: ReadonlyArray<{
-    id: string;
-    /** One-line role from the peer's `cfg.agents.<id>.identity.theme` or
-     *  IDENTITY.md `Theme:` field, or undefined when no role is set. */
-    role?: string;
-  }>;
   /**
    * Active channel surface for this turn. When the gateway has started
    * channel adapters (WhatsApp, Slack, Telegram, …), the agent needs to
@@ -376,6 +361,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     );
   } else {
     lines.push("Tool availability (filtered by policy):");
+    lines.push("Tool names are case-sensitive. Call tools exactly as listed.");
     for (const t of args.toolDescriptions) {
       const summary = t.summary?.trim();
       lines.push(summary ? `- ${t.name}: ${summary}` : `- ${t.name}`);
@@ -619,30 +605,15 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
     lines.push("");
   }
 
-  // 7b''. ## Agents — list of peer agents the operator has configured.
-  // Mirrors the reference codebase's pattern: the model SEES every
-  // configured peer agent up front (without needing to call `agents_list`)
-  // so it can immediately delegate via `sessions_send({agentId, message})`
-  // when the user asks for something a specialist peer handles better.
+  // 7b'''. # Sub-agents guidance (conditional on `subAgents` capability).
   //
-  // Skipped when:
-  //   - only the bootstrap agent exists (no peers to list — pointless)
-  //   - sub-agent / cron / minimal mode (scoped task, no delegation surface)
-  //   - the agent catalogue itself is unreadable (e.g. mid-init)
-  //
-  // Each peer is one line: `- <id> — <one-line role>`. The role comes from
-  // the agent's `identity.name` / `identity.theme` config; falls back to
-  // the agent id alone.
-  if (!isMinimalMode && args.peerAgents && args.peerAgents.length > 0) {
-    lines.push("## Agents");
-    lines.push(
-      `Other agents you can delegate to via \`sessions_send({ agentId, message })\`. To switch the user to a peer for direct conversation, tell them to type \`/agent <id>\` in the TUI.`,
-    );
-    lines.push("");
-    for (const peer of args.peerAgents) {
-      const role = peer.role ? ` — ${peer.role}` : "";
-      lines.push(`- ${peer.id}${role}`);
-    }
+  // SUB_AGENTS_GUIDANCE carries the load-bearing rule the model needs:
+  // "Use `agents_list` to see what peer agents are configured before
+  // referring to one." Mirrors OC's "use the tool, not memory" nudge for
+  // delegation + inventory questions. Rendered BEFORE `## Agent & Skill
+  // Management` (the operator-facing mutation surface).
+  if (args.capabilities?.subAgents && !isMinimalMode) {
+    lines.push(SUB_AGENTS_GUIDANCE);
     lines.push("");
   }
 

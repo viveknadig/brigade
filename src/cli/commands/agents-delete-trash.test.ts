@@ -14,6 +14,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readFileSync,
 	readdirSync,
 	rmSync,
 	writeFileSync,
@@ -94,6 +95,56 @@ describe("agents delete: H6 trash semantics", () => {
 		assert.ok(movedScout, "moved scout entry must be timestamped 'scout-<ISO>'");
 		// The ISO suffix has colons + dots replaced with dashes (see safeRm).
 		assert.match(movedScout, /^scout-\d{4}-\d{2}-\d{2}T/);
+	});
+
+	it("(d) strips the deleted id from cfg.agents.defaults.subagents.allowAgents", async () => {
+		// pruneAgentConfig must keep the allowlist symmetric with the
+		// `applyAutoAllowOnCreate` seed: a deleted agent's id must be
+		// removed from both the shared `defaults.subagents.allowAgents`
+		// list AND any per-agent override that names it.
+		const agentDir = join(stateDir, "agents", "scout");
+		const workspaceDir = join(agentDir, "workspace");
+		mkdirSync(workspaceDir, { recursive: true });
+		writeFileSync(join(workspaceDir, "marker.txt"), "x");
+		writeConfig({
+			agents: {
+				defaults: {
+					subagents: { allowAgents: ["scout", "netpulse"] },
+				},
+				main: {},
+				scout: { workspace: workspaceDir },
+				netpulse: {
+					// Per-agent override that ALSO names scout — both lists must
+					// get the symmetric cleanup.
+					subagents: { allowAgents: ["scout"] },
+				},
+			},
+		});
+
+		const { runAgentsDelete } = await import("./agents-cmd.js");
+		const result = await captureStdio(() =>
+			runAgentsDelete({ id: "scout", force: true, json: true }),
+		);
+		assert.equal(result, 0);
+
+		const cfg = JSON.parse(readFileSync(join(stateDir, "brigade.json"), "utf8")) as {
+			agents: {
+				defaults?: { subagents?: { allowAgents?: unknown } };
+				netpulse?: { subagents?: { allowAgents?: unknown } };
+			};
+		};
+		// Defaults list: scout removed, netpulse kept.
+		assert.deepEqual(
+			cfg.agents.defaults?.subagents?.allowAgents,
+			["netpulse"],
+			"defaults.subagents.allowAgents must drop the deleted id",
+		);
+		// Per-agent override: scout removed (list now empty array).
+		assert.deepEqual(
+			cfg.agents.netpulse?.subagents?.allowAgents,
+			[],
+			"per-agent subagents.allowAgents must also drop the deleted id",
+		);
 	});
 
 	it("(c) caps trash entries at 10 — the 11th delete evicts the oldest", async () => {

@@ -46,6 +46,21 @@ describe("guidance constants — bodies still load-bearing", () => {
 		assert.match(MEMORY_GUIDANCE, /not instructions/i);
 	});
 
+	it("MEMORY_GUIDANCE keeps the OC-mirror positive scope + citations line", () => {
+		// Mirrors the reference codebase's `## Memory Recall` block: a
+		// POSITIVE scope ("prior work, decisions, dates, people, preferences,
+		// or todos") and a Citations footer — but NO "do not use memory for
+		// live state" exclusion paragraph. The exclusion was a Brigade-only
+		// divergence; OC uses dedicated `## Tooling` / `## Runtime` sections
+		// to handle inventory questions and lets the positive scope do the
+		// steering work.
+		assert.match(MEMORY_GUIDANCE, /prior work, decisions, dates, people, preferences, or todos/);
+		assert.match(MEMORY_GUIDANCE, /Citations: include Source:/);
+		assert.doesNotMatch(MEMORY_GUIDANCE, /Do NOT use memory for questions about what currently exists/);
+		assert.doesNotMatch(MEMORY_GUIDANCE, /the live tool wins/i);
+		assert.doesNotMatch(MEMORY_GUIDANCE, /project conventions, environment, people/);
+	});
+
 	it("SKILLS_GUIDANCE covers scan-before-reply + patch-while-using (Primitive #5)", () => {
 		assert.match(SKILLS_GUIDANCE, /Before replying/i);
 		assert.match(SKILLS_GUIDANCE, /patch it before finishing/i);

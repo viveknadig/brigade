@@ -119,10 +119,12 @@ export function makeRecallMemoryTool(
 		displaySummary: "searching memory",
 		description:
 			"Search your durable memory — structured facts plus MEMORY.md and memory/*.md daily " +
-			"notes — for relevant context before answering. Use this whenever the user refers to " +
-			"past context, their preferences, project conventions, or anything you might have noted " +
-			"earlier. Returns matching facts and scored note snippets (with file + line range); " +
-			"follow up with read_memory to pull the full surrounding text of a note.",
+			"notes — for relevant remembered context. Use this for questions about prior work, " +
+			"decisions, dates, people, preferences, or todos. Do NOT use this for live inventory " +
+			"(which agents/channels/skills/cron jobs/files exist) — that comes from `agents_list`, " +
+			"`ls`, etc. Returns matching facts and scored note snippets " +
+			"(with file + line range); follow up with read_memory to pull the full surrounding " +
+			"text of a note.",
 		parameters: RecallMemoryParams,
 		async execute(_toolCallId, params): Promise<AgentToolResult<RecallMemoryDetails>> {
 			const query = readStringParam(params as Record<string, unknown>, "query", {

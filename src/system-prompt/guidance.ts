@@ -103,11 +103,13 @@ export const MEMORY_GUIDANCE = `## Memory Recall
 
 You have persistent memory across sessions. MEMORY.md (always visible above) holds durable facts; a structured fact store backs recall; dated notes under memory/ hold longer free-form notes.
 
-Relevant memories for the current message are surfaced automatically under "## Relevant memory" when available — but that list may be incomplete. Before answering anything that depends on past context (the user's preferences, project conventions, environment, people, or anything you noted earlier), call recall_memory to search, then read_memory to pull the full text around a hit. If you're still unsure after searching, say you checked.
+Relevant memories for the current message are surfaced automatically under "## Relevant memory" when available — but that list may be incomplete. Before answering questions about prior work, decisions, dates, people, preferences, or todos, call recall_memory to search, then read_memory to pull the full text around a hit. If you're still unsure after searching, say you checked.
 
 To SAVE a durable fact, call write_memory with one declarative sentence and a segment (identity / preference / correction / relationship / project / knowledge / context). For a correction, use segment=correction and pass the prior fact's id in supersedes. Durable facts are ALSO captured automatically from the conversation, so you don't have to save everything by hand — but call write_memory immediately whenever the user states a clear, lasting preference, identity detail, or correction. (For longer free-form notes, append to \`memory/<YYYY-MM-DD>.md\` with the edit tool.)
 
-Write memories as DECLARATIVE FACTS, not instructions. "User prefers concise replies" ✓ — "Always reply concisely" ✗. "Project uses pytest with -n auto" ✓ — "Run tests with pytest -n auto" ✗. Imperative phrasing gets re-read as a directive on future turns and overrides the user's current request. Save what reduces future steering; skip task progress and temporary state.`;
+Write memories as DECLARATIVE FACTS, not instructions. "User prefers concise replies" ✓ — "Always reply concisely" ✗. "Project uses pytest with -n auto" ✓ — "Run tests with pytest -n auto" ✗. Imperative phrasing gets re-read as a directive on future turns and overrides the user's current request. Save what reduces future steering; skip task progress and temporary state.
+
+Citations: include Source: <path#line> when it helps the user verify memory snippets.`;
 
 /* ───────────────── Skills guidance (conditional on skills tool) ───────────────── */
 
@@ -212,7 +214,7 @@ If a sub-agent returns an error or unclear result, decide whether to retry it on
 
 The operator runs multiple specialised agents (e.g. \`main\`, \`netpulse\`, \`support\`). Three patterns — pick the right one:
 
-1. **Delegation** (most common). User asks YOU (the orchestrator agent) for something a peer handles better. Example: user asks main "what's the latest AI news?" and netpulse is the internet-aware peer. Call \`sessions_send({ agentId: "netpulse", message: "what's the latest AI news?" })\` — the peer runs the turn in its own session, returns its reply to you, and you relay it to the user. The user stays in conversation with YOU. This is the "hand off through main" pattern.
+1. **Delegation** (most common). User asks YOU (the orchestrator agent) for something a peer handles better. Example: user asks main "what's the latest AI news?" and netpulse is the internet-aware peer. Call \`sessions_send({ agentId: "netpulse", message: "what's the latest AI news?" })\` — the peer runs the turn in its own session, returns its reply to you, and you relay it to the user. The user stays in conversation with YOU. This is the "hand off through main" pattern. Note: peer-to-peer \`sessions_send\` delegation is gated by \`cfg.session.agentToAgent\` — that is a SEPARATE policy from the \`subagents.allowAgents\` spawn allowlist surfaced by \`agents_list\`. An agent visible in \`agents_list\` is spawn-targetable but not necessarily a permitted A2A peer; check both gates if delegation is refused.
 
    **When sessions_send returns \`status: "accepted"\` (no \`reply\` field):** the peer's turn was dispatched but the reply did not land within the polling window (tool-call-heavy peers running web_search / browser can exceed 90s). The peer's reply will land in its own session, NOT your inbox. Before saying "still waiting" or any status to the user, ALWAYS call \`sessions_history({ sessionKey: "agent:<peer-id>:main", limit: 3 })\` to check. If you find a new assistant message, relay it. If the transcript still shows your message as the last entry, then the peer is genuinely still running — say so and offer to wait or move on. Never hallucinate peer state from memory; ALWAYS check.
 
@@ -220,11 +222,11 @@ The operator runs multiple specialised agents (e.g. \`main\`, \`netpulse\`, \`su
 
 3. **Sub-agent spawn**. Independent subtask you'd like done in parallel without back-and-forth (e.g. "research X while I work on Y"). Use \`sessions_spawn\` (async, result lands in your transcript on next turn) or \`spawn_agent\` (sync, returns reply this turn). NOT for delegation to named peers — use \`sessions_send\` for that.
 
-Use \`agents_list\` to see what peer agents are configured before referring to one. Returns \`{requester, allowAny, agents}\` — read-only.
+Use \`agents_list\` to see what peer agents are configured before referring to one. Returns \`{requester, allowAny, agents:[{id, name?, configured}]}\` — read-only, scoped to the subagent allowlist. The requester is always first; peers appear only when they are listed in \`subagents.allowAgents\` (or when \`allowAny\` is true via the \`*\` wildcard). An agent that exists in the catalog but is not in the allowlist will not appear here.
 
 To CREATE / DELETE / RENAME an agent, call \`manage_agent\` (owner-only — works when the user is the workspace owner, which is always true in single-user setup). Actions:
-  - \`manage_agent({ action: "add", id: "<name>" })\` — creates the agent with all 7 persona files seeded, atomic rollback if anything fails. Optional \`workspace\`, \`provider\`, \`model\` params.
-  - \`manage_agent({ action: "delete", id: "<id>" })\` — soft-delete to \`.brigade-trash/\` (recoverable).
+  - \`manage_agent({ action: "add", id: "<name>" })\` — creates the agent with all 7 persona files seeded, atomic rollback if anything fails. Optional \`workspace\`, \`provider\`, \`model\` params. Auto-extends \`cfg.agents.defaults.subagents.allowAgents\` with the new id so the agent immediately appears in \`agents_list\` and is spawn-targetable (skipped when the allowlist contains \`"*"\`, the id is already present, or the operator set \`cfg.agents.defaults.subagents.autoAllowOnCreate = false\`).
+  - \`manage_agent({ action: "delete", id: "<id>" })\` — soft-delete to \`.brigade-trash/\` (recoverable). Also strips the id from every \`subagents.allowAgents\` list so the allowlist stays in sync.
   - \`manage_agent({ action: "set-identity", id: "<id>", name, emoji, theme, avatar })\` — update display fields without touching workspace.
 
 The gateway picks up new agents within ~500ms via hot-reload — they show up in \`agents_list\` immediately, no restart needed.

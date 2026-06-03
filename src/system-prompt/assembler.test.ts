@@ -288,14 +288,81 @@ describe("assembleSystemPrompt — capability-gated sections", () => {
 		assert.doesNotMatch(out.text, /<available_skills>/);
 	});
 
-	it("Sub-agents block is still unwired (Primitive #6)", () => {
+	// SUB_AGENTS_GUIDANCE is now wired into the assembler (anti-hallucination
+	// fix). Renders when `capabilities.subAgents` is true and we're not in
+	// minimal mode — its body carries the load-bearing "use agents_list to
+	// see what peer agents are configured" rule that trains the model to
+	// hit the live tool instead of free-associating from stale transcript
+	// history. Previously dead-exported.
+	it("injects the Sub-agents guidance when capabilities.subAgents is true", () => {
 		const out = assembleSystemPrompt({
 			runtime: MOCK_RUNTIME,
 			personaFiles: [],
 			toolDescriptions: [],
 			capabilities: { subAgents: true },
 		});
+		assert.match(out.text, /# Sub-agents/);
+		assert.match(out.text, /Use `agents_list` to see what peer agents are configured/);
+	});
+
+	it("does NOT inject the Sub-agents guidance when capabilities.subAgents is absent", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+		});
 		assert.doesNotMatch(out.text, /# Sub-agents/);
+	});
+
+	it("does NOT inject the Sub-agents guidance in minimal mode (sub-agent / cron)", () => {
+		const sub = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" }],
+			toolDescriptions: [],
+			capabilities: { subAgents: true, subagentMode: true },
+		});
+		assert.doesNotMatch(sub.text, /# Sub-agents/);
+		const cron = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" }],
+			toolDescriptions: [],
+			capabilities: { subAgents: true, cronMode: true },
+		});
+		assert.doesNotMatch(cron.text, /# Sub-agents/);
+	});
+});
+
+describe("assembleSystemPrompt — no ## Agents block (OC mirror)", () => {
+	// The assembler deliberately does NOT enumerate peer agents in the
+	// system prompt. The model learns the agent catalog exclusively via
+	// the `agents_list` tool (allowlist-scoped) + the Runtime line's
+	// `agent=<id>` field. This is the anti-hallucination contract: prompt-
+	// side silence + a scoped tool the model must call.
+
+	it("never emits a ## Agents block", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [],
+			toolDescriptions: [],
+		});
+		assert.doesNotMatch(out.text, /## Agents/);
+	});
+
+	it("does not emit a ## Agents block in any minimal mode either", () => {
+		const sub = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" }],
+			toolDescriptions: [],
+			capabilities: { subagentMode: true },
+		});
+		assert.doesNotMatch(sub.text, /## Agents/);
+		const cron = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" }],
+			toolDescriptions: [],
+			capabilities: { cronMode: true },
+		});
+		assert.doesNotMatch(cron.text, /## Agents/);
 	});
 });
 
