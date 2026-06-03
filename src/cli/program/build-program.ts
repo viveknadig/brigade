@@ -899,6 +899,200 @@ export function buildProgram(): Command {
       );
     });
 
+  /* ──────────────────────────── agents ──────────────────────────── */
+  // CRUD over the isolated-agent surface: each agent has its own workspace,
+  // auth profiles, exec allowlist, sessions, and optional channel/account
+  // routing bindings. `brigade.json` stores agents as a keyed map under
+  // `cfg.agents.<id>` and bindings under `cfg.bindings.entries[]`.
+  //
+  // Bare `brigade agents` defaults to `list` so a no-arg invocation shows
+  // every configured agent (parity with the reference codebase shape).
+  // `--bind` is repeatable: Commander collects every occurrence into an
+  // array via the collectStrings accumulator below.
+  const collectStrings = (value: string, previous: string[] = []): string[] => [...previous, value];
+  const agents = program
+    .command("agents")
+    .description("Manage isolated agents (workspace + auth + routing)")
+    .action(async () => {
+      const { runAgentsList } = await import("../commands/agents-cmd.js");
+      process.exit(await runAgentsList({}));
+    });
+
+  agents
+    .command("list")
+    .description("List every configured agent (default subcommand)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .option("--bindings", "include routing bindings per agent", false)
+    .action(async (opts: { json?: boolean; bindings?: boolean }) => {
+      const { runAgentsList } = await import("../commands/agents-cmd.js");
+      process.exit(await runAgentsList({ json: opts.json, bindings: opts.bindings }));
+    });
+
+  agents
+    .command("bindings")
+    .description("List routing bindings (optionally filtered by --agent)")
+    .option("--agent <id>", "show bindings owned by this agent only")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { agent?: string; json?: boolean }) => {
+      const { runAgentsBindings } = await import("../commands/agents-cmd.js");
+      process.exit(
+        await runAgentsBindings({
+          ...(opts.agent !== undefined ? { agent: opts.agent } : {}),
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+        }),
+      );
+    });
+
+  agents
+    .command("bind")
+    .description("Claim channel/account routing slots for an agent")
+    .requiredOption("--agent <id>", "agent id to bind slots to")
+    .option(
+      "--bind <spec>",
+      'binding spec — "<channel>" or "<channel>:<accountId>" (repeatable)',
+      collectStrings,
+      [],
+    )
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { agent: string; bind: string[]; json?: boolean }) => {
+      const { runAgentsBind } = await import("../commands/agents-cmd.js");
+      process.exit(
+        await runAgentsBind({
+          agent: opts.agent,
+          bind: opts.bind,
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+        }),
+      );
+    });
+
+  agents
+    .command("unbind")
+    .description("Release channel/account routing slots from an agent")
+    .requiredOption("--agent <id>", "agent id to unbind slots from")
+    .option(
+      "--bind <spec>",
+      'binding spec — "<channel>" or "<channel>:<accountId>" (repeatable)',
+      collectStrings,
+      [],
+    )
+    .option("--all", "remove every binding owned by --agent", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { agent: string; bind: string[]; all?: boolean; json?: boolean }) => {
+      const { runAgentsUnbind } = await import("../commands/agents-cmd.js");
+      process.exit(
+        await runAgentsUnbind({
+          agent: opts.agent,
+          bind: opts.bind,
+          ...(opts.all !== undefined ? { all: opts.all } : {}),
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+        }),
+      );
+    });
+
+  agents
+    .command("add [name]")
+    .description("Create a new isolated agent (defaults workspace to ~/.brigade/agents/<id>/workspace/)")
+    .option(
+      "--workspace <dir>",
+      "workspace directory for this agent (default: ~/.brigade/agents/<id>/workspace/)",
+    )
+    .option("--model <id>", "default model for this agent")
+    .option("--provider <id>", "default provider for this agent")
+    .option("--agent-dir <dir>", "override the on-disk agent directory")
+    .option(
+      "--bind <spec>",
+      'attach a channel/account binding at create time (repeatable)',
+      collectStrings,
+      [],
+    )
+    .option("--non-interactive", "explicit flag for the CI/automation path", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(
+      async (
+        name: string | undefined,
+        opts: {
+          workspace?: string;
+          model?: string;
+          provider?: string;
+          agentDir?: string;
+          bind: string[];
+          nonInteractive?: boolean;
+          json?: boolean;
+        },
+      ) => {
+        const { runAgentsAdd } = await import("../commands/agents-cmd.js");
+        process.exit(
+          await runAgentsAdd({
+            ...(name !== undefined ? { name } : {}),
+            ...(opts.workspace !== undefined ? { workspace: opts.workspace } : {}),
+            ...(opts.model !== undefined ? { model: opts.model } : {}),
+            ...(opts.provider !== undefined ? { provider: opts.provider } : {}),
+            ...(opts.agentDir !== undefined ? { agentDir: opts.agentDir } : {}),
+            bind: opts.bind,
+            ...(opts.nonInteractive !== undefined ? { nonInteractive: opts.nonInteractive } : {}),
+            ...(opts.json !== undefined ? { json: opts.json } : {}),
+          }),
+        );
+      },
+    );
+
+  agents
+    .command("set-identity")
+    .description("Set or refresh an agent's identity (name / theme / emoji / avatar)")
+    .requiredOption("--agent <id>", "agent id to update")
+    .option("--workspace <dir>", "workspace directory whose IDENTITY.md to consult")
+    .option("--identity-file <path>", "explicit IDENTITY.md path to read")
+    .option("--from-identity", "load identity fields from IDENTITY.md in the workspace", false)
+    .option("--name <name>", "display name override")
+    .option("--theme <theme>", "theme override")
+    .option("--emoji <emoji>", "emoji override")
+    .option("--avatar <path>", "avatar path override")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(
+      async (opts: {
+        agent: string;
+        workspace?: string;
+        identityFile?: string;
+        fromIdentity?: boolean;
+        name?: string;
+        theme?: string;
+        emoji?: string;
+        avatar?: string;
+        json?: boolean;
+      }) => {
+        const { runAgentsSetIdentity } = await import("../commands/agents-cmd.js");
+        process.exit(
+          await runAgentsSetIdentity({
+            agent: opts.agent,
+            ...(opts.workspace !== undefined ? { workspace: opts.workspace } : {}),
+            ...(opts.identityFile !== undefined ? { identityFile: opts.identityFile } : {}),
+            ...(opts.fromIdentity !== undefined ? { fromIdentity: opts.fromIdentity } : {}),
+            ...(opts.name !== undefined ? { name: opts.name } : {}),
+            ...(opts.theme !== undefined ? { theme: opts.theme } : {}),
+            ...(opts.emoji !== undefined ? { emoji: opts.emoji } : {}),
+            ...(opts.avatar !== undefined ? { avatar: opts.avatar } : {}),
+            ...(opts.json !== undefined ? { json: opts.json } : {}),
+          }),
+        );
+      },
+    );
+
+  agents
+    .command("delete <id>")
+    .description("Delete an agent + its workspace/sessions (requires --force)")
+    .option("--force", "skip the safety prompt and actually delete", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (id: string, opts: { force?: boolean; json?: boolean }) => {
+      const { runAgentsDelete } = await import("../commands/agents-cmd.js");
+      process.exit(
+        await runAgentsDelete({
+          id,
+          ...(opts.force !== undefined ? { force: opts.force } : {}),
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+        }),
+      );
+    });
+
   return program;
 }
 

@@ -480,14 +480,31 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		const bootAgentsMap = (args.bootConfig.agents as
 			| { [id: string]: { provider?: string; model?: { primary?: string } } | undefined }
 			| undefined) ?? {};
+		const defaultsEntry = bootAgentsMap.defaults;
+		const defaultsProvider =
+			defaultsEntry && typeof defaultsEntry.provider === "string" ? defaultsEntry.provider : undefined;
+		const defaultsModelId =
+			defaultsEntry && typeof defaultsEntry.model === "object" && defaultsEntry.model &&
+			typeof defaultsEntry.model.primary === "string"
+				? defaultsEntry.model.primary
+				: undefined;
 		for (const [id, entry] of Object.entries(bootAgentsMap)) {
 			if (id === "defaults" || !entry || typeof entry !== "object") continue;
-			const aProvider = typeof entry.provider === "string" ? entry.provider : undefined;
+			const aProvider =
+				(typeof entry.provider === "string" ? entry.provider : undefined) ?? defaultsProvider;
 			const aModelId =
-				typeof entry.model === "object" && entry.model && typeof entry.model.primary === "string"
+				(typeof entry.model === "object" && entry.model && typeof entry.model.primary === "string"
 					? entry.model.primary
-					: undefined;
-			if (!aProvider || !aModelId) continue;
+					: undefined) ?? defaultsModelId;
+			if (!aProvider || !aModelId) {
+				// Observability: surface the misconfigured agent so the operator
+				// can find out why `/agent <id>` won't see it. Silent-skip is the
+				// quiet bug that ate the user's `support` agent at boot.
+				bootLog(
+					`skipping agent "${id}" — no provider/model resolved (per-agent entry has none and cfg.agents.defaults is incomplete)`,
+				);
+				continue;
+			}
 			// Validate against the per-agent auth — never use the boot agent's
 			// keys to vouch for another agent's model selection.
 			const aModel =
@@ -499,7 +516,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					modelsFile,
 					authStorage: getAuthStorageForAgent(id),
 				})) as Model<string> | undefined);
-			if (!aModel) continue;
+			if (!aModel) {
+				bootLog(
+					`skipping agent "${id}" — model ${aProvider}/${aModelId} could not be resolved (check auth profile + provider availability)`,
+				);
+				continue;
+			}
 			perAgentRuntime.set(id, {
 				provider: aProvider,
 				modelId: aModelId,

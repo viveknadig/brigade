@@ -1288,6 +1288,34 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 				);
 				return;
 			}
+			let known: AgentSummary[];
+			try {
+				known = await client.request("agents.list");
+			} catch (err) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.error("✗")} ${brand.error(
+							`agents.list failed: ${err instanceof Error ? err.message : String(err)}`,
+						)}`,
+						0,
+						0,
+					),
+				);
+				return;
+			}
+			if (!known.some((a) => a.id === arg)) {
+				const available = known.map((a) => a.id).join(", ") || "(none)";
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.error("✗")} ${brand.error(`unknown agent "${arg}"`)}\n  ${brand.dim(
+							`available: ${available}`,
+						)}\n  ${brand.dim("usage: /agent <id> — try /agents to see the full list")}`,
+						0,
+						0,
+					),
+				);
+				return;
+			}
 			boundAgentId = arg;
 			insertBeforeEditor(
 				new Text(

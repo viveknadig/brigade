@@ -118,6 +118,45 @@ brigade pairing revoke <code>
 
 ---
 
+## 🧑‍🤝‍🧑 Agents — isolated personas
+
+Each agent has its own workspace (persona files), auth profiles, exec allowlist, sessions, and optional channel/account routing bindings. `brigade.json` stores them under `cfg.agents.<id>` (keyed map) and `cfg.bindings.entries[]` (routing rules). The bare `brigade agents` invocation defaults to `list`.
+
+```bash
+brigade agents                                                # list every agent (default)
+brigade agents list [--json] [--bindings]
+brigade agents bindings [--agent <id>] [--json]
+brigade agents bind --agent <id> --bind <spec> [--bind <spec> …] [--json]
+brigade agents unbind --agent <id> (--bind <spec> [--bind <spec> …] | --all) [--json]
+brigade agents add <name> [--workspace <dir>]
+                  [--model <id>] [--provider <id>] [--agent-dir <dir>]
+                  [--bind <spec> [--bind <spec> …]]
+                  [--non-interactive] [--json]
+brigade agents set-identity --agent <id>
+                  [--workspace <dir>] [--identity-file <path>] [--from-identity]
+                  [--name <…>] [--theme <…>] [--emoji <…>] [--avatar <…>]
+                  [--json]
+brigade agents delete <id> --force [--json]
+```
+
+**Binding spec shape**
+
+A binding spec is either a bare channel id (`whatsapp`, `telegram`, `discord`) or `<channel>:<accountId>` to scope the binding to a single account (`whatsapp:+15551234567`). Bindings are first-come-first-served across agents — a slot already owned by another agent is reported as a conflict (exit-1) instead of silently re-routed.
+
+**Reserved ids**
+
+`main` (the default agent), `none`, `null`, `undefined`, `default`, `all`, and `any` are reserved and cannot be used as agent ids. `main` additionally cannot be `delete`d.
+
+**Workspace defaulting**
+
+`agents add <name>` without `--workspace` auto-defaults to `~/.brigade/agents/<name>/workspace/`. Pass `--workspace <dir>` only when you want a custom location.
+
+**Interactive parity**
+
+`add`, `delete`, and `set-identity` ship non-interactive first. The interactive wizard (workspace picker, identity prompts, delete confirm) is a follow-up; until it lands these commands fail loudly with a clear message rather than blocking on a TTY prompt.
+
+---
+
 ## 🗂️ Sessions
 
 Per-agent transcripts at `~/.brigade/agents/<id>/sessions/`.
