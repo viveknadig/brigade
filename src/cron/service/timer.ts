@@ -428,7 +428,21 @@ export async function runDueJob(
 		// `lastDelivered` / `lastDeliveryStatus` / `lastDeliveryError` onto
 		// the job state under the same lock so a partially-failed delivery
 		// leaves an audit trail the operator can `cron list` to inspect.
-		if (outcome.status === "ok" && !deleteAfterApply) {
+		//
+		// This MUST run even when `deleteAfterApply` is true. One-shot `at`
+		// reminders ("remind me to drink water in 5 minutes") default to
+		// `deleteAfterRun: true`, so the job was spliced out of the store
+		// above BEFORE we reach here — but delivering that reply is the WHOLE
+		// POINT of the reminder; the deletion is just post-fire cleanup.
+		// Gating delivery on `!deleteAfterApply` silently dropped the reply of
+		// EVERY default one-shot reminder on the floor: the isolated run
+		// produced "time to hydrate!" but it never reached WhatsApp, and the
+		// operator only got it after manually nudging the main session. The
+		// `idx2 >= 0` guard below makes the delivery-state write-back a no-op
+		// when the job was already deleted, so a deleted one-shot still
+		// delivers without trying to persist `lastDelivered` onto a row that
+		// no longer exists.
+		if (outcome.status === "ok") {
 			const deliveryResult = await maybeDeliverAnnounce(state, applied, outcome);
 			if (deliveryResult) {
 				const idx2 = state.store.jobs.findIndex((j) => j.id === job.id);
@@ -501,7 +515,12 @@ async function maybeDeliverAnnounce(
 		});
 		return { status: "not-delivered", delivered: false, error: "empty reply summary" };
 	}
-	const text = formatAnnounceText(job, summary);
+	// The CHANNEL (WhatsApp/Slack/...) gets the model's reply VERBATIM — the
+	// recipient must never see internal [cron "name"] tagging. Only the
+	// operator's TUI awareness event (below) keeps the tag, so a firing can
+	// be told apart from the assistant's own lines in the operator console.
+	const channelText = summary;
+	const awarenessText = formatAnnounceText(job, summary);
 	// Last-channel fallback. When the operator (or the model) didn't set an
 	// explicit `delivery.channel/to` AND the turn that scheduled this cron
 	// had no channelContext (typical pure-TUI scheduling), the job lands
@@ -535,7 +554,7 @@ async function maybeDeliverAnnounce(
 		try {
 			delivered = await dispatcher({
 				job,
-				text,
+				text: channelText,
 				channel,
 				to,
 				...(resolvedAccountId ? { accountId: resolvedAccountId } : {}),
@@ -575,7 +594,7 @@ async function maybeDeliverAnnounce(
 	if (enqueue) {
 		try {
 			enqueue({
-				text,
+				text: awarenessText,
 				jobId: job.id,
 				jobName: job.name,
 				source: "cron",

@@ -19,7 +19,12 @@ export interface RuntimeParams {
   channelLabel: string;
   thinkingLevel: string;
   timezone: string;
+  /** UTC ISO timestamp (machine-readable, kept for back-compat). */
   nowIso: string;
+  /** Human-readable wall-clock time in the operator's local timezone
+   *  (e.g. "Tue 2026-06-03 15:46"). The model reads this directly so it
+   *  never has to convert UTC to local in its head. */
+  nowLocal: string;
   repoRoot: string | undefined;
 }
 
@@ -33,6 +38,8 @@ export interface ResolveRuntimeArgs {
 }
 
 export function resolveRuntimeParams(args: ResolveRuntimeArgs): RuntimeParams {
+  const tz = resolveTimezone();
+  const now = new Date();
   return {
     agentId: args.agentId,
     workspaceDir: args.workspaceDir,
@@ -45,13 +52,17 @@ export function resolveRuntimeParams(args: ResolveRuntimeArgs): RuntimeParams {
     modelLabel: args.modelLabel,
     channelLabel: args.channelLabel ?? "cli",
     thinkingLevel: args.thinkingLevel ?? "off",
-    timezone: resolveTimezone(),
-    nowIso: new Date().toISOString(),
+    timezone: tz,
+    nowIso: now.toISOString(),
+    nowLocal: formatLocalNow(now, tz),
     repoRoot: findGitRoot(args.workspaceDir) ?? findGitRoot(args.cwd),
   };
 }
 
 // Renders to a single one-liner for the prompt's `## Runtime` block.
+// `now=` carries the operator-local wall-clock time so the model never
+// has to convert UTC to local in its head — UTC ISO is kept in parentheses
+// for tools/logs that need the machine-readable form.
 export function formatRuntimeLine(p: RuntimeParams): string {
   const parts = [
     `agent=${p.agentId}`,
@@ -60,7 +71,7 @@ export function formatRuntimeLine(p: RuntimeParams): string {
     `node=${p.nodeVersion}`,
     `shell=${p.shell ?? "?"}`,
     `tz=${p.timezone}`,
-    `now=${p.nowIso}`,
+    `now=${p.nowLocal} ${p.timezone} (UTC ${p.nowIso})`,
     `model=${p.modelLabel}`,
     `channel=${p.channelLabel}`,
     `thinking=${p.thinkingLevel}`,
@@ -87,6 +98,38 @@ function resolveTimezone(): string {
     return Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
   } catch {
     return "UTC";
+  }
+}
+
+// Renders a Date in the operator's local timezone as `Ddd YYYY-MM-DD HH:mm`
+// (e.g. `Tue 2026-06-03 15:46`). Used by the `## Runtime` line so the model
+// reads a local wall-clock time directly. Falls back to UTC ISO if the
+// platform's Intl can't honour the requested tz.
+export function formatLocalNow(now: Date, tz: string): string {
+  try {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: tz,
+      weekday: "short",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(now);
+    const lookup = (type: string): string =>
+      parts.find((p) => p.type === type)?.value ?? "";
+    const weekday = lookup("weekday");
+    const year = lookup("year");
+    const month = lookup("month");
+    const day = lookup("day");
+    let hour = lookup("hour");
+    const minute = lookup("minute");
+    // Intl en-GB sometimes returns "24" for midnight — normalise to "00".
+    if (hour === "24") hour = "00";
+    return `${weekday} ${year}-${month}-${day} ${hour}:${minute}`;
+  } catch {
+    return now.toISOString();
   }
 }
 

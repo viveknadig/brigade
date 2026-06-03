@@ -34,7 +34,11 @@ import { createSessionsHistoryTool } from "./history.js";
 import { createSessionsListTool } from "./list.js";
 import { createSessionsSendTool } from "./send.js";
 import { createSessionsSpawnTool } from "./spawn.js";
-import type { ToolResultEnvelope } from "./shared.js";
+import type {
+	AgentToAgentPolicy,
+	SessionToolsVisibility,
+	ToolResultEnvelope,
+} from "./shared.js";
 
 export {
 	createSessionsHistoryTool,
@@ -66,6 +70,19 @@ export interface CreateSessionsToolsBundleParams {
 	workspaceDir?: string;
 	/** Sandbox flag — tightens `sessions_list` visibility to spawned-only. */
 	sandboxed?: boolean;
+	/** Visibility scope for the caller's session: self/tree/agent/all. */
+	visibility?: SessionToolsVisibility;
+	/** A2A policy resolved from `cfg.session.agentToAgent`. */
+	a2aPolicy?: AgentToAgentPolicy;
+	/** Session keys the caller (transitively) spawned — used for tree-scope. */
+	spawnedKeys?: ReadonlySet<string>;
+	/**
+	 * Fail-closed opt-out — set to true ONLY when the caller is a trusted
+	 * internal pathway (boot wiring, cron lane, heartbeat). Channel-routed
+	 * and model-side bundles must leave this unset so the four sessions
+	 * tools refuse traffic when policy is missing.
+	 */
+	bypassAccessGuard?: boolean;
 }
 
 export interface SessionsToolsBundle {
@@ -97,9 +114,19 @@ export function createSessionsToolsBundle(
 		agentTo: ctx?.requesterSenderId,
 		sandboxed: params.sandboxed,
 	};
+	// Shared access-guard context — threaded into every tool so each
+	// execute body can fail-closed BEFORE dispatching. The bypass flag is
+	// forwarded only when the factory caller explicitly opts in.
+	const accessGuard = {
+		...(params.visibility ? { visibility: params.visibility } : {}),
+		...(params.a2aPolicy ? { a2aPolicy: params.a2aPolicy } : {}),
+		...(params.spawnedKeys ? { spawnedKeys: params.spawnedKeys } : {}),
+		...(params.bypassAccessGuard === true ? { bypassAccessGuard: true } : {}),
+	};
 	const send = createSessionsSendTool({
 		agentSessionKey: sharedOpts.agentSessionKey,
 		agentChannel: sharedOpts.agentChannel,
+		...accessGuard,
 	});
 	const spawn = createSessionsSpawnTool({
 		agentSessionKey: sharedOpts.agentSessionKey,
@@ -111,13 +138,16 @@ export function createSessionsToolsBundle(
 		callerDepth: params.callerDepth,
 		maxSpawnDepth: params.maxSpawnDepth,
 		maxChildrenPerAgent: params.maxChildrenPerAgent,
+		...accessGuard,
 	});
 	const list = createSessionsListTool({
 		agentSessionKey: sharedOpts.agentSessionKey,
 		sandboxed: params.sandboxed,
+		...accessGuard,
 	});
 	const history = createSessionsHistoryTool({
 		agentSessionKey: sharedOpts.agentSessionKey,
+		...accessGuard,
 	});
 	return { send, spawn, list, history };
 }

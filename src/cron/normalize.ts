@@ -47,6 +47,100 @@ function defaultDeliveryModeForPayload(payload: CronPayload): CronDelivery["mode
 }
 
 /**
+ * Relative-offset → absolute `at` resolver (input-only sugar).
+ *
+ * LLMs are unreliable at producing 13-digit epoch-millisecond timestamps: a
+ * "remind me in 5 minutes" turn has the model emit `Date.now() + 300_000`
+ * from its head, and it routinely lands minutes off (observed in production:
+ * a "5 minutes" reminder got scheduled ~14 minutes out, fired late, and the
+ * operator had already given up). The model has no real `Date.now()` — the
+ * runtime prompt carries only a wall-clock + ISO string — so it GUESSES the
+ * epoch, and the reminder fires at the wrong time.
+ *
+ * The fix: let the model express the OFFSET ("in N minutes") and resolve it
+ * to an absolute fire-time SERVER-SIDE against the real clock. This is an
+ * input-only alias — exactly like `sessionTarget: "current"` — that rewrites
+ * to the canonical `{kind: "at", at: <epoch ms>}` BEFORE validation, so
+ * nothing downstream (timer, schedule math, delivery) ever sees the relative
+ * form.
+ *
+ * Recognised when the schedule object carries `kind: "in"` OR any relative
+ * field while NO absolute `at`/`atMs` is present (an explicit `at` always
+ * wins, preserving back-compat). Multiple fields SUM, so
+ * `{inHours: 1, inMinutes: 30}` = 90 minutes. A few spelling variants are
+ * accepted so a non-frontier model's phrasing still lands.
+ *
+ *   {kind: "in", inMinutes: 5}   → at = now + 5 min
+ *   {inSeconds: 90}              → at = now + 90 s
+ *   {kind: "at", inMinutes: 5}   → at = now + 5 min (relative wins; no `at`)
+ *   {kind: "at", at: 1780…}      → unchanged (absolute `at` present)
+ */
+const RELATIVE_OFFSET_FIELDS: ReadonlyArray<readonly [string, number]> = [
+	["inms", 1],
+	["inmillis", 1],
+	["inmilliseconds", 1],
+	["insec", 1000],
+	["insecs", 1000],
+	["insecond", 1000],
+	["inseconds", 1000],
+	["inmin", 60_000],
+	["inmins", 60_000],
+	["inminute", 60_000],
+	["inminutes", 60_000],
+	["inhour", 3_600_000],
+	["inhours", 3_600_000],
+	["inhr", 3_600_000],
+	["inhrs", 3_600_000],
+	["inday", 86_400_000],
+	["indays", 86_400_000],
+];
+
+/** Sum every recognised relative-offset field (case-insensitive). Returns
+ *  `undefined` when none are present, so the caller can tell "no relative
+ *  signal" apart from "a zero offset". */
+function readRelativeOffsetMs(rec: Record<string, unknown>): number | undefined {
+	const lowerKeyed = new Map<string, unknown>();
+	for (const key of Object.keys(rec)) lowerKeyed.set(key.toLowerCase(), rec[key]);
+	let total = 0;
+	let found = false;
+	for (const [key, mult] of RELATIVE_OFFSET_FIELDS) {
+		const v = lowerKeyed.get(key);
+		if (typeof v === "number" && Number.isFinite(v)) {
+			total += v * mult;
+			found = true;
+		}
+	}
+	return found ? total : undefined;
+}
+
+/**
+ * Rewrite a relative-offset schedule input into the canonical
+ * `{kind: "at", at: <epoch ms>}` form using `nowMs`. Pass-through for any
+ * input that isn't a relative form (absolute `at`, `every`, `cron`, etc.).
+ * Throws a clear error for a `kind: "in"` with a missing / non-positive
+ * offset so the caller (agent tool / RPC) gets an actionable refusal.
+ */
+export function resolveRelativeScheduleInput(raw: unknown, nowMs: number): unknown {
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return raw;
+	const rec = raw as Record<string, unknown>;
+	const kind = typeof rec.kind === "string" ? rec.kind.toLowerCase() : undefined;
+	const hasAbsoluteAt = rec.at !== undefined || rec.atMs !== undefined;
+	const offsetMs = readRelativeOffsetMs(rec);
+	const isRelative = kind === "in" || (offsetMs !== undefined && !hasAbsoluteAt);
+	if (!isRelative) return raw;
+	if (offsetMs === undefined) {
+		throw new Error(
+			'cron relative schedule (kind "in") requires a positive offset — ' +
+				"one of inSeconds / inMinutes / inHours / inDays / inMs",
+		);
+	}
+	if (offsetMs <= 0) {
+		throw new Error(`cron relative schedule offset must be positive (got ${offsetMs} ms)`);
+	}
+	return { kind: "at", at: nowMs + offsetMs };
+}
+
+/**
  * Coerce a permissive caller-supplied schedule into a canonical `CronSchedule`.
  *
  * The agent tool's TypeBox shape is `Type.Any()` so the LLM can pass any of:
@@ -284,10 +378,17 @@ export function defaultCronJobCreate(
 	input: CronJobCreate,
 	opts?: CronJobCreateNormalizeOpts,
 ): Required<Pick<CronJobCreate, "enabled" | "sessionTarget" | "wakeMode">> & CronJobCreate {
+	// Resolve a relative offset ("in 5 minutes") to an absolute `at` against
+	// the scheduler clock FIRST — so the model never has to compute a 13-digit
+	// epoch in its head (it gets that wrong; see `resolveRelativeScheduleInput`).
+	// Pass-through for absolute / every / cron inputs. Use one clock reading for
+	// both the relative resolve and the future-time guard below so they agree.
+	const nowForSchedule = opts?.nowMs ?? Date.now();
+	const relativeResolved = resolveRelativeScheduleInput(input.schedule, nowForSchedule);
 	// Coerce permissive caller input (bare string / object-without-kind) into
 	// the canonical CronSchedule shape BEFORE we touch staggerMs etc. — see
 	// `coerceScheduleInput` for the supported shapes.
-	const coerced = coerceScheduleInput(input.schedule);
+	const coerced = coerceScheduleInput(relativeResolved);
 	const schedule = normalizeSchedule(coerced);
 	// Future-time validation on the create-path ONLY (not on the bare
 	// coercer, which is also used for shape-canonicalising stored / replayed
@@ -298,7 +399,7 @@ export function defaultCronJobCreate(
 	// `opts.nowMs` so simulated-clock tests use the scheduler's virtual
 	// time rather than wall-clock `Date.now()`.
 	if (schedule.kind === "at") {
-		assertFutureAtTimestamp(schedule.at, opts?.nowMs ?? Date.now());
+		assertFutureAtTimestamp(schedule.at, nowForSchedule);
 	}
 	const sessionTargetRaw =
 		input.sessionTarget ?? defaultSessionTargetForPayload(input.payload);

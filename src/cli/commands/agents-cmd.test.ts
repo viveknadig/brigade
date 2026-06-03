@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 let stateDir: string;
@@ -239,8 +239,13 @@ describe("agents-cmd: runAgentsAdd", () => {
 			const cfg = readConfig();
 			const agents = cfg.agents as Record<string, unknown>;
 			assert.ok(agents.scout);
-			const entry = agents.scout as { workspace?: string; model?: string };
-			assert.equal(entry.model, "claude-opus-4-7");
+			// C1: bare model strings are normalized to {primary} so the gateway
+			// boot loop can read entry.model.primary.
+			const entry = agents.scout as {
+				workspace?: string;
+				model?: { primary?: string } | string;
+			};
+			assert.deepEqual(entry.model, { primary: "claude-opus-4-7" });
 		} finally {
 			rmSync(ws, { recursive: true, force: true });
 		}
@@ -366,5 +371,188 @@ describe("agents-cmd: runAgentsDelete", () => {
 		const { result, err } = await captureStdio(() => runAgentsDelete({ id: "ghost", force: true }));
 		assert.equal(result, 1);
 		assert.match(err, /not found/);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// C3 — external-workspace guard. `agents delete --force` must refuse to
+// wipe a configured workspace path that lives OUTSIDE the resolved state
+// dir unless the operator explicitly passes `--allow-external-workspace`.
+// A typo on a custom workspace path used to silently nuke the wrong tree.
+// ─────────────────────────────────────────────────────────────────────────
+describe("agents-cmd: runAgentsDelete — C3 external-workspace guard", () => {
+	it("deletes normally when the workspace lives INSIDE the state dir", async () => {
+		const insideWs = join(stateDir, "agents", "scout", "workspace");
+		mkdirSync(insideWs, { recursive: true });
+		writeFileSync(join(insideWs, "marker.txt"), "x");
+		writeConfig({
+			agents: { main: {}, scout: { workspace: insideWs } },
+		});
+		const { runAgentsDelete } = await import("./agents-cmd.js");
+		const { result } = await captureStdio(() =>
+			runAgentsDelete({ id: "scout", force: true, json: true }),
+		);
+		assert.equal(result, 0);
+		// Original location is gone (moved to trash).
+		assert.equal(
+			existsSync(insideWs),
+			false,
+			"workspace inside state dir should have been removed",
+		);
+	});
+
+	it("refuses an external workspace without --allow-external-workspace", async () => {
+		const externalWs = mkdtempSync(join(tmpdir(), "br-ext-ws-"));
+		try {
+			writeFileSync(join(externalWs, "marker.txt"), "x");
+			writeConfig({
+				agents: { main: {}, scout: { workspace: externalWs } },
+			});
+			const { runAgentsDelete } = await import("./agents-cmd.js");
+			const { result, err } = await captureStdio(() =>
+				runAgentsDelete({ id: "scout", force: true }),
+			);
+			assert.equal(result, 1);
+			assert.match(err, /external workspace/i);
+			// Workspace + its marker file must be untouched.
+			assert.equal(
+				existsSync(join(externalWs, "marker.txt")),
+				true,
+				"external workspace must NOT have been removed",
+			);
+			// The agent entry must also remain in the config so the operator
+			// can re-run with the flag.
+			const cfg = readConfig();
+			const agents = cfg.agents as Record<string, unknown>;
+			assert.ok(agents.scout, "agent entry must survive a refused delete");
+		} finally {
+			rmSync(externalWs, { recursive: true, force: true });
+		}
+	});
+
+	it("deletes an external workspace WITH --allow-external-workspace", async () => {
+		const externalWs = mkdtempSync(join(tmpdir(), "br-ext-ws-"));
+		try {
+			writeFileSync(join(externalWs, "marker.txt"), "x");
+			writeConfig({
+				agents: { main: {}, scout: { workspace: externalWs } },
+			});
+			const { runAgentsDelete } = await import("./agents-cmd.js");
+			const { result } = await captureStdio(() =>
+				runAgentsDelete({
+					id: "scout",
+					force: true,
+					allowExternalWorkspace: true,
+					json: true,
+				}),
+			);
+			assert.equal(result, 0);
+			// Original is gone (moved to trash sibling, then resides under
+			// <parent>/.brigade-trash/... — not at the original path).
+			assert.equal(
+				existsSync(externalWs),
+				false,
+				"external workspace must be removed when the flag is set",
+			);
+			const cfg = readConfig();
+			const agents = cfg.agents as Record<string, unknown>;
+			assert.equal(agents.scout, undefined);
+		} finally {
+			rmSync(externalWs, { recursive: true, force: true });
+			// Trash dir lives at <parent>/.brigade-trash/ — clean it up too.
+			const parent = dirname(externalWs);
+			const trash = join(parent, ".brigade-trash");
+			rmSync(trash, { recursive: true, force: true });
+		}
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// H2 — every runner must emit a parseable JSON error envelope of the
+// shape `{ "error": "<message>" }` on stderr when `--json` is set and an
+// error path fires. Without this, scripts can't reliably tell success
+// from failure when piping the output through `jq`.
+// ─────────────────────────────────────────────────────────────────────────
+describe("agents-cmd: H2 --json error envelopes", () => {
+	function assertJsonError(err: string, pattern: RegExp): void {
+		// stderr may contain extra `Normalized agent id` debug lines on the
+		// stdout side; the JSON envelope is the last stderr token written.
+		const trimmed = err.trim();
+		const lastNl = trimmed.lastIndexOf("\n");
+		const envelope = lastNl >= 0 ? trimmed.slice(lastNl + 1) : trimmed;
+		const parsed = JSON.parse(envelope) as { error?: string };
+		assert.equal(typeof parsed.error, "string");
+		assert.match(parsed.error ?? "", pattern);
+	}
+
+	it("list — emits JSON envelope when config load fails", async () => {
+		// Write a syntactically broken brigade.json so loadConfig throws.
+		writeFileSync(join(stateDir, "brigade.json"), "{not-json");
+		const { runAgentsList } = await import("./agents-cmd.js");
+		const { result, err } = await captureStdio(() => runAgentsList({ json: true }));
+		assert.equal(result, 1);
+		assertJsonError(err, /failed to read brigade\.json/);
+	});
+
+	it("bindings — emits JSON envelope when --agent is unknown", async () => {
+		writeConfig({ agents: { main: {} } });
+		const { runAgentsBindings } = await import("./agents-cmd.js");
+		const { result, err } = await captureStdio(() =>
+			runAgentsBindings({ agent: "ghost", json: true }),
+		);
+		assert.equal(result, 1);
+		assertJsonError(err, /not found/);
+	});
+
+	it("bind — emits JSON envelope when no --bind specs are supplied", async () => {
+		writeConfig({ agents: { main: {} } });
+		const { runAgentsBind } = await import("./agents-cmd.js");
+		const { result, err } = await captureStdio(() =>
+			runAgentsBind({ agent: "main", json: true }),
+		);
+		assert.equal(result, 1);
+		assertJsonError(err, /at least one --bind/);
+	});
+
+	it("unbind — emits JSON envelope when both --all and --bind are set", async () => {
+		writeConfig({ agents: { main: {} } });
+		const { runAgentsUnbind } = await import("./agents-cmd.js");
+		const { result, err } = await captureStdio(() =>
+			runAgentsUnbind({ agent: "main", all: true, bind: ["whatsapp"], json: true }),
+		);
+		assert.equal(result, 1);
+		assertJsonError(err, /either --all or --bind/);
+	});
+
+	it("add — emits JSON envelope when the name is missing", async () => {
+		const { runAgentsAdd } = await import("./agents-cmd.js");
+		const { result, err } = await captureStdio(() => runAgentsAdd({ json: true }));
+		assert.equal(result, 1);
+		assertJsonError(err, /Agent name is required/);
+	});
+
+	it("set-identity — emits JSON envelope when nothing to write", async () => {
+		writeConfig({ agents: { main: {}, scout: {} } });
+		const ws = mkdtempSync(join(tmpdir(), "br-id-ws-"));
+		try {
+			const { runAgentsSetIdentity } = await import("./agents-cmd.js");
+			const { result, err } = await captureStdio(() =>
+				runAgentsSetIdentity({ agent: "scout", workspace: ws, json: true }),
+			);
+			assert.equal(result, 1);
+			assertJsonError(err, /No identity data/);
+		} finally {
+			rmSync(ws, { recursive: true, force: true });
+		}
+	});
+
+	it("delete — emits JSON envelope when the agent does not exist", async () => {
+		writeConfig({ agents: { main: {} } });
+		const { runAgentsDelete } = await import("./agents-cmd.js");
+		const { result, err } = await captureStdio(() =>
+			runAgentsDelete({ id: "ghost", force: true, json: true }),
+		);
+		assert.equal(result, 1);
+		assertJsonError(err, /not found/);
 	});
 });

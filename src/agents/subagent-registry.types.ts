@@ -44,7 +44,8 @@ export type SpawnSubagentSandboxMode = "inherit" | "require";
 export type SubagentRunOutcome =
 	| { status: "ok"; text?: string }
 	| { status: "error"; error: string; text?: string }
-	| { status: "timeout"; text?: string };
+	| { status: "timeout"; text?: string }
+	| { status: "abort"; text?: string; reason?: string };
 
 export type SubagentRunRecord = {
 	runId: string;

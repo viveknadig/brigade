@@ -76,6 +76,13 @@ export interface BrigadeAgentDefaults {
   maxConcurrent?: number;
   /** Max in-flight sub-agent runs on the global `Subagent` lane (default 8). */
   maxSubagentConcurrent?: number;
+  /**
+   * Default skill allowlist applied to every agent that does NOT declare
+   * its own `skills` field. Semantics: `[]` = no skills; absent =
+   * every discovered/enabled skill is allowed. Mirrors the reference
+   * codebase's `agents.defaults.skills` field.
+   */
+  skills?: string[];
   [key: string]: unknown;
 }
 
@@ -92,6 +99,16 @@ export interface BrigadeModelSelection {
 export interface AgentConfig {
   workspace?: string | null;
   defaultRoute?: string | null;
+  /**
+   * Per-agent skill allowlist. When set, only skills whose `name` is in
+   * this list are exposed in the assembled `<available_skills>` block.
+   * Semantics:
+   *   - `[]`     — agent sees no skills at all
+   *   - absent  — fall back to `agents.defaults.skills`; if THAT is also
+   *               absent, every discovered/enabled skill is allowed
+   * Mirrors the reference codebase's per-agent `skills` field.
+   */
+  skills?: string[];
   [key: string]: unknown;
 }
 
@@ -289,7 +306,53 @@ export function readConfigOrInit(): BrigadeConfig {
   return parsed;
 }
 
+// H8: in-process serialization for read-modify-write callers. Sync writes
+// already serialize on the event-loop tick, but async tasks that each
+// `loadConfig() → mutate → saveConfig()` would otherwise interleave: two
+// readers see the same on-disk state, both write back their own diff,
+// and one mutation gets stomped. `mutateConfigAtomic` does the read +
+// mutate + write under a single Promise-chain queue so every callback
+// observes (and writes back) the freshest state on disk.
+let writeChain: Promise<void> = Promise.resolve();
+
 export function writeConfigSafe(config: BrigadeConfig): void {
+  writeConfigSafeInternal(config);
+  // Refresh the queue head so any async awaiter that lands later
+  // serializes after this sync call has already flushed to disk.
+  writeChain = writeChain.then(() => {
+    /* serial fence */
+  });
+}
+
+export function writeConfigSafeAsync(config: BrigadeConfig): Promise<void> {
+  const next = writeChain.then(() => {
+    writeConfigSafeInternal(config);
+  });
+  writeChain = next.catch(() => {});
+  return next;
+}
+
+/**
+ * Async read-modify-write under the in-process queue. Each mutator runs
+ * with the just-loaded cfg as input and its returned cfg becomes the
+ * next on-disk state. Failures in one mutator do not poison subsequent
+ * awaiters.
+ */
+export function mutateConfigAtomic(
+  mutate: (current: BrigadeConfig) => BrigadeConfig | Promise<BrigadeConfig>,
+): Promise<BrigadeConfig> {
+  let resultRef: BrigadeConfig | undefined;
+  const next = writeChain.then(async () => {
+    const current = readConfigOrInit();
+    const updated = await mutate(current);
+    writeConfigSafeInternal(updated);
+    resultRef = updated;
+  });
+  writeChain = next.catch(() => {});
+  return next.then(() => resultRef as BrigadeConfig);
+}
+
+function writeConfigSafeInternal(config: BrigadeConfig): void {
   const cfgPath = resolveConfigPath();
   ensureDir(path.dirname(cfgPath));
 

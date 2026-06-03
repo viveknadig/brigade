@@ -114,6 +114,37 @@ interface RepairResult {
 }
 
 /**
+ * Value-compare a stored schedule against its canonical form. Reference
+ * inequality is useless here — `coerceScheduleInput` always allocates a fresh
+ * object, so `canonical !== job.schedule` was ALWAYS true, marking every job
+ * "repaired" on every load: `ensureLoaded` then recomputed nextRunAtMs (off
+ * real wall-clock, not the scheduler clock) and re-persisted on EVERY tick —
+ * spamming "canonicalised on load" and clobbering stored fire-times (incl.
+ * backoff + missed-replay slots). A by-value check makes an already-canonical
+ * load a true no-op. A string / kindless / shape-shifted original is treated
+ * as NOT equivalent, so genuine legacy repairs still fire.
+ */
+function schedulesEquivalent(original: unknown, canonical: CronJob["schedule"]): boolean {
+	if (!original || typeof original !== "object") return false;
+	const o = original as Record<string, unknown>;
+	if (o.kind !== canonical.kind) return false;
+	switch (canonical.kind) {
+		case "at":
+			return o.at === canonical.at;
+		case "every":
+			return o.everyMs === canonical.everyMs && o.anchorMs === canonical.anchorMs;
+		case "cron":
+			return (
+				o.expr === canonical.expr &&
+				o.tz === canonical.tz &&
+				o.staggerMs === canonical.staggerMs
+			);
+		default:
+			return false;
+	}
+}
+
+/**
  * Repair variant that also reports whether the job changed shape vs disk —
  * lets `loadCronStoreWithRepairFlag` decide to persist the canonical form
  * ONCE so subsequent loads see no change and don't re-emit the "repaired"
@@ -131,7 +162,21 @@ function repairLoadedJobWithFlag(job: CronJob): RepairResult | null {
 		});
 		return null;
 	}
-	const scheduleChanged = canonical !== job.schedule;
+	// Migration: legacy `every` jobs created before anchors were persisted
+	// carry no `anchorMs`, so `computeNextRunAtMs` re-anchors to "now" on every
+	// recompute and the fire grid drifts forward on each restart (an hourly
+	// reminder kept sliding past its slot and never fired). Stamp a stable
+	// anchor from the job's creation time (falling back to its current
+	// next-fire) so the grid is fixed from here on — marks the schedule
+	// changed below, so nextRunAtMs is recomputed + persisted ONCE.
+	if (canonical.kind === "every" && canonical.anchorMs === undefined) {
+		const anchor =
+			typeof job.createdAtMs === "number" ? job.createdAtMs : job.state?.nextRunAtMs;
+		if (typeof anchor === "number") {
+			canonical = { ...canonical, anchorMs: anchor };
+		}
+	}
+	const scheduleChanged = !schedulesEquivalent(job.schedule, canonical);
 	// Recompute nextRunAtMs if it's missing on an enabled job (this is the
 	// signature of an OLD build's failed compute) OR if we just changed the
 	// schedule shape (a new canonical may have a different fire-time).

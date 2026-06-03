@@ -85,6 +85,27 @@ describe("agents-config: applyAgentConfig", () => {
 		const agents = next.agents as Record<string, unknown>;
 		assert.equal(Object.keys(agents).length, 1);
 	});
+
+	it("wraps a bare model string as {primary} so server boot can read entry.model.primary", async () => {
+		const { applyAgentConfig } = await import("./agents-config.js");
+		const next = applyAgentConfig({ agents: {} }, { agentId: "foo", model: "gpt-5" });
+		const agents = next.agents as Record<string, { model?: { primary?: string } }>;
+		assert.deepEqual(agents.foo?.model, { primary: "gpt-5" });
+	});
+
+	it("passes an existing model object through unchanged", async () => {
+		const { applyAgentConfig } = await import("./agents-config.js");
+		const next = applyAgentConfig(
+			{ agents: {} },
+			{ agentId: "foo", model: { primary: "claude-opus-4-7", fallbacks: ["gpt-5"] } },
+		);
+		const agents = next.agents as Record<
+			string,
+			{ model?: { primary?: string; fallbacks?: string[] } }
+		>;
+		assert.equal(agents.foo?.model?.primary, "claude-opus-4-7");
+		assert.deepEqual(agents.foo?.model?.fallbacks, ["gpt-5"]);
+	});
 });
 
 describe("agents-config: pruneAgentConfig", () => {

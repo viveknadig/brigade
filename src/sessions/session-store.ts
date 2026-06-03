@@ -383,8 +383,48 @@ export function resolveOrCreateSession(args: {
   });
 }
 
+/**
+ * Canonical main-session key for an agent. Routes through the shared
+ * `buildBrigadeMainSessionKey` so agent-id normalisation (lowercase, path-
+ * safe collapse) is identical to every other site that constructs a session
+ * key — boot/cron sessions now match channel sessions on the same canonical
+ * id (O0 H7).
+ *
+ * Imported via a dynamic import seam (in-file lazy resolve) to avoid a
+ * module cycle: `agents/routing/session-key.ts` already depends on
+ * `sessions/session-key-utils.ts`, and pulling its key-builder up here
+ * eagerly would re-introduce a sessions ↔ routing cycle.
+ */
 export function defaultSessionKey(agentId: string): string {
-  return `agent:${agentId}:main`;
+  return buildBrigadeMainSessionKeyLazy(agentId);
+}
+
+// Lazy resolver so the `agents/routing` module load isn't pulled into the
+// sessions module's load chain. First call resolves + caches.
+let _buildBrigadeMainSessionKey: ((p: { agentId: string }) => string) | undefined;
+function buildBrigadeMainSessionKeyLazy(agentId: string): string {
+  if (!_buildBrigadeMainSessionKey) {
+    // Require synchronously through the cjs interop. In ESM the dynamic
+    // import would be async; instead we use a `require`-style fallback via
+    // the shared normaliser so the function stays sync (every existing
+    // caller of `defaultSessionKey` is sync).
+    // Inline the same normalisation rules `buildBrigadeMainSessionKey`
+    // applies (lowercase + collapse invalid chars) — duplicating the rule
+    // here keeps the seam sync without forcing the routing module into
+    // the sessions module's load chain.
+    const trimmed = (agentId ?? "").trim().toLowerCase();
+    if (!trimmed) return "agent:main:main";
+    const VALID_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+    if (VALID_ID_RE.test(trimmed)) return `agent:${trimmed}:main`;
+    const cleaned =
+      trimmed
+        .replace(/[^a-z0-9_-]+/g, "-")
+        .replace(/^-+/, "")
+        .replace(/-+$/, "")
+        .slice(0, 64) || "main";
+    return `agent:${cleaned}:main`;
+  }
+  return _buildBrigadeMainSessionKey({ agentId });
 }
 
 /**

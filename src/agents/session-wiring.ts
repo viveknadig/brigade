@@ -125,6 +125,17 @@ export function assembleBrigadeToolset(opts: {
 	 * registry; ignored when `sessionContext` is unset.
 	 */
 	sandboxedSessionTools?: boolean;
+	/**
+	 * Per-turn session-tool access guard — visibility + A2A policy +
+	 * spawned-tree containment. Threaded through to `createBrigadeTools`
+	 * so the four sessions tools fail-closed BEFORE dispatching when
+	 * the caller is not allowed to reach the target session.
+	 */
+	sessionToolAccess?: {
+		visibility?: import("./tools/sessions/shared.js").SessionToolsVisibility;
+		a2aPolicy?: import("./tools/sessions/shared.js").AgentToAgentPolicy;
+		spawnedKeys?: ReadonlySet<string>;
+	};
 }): BrigadeToolset {
 	const rawCustomTools = createBrigadeTools({
 		workspaceDir: opts.workspaceDir,
@@ -136,6 +147,9 @@ export function assembleBrigadeToolset(opts: {
 		...(opts.sessionContext ? { sessionContext: opts.sessionContext } : {}),
 		...(opts.sandboxedSessionTools !== undefined
 			? { sandboxedSessionTools: opts.sandboxedSessionTools }
+			: {}),
+		...(opts.sessionToolAccess !== undefined
+			? { sessionToolAccess: opts.sessionToolAccess }
 			: {}),
 	});
 	const senderIsOwner = opts.senderIsOwner ?? true;

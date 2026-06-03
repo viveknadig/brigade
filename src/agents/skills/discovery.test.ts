@@ -135,4 +135,78 @@ describe("discoverSkills", () => {
 		const res = discoverSkills({ workspaceSkillsDir: ws, eligibilityCtx: LINUX });
 		assert.deepEqual(res.skills.map((s) => s.name), ["apple", "mango", "zebra"]);
 	});
+
+	it("discovers a managed skill with source=managed (S3)", () => {
+		const managed = path.join(root, "managed");
+		const ws = path.join(root, "workspace", "skills");
+		writeSkill(managed, "foo", "description: managed install");
+		const res = discoverSkills({
+			workspaceSkillsDir: ws,
+			managedSkillsDir: managed,
+			eligibilityCtx: LINUX,
+		});
+		assert.equal(res.skills.length, 1);
+		assert.equal(res.skills[0]?.name, "foo");
+		assert.equal(res.skills[0]?.source, "managed");
+	});
+
+	it("discovers personal + project skills with the correct source tags (S6)", () => {
+		const personal = path.join(root, "personal");
+		const project = path.join(root, "project");
+		const ws = path.join(root, "workspace", "skills");
+		writeSkill(personal, "perskill", "description: personal");
+		writeSkill(project, "projskill", "description: project");
+		const res = discoverSkills({
+			workspaceSkillsDir: ws,
+			personalSkillsDir: personal,
+			projectSkillsDir: project,
+			eligibilityCtx: LINUX,
+		});
+		const byName = new Map(res.skills.map((s) => [s.name, s.source]));
+		assert.equal(byName.get("perskill"), "agents-skills-personal");
+		assert.equal(byName.get("projskill"), "agents-skills-project");
+	});
+
+	it("workspace shadows personal which shadows managed which shadows bundled (precedence S6)", () => {
+		const bundled = path.join(root, "bundled");
+		const managed = path.join(root, "managed");
+		const personal = path.join(root, "personal");
+		const project = path.join(root, "project");
+		const ws = path.join(root, "workspace", "skills");
+		writeSkill(bundled, "shared", "description: bundled");
+		writeSkill(managed, "shared", "description: managed");
+		writeSkill(personal, "shared", "description: personal");
+		writeSkill(project, "shared", "description: project");
+		writeSkill(ws, "shared", "description: workspace");
+		const res = discoverSkills({
+			workspaceSkillsDir: ws,
+			bundledSkillsDir: bundled,
+			managedSkillsDir: managed,
+			personalSkillsDir: personal,
+			projectSkillsDir: project,
+			eligibilityCtx: LINUX,
+		});
+		assert.equal(res.skills.length, 1);
+		assert.equal(res.skills[0]?.source, "workspace");
+		assert.ok(res.promptBlock?.includes("workspace"));
+	});
+
+	it("skillAllowlist drops names not in the list (S1)", () => {
+		const ws = path.join(root, "workspace", "skills");
+		writeSkill(ws, "alpha", "description: a");
+		writeSkill(ws, "beta", "description: b");
+		const res = discoverSkills({
+			workspaceSkillsDir: ws,
+			skillAllowlist: ["alpha"],
+			eligibilityCtx: LINUX,
+		});
+		assert.deepEqual(res.skills.map((s) => s.name), ["alpha"]);
+		// `[]` denies all
+		const denied = discoverSkills({
+			workspaceSkillsDir: ws,
+			skillAllowlist: [],
+			eligibilityCtx: LINUX,
+		});
+		assert.equal(denied.skills.length, 0);
+	});
 });

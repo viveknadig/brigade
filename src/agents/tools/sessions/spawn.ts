@@ -26,10 +26,13 @@ import type {
 	SpawnSubagentSandboxMode,
 } from "../../subagent-registry.types.js";
 import {
+	checkSessionToolAccess,
 	describeSessionsSpawnTool,
 	jsonToolResult,
 	SESSIONS_SPAWN_TOOL_DISPLAY_SUMMARY,
 	ToolInputError,
+	type AgentToAgentPolicy,
+	type SessionToolsVisibility,
 	type ToolResultEnvelope,
 } from "./shared.js";
 
@@ -60,6 +63,18 @@ export interface SessionsSpawnToolOptions {
 	callerDepth?: number;
 	maxSpawnDepth?: number;
 	maxChildrenPerAgent?: number;
+	/** Visibility scope for the caller's session: self/tree/agent/all. */
+	visibility?: SessionToolsVisibility;
+	/** A2A policy resolved from `cfg.session.agentToAgent`. */
+	a2aPolicy?: AgentToAgentPolicy;
+	/** Session keys the caller (transitively) spawned — used for tree-scope. */
+	spawnedKeys?: ReadonlySet<string>;
+	/**
+	 * Fail-closed opt-out — set to true ONLY for trusted internal pathways.
+	 * Untrusted callers leave this unset so unwired bundles refuse spawn
+	 * requests by default.
+	 */
+	bypassAccessGuard?: boolean;
 }
 
 export interface SessionsSpawnToolDescriptor {
@@ -135,6 +150,41 @@ export function createSessionsSpawnTool(
 		parameters: SESSIONS_SPAWN_SCHEMA,
 		execute: async (args) => {
 			const parsed = coerceArgs(args);
+			// Fail-closed: an unwired bundle (missing caller key OR
+			// visibility OR A2A policy) refuses every spawn. Internal trusted
+			// pathways opt out via `bypassAccessGuard: true`.
+			if (opts.bypassAccessGuard !== true) {
+				if (!opts.agentSessionKey || !opts.visibility || !opts.a2aPolicy) {
+					return jsonToolResult({
+						status: "forbidden",
+						error: "sessions_spawn forbidden: session access policy not configured",
+					});
+				}
+				// Cross-agent spawn guard — when the caller specifies a
+				// cross-agent `agentId` the spawn would land OUTSIDE the
+				// caller's own agent. Refuse unless the A2A policy permits
+				// it. We synthesise the would-be target key as
+				// `agent:<id>:subagent` for the visibility check; when no
+				// `agentId` override is supplied, the spawn stays within the
+				// caller's own agent and passes the same-key fast path.
+				if (parsed.agentId && parsed.agentId !== opts.requesterAgentIdOverride) {
+					const targetKey = `agent:${parsed.agentId}:subagent`;
+					const access = checkSessionToolAccess({
+						action: "send",
+						requesterSessionKey: opts.agentSessionKey,
+						targetSessionKey: targetKey,
+						visibility: opts.visibility,
+						a2aPolicy: opts.a2aPolicy,
+						...(opts.spawnedKeys ? { spawnedKeys: opts.spawnedKeys } : {}),
+					});
+					if (!access.allowed) {
+						return jsonToolResult({
+							status: "forbidden",
+							error: access.error,
+						});
+					}
+				}
+			}
 			const result = await spawnSubagentDirect(parsed, {
 				agentSessionKey: opts.agentSessionKey,
 				agentChannel: opts.agentChannel,

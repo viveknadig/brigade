@@ -9,6 +9,7 @@ import {
   REASONING_FORMAT_GUIDANCE,
   SKILLS_GUIDANCE,
   shouldUseReasoningFormat,
+  TIME_GROUNDING_GUIDANCE,
   WEB_TOOLS_GUIDANCE,
 } from "./guidance.js";
 import type { ContextFile } from "./types.js";
@@ -554,6 +555,16 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   lines.push(
     "Treat this directory as the single global workspace for file operations unless explicitly instructed otherwise.",
   );
+  lines.push("");
+
+  // 8b. ## Time (always-on).
+  // The Runtime line carries `now=` in operator-local form already; this
+  // block tells the model to READ that form directly instead of converting
+  // UTC math in its head (the failure mode that caused the "11:18 AM IST
+  // when it was 3:46 PM IST" hallucination). Cheap (~3 sentences) and
+  // applies to every turn — including sub-agent / cron runs that consume
+  // UTC ms timestamps from tools.
+  lines.push(TIME_GROUNDING_GUIDANCE);
   lines.push("");
 
   // 7b. ## Memory (conditional on the memory capability).

@@ -124,6 +124,17 @@ export interface CreateBrigadeToolsOptions {
 	 * dispatcher) to compute.
 	 */
 	sandboxedSessionTools?: boolean;
+	/**
+	 * Per-turn session-tool access guard — visibility scope + A2A policy +
+	 * spawned-tree containment. Threaded through to the sessions tool bundle
+	 * so each tool's execute body can fail-closed BEFORE dispatching to a
+	 * session the caller is not allowed to reach.
+	 */
+	sessionToolAccess?: {
+		visibility?: import("./sessions/shared.js").SessionToolsVisibility;
+		a2aPolicy?: import("./sessions/shared.js").AgentToAgentPolicy;
+		spawnedKeys?: ReadonlySet<string>;
+	};
 }
 
 /**
@@ -183,6 +194,18 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 			...(opts.subagentContext.parentModelId !== undefined
 				? { parentModelId: opts.subagentContext.parentModelId }
 				: {}),
+			// Wave O0.5 — thread the access policy so the spawn_agent tool
+			// can fail-closed against the parent's visibility + A2A policy
+			// the same way the sessions_* tool surface does.
+			...(opts.sessionToolAccess?.visibility !== undefined
+				? { visibility: opts.sessionToolAccess.visibility }
+				: {}),
+			...(opts.sessionToolAccess?.a2aPolicy !== undefined
+				? { a2aPolicy: opts.sessionToolAccess.a2aPolicy }
+				: {}),
+			...(opts.sessionToolAccess?.spawnedKeys !== undefined
+				? { spawnedKeys: opts.sessionToolAccess.spawnedKeys }
+				: {}),
 		});
 		const filtered = filterToolsForSubagentDepth({
 			tools: [spawnAgentTool],
@@ -216,6 +239,18 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 				...(opts.channelContext !== undefined ? { channelContext: opts.channelContext } : {}),
 				...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
 				...(agentSessionKey !== undefined ? { agentSessionKey } : {}),
+				// Wave O0.6 — thread visibility + A2A so the cron tool
+				// can refuse cross-agent `cron add` whose `job.agentId`
+				// targets another agent and policy disallows it.
+				...(opts.sessionToolAccess?.visibility !== undefined
+					? { visibility: opts.sessionToolAccess.visibility }
+					: {}),
+				...(opts.sessionToolAccess?.a2aPolicy !== undefined
+					? { a2aPolicy: opts.sessionToolAccess.a2aPolicy }
+					: {}),
+				...(opts.sessionToolAccess?.spawnedKeys !== undefined
+					? { spawnedKeys: opts.sessionToolAccess.spawnedKeys }
+					: {}),
 			}),
 		);
 	}
@@ -244,6 +279,15 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 			maxSpawnDepth: opts.subagentMaxDepth,
 			workspaceDir: opts.workspaceDir,
 			sandboxed: opts.sandboxedSessionTools,
+			...(opts.sessionToolAccess?.visibility !== undefined
+				? { visibility: opts.sessionToolAccess.visibility }
+				: {}),
+			...(opts.sessionToolAccess?.a2aPolicy !== undefined
+				? { a2aPolicy: opts.sessionToolAccess.a2aPolicy }
+				: {}),
+			...(opts.sessionToolAccess?.spawnedKeys !== undefined
+				? { spawnedKeys: opts.sessionToolAccess.spawnedKeys }
+				: {}),
 		});
 		tools.push(...sessionsTools);
 	}

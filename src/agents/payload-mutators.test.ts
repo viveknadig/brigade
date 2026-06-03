@@ -8,7 +8,9 @@ import {
   scrubRefusalSentinelInTranscript,
   sweepStaleAnthropicCacheControl,
   buildBrigadeTransformContext,
+  wrapStreamFnWithPayloadMutations,
 } from "./payload-mutators.js";
+import { CACHE_BOUNDARY_MARKER } from "../system-prompt/cache-boundary.js";
 
 interface CacheBlock {
   type: string;
@@ -188,4 +190,44 @@ test("pruneProcessedHistoryImages: text-only sessions return identity (no alloca
   ] as unknown as AgentMessage[];
   const out = pruneProcessedHistoryImages(messages);
   assert.strictEqual(out, messages);
+});
+
+test("wrapStreamFnWithPayloadMutations: composes onPayload, runs CACHE_BOUNDARY_MARKER strip", async () => {
+  // Fake AgentSession with a stub streamFn we can intercept. We capture the
+  // wrapped options so we can fire the wrapped onPayload manually + observe
+  // the mutator effects.
+  let capturedOptions: { onPayload?: (payload: unknown, m: unknown) => unknown } | undefined;
+  const stubSession = {
+    agent: {
+      streamFn: (_model: unknown, _ctx: unknown, options: typeof capturedOptions) => {
+        capturedOptions = options;
+        return undefined;
+      },
+    },
+  };
+  wrapStreamFnWithPayloadMutations(stubSession as never);
+  // Invoke the wrapped streamFn (model + ctx are placeholders the wrap
+  // only forwards). The wrap installs a composed onPayload.
+  (stubSession.agent.streamFn as unknown as Function)(
+    { provider: "anthropic", id: "claude" },
+    {},
+    {},
+  );
+  assert.ok(capturedOptions?.onPayload, "wrap installs an onPayload");
+  // System prompt carries the cache-boundary marker; after the mutator
+  // chain runs the marker must NOT appear in any string in the payload.
+  const payload: { system: string } = {
+    system: `prefix\n${CACHE_BOUNDARY_MARKER}\nsuffix`,
+  };
+  await capturedOptions!.onPayload!(payload, { provider: "openai", id: "gpt-4o" });
+  // For non-Anthropic the strip leaves a plain text without the marker
+  // (system is still a string post-strip on non-Anthropic providers).
+  assert.ok(!JSON.stringify(payload).includes(CACHE_BOUNDARY_MARKER));
+});
+
+test("wrapStreamFnWithPayloadMutations: is a no-op when streamFn is missing", () => {
+  const stubSession = { agent: {} };
+  // Should not throw.
+  wrapStreamFnWithPayloadMutations(stubSession as never);
+  assert.ok(true);
 });

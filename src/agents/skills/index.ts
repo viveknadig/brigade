@@ -9,14 +9,21 @@
  * existing `read` tool — no skill-specific tool exists.
  */
 
+import * as os from "node:os";
 import * as path from "node:path";
 
 import type { BrigadeConfig } from "../../config/io.js";
-import { resolveBundledSkillsDir } from "../../config/paths.js";
+import { resolveBundledSkillsDir, resolveManagedSkillsDir } from "../../config/paths.js";
+import {
+	resolveEffectiveAgentSkillFilter,
+} from "./agent-filter.js";
 import { discoverSkills, type DiscoveredSkill, type SkillDiscoveryResult } from "./discovery.js";
 
 export {
 	discoverSkills,
+	SOURCE_MANAGED,
+	SOURCE_PERSONAL,
+	SOURCE_PROJECT,
 	type DiscoveredSkill,
 	type SkillDiscoveryResult,
 	type DiscoverSkillsArgs,
@@ -28,6 +35,10 @@ export {
 	parseEligibility,
 	type SkillEligibility,
 } from "./eligibility.js";
+export {
+	resolveEffectiveAgentSkillFilter,
+	isSkillAllowedForAgent,
+} from "./agent-filter.js";
 
 /** The empty result — skills disabled or none found. */
 const EMPTY: SkillDiscoveryResult = {
@@ -53,6 +64,13 @@ export interface DiscoverEligibleSkillsArgs {
 	workspaceDir: string;
 	/** The active config (caller already has it loaded; avoids a second read). */
 	config: BrigadeConfig;
+	/**
+	 * Optional agent id. When supplied, the per-agent skill allowlist
+	 * (`cfg.agents.<id>.skills`, falling back to `cfg.agents.defaults.skills`)
+	 * gates which discovered skills land in the prompt block. Omit for
+	 * single-agent / legacy callers that don't enforce per-agent scope.
+	 */
+	agentId?: string;
 }
 
 /**
@@ -62,11 +80,16 @@ export interface DiscoverEligibleSkillsArgs {
  */
 export function discoverEligibleSkills(args: DiscoverEligibleSkillsArgs): SkillDiscoveryResult {
 	if (args.config.skills?.enabled === false) return EMPTY;
+	const allowlist = resolveEffectiveAgentSkillFilter(args.config, args.agentId);
 	return discoverSkills({
 		workspaceSkillsDir: path.join(args.workspaceDir, "skills"),
 		bundledSkillsDir: resolveBundledSkillsDir(),
+		managedSkillsDir: resolveManagedSkillsDir(),
+		personalSkillsDir: path.join(os.homedir(), ".agents", "skills"),
+		projectSkillsDir: path.join(args.workspaceDir, ".agents", "skills"),
 		extraPaths: args.config.skills?.paths ?? [],
 		disabledNames: resolveDisabledNames(args.config),
+		...(allowlist !== undefined ? { skillAllowlist: allowlist } : {}),
 		// Pass the active config so `requires.config` paths actually gate
 		// channel-specific skills (e.g. a bluebubbles skill is hidden when
 		// the operator has no `channels.bluebubbles` section). Without this

@@ -20,6 +20,7 @@
 // are documented but parked behind a feature flag until the wiring exists.
 
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { Api, Model, ThinkingLevel } from "@mariozechner/pi-ai";
 
 import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
 import { sanitizeMessages } from "./sanitize-surrogates.js";
@@ -228,6 +229,12 @@ export interface BrigadeTransformContextOptions {
   // to true — the prune is a safe no-op on text-only transcripts and saves
   // tens of thousands of tokens on image-heavy sessions.
   pruneOldImages?: boolean;
+  // Active model for this turn. When provided, the message-level provider
+  // quirks (Mistral tool-id sanitiser, OpenAI-Responses reasoning-pair
+  // downgrade, Anthropic thinking-block strip) gate themselves on the model
+  // so non-matching providers stay untouched. When undefined the quirks
+  // run defensively (strip-everything mode) — safe but more aggressive.
+  activeModel?: Model<any>;
 }
 
 export interface BrigadeTransformContextHooks {
@@ -286,6 +293,36 @@ export function buildBrigadeTransformContext(
         // safe fallback per Pi contract
       }
     }
+    // Message-level provider quirks. Each pass is a pure function over the
+    // message array and gated on the active model — safe no-op when the
+    // provider doesn't match. Order:
+    //   - dropAnthropicThinkingBlocks: strip stale thinking from history,
+    //     preserving the latest assistant's thinking ONLY on Anthropic for
+    //     prompt-cache continuity.
+    //   - sanitizeMistralToolCallIds: rewrite toolu_/call_ ids to Mistral's
+    //     9-char format when active model is Mistral.
+    //   - downgradeOpenAIResponsesReasoningPairs: drop thinking from any
+    //     assistant message that ALSO carries a toolCall, when active model
+    //     uses OpenAI's Responses API.
+    try {
+      working = dropAnthropicThinkingBlocks(working, options.activeModel);
+    } catch {
+      // safe fallback
+    }
+    if (isMistralModel(options.activeModel)) {
+      try {
+        working = sanitizeMistralToolCallIds(working);
+      } catch {
+        // safe fallback
+      }
+    }
+    if (isOpenAIResponsesModel(options.activeModel)) {
+      try {
+        working = downgradeOpenAIResponsesReasoningPairs(working);
+      } catch {
+        // safe fallback
+      }
+    }
     // Surrogate sanitization runs LAST so any text written by earlier
     // passes (synthesised tool_result blocks, etc.) is also cleaned.
     // Lone UTF-16 surrogate halves crash Anthropic / OpenAI intake with
@@ -342,7 +379,6 @@ export const PROVIDER_QUIRKS_PARKED = {
 // single file is the source of truth for provider-side mutations.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import type { Api, Model, ThinkingLevel } from "@mariozechner/pi-ai";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
 
 import { CACHE_BOUNDARY_MARKER } from "../system-prompt/cache-boundary.js";

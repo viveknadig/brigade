@@ -25,6 +25,7 @@ import {
 	type CronSystemEventArgs,
 } from "./state.js";
 import { add as cronAdd } from "./ops.js";
+import { persist } from "./store.js";
 import {
 	MAX_TIMER_DELAY_MS,
 	MIN_REFIRE_GAP_MS,
@@ -388,6 +389,12 @@ describe("cron delivery — TUI awareness fires regardless of channel delivery (
 			// Channel delivery DID happen.
 			assert.equal(channelSends.length, 1, "channel dispatcher fired");
 			assert.equal(channelSends[0]!.channel, "whatsapp");
+			// The CHANNEL message is the model's reply VERBATIM — no internal tag.
+			assert.ok(
+				!channelSends[0]!.text.includes("[cron"),
+				`channel message must not carry the [cron "name"] tag: ${channelSends[0]!.text}`,
+			);
+			assert.equal(channelSends[0]!.text, "your reminder is ready", "channel gets the reply verbatim");
 			// AND the operator's TUI awareness ALSO fired — the regression
 			// this test guards against (Bug #4).
 			assert.equal(
@@ -405,8 +412,104 @@ describe("cron delivery — TUI awareness fires regardless of channel delivery (
 				"awareness text carries the cron prefix",
 			);
 			assert.ok(
+				aware.text.includes('[cron "morning-check"]'),
+				"TUI awareness event keeps the [cron \"name\"] tag",
+			);
+			assert.ok(
 				aware.text.includes("your reminder is ready"),
 				"awareness text carries the run summary",
+			);
+			stopTimer(state);
+		} finally {
+			try {
+				fs.rmSync(tempDir, { recursive: true, force: true });
+			} catch {
+				/* best-effort */
+			}
+		}
+	});
+
+	it("one-shot `at` reminder with DEFAULT deleteAfterRun STILL delivers its reply before auto-deleting", async () => {
+		// Regression for the production "remind me to drink water in 5
+		// minutes" path. A `kind: "at"` reminder defaults to
+		// `deleteAfterRun: true`, so the job is spliced from the store on a
+		// successful run. Delivery USED to be gated on `!deleteAfterApply`,
+		// which silently discarded the reply of EVERY default one-shot
+		// reminder — the isolated turn produced "Time to hydrate!" but it
+		// never reached WhatsApp; the operator only saw it after manually
+		// nudging the main session. Delivery must fire regardless of the
+		// auto-delete, and the job must still be gone afterwards (and the
+		// post-delivery state write-back must not crash on the spliced row).
+		let now = 1_700_000_000_000;
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-cron-oneshot-deliver-test-"));
+		try {
+			const storePath = path.join(tempDir, "cron.json");
+			const systemEvents: CronSystemEventArgs[] = [];
+			const channelSends: Array<{ channel: string; to: string; text: string }> = [];
+			const state = createCronServiceState({
+				storePath,
+				config: { enabled: true },
+				deps: {
+					log: createSubsystemLogger("cron-test-oneshot-deliver"),
+					nowMs: () => now,
+					enqueueSystemEvent: (args) => {
+						systemEvents.push(args);
+					},
+					runIsolatedAgentJob: async () => ({
+						status: "ok",
+						summary: "Time to hydrate! 💧",
+					}),
+					deliverCronAnnounce: async (args) => {
+						channelSends.push({
+							channel: args.channel ?? "",
+							to: args.to ?? "",
+							text: args.text,
+						});
+						return true;
+					},
+				},
+			});
+			const created = await cronAdd(state, {
+				name: "drink-water-reminder",
+				enabled: true,
+				agentId: "main",
+				sessionKey: "agent:main:whatsapp:direct:917702616808",
+				schedule: { kind: "at", at: now + 10_000 },
+				sessionTarget: "isolated",
+				payload: { kind: "agentTurn", message: "remind me to drink water" },
+				delivery: {
+					mode: "announce",
+					channel: "whatsapp",
+					to: "277888729362470@lid",
+				},
+				// Deliberately NOT setting `deleteAfterRun` — `at` jobs default
+				// it to `true`. This is the EXACT production reminder shape.
+			});
+			now += 11_000;
+			await onTimer(state);
+
+			// The reminder reply reached the channel even though the job
+			// auto-deleted on success.
+			assert.equal(
+				channelSends.length,
+				1,
+				"one-shot reminder must still deliver to the channel",
+			);
+			assert.equal(channelSends[0]!.channel, "whatsapp");
+			assert.equal(channelSends[0]!.to, "277888729362470@lid");
+			assert.ok(
+				channelSends[0]!.text.includes("Time to hydrate"),
+				"delivered text carries the run summary",
+			);
+			// TUI awareness also fired (Bug #4 guard) — with delivered=true.
+			assert.equal(systemEvents.length, 1, "awareness event fires for one-shot too");
+			assert.equal(systemEvents[0]!.delivered, true);
+			// The one-shot auto-deleted (default deleteAfterRun: true) — gone
+			// from the store, no crash on the post-delivery state write-back.
+			assert.equal(
+				state.store.jobs.find((j) => j.id === created.id),
+				undefined,
+				"one-shot job auto-deletes after a successful run",
 			);
 			stopTimer(state);
 		} finally {
@@ -781,18 +884,24 @@ describe("cron timer — planStartupCatchup", () => {
 					nowMs: () => now,
 				},
 			});
-			// Three past-due recurring jobs.
+			// Three recurring jobs, then forced past-due ON DISK (simulating a gateway
+			// that was down past their fire slots). The override is applied AFTER all
+			// adds and PERSISTED — each `cronAdd` reloads the store from disk and
+			// `planStartupCatchup` reloads again, so an in-memory-only override set
+			// mid-loop would be discarded before catchup ever saw it.
 			for (let i = 0; i < 3; i++) {
-				const job = await cronAdd(state, {
+				await cronAdd(state, {
 					name: `over-cap-${i}`,
 					enabled: true,
 					schedule: { kind: "every", everyMs: 60_000 },
 					sessionTarget: "main",
 					payload: { kind: "systemEvent", text: `j-${i}` },
 				});
-				const idx = state.store.jobs.findIndex((j) => j.id === job.id);
-				state.store.jobs[idx]!.state.nextRunAtMs = now - 30_000;
 			}
+			for (const job of state.store.jobs) {
+				job.state.nextRunAtMs = now - 30_000;
+			}
+			await persist(state);
 			await planStartupCatchup(state);
 			// All 3 still have a nextRunAtMs (none was silently dropped) and
 			// they're spread out across the stagger window so they don't

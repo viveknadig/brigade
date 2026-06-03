@@ -39,6 +39,12 @@ const log = createSubsystemLogger("skills/discovery");
 /** Source roots, lowest → highest precedence (later wins on a name collision). */
 const SOURCE_BUNDLED = "bundled";
 const SOURCE_CONFIG = "config";
+/** `~/.brigade/skills/` — managed-dir installs (`skills.install` RPC). */
+export const SOURCE_MANAGED = "managed";
+/** `~/.agents/skills/` — operator's personal skills shared across projects. */
+export const SOURCE_PERSONAL = "agents-skills-personal";
+/** `<workspace>/.agents/skills/` — project-scoped skills. */
+export const SOURCE_PROJECT = "agents-skills-project";
 const SOURCE_WORKSPACE = "workspace";
 
 /** A discovered, eligible skill — lean metadata for status/diagnostics. */
@@ -68,10 +74,24 @@ export interface DiscoverSkillsArgs {
 	workspaceSkillsDir: string;
 	/** `<packageRoot>/skills` — shipped starter skills. Omit/missing to skip. */
 	bundledSkillsDir?: string;
-	/** Extra search roots from config (`skills.paths`). Below workspace in precedence. */
+	/** `~/.brigade/skills/` — `skills.install` RPC drop-zone. Above bundled. */
+	managedSkillsDir?: string;
+	/** `~/.agents/skills/` — operator's cross-project personal skills. */
+	personalSkillsDir?: string;
+	/** `<workspace>/.agents/skills/` — project-scoped skills. */
+	projectSkillsDir?: string;
+	/** Extra search roots from config (`skills.paths`). Above bundled, below managed. */
 	extraPaths?: string[];
 	/** Names disabled via config (`skills.entries[name].enabled === false`). */
 	disabledNames?: Set<string>;
+	/**
+	 * Per-agent skill allowlist (`cfg.agents.<id>.skills`, falling back to
+	 * `cfg.agents.defaults.skills`). `undefined` means "no restriction"; `[]`
+	 * means "deny all". When a name isn't in the allowlist, the skill is
+	 * dropped from the rendered prompt block but still counted in
+	 * `totalDiscovered` so diagnostics can show the operator what was hidden.
+	 */
+	skillAllowlist?: string[];
 	/** Injected platform/env for eligibility (tests). Defaults to the live host. */
 	eligibilityCtx?: EligibilityEnv;
 }
@@ -100,10 +120,17 @@ function scanRoot(dir: string | undefined, source: string): { skills: Skill[]; d
 export function discoverSkills(args: DiscoverSkillsArgs): SkillDiscoveryResult {
 	const diagnostics: unknown[] = [];
 	// Merge lowest → highest precedence so a workspace skill overrides a
-	// same-named bundled (or config-path) one — the user can shadow a shipped
-	// skill by dropping a same-named folder in their workspace.
+	// same-named bundled (or config-path / managed / personal / project) one —
+	// the user can shadow a shipped skill by dropping a same-named folder
+	// further up the chain. Order:
+	//   bundled < config.skills.paths < managed (~/.brigade/skills)
+	//          < personal (~/.agents/skills) < project (<ws>/.agents/skills)
+	//          < workspace (<ws>/skills)
 	const roots: Array<[string | undefined, string]> = [[args.bundledSkillsDir, SOURCE_BUNDLED]];
 	for (const p of args.extraPaths ?? []) roots.push([p, SOURCE_CONFIG]);
+	roots.push([args.managedSkillsDir, SOURCE_MANAGED]);
+	roots.push([args.personalSkillsDir, SOURCE_PERSONAL]);
+	roots.push([args.projectSkillsDir, SOURCE_PROJECT]);
 	roots.push([args.workspaceSkillsDir, SOURCE_WORKSPACE]);
 
 	const byName = new Map<string, { skill: Skill; source: string }>();
@@ -116,11 +143,16 @@ export function discoverSkills(args: DiscoverSkillsArgs): SkillDiscoveryResult {
 	const totalDiscovered = byName.size;
 	const disabled = args.disabledNames ?? new Set<string>();
 	const ctx = args.eligibilityCtx;
+	const allowlist = args.skillAllowlist;
 
 	const eligiblePi: Skill[] = [];
 	const skills: DiscoveredSkill[] = [];
 	for (const { skill, source } of byName.values()) {
 		if (disabled.has(skill.name)) continue;
+		// Per-agent allowlist (S1) — `undefined` is "no restriction"; `[]` is
+		// explicit deny-all. `includes` keeps it O(n*m) for small lists; if
+		// the catalogue grows past dozens of skills this becomes a Set lookup.
+		if (allowlist !== undefined && !allowlist.includes(skill.name)) continue;
 		const eligibility = readSkillEligibility(skill.filePath);
 		if (!(ctx ? isSkillEligible(eligibility, ctx) : isSkillEligible(eligibility))) continue;
 		eligiblePi.push(skill);

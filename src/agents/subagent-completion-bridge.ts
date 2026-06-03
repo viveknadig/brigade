@@ -35,12 +35,16 @@
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { onAgentEvent } from "./agent-events.js";
-import { enqueueSystemEvent } from "./session-inbox.js";
+import {
+	deliverSubagentCompletionAnnounce,
+	pickReplyTextFromRegistryEntry,
+} from "./subagent-announce-delivery.js";
 import {
 	getSubagentRun,
 	markSubagentRunCompleted,
 } from "./subagent-registry.js";
 import {
+	SUBAGENT_ENDED_OUTCOME_ABORT,
 	SUBAGENT_ENDED_OUTCOME_ERROR,
 	SUBAGENT_ENDED_OUTCOME_OK,
 	SUBAGENT_ENDED_OUTCOME_TIMEOUT,
@@ -67,34 +71,61 @@ function deriveOutcomes(data: Record<string, unknown>): {
 	lifecycleOutcome: SubagentLifecycleEndedOutcome;
 	error?: string;
 	reason: string;
+	replyText?: string;
 } {
 	const ok = data.ok;
 	const error = typeof data.error === "string" ? data.error : undefined;
 	const timedOut = data.timedOut === true || data.reason === "timeout";
+	const aborted = data.aborted === true || data.reason === "abort" || data.reason === "aborted";
+	// Wave O0.7 - lifecycle producers (agent-dispatcher) now thread the
+	// child's final assistant text on the `phase:"end"` payload as
+	// `reply`. The completion bridge plucks it here so the announce-
+	// delivery payload carries the actual child output to the parent.
+	const replyText = typeof data.reply === "string" ? data.reply : undefined;
+	if (aborted) {
+		return {
+			runOutcome: { status: "abort", ...(replyText ? { text: replyText } : {}) },
+			lifecycleOutcome: SUBAGENT_ENDED_OUTCOME_ABORT,
+			reason: "abort",
+			...(error ? { error } : {}),
+			...(replyText ? { replyText } : {}),
+		};
+	}
 	if (timedOut) {
 		return {
-			runOutcome: { status: "timeout" },
+			runOutcome: { status: "timeout", ...(replyText ? { text: replyText } : {}) },
 			lifecycleOutcome: SUBAGENT_ENDED_OUTCOME_TIMEOUT,
 			reason: "timeout",
 			...(error ? { error } : {}),
+			...(replyText ? { replyText } : {}),
 		};
 	}
 	if (ok === false || error) {
 		return {
-			runOutcome: { status: "error", error: error ?? "unknown error" },
+			runOutcome: {
+				status: "error",
+				error: error ?? "unknown error",
+				...(replyText ? { text: replyText } : {}),
+			},
 			lifecycleOutcome: SUBAGENT_ENDED_OUTCOME_ERROR,
 			reason: "error",
 			error: error ?? "unknown error",
+			...(replyText ? { replyText } : {}),
 		};
 	}
 	return {
-		runOutcome: { status: "ok" },
+		runOutcome: { status: "ok", ...(replyText ? { text: replyText } : {}) },
 		lifecycleOutcome: SUBAGENT_ENDED_OUTCOME_OK,
 		reason: "complete",
+		...(replyText ? { replyText } : {}),
 	};
 }
 
-function formatAnnounceText(params: {
+// Wave O0.7 - the rich announce text now lives in
+// `subagent-announce-delivery.ts`; the bridge just passes the entry and
+// the lifecycle outcome through. Keep the legacy short-form helper
+// available for callers that only want the headline (e.g. log lines).
+function formatLegacyAnnounceHeadline(params: {
 	label?: string;
 	outcome: SubagentLifecycleEndedOutcome;
 	error?: string;
@@ -106,9 +137,15 @@ function formatAnnounceText(params: {
 	if (params.outcome === SUBAGENT_ENDED_OUTCOME_TIMEOUT) {
 		return `Sub-agent${tag} timed out.`;
 	}
+	if (params.outcome === SUBAGENT_ENDED_OUTCOME_ABORT) {
+		return `Sub-agent${tag} was aborted.`;
+	}
 	const detail = params.error?.trim() ? `: ${params.error.trim()}` : "";
 	return `Sub-agent${tag} failed${detail}`;
 }
+// Local alias kept so the inbox-fallback branch below (Wave O0.7) can
+// fall back to the short-form when `enqueueSystemEvent` is bypassed.
+const formatAnnounceText = formatLegacyAnnounceHeadline;
 
 /**
  * Install the bridge. Returns a disposer that unsubscribes from the
@@ -134,7 +171,7 @@ export function installSubagentCompletionBridge(): () => void {
 		// idempotent, but skipping the call avoids needless work + log noise.
 		if (entry.endedAt) return;
 
-		const { runOutcome, lifecycleOutcome, error, reason } = deriveOutcomes(
+		const { runOutcome, lifecycleOutcome, error, reason, replyText } = deriveOutcomes(
 			data as Record<string, unknown>,
 		);
 
@@ -154,30 +191,52 @@ export function installSubagentCompletionBridge(): () => void {
 				});
 			}
 
-			// Audit 11 producer gap: when a sub-agent completes, the parent
-			// session needs a wake signal so its next turn (TUI prompt, channel
-			// inbound, or interval heartbeat) drains the completion announce
-			// and the model sees "child X finished — here's the result". Without
-			// this, the parent has no in-band visibility into child lifecycle.
+			// Wave O0.7 - announce-delivery into the parent's session inbox so
+			// the parent's next turn sees "child X finished, here is the
+			// reply". The dedicated module formats the rich message body
+			// (status + duration + truncated reply) and gates the enqueue
+			// idempotently on `subagent:ended:<runId>`.
 			const parentSessionKey =
 				entry.requesterSessionKey?.trim() || entry.controllerSessionKey?.trim();
 			if (!parentSessionKey || parentSessionKey === "main") {
-				// Parent is the operator's main session or unknown — nothing to
-				// enqueue (the TUI sees lifecycle events directly via Step 18's
-				// agent-events stream, no inbox needed).
+				// Parent is the operator's main session or unknown - the TUI
+				// sees lifecycle events directly via Step 18's agent-events
+				// stream, no inbox needed.
 				return;
 			}
 			try {
-				const text = formatAnnounceText({
-					label: entry.label,
+				// Prefer the reply text carried on the lifecycle event, else
+				// pull whatever the registry already captured for the run.
+				const fallbackReply = replyText ?? pickReplyTextFromRegistryEntry(entry);
+				const durationMs =
+					typeof entry.createdAt === "number"
+						? Math.max(0, Date.now() - entry.createdAt)
+						: undefined;
+				const enqueued = deliverSubagentCompletionAnnounce({
+					parentSessionKey,
+					childSessionKey: entry.childSessionKey,
+					runId,
 					outcome: lifecycleOutcome,
-					error,
+					...(entry.label ? { label: entry.label } : {}),
+					...(error ? { error } : {}),
+					...(fallbackReply ? { replyText: fallbackReply } : {}),
+					...(durationMs !== undefined ? { durationMs } : {}),
 				});
-				enqueueSystemEvent(text, {
-					sessionKey: parentSessionKey,
-					contextKey: `subagent:ended:${runId}`,
-					trusted: true,
-				});
+				if (!enqueued) {
+					// Fall back to the short-form text if the rich announce
+					// was deduped or the inbox dropped it. The headline is
+					// still useful for observability.
+					const text = formatAnnounceText({
+						label: entry.label,
+						outcome: lifecycleOutcome,
+						error,
+					});
+					log.debug("subagent announce inbox enqueue dropped; headline only", {
+						runId,
+						parentSessionKey,
+						text,
+					});
+				}
 			} catch (err) {
 				log.warn("subagent completion announce enqueue failed", {
 					runId,

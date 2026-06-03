@@ -9,7 +9,6 @@ import type { BrigadeConfig } from "../../config/io.js";
 import type { ChannelAdapter, ChannelStartContext, InboundMessage, OutboundSendOptions } from "../extensions/types.js";
 import { addAllowFrom, readPendingPairings } from "./access-control/index.js";
 import { startChannels } from "./manager.js";
-import { channelSessionKey } from "./session-key.js";
 
 // Most non-ACL tests in this file don't care about the gate — they pre-date
 // access control and just verify the inbound→turn→reply flow. We default the
@@ -55,24 +54,6 @@ function makeFakeChannel(overrides: Partial<ChannelAdapter> = {}): {
 	};
 	return { adapter, ctx: () => ctx!, sent, sentWithOpts, stopped: () => stopped };
 }
-
-describe("channelSessionKey", () => {
-	it("scopes per agent + channel + conversation with a readable prefix", () => {
-		const key = channelSessionKey("main", "whatsapp", "123@s.whatsapp.net");
-		assert.match(key, /^agent:main:whatsapp:123@s\.whatsapp\.net\.[0-9a-f]{8}$/);
-	});
-	it("sanitizes whitespace + reserved separators in the readable prefix", () => {
-		const key = channelSessionKey("main", "slack", "C 01:thread");
-		assert.match(key, /^agent:main:slack:C_01_thread\.[0-9a-f]{8}$/);
-	});
-	it("never collides distinct ids that sanitize to the same prefix", () => {
-		// "a:b" and "a b" both sanitize to "a_b" — the raw-id hash keeps them apart.
-		assert.notEqual(channelSessionKey("main", "x", "a:b"), channelSessionKey("main", "x", "a b"));
-	});
-	it("is stable for the same id", () => {
-		assert.equal(channelSessionKey("main", "x", "c1"), channelSessionKey("main", "x", "c1"));
-	});
-});
 
 describe("startChannels", () => {
 	it("starts a configured channel and reports it", async () => {

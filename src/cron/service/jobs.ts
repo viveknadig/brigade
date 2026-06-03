@@ -39,6 +39,7 @@ import type {
 	CronJobPatch,
 	CronJobState,
 	CronPayload,
+	CronSchedule,
 	CronSessionTarget,
 } from "../types.js";
 
@@ -80,6 +81,20 @@ export interface CronJobExecutionResult {
 }
 
 /**
+ * Stamp a stable anchor on an `every` schedule so its fire grid survives
+ * restarts and recomputes. Without a persisted anchor, `computeNextRunAtMs`
+ * falls back to `anchorMs ?? nowMs` on EVERY call, so each restart's catchup
+ * re-anchors the grid to "now" — an hourly reminder created at 5:29 keeps
+ * sliding forward (6:33, 7:40, …) and never fires its promised slot. No-op
+ * for non-`every` kinds and for `every` schedules with an explicit anchor.
+ */
+function stampEveryAnchor(schedule: CronSchedule, nowMs: number): CronSchedule {
+	if (schedule.kind !== "every") return schedule;
+	if (typeof schedule.anchorMs === "number") return schedule;
+	return { ...schedule, anchorMs: nowMs };
+}
+
+/**
  * Build a fresh `CronJob` from a caller's (defaulted) input. Validates the
  * session-target safety + the supported-spec pairing rules — throws on
  * failure so the caller never persists a malformed job. UUID v4 ids.
@@ -97,7 +112,7 @@ export function createJob(input: CronJobCreate, nowMs: number): CronJob {
 		enabled: input.enabled ?? true,
 		...(input.agentId !== undefined ? { agentId: input.agentId } : {}),
 		...(input.sessionKey !== undefined ? { sessionKey: input.sessionKey } : {}),
-		schedule: input.schedule,
+		schedule: stampEveryAnchor(input.schedule, nowMs),
 		sessionTarget: input.sessionTarget,
 		...(input.wakeMode !== undefined ? { wakeMode: input.wakeMode } : {}),
 		payload: input.payload,
@@ -135,7 +150,7 @@ export function applyJobPatch(
 		...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
 		...(patch.agentId !== undefined ? { agentId: patch.agentId } : {}),
 		...(patch.sessionKey !== undefined ? { sessionKey: patch.sessionKey } : {}),
-		...(patch.schedule !== undefined ? { schedule: patch.schedule } : {}),
+		...(patch.schedule !== undefined ? { schedule: stampEveryAnchor(patch.schedule, nowMs) } : {}),
 		sessionTarget: nextSessionTarget,
 		...(patch.wakeMode !== undefined ? { wakeMode: patch.wakeMode } : {}),
 		payload: nextPayload,
@@ -244,6 +259,17 @@ export function normalizeJobTickState(
 ): { job: CronJob; changed: boolean } {
 	let changed = false;
 	const next: CronJob = { ...job, state: { ...job.state } };
+	// Anchor normalization (reference-codebase parity): an `every` job MUST carry a
+	// stable anchor, or computeNextRunAtMs's `anchorMs ?? nowMs` fallback
+	// re-anchors the fire grid to "now" on every recompute and drifts it
+	// forward (the hourly-reminder bug). If the anchor is missing — a legacy
+	// job, or one built outside createJob — stamp it from the job's CREATION
+	// time, never `nowMs`. Mirrors the reference per-tick resolveEveryAnchorMs.
+	if (next.schedule.kind === "every" && next.schedule.anchorMs === undefined) {
+		const anchor = typeof next.createdAtMs === "number" ? next.createdAtMs : nowMs;
+		next.schedule = { ...next.schedule, anchorMs: anchor };
+		changed = true;
+	}
 	if (typeof next.state.runningAtMs === "number" && nowMs - next.state.runningAtMs > STUCK_RUN_MS) {
 		delete next.state.runningAtMs;
 		changed = true;

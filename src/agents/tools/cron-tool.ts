@@ -53,6 +53,7 @@ import {
 	readNumberParam,
 	readStringParam,
 } from "./common.js";
+import { checkSessionToolAccess } from "./sessions/shared.js";
 import type { BrigadeTool } from "./types.js";
 
 /**
@@ -118,6 +119,18 @@ export interface MakeCronToolOptions {
 	 * `"isolated"` and `contextMessages` becomes a no-op).
 	 */
 	agentSessionKey?: string;
+	/**
+	 * Wave O0.6 — caller's visibility scope + A2A policy. When the caller
+	 * tries to schedule a cron whose `job.agentId` targets a DIFFERENT
+	 * agent than the caller itself AND the caller is not a sub-agent of
+	 * that target, refuse unless the A2A policy allows it. Unwired
+	 * bundles fall through the existing behaviour (no cross-agent guard)
+	 * because the tool already runs `ownerOnly: true`, but threading the
+	 * policy makes the cross-agent path explicit.
+	 */
+	visibility?: import("./sessions/shared.js").SessionToolsVisibility;
+	a2aPolicy?: import("./sessions/shared.js").AgentToAgentPolicy;
+	spawnedKeys?: ReadonlySet<string>;
 }
 
 /**
@@ -224,8 +237,8 @@ const CronToolParams = Type.Object({
 type CronToolDetails =
 	| { action: "status"; status: unknown }
 	| { action: "list"; result: unknown }
-	| { action: "add"; job: unknown }
-	| { action: "update"; job: unknown }
+	| { action: "add"; job: unknown; firesAtLocal?: string }
+	| { action: "update"; job: unknown; firesAtLocal?: string }
 	| { action: "remove"; removed: boolean; jobId: string }
 	| { action: "run"; jobId: string; mode: string; latestRun?: unknown }
 	| { action: "runs"; jobId: string; entries: unknown[] }
@@ -247,6 +260,9 @@ export function makeCronTool(
 	const channelContext = opts.channelContext;
 	const callerAgentId = opts.agentId;
 	const agentSessionKey = opts.agentSessionKey;
+	const callerVisibility = opts.visibility;
+	const callerA2aPolicy = opts.a2aPolicy;
+	const callerSpawnedKeys = opts.spawnedKeys;
 	return {
 		name: "cron",
 		label: "cron",
@@ -263,17 +279,26 @@ export function makeCronTool(
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
 			"SCHEDULE KIND — pick by user intent:\n" +
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
-			"### `at` — ONE-SHOT at a future moment ###\n" +
+			"### `in` / `at` — ONE-SHOT at a future moment ###\n" +
 			"USE THIS for:\n" +
 			"  • \"in N minutes/hours\" / \"in 2 mins\" / \"30 minutes from now\"\n" +
 			"  • \"tomorrow at 9am\" / \"next Tuesday\" / specific future moment\n" +
 			"  • Any reminder that fires EXACTLY ONCE and then auto-deletes\n" +
-			"Shape: `{kind: \"at\", at: <epoch_ms>}` OR `{kind: \"at\", atMs: <epoch_ms>}`\n" +
-			"For \"in 2 minutes\": calculate `Date.now() + 2 * 60 * 1000` and pass as `at`.\n" +
+			"RELATIVE (\"in N minutes/hours\") -- STRONGLY PREFERRED. Pass the OFFSET and\n" +
+			"let the SERVER compute the exact fire time against the real clock. DO NOT\n" +
+			"compute epoch milliseconds yourself: you have no reliable clock and WILL get\n" +
+			"the arithmetic wrong (a real \"5 minutes\" reminder once landed ~14 minutes\n" +
+			"out, and the operator never got it on time). Shapes:\n" +
+			"  `{kind: \"in\", inMinutes: 5}` -- also `inSeconds` / `inHours` / `inDays` / `inMs`;\n" +
+			"  combine units, e.g. `{kind: \"in\", inHours: 1, inMinutes: 30}` = 90 minutes.\n" +
+			"ABSOLUTE moment (\"tomorrow at 9am\"): `{kind: \"at\", at: \"<ISO-8601>\"}` -- pass\n" +
+			"an ISO-8601 STRING with the operator's timezone offset (e.g.\n" +
+			"`\"2026-06-03T16:31:00+05:30\"`), NOT raw epoch milliseconds. A bare\n" +
+			"`YYYY-MM-DD` or naive `YYYY-MM-DDTHH:mm:ss` (no offset) is read as UTC.\n" +
 			"NEVER use a 5-field cron expression for a relative reminder — cron expressions\n" +
 			"match absolute calendar slots and may resolve a year out (e.g. `43 13 1 6 *`\n" +
 			"interpreted on June 1 at 13:45 fires June 1 NEXT YEAR, not the 13:43 that\n" +
-			"already passed). For one-shots, ALWAYS use `at`.\n\n" +
+			"already passed). For one-shots, ALWAYS use `in` (relative) or `at` (ISO).\n\n" +
 			"#### AM/PM + CLOCK TIME RULE — CRITICAL ####\n" +
 			"When the user names a clock time without an explicit DATE (e.g. \"12:27 AM\",\n" +
 			"\"9pm\", \"tomorrow at 8\"), compute the NEXT FUTURE instance of that time. If\n" +
@@ -321,6 +346,15 @@ export function makeCronTool(
 			"  • 10am Tokyo:          `{kind: \"cron\", expr: \"0 10 * * *\", tz: \"Asia/Tokyo\"}`\n" +
 			"  • First-of-month 9am:  `{kind: \"cron\", expr: \"0 9 1 * *\", tz: \"Asia/Kolkata\"}`\n" +
 			"  • Every 15 min (any tz): `{kind: \"cron\", expr: \"*/15 * * * *\"}`\n\n" +
+			"DISPLAYING TIMES TO THE USER -- CRITICAL:\n" +
+			"  The `add` / `update` result includes `firesAtLocal` -- the EXACT fire\n" +
+			"  time the server computed in the operator's local timezone (e.g.\n" +
+			"  \"Tue, Jun 3, 4:57 PM GMT+5:30\"). When telling the user WHEN a job\n" +
+			"  fires, QUOTE `firesAtLocal` -- do NOT compute, add, or convert any\n" +
+			"  time yourself (you have no reliable clock and WILL get it wrong; a\n" +
+			"  \"5 minutes\" reminder was once announced for a time already in the\n" +
+			"  past). You may render it naturally (\"4:57 PM IST\") but the clock\n" +
+			"  time and date MUST match `firesAtLocal`. NEVER state UTC times.\n\n" +
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
 			"PAYLOAD — `payload.kind`:\n" +
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
@@ -417,7 +451,7 @@ export function makeCronTool(
 			"User: \"remind me to drink water in 2 minutes\"\n" +
 			"  → {action: \"add\", job: {\n" +
 			"      name: \"water-reminder\",\n" +
-			"      schedule: {kind: \"at\", at: <Date.now() + 120000>},\n" +
+			"      schedule: {kind: \"in\", inMinutes: 2},\n" +
 			"      payload: {kind: \"agentTurn\", message: \"Remind the operator: drink water.\"}\n" +
 			"    }}\n\n" +
 			"User: \"ping me every 30 minutes to stretch\"\n" +
@@ -509,6 +543,48 @@ export function makeCronTool(
 							{ action, job: null } as never,
 						);
 					}
+					// Wave O0.6 — cross-agent cron guard. When the model
+					// schedules a job whose `job.agentId` differs from the
+					// caller's own agentId AND the caller is not a sub-agent
+					// of that target, refuse unless the A2A policy allows
+					// it. The same-key fast-path covers in-agent scheduling
+					// (callerAgentId === jobAgentId) without surfacing the
+					// guard. The check is best-effort when policy is unset
+					// (legacy / unwired bundles) — the tool is ownerOnly so
+					// the broader gate still applies.
+					const jobAgentIdRaw =
+						typeof (jobInput as { agentId?: unknown }).agentId === "string"
+							? ((jobInput as { agentId: string }).agentId.trim())
+							: "";
+					if (
+						jobAgentIdRaw.length > 0 &&
+						callerAgentId &&
+						jobAgentIdRaw !== callerAgentId &&
+						callerVisibility &&
+						callerA2aPolicy
+					) {
+						// Synthesised target key: the canonical default
+						// session for the cross-agent target. The cron will
+						// land on this session at fire time, so it's the
+						// right thing to evaluate the access check against.
+						const targetKey = `agent:${jobAgentIdRaw}:main`;
+						const requesterKey =
+							agentSessionKey ?? `agent:${callerAgentId}:main`;
+						const verdict = checkSessionToolAccess({
+							action: "send",
+							requesterSessionKey: requesterKey,
+							targetSessionKey: targetKey,
+							visibility: callerVisibility,
+							a2aPolicy: callerA2aPolicy,
+							...(callerSpawnedKeys ? { spawnedKeys: callerSpawnedKeys } : {}),
+						});
+						if (!verdict.allowed) {
+							return failedTextResult(
+								verdict.error,
+								{ action, job: null } as never,
+							);
+						}
+					}
 					// Auto-fill delivery.channel/to/threadId from the active channel
 					// context when the operator scheduled this from a channel-routed
 					// turn (e.g. WhatsApp). The model can override by passing
@@ -552,7 +628,7 @@ export function makeCronTool(
 							? { sessionContext: { sessionKey: agentSessionKey } }
 							: undefined,
 					);
-					return payloadTextResult({ action, job: created });
+					return payloadTextResult({ action, job: created, firesAtLocal: describeFireTime(created.state.nextRunAtMs) });
 				}
 				case "update": {
 					const jobId = readStringParam(params, "jobId", { required: true });
@@ -589,7 +665,7 @@ export function makeCronTool(
 						);
 					}
 					const updated = await cronUpdate(state, jobId, patch as CronJobPatch);
-					return payloadTextResult({ action, job: updated });
+					return payloadTextResult({ action, job: updated, firesAtLocal: describeFireTime(updated.state.nextRunAtMs) });
 				}
 				case "remove": {
 					const jobId = readStringParam(params, "jobId", { required: true });
@@ -712,4 +788,35 @@ export function applyChannelContextToCronAdd(
 		...jobInput,
 		delivery: autofilled,
 	};
+}
+
+/**
+ * Format a fire-time epoch (ms) into a ready-to-quote local-time string in the
+ * operator's host timezone, e.g. "Tue, Jun 3, 4:57 PM GMT+5:30". Handed back on
+ * `add`/`update` so the MODEL never converts an epoch to local time itself --
+ * it gets that wrong (it once announced a 5-minute reminder for a time already
+ * in the past). The model is told to quote `firesAtLocal` verbatim. `tzOverride`
+ * exists for tests; production uses the host timezone. Returns undefined for a
+ * missing / non-finite time (e.g. a recurring job between fires).
+ */
+export function describeFireTime(
+	epochMs: number | undefined,
+	tzOverride?: string,
+): string | undefined {
+	if (typeof epochMs !== "number" || !Number.isFinite(epochMs)) return undefined;
+	try {
+		const tz = tzOverride || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+		return new Intl.DateTimeFormat("en-US", {
+			timeZone: tz,
+			weekday: "short",
+			month: "short",
+			day: "numeric",
+			hour: "numeric",
+			minute: "2-digit",
+			hour12: true,
+			timeZoneName: "short",
+		}).format(new Date(epochMs));
+	} catch {
+		return new Date(epochMs).toISOString();
+	}
 }

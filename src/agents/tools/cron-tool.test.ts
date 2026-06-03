@@ -18,7 +18,7 @@ import {
 } from "../../cron/service/state.js";
 import { stopTimer } from "../../cron/service/timer.js";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
-import { makeCronTool } from "./cron-tool.js";
+import { describeFireTime, makeCronTool } from "./cron-tool.js";
 
 function setupCronService(): { state: CronServiceState; cleanup: () => void } {
 	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-cron-tool-test-"));
@@ -201,5 +201,21 @@ describe("cron-tool — sessionTarget 'current' resolution", () => {
 		} finally {
 			fx.cleanup();
 		}
+	});
+});
+
+describe("describeFireTime — server-formatted fire time (model quotes this, never computes)", () => {
+	it("formats an epoch to a local 12-hour string in the given timezone", () => {
+		// 2026-06-03T11:27:00Z == 4:57 PM in Asia/Kolkata (+05:30) — the exact
+		// "5 minutes from 4:52 PM" case the model used to mis-announce as 4:43 PM.
+		const epoch = Date.UTC(2026, 5, 3, 11, 27, 0);
+		const out = describeFireTime(epoch, "Asia/Kolkata");
+		assert.ok(out, "returns a string");
+		assert.ok(out.includes("4:57"), `expected "4:57" in ${JSON.stringify(out)}`);
+		assert.match(out, /PM/);
+	});
+	it("returns undefined for missing or non-finite input", () => {
+		assert.equal(describeFireTime(undefined, "UTC"), undefined);
+		assert.equal(describeFireTime(Number.NaN, "UTC"), undefined);
 	});
 });

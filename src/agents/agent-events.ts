@@ -30,6 +30,7 @@ import {
 } from "./subagent-registry-completion.js";
 import { addHeartbeatFiredHook } from "./heartbeat-runner.js";
 import { onSessionStateChange } from "./session-registry.js";
+import { installSubagentAbortCascade } from "./subagent-abort-cascade.js";
 import { installSubagentCompletionBridge } from "./subagent-completion-bridge.js";
 import type {
 	AgentEventPayload,
@@ -286,6 +287,13 @@ export function wireAgentEventsBridge(): () => void {
 	// and enqueues a completion announce into the parent's inbox.
 	const disposeSubagentCompletion = installSubagentCompletionBridge();
 
+	// Wave O0.7 - parent-abort cascade. When a parent session terminates
+	// (operator Ctrl+C, programmatic abort, shutdown), every transitively-
+	// spawned child is aborted in turn so a cancelled parent does not leave
+	// children burning provider tokens. The cascade fires off the same
+	// `onSessionStateChange` listener wave the bridge above uses.
+	const disposeSubagentAbortCascade = installSubagentAbortCascade();
+
 	// P2#2 (Wave H) — 60s sweeper. Without this, the `runContextById` map
 	// grows forever when a turn registers a context and crashes / hot-
 	// reloads before `clearAgentRunContext` runs. A 30-minute TTL keeps
@@ -313,6 +321,7 @@ export function wireAgentEventsBridge(): () => void {
 		disposeHeartbeatHook();
 		disposeSessionListener();
 		disposeSubagentCompletion();
+		disposeSubagentAbortCascade();
 		clearInterval(sweeperTimer);
 		state.bridgeInstalled = false;
 		state.disposeBridge = null;

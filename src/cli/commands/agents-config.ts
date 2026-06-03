@@ -214,7 +214,7 @@ export function applyAgentConfig(
 		name?: string;
 		workspace?: string;
 		agentDir?: string;
-		model?: string;
+		model?: string | { primary?: string; fallbacks?: string[] };
 		provider?: string;
 		identity?: BrigadeAgentIdentity;
 	},
@@ -231,12 +231,23 @@ export function applyAgentConfig(
 		? { ...(base.identity ?? {}), ...params.identity }
 		: base.identity;
 
+	// C1: server.ts boot loop reads `entry.model.primary` — a bare string
+	// would be silently skipped. Normalize {primary} for object writes;
+	// pass through object form unchanged.
+	let modelPatch: BrigadeAgentEntry["model"] | undefined;
+	if (typeof params.model === "string") {
+		const trimmedModel = params.model.trim();
+		if (trimmedModel) modelPatch = { primary: trimmedModel };
+	} else if (params.model && typeof params.model === "object") {
+		modelPatch = params.model;
+	}
+
 	const nextEntry: BrigadeAgentEntry = {
 		...base,
 		...(trimmedName ? { name: trimmedName } : {}),
 		...(params.workspace ? { workspace: params.workspace } : {}),
 		...(params.agentDir ? { agentDir: params.agentDir } : {}),
-		...(params.model ? { model: params.model } : {}),
+		...(modelPatch ? { model: modelPatch } : {}),
 		...(params.provider ? { provider: params.provider } : {}),
 		...(mergedIdentity ? { identity: mergedIdentity } : {}),
 	};

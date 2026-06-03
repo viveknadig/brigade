@@ -31,6 +31,30 @@ import { resolveSessionLane } from "../process/session-lane.js";
 
 const log = createSubsystemLogger("core/agent-dispatcher");
 
+/**
+ * Wave O0.7 - tease the child's final assistant text out of the
+ * runAgentTurn result so the lifecycle `phase:"end"` event can carry it.
+ *
+ * Adapters return one of three shapes:
+ *   - { ok, reply?: string }                                  (TUI/cron path)
+ *   - { ok, result: { reply?: string } }                      (legacy)
+ *   - { ok, result: RunSingleTurnResult }                     (Pi runtime adapter)
+ *
+ * Returns the first non-empty string found, or undefined.
+ */
+function extractReplyFromResult(
+	result: { ok: boolean; error?: string; result?: unknown; reply?: string },
+): string | undefined {
+	if (typeof result.reply === "string" && result.reply.trim()) {
+		return result.reply;
+	}
+	const inner = result.result as { reply?: unknown } | undefined;
+	if (inner && typeof inner.reply === "string" && inner.reply.trim()) {
+		return inner.reply;
+	}
+	return undefined;
+}
+
 export interface DispatchAgentRunParams {
 	sessionKey: string;
 	message: string;
@@ -101,6 +125,12 @@ export function dispatchAgentRun(
 			channel: params.channel,
 			accountId: params.accountId,
 			threadId: params.threadId,
+			// Wave O0.7 - thread spawn lineage onto the live-session metadata
+			// so `sessions.list` can surface "spawnedBy" without a session-
+			// store round-trip when the persisted entry has not been written
+			// yet (sub-agent gateway handoff race).
+			...(params.spawnedBy ? { spawnedBy: params.spawnedBy } : {}),
+			...(params.label ? { label: params.label } : {}),
 		},
 	});
 
@@ -121,11 +151,23 @@ export function dispatchAgentRun(
 			// Forward the resolved agentId (caller-supplied OR sessionKey-derived)
 			// so downstream `runAgentTurn` adapters don't have to re-resolve it.
 			const result = await deps.runAgentTurn({ ...params, agentId, runId });
+			// Wave O0.7 - thread the child's final reply text on the
+			// lifecycle `phase:"end"` payload so the completion bridge can
+			// deliver it into the parent's inbox. The runner now returns
+			// `result.reply` whenever the adapter is able to read the
+			// session's last assistant text; if it can't, the bridge falls
+			// back to the registry's frozenResultText capture.
+			const replyText = extractReplyFromResult(result);
 			emitAgentEvent({
 				runId,
 				stream: "lifecycle",
 				sessionKey: params.sessionKey,
-				data: { phase: "end", ok: result.ok, ...(result.error ? { error: result.error } : {}) },
+				data: {
+					phase: "end",
+					ok: result.ok,
+					...(result.error ? { error: result.error } : {}),
+					...(replyText ? { reply: replyText } : {}),
+				},
 			});
 			return result;
 		} catch (err) {

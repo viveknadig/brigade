@@ -330,3 +330,56 @@ describe("applyJobPatch", () => {
 		assert.equal(patched.state.nextRunAtMs, undefined);
 	});
 });
+
+describe("createJob — every-schedule anchor stability (restart-drift fix)", () => {
+	it("stamps a persisted anchorMs = creation time on an `every` schedule", () => {
+		const job = createJob(buildBaseAgentTurnCreate(), BASE_NOW);
+		assert.equal(job.schedule.kind, "every");
+		if (job.schedule.kind !== "every") throw new Error("unreachable");
+		assert.equal(job.schedule.anchorMs, BASE_NOW, "anchor persisted at creation");
+		assert.equal(job.state.nextRunAtMs, BASE_NOW + 60_000, "first fire one interval out");
+	});
+
+	it("keeps the SAME fire grid when recomputed later (a restart must not drift it)", () => {
+		// Reproduces the production hourly-reminder bug: an `every` job whose
+		// next-fire was recomputed after a restart used to re-anchor to `now`,
+		// sliding the schedule forward a whole interval and dropping the slot
+		// the operator was promised. A persisted anchor fixes the grid.
+		const job = createJob(buildBaseAgentTurnCreate(), BASE_NOW);
+		const recomputed = computeJobNextRunAtMs(job, BASE_NOW + 35_000);
+		assert.equal(recomputed, BASE_NOW + 60_000, "still the original slot, not now+interval");
+		const afterSlot = computeJobNextRunAtMs(job, BASE_NOW + 70_000);
+		assert.equal(afterSlot, BASE_NOW + 120_000, "advances to the next fixed slot");
+	});
+
+	it("does not override an explicit caller-supplied anchorMs", () => {
+		const create = buildBaseAgentTurnCreate();
+		create.schedule = { kind: "every", everyMs: 60_000, anchorMs: BASE_NOW - 5_000 };
+		const job = createJob(create, BASE_NOW);
+		if (job.schedule.kind !== "every") throw new Error("unreachable");
+		assert.equal(job.schedule.anchorMs, BASE_NOW - 5_000, "caller anchor preserved");
+	});
+});
+
+describe("normalizeJobTickState — every-anchor self-heal (reference-codebase parity)", () => {
+	it("stamps a missing `every` anchor from createdAtMs, NOT nowMs (no drift)", () => {
+		const job = createJob(buildBaseAgentTurnCreate(), BASE_NOW);
+		// Simulate a legacy / anchor-less job (e.g. one loaded from an old store
+		// or constructed outside createJob).
+		const stripped = {
+			...job,
+			createdAtMs: BASE_NOW,
+			schedule: { kind: "every" as const, everyMs: 60_000 },
+		};
+		const muchLater = BASE_NOW + 5 * 60_000;
+		const { job: normalized, changed } = normalizeJobTickState(stripped, muchLater);
+		assert.equal(changed, true, "anchor-less every job is normalized");
+		assert.equal(normalized.schedule.kind, "every");
+		if (normalized.schedule.kind !== "every") throw new Error("unreachable");
+		assert.equal(
+			normalized.schedule.anchorMs,
+			BASE_NOW,
+			"anchored to createdAtMs, never nowMs",
+		);
+	});
+});

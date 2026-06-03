@@ -34,7 +34,63 @@ import {
 } from "../../agents/session-registry.js";
 import { resolveAgentIdFromSessionKey } from "../../agents/routing/session-key.js";
 import { spawnSubagentDirect } from "../../agents/subagent-spawn.js";
-import { upsertSessionEntry } from "../../sessions/session-store.js";
+import { readSessionStore, upsertSessionEntry } from "../../sessions/session-store.js";
+
+/**
+ * Wave O0.5: server-side access guard.
+ *
+ * Each handler accepts an optional `accessCheck` dep. The gateway boot path
+ * wires a closure that resolves the requester's session key from the
+ * per-connection auth context + the current visibility/A2A policy, then
+ * defers to `checkSessionToolAccess` (the same helper the tool surface uses).
+ *
+ * Handlers that receive `accessCheck === undefined` execute as before —
+ * meaningful for legacy in-process callers (boot wiring, test fixtures)
+ * that have already proven trust. WebSocket RPC always wires a guard.
+ */
+export type SessionsHandlerAccessAction =
+	| "list"
+	| "history"
+	| "send"
+	| "spawn"
+	| "abort"
+	| "steer"
+	| "agent"
+	| "patch";
+
+export interface SessionsHandlerAccessCheck {
+	(params: {
+		action: SessionsHandlerAccessAction;
+		targetSessionKey: string;
+	}): { allowed: boolean; reason?: string };
+}
+
+/**
+ * Typed error thrown when the access guard refuses a gateway-side call.
+ * The WebSocket dispatcher reads `code` and maps it to a typed RPC error
+ * envelope (instead of the generic `internal` bucket), and in-process
+ * callers can catch on `name === "SessionsAccessForbiddenError"`.
+ */
+export class SessionsAccessForbiddenError extends Error {
+	readonly code = "forbidden";
+	constructor(reason: string) {
+		super(reason);
+		this.name = "SessionsAccessForbiddenError";
+	}
+}
+
+function enforceAccess(
+	check: SessionsHandlerAccessCheck | undefined,
+	action: SessionsHandlerAccessAction,
+	targetSessionKey: string,
+): void {
+	if (!check) return;
+	const verdict = check({ action, targetSessionKey });
+	if (verdict.allowed) return;
+	throw new SessionsAccessForbiddenError(
+		verdict.reason ?? `sessions.${action} forbidden`,
+	);
+}
 import type {
 	SessionsHistoryParams,
 	SessionsHistoryResult,
@@ -59,6 +115,12 @@ export interface SessionsListHandlerDeps {
 	 * returned.
 	 */
 	enrichRow?: (record: LiveSessionRecord) => SessionListRow;
+	/**
+	 * Wave O0.5 access guard. When set, every candidate row is checked
+	 * before inclusion; refused rows are dropped (NOT an error — list is
+	 * filter-shaped). Omitted by trusted in-process callers.
+	 */
+	accessCheck?: SessionsHandlerAccessCheck;
 }
 
 export async function handleSessionsList(
@@ -67,7 +129,16 @@ export async function handleSessionsList(
 ): Promise<SessionsListResult> {
 	const live = listLiveSessions();
 	const filtered = applyFilters(live, params);
-	const rows = filtered.map((entry) => buildRow(entry, deps));
+	const visible = deps.accessCheck
+		? filtered.filter((entry) => {
+				const verdict = deps.accessCheck!({
+					action: "list",
+					targetSessionKey: entry.sessionKey,
+				});
+				return verdict.allowed;
+			})
+		: filtered;
+	const rows = visible.map((entry) => buildRow(entry, deps));
 	return { sessions: rows, count: rows.length };
 }
 
@@ -94,14 +165,47 @@ function applyFilters(rows: LiveSessionRecord[], params: SessionsListParams): Li
 }
 
 function buildRow(entry: LiveSessionRecord, deps: SessionsListHandlerDeps): SessionListRow {
-	if (deps.enrichRow) return deps.enrichRow(entry);
-	return {
-		sessionKey: entry.sessionKey,
-		agentId: entry.agentId,
-		state: entry.state,
-		startedAt: entry.createdAt,
-		updatedAt: entry.lastActivityAt,
-	};
+	const base: SessionListRow = deps.enrichRow
+		? deps.enrichRow(entry)
+		: {
+				sessionKey: entry.sessionKey,
+				agentId: entry.agentId,
+				state: entry.state,
+				startedAt: entry.createdAt,
+				updatedAt: entry.lastActivityAt,
+			};
+	// Wave O0.7 - surface spawn lineage from the persisted session store
+	// so a `sessions_list` caller can see parent/depth without a separate
+	// metadata RPC. Read is best-effort; on any IO error we fall back to
+	// the live-registry metadata (`spawnedBy` set on dispatch).
+	if (!base.spawnedBy || base.spawnDepth === undefined) {
+		try {
+			const agentId = entry.agentId;
+			if (agentId) {
+				const store = readSessionStore(agentId);
+				const persisted = store.sessions[entry.sessionKey];
+				if (persisted?.subagent) {
+					if (!base.spawnedBy && persisted.subagent.spawnedBy) {
+						base.spawnedBy = persisted.subagent.spawnedBy;
+					}
+					if (base.spawnDepth === undefined && typeof persisted.subagent.spawnDepth === "number") {
+						base.spawnDepth = persisted.subagent.spawnDepth;
+					}
+					if (!base.label && persisted.subagent.label) {
+						base.label = persisted.subagent.label;
+					}
+				}
+			}
+		} catch {
+			// best-effort enrichment; lineage absent is non-fatal
+		}
+	}
+	// Also fall back to the live-registry metadata (set at dispatch time)
+	// for the parent key when the store-side metadata is absent.
+	if (!base.spawnedBy && typeof entry.metadata?.spawnedBy === "string") {
+		base.spawnedBy = entry.metadata.spawnedBy;
+	}
+	return base;
 }
 
 /* ─── sessions.history ──────────────────────────────────────────── */
@@ -112,6 +216,12 @@ export interface SessionsHistoryHandlerDeps {
 		sessionKey: string;
 		limit?: number;
 	}) => Promise<ReadonlyArray<unknown>>;
+	/**
+	 * Wave O0.5 access guard. Refused calls throw
+	 * `SessionsAccessForbiddenError` which the RPC layer maps to a typed
+	 * `forbidden` response. Omitted by trusted in-process callers.
+	 */
+	accessCheck?: SessionsHandlerAccessCheck;
 }
 
 export async function handleSessionsHistory(
@@ -122,6 +232,7 @@ export async function handleSessionsHistory(
 	if (!sessionKey) {
 		return { messages: [] };
 	}
+	enforceAccess(deps.accessCheck, "history", sessionKey);
 	const messages = await deps.readMessages({
 		sessionKey,
 		...(typeof params.limit === "number" ? { limit: params.limit } : {}),
@@ -131,12 +242,19 @@ export async function handleSessionsHistory(
 
 /* ─── sessions.send ─────────────────────────────────────────────── */
 
-export interface SessionsSendHandlerDeps extends DispatchAgentRunDeps {}
+export interface SessionsSendHandlerDeps extends DispatchAgentRunDeps {
+	/**
+	 * Wave O0.5 access guard. Refused calls throw
+	 * `SessionsAccessForbiddenError`. Omitted by trusted in-process callers.
+	 */
+	accessCheck?: SessionsHandlerAccessCheck;
+}
 
 export async function handleSessionsSend(
 	params: SessionsSendParams,
 	deps: SessionsSendHandlerDeps,
 ): Promise<SessionsSendResult> {
+	enforceAccess(deps.accessCheck, "send", params.sessionKey);
 	const run = dispatchAgentRun(
 		{
 			sessionKey: params.sessionKey,
@@ -166,6 +284,11 @@ export interface SessionsSpawnHandlerDeps {
 	 * a constant.
 	 */
 	resolveCallerDepth?: (params: { sessionKey: string }) => number | Promise<number>;
+	/**
+	 * Wave O0.5 access guard. Spawn is checked against the
+	 * `parentSessionKey` because the child key is minted by the engine.
+	 */
+	accessCheck?: SessionsHandlerAccessCheck;
 }
 
 /* ─── sessions.patch ────────────────────────────────────────────── */
@@ -180,13 +303,20 @@ export interface SessionsSpawnHandlerDeps {
  * scoped to the new `brigade-store.json`. The two stores serve
  * different consumers and never share entries.
  */
+export interface SessionsPatchHandlerDeps {
+	/** Wave O0.5 access guard — refused calls throw. */
+	accessCheck?: SessionsHandlerAccessCheck;
+}
+
 export async function handleSessionsPatch(
 	params: SessionsPatchParams,
+	deps: SessionsPatchHandlerDeps = {},
 ): Promise<SessionsPatchResult> {
 	const sessionKey = params.sessionKey.trim();
 	if (!sessionKey) {
 		return { ok: false, created: false };
 	}
+	enforceAccess(deps.accessCheck, "patch", sessionKey);
 	const agentId = resolveAgentIdFromSessionKey(sessionKey);
 	const patch = params.patch ?? {};
 	// upsertSessionEntry reports `created=true` when the entry was minted.
@@ -204,6 +334,7 @@ export async function handleSessionsSpawn(
 	params: SessionsSpawnParams,
 	deps: SessionsSpawnHandlerDeps = {},
 ): Promise<SessionsSpawnResult> {
+	enforceAccess(deps.accessCheck, "spawn", params.parentSessionKey);
 	const callerDepth = deps.resolveCallerDepth
 		? await deps.resolveCallerDepth({ sessionKey: params.parentSessionKey })
 		: 0;

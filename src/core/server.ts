@@ -50,7 +50,6 @@ import {
 	type RequestParams,
 	type ResponseFor,
 	type SessionStateSnapshot,
-	type SessionSummary,
 	TICK_INTERVAL_MS,
 } from "../protocol.js";
 // Per-turn execution path (the single canonical runtime). The gateway no
@@ -89,7 +88,12 @@ import { runCronIsolatedAgentJob } from "../cron/isolated-agent/run.js";
 import { createCronServiceState } from "../cron/service/state.js";
 import { start as cronStart, stop as cronStop } from "../cron/service/ops.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
-import { DEFAULT_AGENT_ID, resolveAgentDir, resolveAgentWorkspaceDir } from "../config/paths.js";
+import {
+	DEFAULT_AGENT_ID,
+	resolveAgentDir,
+	resolveAgentWorkspaceDir,
+	resolveConfigPath,
+} from "../config/paths.js";
 import { resolveDefaultAgentId } from "../agents/agent-scope.js";
 import type { BrigadeConfig } from "../config/types.js";
 import {
@@ -122,13 +126,23 @@ import {
 	type CronHandlerContext,
 } from "./server-methods/cron.js";
 import { handleHealthMethod } from "./server-methods/health.js";
+import { buildSkillStatusReport } from "../agents/skills/status.js";
+import { installSkill } from "../agents/skills/install.js";
+import type { SkillInstallSpec } from "../agents/skills/install-spec.js";
+import { applySkillUpdate } from "../agents/skills/update-config.js";
 import {
 	handleSessionsHistory,
 	handleSessionsList,
 	handleSessionsPatch,
 	handleSessionsSend,
 	handleSessionsSpawn,
+	type SessionsHandlerAccessCheck,
 } from "./server-methods/sessions.js";
+import {
+	checkSessionToolAccess,
+	createAgentToAgentPolicy,
+	type SessionToolsVisibility,
+} from "../agents/tools/sessions/shared.js";
 import { wireAgentEventsBridge } from "../agents/agent-events.js";
 import { requestHeartbeatNow, setHeartbeatsEnabled } from "../agents/heartbeat-wake.js";
 import {
@@ -155,8 +169,9 @@ import {
 	getLaneQueueSize,
 	sessionLane,
 } from "../process/lanes.js";
-import { defaultSessionKey } from "../sessions/session-store.js";
+import { defaultSessionKey, readSessionStore } from "../sessions/session-store.js";
 import { parseAgentSessionKey } from "../sessions/session-key-utils.js";
+import { resolveSessionTranscriptPath } from "../config/paths.js";
 import { makeExtractionLlm, runExtractionSweep } from "../agents/memory/extract.js";
 import { runDecayGc } from "../agents/memory/decay.js";
 import {
@@ -167,6 +182,7 @@ import {
 } from "../agents/memory/consolidate.js";
 import { loadBrigadeAuthStorage } from "./auth-bridge.js";
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, loadConfig, saveConfig, type Config } from "./config.js";
+import { mutateConfigAtomic } from "../config/io.js";
 import { acquireGatewayLock, type GatewayLockHandle } from "./gateway-lock.js";
 import { clearPidFile, writePidFile } from "./gateway-probe.js";
 
@@ -197,11 +213,11 @@ function persistDefaultModel(cfg: Config, provider: string, modelId: string): Co
 }
 import { type ConsoleStream } from "./console-stream.js";
 import { attachEventLogger, getTodayLogPath } from "./event-logger.js";
-import { pickInitialThinkingLevel } from "./model-caps.js";
+import { pickInitialThinkingLevel, readPersistedThinkingLevel } from "./model-caps.js";
 import { getBuildInfo } from "../version.js";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import { extractIdentityName, isIdentityNameUnset } from "./system-prompt.js";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, watch as fsWatch } from "node:fs";
 import { join as joinPath } from "node:path";
 
 export interface ServerOptions {
@@ -231,6 +247,67 @@ const LOCALHOST_BINDS = new Set(["127.0.0.1", "::1", "localhost", "0.0.0.0/loopb
 
 function isLocalhostBind(host: string): boolean {
 	return LOCALHOST_BINDS.has(host) || host === "::ffff:127.0.0.1";
+}
+
+/**
+ * O0 H1 — sessions.history JSONL reader.
+ *
+ * Resolves the agent id from a canonical session key (`agent:<id>:<rest>`),
+ * looks up the persisted session id via the per-agent session-store, then
+ * reads the JSONL transcript line-by-line and projects `type:"message"`
+ * entries down to their inner `message` field. Last-N truncation honours
+ * the caller's `limit`. Defensive fallbacks on every error path so a
+ * corrupt or missing file never crashes the gateway.
+ */
+function readSessionTranscriptMessages(params: {
+	sessionKey: string;
+	limit?: number;
+}): ReadonlyArray<unknown> {
+	const sessionKey = (params.sessionKey ?? "").trim();
+	if (!sessionKey) return [];
+	const parsed = parseAgentSessionKey(sessionKey);
+	const agentId = parsed?.agentId ?? "main";
+	let entry: { sessionId?: string } | undefined;
+	try {
+		const store = readSessionStore(agentId);
+		entry = store.sessions?.[sessionKey];
+	} catch {
+		return [];
+	}
+	const sessionId = entry?.sessionId;
+	if (!sessionId) return [];
+	let transcriptPath: string;
+	try {
+		transcriptPath = resolveSessionTranscriptPath(agentId, sessionId);
+	} catch {
+		return [];
+	}
+	if (!existsSync(transcriptPath)) return [];
+	let raw: string;
+	try {
+		raw = readFileSync(transcriptPath, "utf8");
+	} catch {
+		return [];
+	}
+	const messages: unknown[] = [];
+	const lines = raw.split(/\r?\n/);
+	for (const line of lines) {
+		const text = line.trim();
+		if (!text) continue;
+		try {
+			const parsedLine = JSON.parse(text) as { type?: string; message?: unknown };
+			if (parsedLine?.type === "message" && parsedLine.message !== undefined) {
+				messages.push(parsedLine.message);
+			}
+		} catch {
+			// Corrupt line — drop and continue.
+		}
+	}
+	const limit = typeof params.limit === "number" && params.limit > 0 ? params.limit : undefined;
+	if (limit !== undefined && messages.length > limit) {
+		return messages.slice(messages.length - limit);
+	}
+	return messages;
 }
 
 export async function startServer(opts: ServerOptions = {}): Promise<ServerHandle> {
@@ -440,6 +517,14 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	};
 	const perAgentRuntime = new Map<string, AgentRuntime>();
 
+	// H4: narrow a persisted `cfg.agents.<id>.thinking` string back to a
+	// ThinkingLevel. set-thinking writes the operator's selection to
+	// brigade.json, but the boot + seed paths previously always derived the
+	// level from the model — silently resetting the choice on every daemon
+	// restart. The validator lives in model-caps.js so unit tests can exercise
+	// it directly.
+	const readPersistedThinking = readPersistedThinkingLevel;
+
 	// The agent identity + session key the gateway drives. A single
 	// long-lived sessionKey gives conversation continuity across turns:
 	// every turn resumes the same JSONL transcript (the per-turn mirror —
@@ -470,17 +555,34 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// Seed perAgentRuntime: defaults entry under the boot agent id, then every
 	// per-agent override (resolving overrides through the registry). Failures
 	// fall back to the boot defaults — a misconfigured agent doesn't kill boot.
+	// H4: honour the persisted `cfg.agents.<bootAgent>.thinking` (set via the
+	// set-thinking RPC) before falling back to the model-derived initial level.
+	// Without this lookup the operator's selection silently resets on every
+	// daemon restart.
+	const bootPersistedThinking = readPersistedThinking(
+		(args.bootConfig.agents as Record<string, unknown> | undefined)?.[agentId],
+	);
 	perAgentRuntime.set(agentId, {
 		provider: args.provider,
 		modelId: args.modelId,
 		model: args.model,
-		thinkingLevel: pickInitialThinkingLevel(args.model),
+		thinkingLevel: bootPersistedThinking ?? pickInitialThinkingLevel(args.model),
 	});
-	{
-		const bootAgentsMap = (args.bootConfig.agents as
-			| { [id: string]: { provider?: string; model?: { primary?: string } } | undefined }
-			| undefined) ?? {};
-		const defaultsEntry = bootAgentsMap.defaults;
+
+	// Reusable per-agent seed pass. Boot calls it with the bootConfig; the
+	// brigade.json watcher (H1) calls it again when the file changes so newly
+	// added agents are usable without restarting the gateway.
+	async function seedAgentsFromConfig(
+		cfgAgents:
+			| {
+					[id: string]:
+						| { provider?: string; model?: { primary?: string }; thinking?: string }
+						| undefined;
+			  }
+			| undefined,
+	): Promise<{ added: string[]; removed: string[] }> {
+		const map = cfgAgents ?? {};
+		const defaultsEntry = map.defaults;
 		const defaultsProvider =
 			defaultsEntry && typeof defaultsEntry.provider === "string" ? defaultsEntry.provider : undefined;
 		const defaultsModelId =
@@ -488,8 +590,21 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			typeof defaultsEntry.model.primary === "string"
 				? defaultsEntry.model.primary
 				: undefined;
-		for (const [id, entry] of Object.entries(bootAgentsMap)) {
+		const seenIds = new Set<string>([agentId]);
+		const added: string[] = [];
+		// H4: honour a persisted `thinking` on the boot agent entry even when
+		// re-seeding (config hot-reload edits the level for the boot agent).
+		const bootPersisted = readPersistedThinking(map[agentId]);
+		if (bootPersisted !== undefined) {
+			const bootCur = perAgentRuntime.get(agentId);
+			if (bootCur && bootCur.thinkingLevel !== bootPersisted) {
+				perAgentRuntime.set(agentId, { ...bootCur, thinkingLevel: bootPersisted });
+			}
+		}
+		for (const [id, entry] of Object.entries(map)) {
 			if (id === "defaults" || !entry || typeof entry !== "object") continue;
+			seenIds.add(id);
+			if (perAgentRuntime.has(id)) continue; // already seeded
 			const aProvider =
 				(typeof entry.provider === "string" ? entry.provider : undefined) ?? defaultsProvider;
 			const aModelId =
@@ -497,16 +612,11 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					? entry.model.primary
 					: undefined) ?? defaultsModelId;
 			if (!aProvider || !aModelId) {
-				// Observability: surface the misconfigured agent so the operator
-				// can find out why `/agent <id>` won't see it. Silent-skip is the
-				// quiet bug that ate the user's `support` agent at boot.
 				bootLog(
 					`skipping agent "${id}" — no provider/model resolved (per-agent entry has none and cfg.agents.defaults is incomplete)`,
 				);
 				continue;
 			}
-			// Validate against the per-agent auth — never use the boot agent's
-			// keys to vouch for another agent's model selection.
 			const aModel =
 				modelRegistry.find(aProvider, aModelId) ??
 				((await resolveModelNeverMiss({
@@ -522,14 +632,38 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				);
 				continue;
 			}
+			// H4: prefer the operator-persisted thinking level over the
+			// model-derived default so a daemon restart honours the choice.
+			const persistedThinking = readPersistedThinking(entry);
 			perAgentRuntime.set(id, {
 				provider: aProvider,
 				modelId: aModelId,
 				model: aModel,
-				thinkingLevel: pickInitialThinkingLevel(aModel),
+				thinkingLevel: persistedThinking ?? pickInitialThinkingLevel(aModel),
 			});
+			added.push(id);
 		}
+		// Evict runtimes for agents that no longer appear in cfg. The boot
+		// agent is always preserved so the snapshot's default never disappears.
+		const removed: string[] = [];
+		for (const existingId of [...perAgentRuntime.keys()]) {
+			if (existingId === agentId) continue;
+			if (seenIds.has(existingId)) continue;
+			perAgentRuntime.delete(existingId);
+			removed.push(existingId);
+		}
+		return { added, removed };
 	}
+
+	await seedAgentsFromConfig(
+		args.bootConfig.agents as
+			| {
+					[id: string]:
+						| { provider?: string; model?: { primary?: string }; thinking?: string }
+						| undefined;
+			  }
+			| undefined,
+	);
 
 	/** Look up runtime entry for an agent id, falling back to the boot default. */
 	const getAgentRuntime = (id: string | undefined): AgentRuntime => {
@@ -547,6 +681,53 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		perAgentRuntime.set(agentId, fab);
 		return fab;
 	};
+
+	// H1: hot-reload watcher. fs.watch on brigade.json + a 500ms debounce
+	// so we coalesce the editor's atomic-write burst (rename + write + close)
+	// into a single re-seed. Newly added agents become usable without
+	// restarting the gateway; removed agents are evicted from perAgentRuntime.
+	let configWatcher: ReturnType<typeof fsWatch> | undefined;
+	let configReloadTimer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const configPath = resolveConfigPath();
+		configWatcher = fsWatch(configPath, { persistent: false }, () => {
+			if (configReloadTimer) clearTimeout(configReloadTimer);
+			configReloadTimer = setTimeout(() => {
+				configReloadTimer = undefined;
+				void (async () => {
+					try {
+						const fresh = await loadConfig();
+						const result = await seedAgentsFromConfig(
+							(fresh as { agents?: Record<string, unknown> }).agents as
+								| {
+										[id: string]:
+											| {
+													provider?: string;
+													model?: { primary?: string };
+													thinking?: string;
+											  }
+											| undefined;
+								  }
+								| undefined,
+						);
+						for (const id of result.added) bootLog(`hot-reload: seeded agent "${id}"`);
+						for (const id of result.removed) bootLog(`hot-reload: evicted agent "${id}"`);
+					} catch (err) {
+						bootLog(
+							`hot-reload failed: ${err instanceof Error ? err.message : String(err)}`,
+						);
+					}
+				})();
+			}, 500);
+		});
+		configWatcher.on("error", (err: Error) => {
+			bootLog(`config watcher error: ${err.message}`);
+		});
+	} catch (err) {
+		bootLog(
+			`config watcher failed to start: ${err instanceof Error ? err.message : String(err)} (hot-reload disabled)`,
+		);
+	}
 
 	// Channel manager (WhatsApp/Slack/…): started after the WS listener is up
 	// (see below), torn down in handle.stop(). Null when no channel is configured.
@@ -1650,6 +1831,19 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const turnModelId = turnRuntime.modelId;
 				const turnThinkingLevel = turnRuntime.thinkingLevel;
 
+				// C2: forward the per-agent `workspace` override from cfg so the
+				// agent-loop's resolveAgentWorkspaceDir() honours it. Without this,
+				// the boot loop seeded perAgentRuntime but the per-turn path always
+				// fell back to the default <state>/agents/<id>/workspace path.
+				const agentsMapNow = (cfgNow.agents as
+					| { [id: string]: { workspace?: unknown } | undefined }
+					| undefined) ?? {};
+				const perAgentEntryNow = agentsMapNow[targetAgentId];
+				const perAgentWorkspace =
+					perAgentEntryNow && typeof perAgentEntryNow.workspace === "string"
+						? perAgentEntryNow.workspace.trim()
+						: "";
+
 				// If a channel inbound passed an AbortSignal, abort the in-flight Pi
 				// session when it fires (so `/stop` from the chat actually cancels).
 				turn.signal?.addEventListener("abort", onAbort, { once: true });
@@ -1662,6 +1856,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					thinkingLevel: turnThinkingLevel as "off" | "low" | "medium" | "high",
 					fallbacks,
 					signal: turn.signal,
+					...(perAgentWorkspace ? { workspaceDir: perAgentWorkspace } : {}),
 					// Forward the channel's senderIsOwner verdict (defaults to true
 					// when undefined — TUI / direct RPC calls are always operator).
 					senderIsOwner: turn.senderIsOwner,
@@ -1742,6 +1937,21 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const targetSessionKey =
 					p.sessionKey?.trim() ||
 					(targetAgentId === agentId ? sessionKey : defaultSessionKey(targetAgentId));
+				// Wave O0.6 — access guard. Injecting a turn into another
+				// agent's session is equivalent to `sessions.send` from the
+				// boot operator's lens: refuse cross-agent prompt RPCs
+				// unless the active visibility + A2A policy permits it.
+				// Same-key fast-path keeps single-agent / TUI callers
+				// flowing through unchanged.
+				const promptVerdict = sessionsAccessCheck({
+					action: "send",
+					targetSessionKey,
+				});
+				if (!promptVerdict.allowed) {
+					const err = new Error(promptVerdict.reason ?? "prompt forbidden");
+					(err as Error & { code?: string }).code = "forbidden";
+					throw err;
+				}
 				// Wave N4 — no hasLiveSession pre-flight. The session-lane FIFO
 				// inside `runGatewayTurn` (sessionLane(turn.sessionKey)) already
 				// serialises every prompt on the same session: a second client's
@@ -1767,6 +1977,18 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const targetKey =
 					p?.sessionKey?.trim() ||
 					(p?.agentId ? defaultSessionKey(p.agentId.trim()) : sessionKey);
+				// Wave O0.5 — access guard. The local-operator WS connection
+				// gets a same-key fast-pass for the boot session; cross-agent
+				// aborts require visibility="all" + A2A allow.
+				const abortVerdict = sessionsAccessCheck({
+					action: "abort",
+					targetSessionKey: targetKey,
+				});
+				if (!abortVerdict.allowed) {
+					const err = new Error(abortVerdict.reason ?? "abort forbidden");
+					(err as Error & { code?: string }).code = "forbidden";
+					throw err;
+				}
 				const liveSession = liveSessionsByKey.get(targetKey);
 				if (liveSession) await liveSession.abort().catch(() => {});
 				broadcastStateAllBindings();
@@ -1777,6 +1999,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const targetKey =
 					p.sessionKey?.trim() ||
 					(p.agentId ? defaultSessionKey(p.agentId.trim()) : sessionKey);
+				// Wave O0.5 — access guard before mutating an in-flight session.
+				const steerVerdict = sessionsAccessCheck({
+					action: "steer",
+					targetSessionKey: targetKey,
+				});
+				if (!steerVerdict.allowed) {
+					const err = new Error(steerVerdict.reason ?? "steer forbidden");
+					(err as Error & { code?: string }).code = "forbidden";
+					throw err;
+				}
 				const liveSession = liveSessionsByKey.get(targetKey);
 				if (!liveSession) throw new Error("nothing to steer — no turn in progress");
 				await liveSession.steer(p.text);
@@ -1791,6 +2023,19 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				// closure-captured `authStorage` would silently use main's creds
 				// for an ops set-model and reject a valid ops key — see Wave B P0#5.
 				const targetAgentId = p.agentId?.trim() || agentId;
+				// Wave O0.6 — access guard. Mutating another agent's runtime
+				// (and persisting that mutation into `cfg.agents.<id>`) is a
+				// cross-agent control operation; refuse callers that cannot
+				// reach the target's session.
+				const setModelVerdict = sessionsAccessCheck({
+					action: "send",
+					targetSessionKey: defaultSessionKey(targetAgentId),
+				});
+				if (!setModelVerdict.allowed) {
+					const err = new Error(setModelVerdict.reason ?? "set-model forbidden");
+					(err as Error & { code?: string }).code = "forbidden";
+					throw err;
+				}
 				const targetAuth = getAuthStorageForAgent(targetAgentId);
 				const target =
 					modelRegistry.find(p.provider, p.modelId) ??
@@ -1820,27 +2065,55 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				// through the existing wizard-shape (`agents.defaults`) so the
 				// onboard wizard + set-model stay coherent; per-agent overrides
 				// land under `agents.<id>` so they don't bleed into defaults.
+				//
+				// H8: route through mutateConfigAtomic so a concurrent TUI
+				// /model + channel inbound + CLI agent add cannot read the
+				// same baseline and stomp each other's diffs.
 				if (targetAgentId === agentId) {
-					await saveConfig(persistDefaultModel(await loadConfig(), p.provider, p.modelId));
+					await mutateConfigAtomic((cur) =>
+						persistDefaultModel(cur as Config, p.provider, p.modelId) as unknown as typeof cur,
+					);
 				} else {
-					const cur = await loadConfig();
-					const next: Config = { ...cur };
-					const agentsMap = {
-						...((next.agents as Record<string, unknown> | undefined) ?? {}),
-					} as Record<string, unknown>;
-					const prevEntry =
-						(agentsMap[targetAgentId] as { model?: { fallbacks?: string[] } } | undefined) ??
-						{};
-					const prevModel = prevEntry.model ?? {};
-					agentsMap[targetAgentId] = {
-						...(typeof agentsMap[targetAgentId] === "object" && agentsMap[targetAgentId]
-							? (agentsMap[targetAgentId] as Record<string, unknown>)
-							: {}),
-						provider: p.provider,
-						model: { ...prevModel, primary: p.modelId },
-					};
-					(next as Record<string, unknown>).agents = agentsMap;
-					await saveConfig(next);
+					await mutateConfigAtomic((cur) => {
+						const next: Config = { ...(cur as Config) };
+						const agentsMap = {
+							...((next.agents as Record<string, unknown> | undefined) ?? {}),
+						} as Record<string, unknown>;
+						const prevEntry =
+							(agentsMap[targetAgentId] as { model?: { fallbacks?: string[] } } | undefined) ??
+							{};
+						const prevModel = prevEntry.model ?? {};
+						// H5: if the per-agent entry has no fallbacks of its own, inherit
+						// from cfg.agents.defaults so set-model doesn't silently drop the
+						// resilient-turn fallback chain configured at onboarding time.
+						let inheritedFallbacks: string[] | undefined;
+						if (!Array.isArray(prevModel.fallbacks) || prevModel.fallbacks.length === 0) {
+							const defaults = agentsMap.defaults as
+								| { model?: { fallbacks?: unknown } }
+								| undefined;
+							if (Array.isArray(defaults?.model?.fallbacks)) {
+								inheritedFallbacks = (defaults?.model?.fallbacks as unknown[]).filter(
+									(f): f is string => typeof f === "string" && f.length > 0,
+								);
+							}
+						}
+						const nextModel: { primary: string; fallbacks?: string[] } = {
+							...prevModel,
+							primary: p.modelId,
+						};
+						if (inheritedFallbacks && inheritedFallbacks.length > 0) {
+							nextModel.fallbacks = inheritedFallbacks;
+						}
+						agentsMap[targetAgentId] = {
+							...(typeof agentsMap[targetAgentId] === "object" && agentsMap[targetAgentId]
+								? (agentsMap[targetAgentId] as Record<string, unknown>)
+								: {}),
+							provider: p.provider,
+							model: nextModel,
+						};
+						(next as Record<string, unknown>).agents = agentsMap;
+						return next as unknown as typeof cur;
+					});
 				}
 				broadcastStateAllBindings();
 				return undefined as ResponseFor[M];
@@ -1850,6 +2123,22 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				// Same per-agent auth resolution as set-model above — never validate
 				// agent:ops's new model against agent:main's keys.
 				const targetAgentId = p.agentId?.trim() || agentId;
+				// Wave O0.6 — access guard. Abort+swap+replay on another
+				// agent's live session is identical in blast radius to a
+				// cross-agent send; reject when policy disallows.
+				const switchVerdict = sessionsAccessCheck({
+					action: "send",
+					targetSessionKey:
+						p.sessionKey?.trim() ||
+						(targetAgentId === agentId ? sessionKey : defaultSessionKey(targetAgentId)),
+				});
+				if (!switchVerdict.allowed) {
+					const err = new Error(
+						switchVerdict.reason ?? "switch-model-mid-turn forbidden",
+					);
+					(err as Error & { code?: string }).code = "forbidden";
+					throw err;
+				}
 				const targetAuth = getAuthStorageForAgent(targetAgentId);
 				const target =
 					modelRegistry.find(p.provider, p.modelId) ??
@@ -1908,6 +2197,23 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			case "set-thinking": {
 				const p = params as RequestParams["set-thinking"];
 				const targetAgentId = p.agentId?.trim() || agentId;
+				// Wave O0.6 — access guard. Toggling another agent's
+				// reasoning level mutates its in-flight session AND
+				// persists into `cfg.agents.<id>.thinking`; treat as a
+				// cross-agent send.
+				const thinkingVerdict = sessionsAccessCheck({
+					action: "send",
+					targetSessionKey:
+						p.sessionKey?.trim() ||
+						(targetAgentId === agentId ? sessionKey : defaultSessionKey(targetAgentId)),
+				});
+				if (!thinkingVerdict.allowed) {
+					const err = new Error(
+						thinkingVerdict.reason ?? "set-thinking forbidden",
+					);
+					(err as Error & { code?: string }).code = "forbidden";
+					throw err;
+				}
 				const cur = getAgentRuntime(targetAgentId);
 				// Mutate only the target agent's thinking level. The next turn
 				// for that agent reads it back; other agents' turns are unaffected.
@@ -1928,6 +2234,31 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						/* clamp / unsupported — snapshot still reflects intent */
 					}
 				}
+				// H4: persist the new thinking level so a daemon restart picks up
+				// the operator's selection instead of resetting to the model's
+				// initial default.
+				//
+				// H8: read+mutate+write under the in-process mutex so a
+				// concurrent set-model / agents-add can't stomp this update.
+				try {
+					await mutateConfigAtomic((cur2) => {
+						const next: Config = { ...(cur2 as Config) };
+						const agentsMap = {
+							...((next.agents as Record<string, unknown> | undefined) ?? {}),
+						} as Record<string, unknown>;
+						const prevEntry =
+							agentsMap[targetAgentId] && typeof agentsMap[targetAgentId] === "object"
+								? (agentsMap[targetAgentId] as Record<string, unknown>)
+								: {};
+						agentsMap[targetAgentId] = { ...prevEntry, thinking: p.level };
+						(next as Record<string, unknown>).agents = agentsMap;
+						return next as unknown as typeof cur2;
+					});
+				} catch (err) {
+					bootLog(
+						`set-thinking: persistence failed for ${targetAgentId}: ${err instanceof Error ? err.message : String(err)}`,
+					);
+				}
 				broadcastStateAllBindings();
 				return undefined as ResponseFor[M];
 			}
@@ -1941,6 +2272,19 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const targetKey =
 					p?.sessionKey?.trim() ||
 					(p?.agentId ? defaultSessionKey(p.agentId.trim()) : sessionKey);
+				// Wave O0.6 — access guard. Forcing compaction on another
+				// agent's live session rewrites its context and is a
+				// destructive cross-agent operation; refuse when policy
+				// disallows.
+				const compactVerdict = sessionsAccessCheck({
+					action: "send",
+					targetSessionKey: targetKey,
+				});
+				if (!compactVerdict.allowed) {
+					const err = new Error(compactVerdict.reason ?? "compact forbidden");
+					(err as Error & { code?: string }).code = "forbidden";
+					throw err;
+				}
 				const liveSession = liveSessionsByKey.get(targetKey);
 				if (!liveSession) {
 					throw new Error(
@@ -2005,27 +2349,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				});
 				return entries as ResponseFor[M];
 			}
-			case "sessions.list": {
-				// Wave N5 (bug #9) — surface live sessions (one per in-flight
-				// Pi session keyed by sessionKey). When `all` is true, return
-				// every agent's sessions; otherwise filter to the supplied
-				// agentId (or fall through to the boot agent for legacy
-				// single-agent callers).
-				const p = (params ?? {}) as RequestParams["sessions.list"];
-				const wantsAll = p && typeof p === "object" && p.all === true;
-				const filterAgentId = (p && typeof p === "object" && typeof p.agentId === "string"
-					? p.agentId.trim()
-					: agentId) || agentId;
-				const entries: SessionSummary[] = [];
-				for (const liveKey of liveSessionsByKey.keys()) {
-					const parsed = parseAgentSessionKey(liveKey);
-					const ownerAgentId = parsed?.agentId ?? agentId;
-					if (!wantsAll && ownerAgentId !== filterAgentId) continue;
-					entries.push({ sessionKey: liveKey, agentId: ownerAgentId });
-				}
-				entries.sort((a, b) => a.sessionKey.localeCompare(b.sessionKey));
-				return entries as ResponseFor[M];
-			}
+			// Wave O0.6 — the stale `sessions.list` switch case was removed.
+			// All `sessions.list` traffic now flows through the registered
+			// handler (`registerGatewayHandler("sessions.list", ...)` below),
+			// which is fully guarded by `sessionsAccessCheck`. The switch
+			// case here previously duplicated the logic and could be
+			// reached if the registered handler dispatched fall-through —
+			// but the `default:` branch of this switch checks
+			// `customMethods.get(method)` first, so a registered handler
+			// always wins. The case was dead code maintenance-wise AND a
+			// foot-gun if someone unregistered the handler.
 			/* ─── Cron methods (Wave N6) ─────────────────────── */
 			case "cron.status": {
 				const ctx: CronHandlerContext = { state: getActiveCronService() };
@@ -2326,6 +2659,117 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// already-defined `runGatewayTurn` so each method dispatches through the
 	// existing serialized turn queue.
 	const disposeHandlers: Array<() => void> = [];
+
+	// Wave O0.5/O0.6 — server-side access guard. The closure resolves
+	// the caller's visibility + A2A policy from the *current* live
+	// config (read fresh on every call so a `system.reload` that
+	// tightens visibility takes effect without daemon restart) and
+	// delegates to `checkSessionToolAccess` — the same helper the tool
+	// surface uses. Today the gateway is localhost-only and the only
+	// requester identity we trust is the boot agent's session
+	// (`sessionKey`).
+	//
+	// TODO(phase-2-multi-user): the requester identity is hard-pinned to
+	// the boot sessionKey here. Phase 2 must thread the actual calling
+	// agentId/sessionKey through `callerContext` on each RPC dispatch so
+	// per-connection auth (HTTP-session) drives the check instead of the
+	// process-wide boot binding. The hard-pin is acceptable for the
+	// single-user gateway because every WS client is localhost + admin
+	// scope, but it silently grants admin reach to anything that opens a
+	// WS connection — must be replaced before multi-user lands.
+	let configReadWarningSurfaced = false;
+	const buildSessionsAccessCheck = (): SessionsHandlerAccessCheck => {
+		return ({ action, targetSessionKey }) => {
+			// Read the live config snapshot so `system.reload` that
+			// tightens visibility/A2A takes effect on the very next RPC.
+			// Sync `loadConfig()` would be ideal but the project's
+			// loadConfig is async; fall back to the cached boot snapshot
+			// when the sync read isn't available. The async refresher
+			// below repopulates a live cache on a best-effort cadence so
+			// the next call sees the new policy.
+			const cfgNow = (liveConfigSnapshot ?? (args.bootConfig as unknown)) as {
+				session?: {
+					sessionTools?: { visibility?: SessionToolsVisibility };
+					agentToAgent?: {
+						enabled?: boolean;
+						allow?: Array<{ from?: unknown; to?: unknown }>;
+					};
+				};
+			};
+			void scheduleLiveConfigRefresh();
+			const visibility: SessionToolsVisibility =
+				cfgNow.session?.sessionTools?.visibility ?? "self";
+			const allowRaw = cfgNow.session?.agentToAgent?.allow;
+			const allow: string[] = [];
+			if (Array.isArray(allowRaw)) {
+				for (const pair of allowRaw) {
+					const from = typeof pair?.from === "string" ? pair.from.trim() : "";
+					const to = typeof pair?.to === "string" ? pair.to.trim() : "";
+					if (from) allow.push(from);
+					if (to) allow.push(to);
+				}
+			}
+			const policy = createAgentToAgentPolicy({
+				enabled: !!cfgNow.session?.agentToAgent?.enabled,
+				allow,
+			});
+			// Requester identity: the boot session key. WS clients today
+			// are the local operator (localhost-bind + admin scope) so the
+			// operator's session anchors the check; Phase 2 will thread a
+			// per-connection key here. Actions that are not list/history/send
+			// are mapped to "send" for the shared helper (which only
+			// distinguishes those three at the error-message level).
+			if (!configReadWarningSurfaced && !liveConfigSnapshot) {
+				configReadWarningSurfaced = true;
+				bootLog(
+					"sessions access guard: using boot-config snapshot until first live reload (TODO phase-2 multi-user)",
+				);
+			}
+			const mapped: "list" | "history" | "send" =
+				action === "list" || action === "history" ? action : "send";
+			const verdict = checkSessionToolAccess({
+				action: mapped,
+				requesterSessionKey: sessionKey,
+				targetSessionKey,
+				visibility,
+				a2aPolicy: policy,
+			});
+			if (verdict.allowed) return { allowed: true };
+			return { allowed: false, reason: verdict.error };
+		};
+	};
+	// Live config cache for the access guard. `system.reload` and the
+	// per-call best-effort refresher keep this fresh so operator-driven
+	// visibility tightening takes effect without a daemon restart.
+	let liveConfigSnapshot: Config | undefined;
+	let liveConfigRefreshInflight: Promise<void> | undefined;
+	let liveConfigLastRefreshMs = 0;
+	const LIVE_CONFIG_REFRESH_MIN_MS = 250;
+	const scheduleLiveConfigRefresh = (): Promise<void> => {
+		if (liveConfigRefreshInflight) return liveConfigRefreshInflight;
+		const now = Date.now();
+		if (liveConfigSnapshot && now - liveConfigLastRefreshMs < LIVE_CONFIG_REFRESH_MIN_MS) {
+			return Promise.resolve();
+		}
+		liveConfigRefreshInflight = (async () => {
+			try {
+				const fresh = await loadConfig();
+				liveConfigSnapshot = fresh;
+				liveConfigLastRefreshMs = Date.now();
+			} catch {
+				// Best-effort — keep the previous snapshot on read failure.
+			} finally {
+				liveConfigRefreshInflight = undefined;
+			}
+		})();
+		return liveConfigRefreshInflight;
+	};
+	// Prime the cache so the very first access check uses the disk state
+	// instead of the boot snapshot when the daemon has been running for a
+	// while before the first cross-agent op.
+	void scheduleLiveConfigRefresh();
+	const sessionsAccessCheck = buildSessionsAccessCheck();
+
 	disposeHandlers.push(
 		registerGatewayHandler("health", (params: unknown) =>
 			handleHealthMethod(params as { probe?: boolean } | undefined, {
@@ -2337,7 +2781,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		registerGatewayHandler("sessions.list", (params: unknown) =>
 			handleSessionsList(
 				params as Parameters<typeof handleSessionsList>[0],
-				{},
+				{ accessCheck: sessionsAccessCheck },
 			),
 		),
 	);
@@ -2345,12 +2789,18 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		registerGatewayHandler("sessions.history", (params: unknown) =>
 			handleSessionsHistory(
 				params as Parameters<typeof handleSessionsHistory>[0],
-				// `readMessages` reads from Pi's transcript JSONL. Brigade's
-				// existing transcript reader is exposed via Pi's SessionManager
-				// in the agent-loop layer — for this milestone we return an
-				// empty array so the tool resolves without throwing. Step 27+
-				// will wire the actual JSONL reader.
-				{ readMessages: async () => [] },
+				// O0 H1 — real JSONL reader. Resolves the agent id + session id
+				// from the canonical `agent:<id>:<rest>` session key via the
+				// session-store index, then reads the matching transcript
+				// JSONL line-by-line. Each line is one SessionEntry; we filter
+				// to `type:"message"` entries and project to `entry.message`
+				// for the wire shape callers expect. Last-N truncation honours
+				// the caller's `limit`. Errors fall back to an empty array so
+				// a corrupt transcript file never crashes the gateway.
+				{
+					readMessages: async (p) => readSessionTranscriptMessages(p),
+					accessCheck: sessionsAccessCheck,
+				},
 			),
 		),
 	);
@@ -2365,11 +2815,18 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					// inbound would.
 					runAgentTurn: async (turn) => {
 						try {
-							await runGatewayTurn({
+							// Wave O0.7 - capture the per-turn reply so the
+							// dispatcher's lifecycle "end" event carries the
+							// child's text. Bridges to subagent-announce-
+							// delivery for the parent's inbox.
+							const result = await runGatewayTurn({
 								text: turn.message,
 								sessionKey: turn.sessionKey,
 							});
-							return { ok: true };
+							return {
+								ok: true,
+								...(typeof result?.reply === "string" ? { reply: result.reply } : {}),
+							};
 						} catch (err) {
 							return {
 								ok: false,
@@ -2377,18 +2834,23 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 							};
 						}
 					},
+					accessCheck: sessionsAccessCheck,
 				},
 			),
 		),
 	);
 	disposeHandlers.push(
 		registerGatewayHandler("sessions.spawn", (params: unknown) =>
-			handleSessionsSpawn(params as Parameters<typeof handleSessionsSpawn>[0], {}),
+			handleSessionsSpawn(params as Parameters<typeof handleSessionsSpawn>[0], {
+				accessCheck: sessionsAccessCheck,
+			}),
 		),
 	);
 	disposeHandlers.push(
 		registerGatewayHandler("sessions.patch", (params: unknown) =>
-			handleSessionsPatch(params as Parameters<typeof handleSessionsPatch>[0]),
+			handleSessionsPatch(params as Parameters<typeof handleSessionsPatch>[0], {
+				accessCheck: sessionsAccessCheck,
+			}),
 		),
 	);
 	// `agent` method: legacy sub-agent fan-out path the spawn engine uses to
@@ -2424,6 +2886,20 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			if (!text || !sessionKey) {
 				return { ok: false, error: "agent: message + sessionKey required" };
 			}
+			// Wave O0.5 — access guard before fan-out dispatch. Refused
+			// calls return an error envelope (legacy fire-and-forget shape)
+			// instead of letting the runner enqueue a turn against a session
+			// the caller is not allowed to reach.
+			const accessVerdict = sessionsAccessCheck({
+				action: "agent",
+				targetSessionKey: sessionKey,
+			});
+			if (!accessVerdict.allowed) {
+				return {
+					ok: false,
+					error: accessVerdict.reason ?? "agent forbidden",
+				};
+			}
 			const run = dispatchAgentRun(
 				{
 					sessionKey,
@@ -2446,12 +2922,19 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				{
 					runAgentTurn: async (turn) => {
 						try {
-							await runGatewayTurn({
+							// Wave O0.7 - thread the child's reply text on the
+							// adapter return so the dispatcher's lifecycle
+							// "end" event carries it to the parent's inbox via
+							// subagent-announce-delivery.
+							const result = await runGatewayTurn({
 								text: turn.message,
 								sessionKey: turn.sessionKey,
 								...(turn.agentId ? { agentId: turn.agentId } : {}),
 							});
-							return { ok: true };
+							return {
+								ok: true,
+								...(typeof result?.reply === "string" ? { reply: result.reply } : {}),
+							};
 						} catch (err) {
 							return {
 								ok: false,
@@ -2461,7 +2944,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					},
 				},
 			);
-			// Same fire-and-forget pattern as sessions.send — return runId now,
+			// Same fire-and-forget pattern as sessions.send - return runId now,
 			// let the lifecycle stream surface the settled outcome.
 			void run.settled.catch(() => undefined);
 			return { ok: true, runId: run.runId };
@@ -2490,21 +2973,106 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			),
 		),
 	);
+	// Wave O0.6 — cron access guard. A cron job's agentId + sessionTarget
+	// determines which agent's session the fire-time turn lands on. Refuse
+	// add/update/run when the caller cannot reach that target. The check
+	// is best-effort for malformed shapes: if the target cannot be
+	// resolved we fall back to the boot agent's session, which is the
+	// safest default for a single-user gateway.
+	const resolveCronTargetSessionKey = (input: {
+		agentId?: unknown;
+		sessionTarget?: unknown;
+		sessionKey?: unknown;
+	}): string => {
+		const rawAgentId =
+			typeof input.agentId === "string" ? input.agentId.trim() : "";
+		const effectiveAgentId = rawAgentId.length > 0 ? rawAgentId : agentId;
+		const rawSessionKey =
+			typeof input.sessionKey === "string" ? input.sessionKey.trim() : "";
+		if (rawSessionKey.length > 0) return rawSessionKey;
+		const target =
+			typeof input.sessionTarget === "string" ? input.sessionTarget.trim() : "";
+		if (target.startsWith("session:")) {
+			const id = target.slice("session:".length).trim();
+			if (id.length > 0) return id;
+		}
+		return defaultSessionKey(effectiveAgentId);
+	};
 	disposeHandlers.push(
-		registerGatewayHandler("cron.add", async (params: unknown) =>
-			handleCronAdd(
+		registerGatewayHandler("cron.add", async (params: unknown) => {
+			const p = (params ?? {}) as Record<string, unknown>;
+			const cronAddVerdict = sessionsAccessCheck({
+				action: "send",
+				targetSessionKey: resolveCronTargetSessionKey(p),
+			});
+			if (!cronAddVerdict.allowed) {
+				const err = new Error(cronAddVerdict.reason ?? "cron.add forbidden");
+				(err as Error & { code?: string }).code = "forbidden";
+				throw err;
+			}
+			return handleCronAdd(
 				params as Parameters<typeof handleCronAdd>[0],
 				cronCtx(),
-			),
-		),
+			);
+		}),
 	);
 	disposeHandlers.push(
-		registerGatewayHandler("cron.update", async (params: unknown) =>
-			handleCronUpdate(
+		registerGatewayHandler("cron.update", async (params: unknown) => {
+			const p = (params ?? {}) as Record<string, unknown>;
+			// Resolve the target against the patch (if it tries to retarget
+			// the job) AND fall back to the persisted job's identity when
+			// the patch leaves agentId unset. Without the existing-job
+			// fallback a caller could blind-mutate someone else's job by
+			// omitting agentId from the patch.
+			const patch = (p.patch ?? {}) as Record<string, unknown>;
+			let existingAgentId: string | undefined;
+			let existingSessionTarget: string | undefined;
+			let existingSessionKey: string | undefined;
+			try {
+				const idRaw =
+					typeof p.id === "string"
+						? p.id
+						: typeof p.jobId === "string"
+							? p.jobId
+							: undefined;
+				const state = cronCtx().state;
+				if (state && idRaw && typeof idRaw === "string" && idRaw.trim().length > 0) {
+					const { getJob } = await import("../cron/service/ops.js");
+					try {
+						const existing = await getJob(state, idRaw.trim());
+						if (typeof existing.agentId === "string") existingAgentId = existing.agentId;
+						if (typeof existing.sessionTarget === "string")
+							existingSessionTarget = existing.sessionTarget;
+						if (typeof existing.sessionKey === "string")
+							existingSessionKey = existing.sessionKey;
+					} catch {
+						// Job lookup failed (not found / corrupt) — fall through
+						// to the patch-only resolution below.
+					}
+				}
+			} catch {
+				// Dynamic import / state lookup failed — patch-only resolution.
+			}
+			const cronUpdateVerdict = sessionsAccessCheck({
+				action: "send",
+				targetSessionKey: resolveCronTargetSessionKey({
+					agentId: patch.agentId ?? existingAgentId,
+					sessionTarget: patch.sessionTarget ?? existingSessionTarget,
+					sessionKey: patch.sessionKey ?? existingSessionKey,
+				}),
+			});
+			if (!cronUpdateVerdict.allowed) {
+				const err = new Error(
+					cronUpdateVerdict.reason ?? "cron.update forbidden",
+				);
+				(err as Error & { code?: string }).code = "forbidden";
+				throw err;
+			}
+			return handleCronUpdate(
 				params as Parameters<typeof handleCronUpdate>[0],
 				cronCtx(),
-			),
-		),
+			);
+		}),
 	);
 	disposeHandlers.push(
 		registerGatewayHandler("cron.remove", async (params: unknown) =>
@@ -2515,12 +3083,56 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		),
 	);
 	disposeHandlers.push(
-		registerGatewayHandler("cron.run", async (params: unknown) =>
-			handleCronRun(
+		registerGatewayHandler("cron.run", async (params: unknown) => {
+			const p = (params ?? {}) as Record<string, unknown>;
+			// Look up the persisted job so we evaluate the access check
+			// against the actual fire-time target — running someone else's
+			// job is equivalent to a cross-agent send.
+			const idRaw =
+				typeof p.id === "string"
+					? p.id
+					: typeof p.jobId === "string"
+						? p.jobId
+						: undefined;
+			let existingAgentId: string | undefined;
+			let existingSessionTarget: string | undefined;
+			let existingSessionKey: string | undefined;
+			try {
+				const state = cronCtx().state;
+				if (state && idRaw && typeof idRaw === "string" && idRaw.trim().length > 0) {
+					const { getJob } = await import("../cron/service/ops.js");
+					try {
+						const existing = await getJob(state, idRaw.trim());
+						if (typeof existing.agentId === "string") existingAgentId = existing.agentId;
+						if (typeof existing.sessionTarget === "string")
+							existingSessionTarget = existing.sessionTarget;
+						if (typeof existing.sessionKey === "string")
+							existingSessionKey = existing.sessionKey;
+					} catch {
+						// Job not found — let the handler surface the error.
+					}
+				}
+			} catch {
+				/* best-effort */
+			}
+			const cronRunVerdict = sessionsAccessCheck({
+				action: "send",
+				targetSessionKey: resolveCronTargetSessionKey({
+					agentId: existingAgentId,
+					sessionTarget: existingSessionTarget,
+					sessionKey: existingSessionKey,
+				}),
+			});
+			if (!cronRunVerdict.allowed) {
+				const err = new Error(cronRunVerdict.reason ?? "cron.run forbidden");
+				(err as Error & { code?: string }).code = "forbidden";
+				throw err;
+			}
+			return handleCronRun(
 				params as Parameters<typeof handleCronRun>[0],
 				cronCtx(),
-			),
-		),
+			);
+		}),
 	);
 	disposeHandlers.push(
 		registerGatewayHandler("cron.runs", async (params: unknown) =>
@@ -2534,6 +3146,78 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		registerGatewayHandler("wake", async (params: unknown) => {
 			handleWake(params as Parameters<typeof handleWake>[0], cronCtx());
 			return undefined;
+		}),
+	);
+
+	/* ─── Skills methods (Wave S) — status / install / update. ─── */
+	// Per-call config + workspaceDir resolution so an operator's edits land
+	// on the very next RPC without a gateway restart. Each handler keeps its
+	// own narrow params parsing — params validation here, business logic in
+	// the dedicated modules under `agents/skills/`.
+	disposeHandlers.push(
+		registerGatewayHandler("skills.status", async (params: unknown) => {
+			const p = (params ?? {}) as { agentId?: string };
+			const cfg = await loadConfig();
+			const targetAgentId =
+				p.agentId && p.agentId.trim().length > 0 ? p.agentId.trim() : agentId;
+			// Wave O0.6 — access guard. The skill report enumerates an
+			// agent's full skill inventory + per-skill enabled state, which
+			// is enough surface for a cross-agent caller to map another
+			// agent's capabilities. Treat as a list-class read against the
+			// target's session.
+			const skillsVerdict = sessionsAccessCheck({
+				action: "list",
+				targetSessionKey: defaultSessionKey(targetAgentId),
+			});
+			if (!skillsVerdict.allowed) {
+				const err = new Error(skillsVerdict.reason ?? "skills.status forbidden");
+				(err as Error & { code?: string }).code = "forbidden";
+				throw err;
+			}
+			const workspaceDir = resolveAgentWorkspaceDir(targetAgentId);
+			return buildSkillStatusReport({
+				workspaceDir,
+				config: cfg as unknown as BrigadeConfig,
+				agentId: targetAgentId,
+			});
+		}),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("skills.install", async (params: unknown) => {
+			const p = (params ?? {}) as Partial<SkillInstallSpec> & { timeoutMs?: number };
+			if (!p.kind) {
+				return { ok: false, message: "skills.install: missing kind" };
+			}
+			return await installSkill(p as SkillInstallSpec, {}, {
+				...(typeof p.timeoutMs === "number" && p.timeoutMs > 0
+					? { timeoutMs: p.timeoutMs }
+					: {}),
+			});
+		}),
+	);
+	disposeHandlers.push(
+		registerGatewayHandler("skills.update", async (params: unknown) => {
+			const p = (params ?? {}) as {
+				name?: string;
+				skillKey?: string;
+				enabled?: boolean;
+				apiKey?: string;
+				env?: Record<string, string>;
+			};
+			const name = (p.name ?? p.skillKey ?? "").trim();
+			if (!name) return { ok: false, message: "skills.update: missing name" };
+			const cfg = await loadConfig();
+			const { config: nextCfg, entry } = applySkillUpdate(
+				cfg as unknown as BrigadeConfig,
+				{
+					name,
+					...(typeof p.enabled === "boolean" ? { enabled: p.enabled } : {}),
+					...(typeof p.apiKey === "string" ? { apiKey: p.apiKey } : {}),
+					...(p.env && typeof p.env === "object" ? { env: p.env } : {}),
+				},
+			);
+			await saveConfig(nextCfg);
+			return { ok: true, name, entry };
 		}),
 	);
 
@@ -3173,6 +3857,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			}
 			try {
 				heartbeatScheduler?.stop();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				if (configReloadTimer) clearTimeout(configReloadTimer);
+				configWatcher?.close();
 			} catch {
 				/* best-effort */
 			}

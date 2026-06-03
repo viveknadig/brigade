@@ -396,8 +396,10 @@ export function describeSessionsSendTool(): string {
 
 export function describeSessionsSpawnTool(): string {
 	return [
-		'Spawn an isolated sub-agent session. mode="run" is one-shot; mode="session" stays available for thread follow-up.',
-		"Sub-agents inherit the parent workspace directory automatically.",
-		"Use this when the work should happen in a fresh child session instead of the current one.",
+		'ASYNC fire-and-forget. Returns IMMEDIATELY with {status:"accepted", childSessionKey, runId}. The child runs in its own session lane.',
+		"WHEN the child finishes, its final assistant reply is DELIVERED into YOUR session transcript as a system message (you will see it on your next turn).",
+		"Do NOT call sessions_history immediately - the result has not landed yet. Use sessions_spawn for parallel fan-out where you do not need the result THIS turn.",
+		"For a blocking call that returns the child's reply as the tool result this turn, use spawn_agent instead.",
+		'mode="run" is one-shot; mode="session" keeps the child available for thread follow-up via sessions_send. Sub-agents inherit the parent workspace directory automatically.',
 	].join(" ");
 }

@@ -27,7 +27,7 @@
  * a higher-level dispatcher can compose them.
  */
 
-import { existsSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import path from "node:path";
 
 import { BUNDLED_MODULES, loadModules } from "../../agents/extensions/index.js";
@@ -39,8 +39,10 @@ import {
 	resolveAgentDir,
 	resolveAgentWorkspaceDir,
 	resolveSessionsDir,
+	resolveStateDir,
 } from "../../config/paths.js";
 import { loadConfig, saveConfig } from "../../core/config.js";
+import { mutateConfigAtomic } from "../../config/io.js";
 import { bootstrapWorkspace } from "../../workspace/bootstrap.js";
 
 import {
@@ -87,6 +89,23 @@ function defaultSink(): OutputSink {
 
 function writeJson(sink: OutputSink, payload: unknown): void {
 	sink.log(JSON.stringify(payload, null, 2));
+}
+
+/**
+ * H2: when --json is set, error paths must emit a parseable JSON envelope
+ * to stderr instead of a human-readable line. Returns the original message
+ * so callers can keep a single `sink.error(msg)` shape behind a guard.
+ */
+function emitErrorJson(
+	sink: OutputSink,
+	opts: { json?: boolean } | undefined,
+	message: string,
+): void {
+	if (opts?.json) {
+		sink.error(JSON.stringify({ error: message }));
+	} else {
+		sink.error(message);
+	}
 }
 
 /** Best-effort home-relative path renderer — keeps screenshots clean. */
@@ -194,7 +213,11 @@ export async function runAgentsList(
 	try {
 		cfg = loadConfig();
 	} catch (err) {
-		sink.error(`brigade agents list: failed to read brigade.json: ${err instanceof Error ? err.message : String(err)}`);
+		emitErrorJson(
+			sink,
+			opts,
+			`brigade agents list: failed to read brigade.json: ${err instanceof Error ? err.message : String(err)}`,
+		);
 		return 1;
 	}
 
@@ -273,17 +296,21 @@ export async function runAgentsBindings(
 	try {
 		cfg = loadConfig();
 	} catch (err) {
-		sink.error(`brigade agents bindings: failed to read brigade.json: ${err instanceof Error ? err.message : String(err)}`);
+		emitErrorJson(
+			sink,
+			opts,
+			`brigade agents bindings: failed to read brigade.json: ${err instanceof Error ? err.message : String(err)}`,
+		);
 		return 1;
 	}
 
 	const filterAgentId = opts.agent?.trim() ? normalizeAgentId(opts.agent) : null;
 	if (opts.agent && !filterAgentId) {
-		sink.error("Agent id is required.");
+		emitErrorJson(sink, opts, "Agent id is required.");
 		return 1;
 	}
 	if (filterAgentId && !hasAgent(cfg, filterAgentId)) {
-		sink.error(`Agent "${filterAgentId}" not found.`);
+		emitErrorJson(sink, opts, `Agent "${filterAgentId}" not found.`);
 		return 1;
 	}
 
@@ -322,30 +349,34 @@ export async function runAgentsBind(
 	try {
 		cfg = loadConfig();
 	} catch (err) {
-		sink.error(`brigade agents bind: failed to read brigade.json: ${err instanceof Error ? err.message : String(err)}`);
+		emitErrorJson(
+			sink,
+			opts,
+			`brigade agents bind: failed to read brigade.json: ${err instanceof Error ? err.message : String(err)}`,
+		);
 		return 1;
 	}
 
 	const agentId = resolveTargetAgentId(cfg, opts.agent, true);
 	if (!agentId) {
-		sink.error("Unable to resolve agent id.");
+		emitErrorJson(sink, opts, "Unable to resolve agent id.");
 		return 1;
 	}
 	if (!hasAgent(cfg, agentId)) {
-		sink.error(`Agent "${agentId}" not found.`);
+		emitErrorJson(sink, opts, `Agent "${agentId}" not found.`);
 		return 1;
 	}
 
 	const specs = (opts.bind ?? []).map((v) => v.trim()).filter(Boolean);
 	if (specs.length === 0) {
-		sink.error("Provide at least one --bind <channel[:accountId]>.");
+		emitErrorJson(sink, opts, "Provide at least one --bind <channel[:accountId]>.");
 		return 1;
 	}
 
 	const catalog = await loadChannelCatalog();
 	const parsed = parseBindingSpecs({ agentId, specs, config: cfg, channels: catalog });
 	if (parsed.errors.length > 0) {
-		sink.error(parsed.errors.join("\n"));
+		emitErrorJson(sink, opts, parsed.errors.join("\n"));
 		return 1;
 	}
 
@@ -400,22 +431,26 @@ export async function runAgentsUnbind(
 	try {
 		cfg = loadConfig();
 	} catch (err) {
-		sink.error(`brigade agents unbind: failed to read brigade.json: ${err instanceof Error ? err.message : String(err)}`);
+		emitErrorJson(
+			sink,
+			opts,
+			`brigade agents unbind: failed to read brigade.json: ${err instanceof Error ? err.message : String(err)}`,
+		);
 		return 1;
 	}
 
 	const agentId = resolveTargetAgentId(cfg, opts.agent, true);
 	if (!agentId) {
-		sink.error("Unable to resolve agent id.");
+		emitErrorJson(sink, opts, "Unable to resolve agent id.");
 		return 1;
 	}
 	if (!hasAgent(cfg, agentId)) {
-		sink.error(`Agent "${agentId}" not found.`);
+		emitErrorJson(sink, opts, `Agent "${agentId}" not found.`);
 		return 1;
 	}
 
 	if (opts.all && (opts.bind?.length ?? 0) > 0) {
-		sink.error("Use either --all or --bind, not both.");
+		emitErrorJson(sink, opts, "Use either --all or --bind, not both.");
 		return 1;
 	}
 
@@ -452,14 +487,14 @@ export async function runAgentsUnbind(
 
 	const specs = (opts.bind ?? []).map((v) => v.trim()).filter(Boolean);
 	if (specs.length === 0) {
-		sink.error("Provide at least one --bind <channel[:accountId]> or use --all.");
+		emitErrorJson(sink, opts, "Provide at least one --bind <channel[:accountId]> or use --all.");
 		return 1;
 	}
 
 	const catalog = await loadChannelCatalog();
 	const parsed = parseBindingSpecs({ agentId, specs, config: cfg, channels: catalog });
 	if (parsed.errors.length > 0) {
-		sink.error(parsed.errors.join("\n"));
+		emitErrorJson(sink, opts, parsed.errors.join("\n"));
 		return 1;
 	}
 
@@ -518,7 +553,11 @@ export async function runAgentsAdd(
 	try {
 		cfg = loadConfig();
 	} catch (err) {
-		sink.error(`brigade agents add: failed to read brigade.json: ${err instanceof Error ? err.message : String(err)}`);
+		emitErrorJson(
+			sink,
+			opts,
+			`brigade agents add: failed to read brigade.json: ${err instanceof Error ? err.message : String(err)}`,
+		);
 		return 1;
 	}
 
@@ -526,17 +565,23 @@ export async function runAgentsAdd(
 	const workspaceFlag = opts.workspace?.trim();
 
 	if (!nameInput) {
-		sink.error("Agent name is required. Usage: brigade agents add <name> [--workspace <dir>]");
+		emitErrorJson(
+			sink,
+			opts,
+			"Agent name is required. Usage: brigade agents add <name> [--workspace <dir>]",
+		);
 		return 1;
 	}
 
 	const agentId = normalizeAgentId(nameInput);
 	if (agentId === DEFAULT_AGENT_ID) {
-		sink.error(`"${DEFAULT_AGENT_ID}" is reserved. Choose another name.`);
+		emitErrorJson(sink, opts, `"${DEFAULT_AGENT_ID}" is reserved. Choose another name.`);
 		return 1;
 	}
 	if (RESERVED_AGENT_IDS.has(agentId)) {
-		sink.error(
+		emitErrorJson(
+			sink,
+			opts,
 			`"${agentId}" is a reserved word and cannot be used as an agent id. Reserved: ${[...RESERVED_AGENT_IDS].join(", ")}.`,
 		);
 		return 1;
@@ -545,7 +590,7 @@ export async function runAgentsAdd(
 		sink.log(`Normalized agent id to "${agentId}".`);
 	}
 	if (findAgentEntryIndex(listAgentEntries(cfg), agentId) >= 0) {
-		sink.error(`Agent "${agentId}" already exists.`);
+		emitErrorJson(sink, opts, `Agent "${agentId}" already exists.`);
 		return 1;
 	}
 
@@ -566,7 +611,7 @@ export async function runAgentsAdd(
 	const catalog = await loadChannelCatalog();
 	const parsed = parseBindingSpecs({ agentId, specs: opts.bind, config: nextConfig, channels: catalog });
 	if (parsed.errors.length > 0) {
-		sink.error(parsed.errors.join("\n"));
+		emitErrorJson(sink, opts, parsed.errors.join("\n"));
 		return 1;
 	}
 	const bindingResult =
@@ -575,15 +620,59 @@ export async function runAgentsAdd(
 			: { config: nextConfig, added: [] as AgentRouteBinding[], updated: [] as AgentRouteBinding[], skipped: [] as AgentRouteBinding[], conflicts: [] as Array<{ binding: AgentRouteBinding; existingAgentId: string }> };
 
 	nextConfig = bindingResult.config;
-	saveConfig(nextConfig);
 
-	// Seed the workspace files (SOUL/IDENTITY/AGENTS/...) so the new agent
-	// is ready for its first turn. Best-effort — log warnings rather than
-	// fail the whole add when a template is missing.
+	// H7: saveConfig + bootstrapWorkspace must be atomic from the caller's
+	// perspective. If bootstrap throws (e.g. invalid workspace path) after
+	// we already persisted the new agent entry, roll the entry back so the
+	// operator does not end up with a half-created agent that boots up but
+	// has no workspace files.
+	//
+	// H8: the agent-add diff is re-applied against the freshest on-disk cfg
+	// inside the in-process mutex (mutateConfigAtomic). A concurrent set-model
+	// or set-thinking can no longer be silently stomped by the snapshot we
+	// read at the top of this function. The rollback also runs through the
+	// mutex so it can't race with another writer either.
 	try {
+		await mutateConfigAtomic((cur) => {
+			let staged = applyAgentConfig(cur as BrigadeConfig, {
+				agentId,
+				name: nameInput,
+				workspace: workspaceDir,
+				agentDir,
+				...(model ? { model } : {}),
+				...(provider ? { provider } : {}),
+			});
+			if (parsed.bindings.length > 0) {
+				const reapplied = applyAgentBindings(staged, parsed.bindings);
+				staged = reapplied.config;
+			}
+			return staged as unknown as typeof cur;
+		});
 		await bootstrapWorkspace(workspaceDir);
 	} catch (err) {
-		sink.error(`Workspace seeding warning: ${err instanceof Error ? err.message : String(err)}`);
+		// Roll back the just-added agent (plus any bindings keyed to it).
+		try {
+			await mutateConfigAtomic((cur) => {
+				const pruned = pruneAgentConfig(cur as BrigadeConfig, agentId);
+				return pruned.config as unknown as typeof cur;
+			});
+		} catch (rollbackErr) {
+			emitErrorJson(
+				sink,
+				opts,
+				`brigade agents add: rollback also failed: ${
+					rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)
+				}`,
+			);
+		}
+		emitErrorJson(
+			sink,
+			opts,
+			`brigade agents add: failed to bootstrap workspace, rolled back agent "${agentId}": ${
+				err instanceof Error ? err.message : String(err)
+			}`,
+		);
+		return 1;
 	}
 
 	const payload = {
@@ -675,7 +764,11 @@ export async function runAgentsSetIdentity(
 	try {
 		cfg = loadConfig();
 	} catch (err) {
-		sink.error(`brigade agents set-identity: failed to read brigade.json: ${err instanceof Error ? err.message : String(err)}`);
+		emitErrorJson(
+			sink,
+			opts,
+			`brigade agents set-identity: failed to read brigade.json: ${err instanceof Error ? err.message : String(err)}`,
+		);
 		return 1;
 	}
 
@@ -704,18 +797,26 @@ export async function runAgentsSetIdentity(
 	let agentId = agentRaw ? normalizeAgentId(agentRaw) : undefined;
 	if (!agentId) {
 		if (!workspaceDir) {
-			sink.error("Select an agent with --agent or provide a workspace via --workspace.");
+			emitErrorJson(
+				sink,
+				opts,
+				"Select an agent with --agent or provide a workspace via --workspace.",
+			);
 			return 1;
 		}
 		const matches = resolveAgentIdByWorkspace(cfg, workspaceDir);
 		if (matches.length === 0) {
-			sink.error(
+			emitErrorJson(
+				sink,
+				opts,
 				`No agent workspace matches ${shortenHomePath(workspaceDir)}. Pass --agent to target a specific agent.`,
 			);
 			return 1;
 		}
 		if (matches.length > 1) {
-			sink.error(
+			emitErrorJson(
+				sink,
+				opts,
 				`Multiple agents match ${shortenHomePath(workspaceDir)}: ${matches.join(", ")}. Pass --agent to choose one.`,
 			);
 			return 1;
@@ -734,7 +835,7 @@ export async function runAgentsSetIdentity(
 			const targetPath =
 				identityFilePath ??
 				(workspaceDir ? path.join(workspaceDir, "IDENTITY.md") : "IDENTITY.md");
-			sink.error(`No identity data found in ${shortenHomePath(targetPath)}.`);
+			emitErrorJson(sink, opts, `No identity data found in ${shortenHomePath(targetPath)}.`);
 			return 1;
 		}
 	}
@@ -755,7 +856,11 @@ export async function runAgentsSetIdentity(
 		!incomingIdentity.theme &&
 		!incomingIdentity.avatar
 	) {
-		sink.error("No identity fields provided. Use --name/--emoji/--theme/--avatar or --from-identity.");
+		emitErrorJson(
+			sink,
+			opts,
+			"No identity fields provided. Use --name/--emoji/--theme/--avatar or --from-identity.",
+		);
 		return 1;
 	}
 
@@ -786,54 +891,132 @@ export async function runAgentsSetIdentity(
 
 /* ───────────────────────── 7. agents delete ───────────────────────── */
 
-/** Best-effort rm — never throws; logs the failure when verbose. */
+/**
+ * H6: move-to-trash instead of hard rm. A typo on `agents delete <id>`
+ * used to be unrecoverable; we now rename the target into a sibling
+ * `.brigade-trash/` and let the operator restore by hand.
+ *
+ * Trash sits next to the original parent and is capped at 10 entries
+ * (oldest first) to keep state-dir from ballooning over time.
+ */
 function safeRm(target: string, sink: OutputSink): void {
 	if (!existsSync(target)) return;
 	try {
-		rmSync(target, { recursive: true, force: true });
+		const parent = path.dirname(target);
+		const trashDir = path.join(parent, ".brigade-trash");
+		try {
+			mkdirSync(trashDir, { recursive: true });
+		} catch {
+			/* fall through — the rename below will surface a real error */
+		}
+		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+		const moved = path.join(trashDir, `${path.basename(target)}-${stamp}`);
+		renameSync(target, moved);
+		// Cap the trash at 10 entries: drop the oldest first (lexicographic
+		// order matches creation order because we stamp with ISO timestamps).
+		try {
+			const entries = readdirSync(trashDir)
+				.map((name) => ({ name, full: path.join(trashDir, name) }))
+				.sort((a, b) => a.name.localeCompare(b.name));
+			while (entries.length > 10) {
+				const oldest = entries.shift();
+				if (oldest) {
+					try {
+						rmSync(oldest.full, { recursive: true, force: true });
+					} catch {
+						/* best-effort GC */
+					}
+				}
+			}
+		} catch {
+			/* best-effort GC */
+		}
 	} catch (err) {
 		sink.error(
-			`Warning: failed to remove ${shortenHomePath(target)}: ${err instanceof Error ? err.message : String(err)}`,
+			`Warning: failed to move ${shortenHomePath(target)} to trash: ${err instanceof Error ? err.message : String(err)}`,
 		);
 	}
 }
 
 export async function runAgentsDelete(
-	opts: { id: string; force?: boolean; json?: boolean },
+	opts: { id: string; force?: boolean; json?: boolean; allowExternalWorkspace?: boolean },
 ): Promise<number> {
 	const sink = defaultSink();
 	let cfg: BrigadeConfig;
 	try {
 		cfg = loadConfig();
 	} catch (err) {
-		sink.error(`brigade agents delete: failed to read brigade.json: ${err instanceof Error ? err.message : String(err)}`);
+		emitErrorJson(
+			sink,
+			opts,
+			`brigade agents delete: failed to read brigade.json: ${err instanceof Error ? err.message : String(err)}`,
+		);
 		return 1;
 	}
 
 	const input = opts.id?.trim();
 	if (!input) {
-		sink.error("Agent id is required.");
+		emitErrorJson(sink, opts, "Agent id is required.");
 		return 1;
 	}
 	const agentId = normalizeAgentId(input);
 	if (agentId !== input) sink.log(`Normalized agent id to "${agentId}".`);
 	if (agentId === DEFAULT_AGENT_ID) {
-		sink.error(`"${DEFAULT_AGENT_ID}" cannot be deleted.`);
+		emitErrorJson(sink, opts, `"${DEFAULT_AGENT_ID}" cannot be deleted.`);
 		return 1;
 	}
 	if (findAgentEntryIndex(listAgentEntries(cfg), agentId) < 0) {
-		sink.error(`Agent "${agentId}" not found.`);
+		emitErrorJson(sink, opts, `Agent "${agentId}" not found.`);
 		return 1;
 	}
 
 	if (!opts.force) {
-		sink.error(
+		emitErrorJson(
+			sink,
+			opts,
 			`Refusing to delete agent "${agentId}" without --force. (Interactive confirm ships in a follow-up.)`,
 		);
 		return 1;
 	}
 
-	const workspaceDir = resolveAgentWorkspaceDir(agentId);
+	// C3: read the configured workspace override BEFORE wiping. The old
+	// code always called resolveAgentWorkspaceDir(agentId) which produces
+	// the default <state>/agents/<id>/workspace path — orphaning any
+	// custom workspace the agent was configured with.
+	const agentsMapRaw = (cfg.agents as Record<string, unknown> | undefined) ?? {};
+	const agentEntryRaw = agentsMapRaw[agentId];
+	const configuredWorkspace =
+		agentEntryRaw && typeof agentEntryRaw === "object" && !Array.isArray(agentEntryRaw)
+			? (agentEntryRaw as { workspace?: unknown }).workspace
+			: undefined;
+	const configuredWorkspaceStr =
+		typeof configuredWorkspace === "string" && configuredWorkspace.trim()
+			? configuredWorkspace.trim()
+			: "";
+
+	const workspaceDir = configuredWorkspaceStr
+		? path.resolve(configuredWorkspaceStr)
+		: resolveAgentWorkspaceDir(agentId);
+
+	// External-workspace guard: refuse to wipe anything outside the state
+	// dir unless the operator explicitly opts in.
+	const stateDir = path.resolve(resolveStateDir());
+	const isInsideState = (() => {
+		const rel = path.relative(stateDir, workspaceDir);
+		return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+	})();
+	if (!isInsideState && !opts.allowExternalWorkspace) {
+		emitErrorJson(
+			sink,
+			opts,
+			`Refusing to remove external workspace ${shortenHomePath(workspaceDir)}. ` +
+				`Re-run with --allow-external-workspace to wipe it.`,
+		);
+		return 1;
+	}
+
+	sink.log(`Workspace target: ${shortenHomePath(workspaceDir)}`);
+
 	const agentDir = resolveAgentDir(agentId);
 	const sessionsDir = resolveSessionsDir(agentId);
 

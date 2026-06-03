@@ -10,11 +10,19 @@
 export const SUBAGENT_ENDED_OUTCOME_OK = "ok" as const;
 export const SUBAGENT_ENDED_OUTCOME_ERROR = "error" as const;
 export const SUBAGENT_ENDED_OUTCOME_TIMEOUT = "timeout" as const;
+/**
+ * Wave O0.7 - `abort` outcome distinguishes a parent-cancelled child from
+ * the generic "error" bucket. Used by the parent-abort cascade so the
+ * announce-delivery's completion text can render "was aborted" instead of
+ * the misleading "failed".
+ */
+export const SUBAGENT_ENDED_OUTCOME_ABORT = "abort" as const;
 
 export type SubagentLifecycleEndedOutcome =
 	| typeof SUBAGENT_ENDED_OUTCOME_OK
 	| typeof SUBAGENT_ENDED_OUTCOME_ERROR
-	| typeof SUBAGENT_ENDED_OUTCOME_TIMEOUT;
+	| typeof SUBAGENT_ENDED_OUTCOME_TIMEOUT
+	| typeof SUBAGENT_ENDED_OUTCOME_ABORT;
 
 export const SUBAGENT_TARGET_KIND_SUBAGENT = "subagent" as const;
 export const SUBAGENT_TARGET_KIND_ACP = "acp" as const;

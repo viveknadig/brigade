@@ -32,6 +32,28 @@ import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
  *     without burning tokens on heavy chain-of-thought.
  *   - Users who want more reasoning can `/thinking high` at runtime.
  */
+/**
+ * H4: narrow a persisted `cfg.agents.<id>.thinking` string back to a
+ * `ThinkingLevel` (or undefined when missing / malformed). Boot + seed
+ * paths use this to honour the operator's set-thinking selection across
+ * daemon restarts — without it, the level silently reset to the model's
+ * initial default on every reboot.
+ */
+const VALID_THINKING_LEVELS: ReadonlySet<ThinkingLevel> = new Set<ThinkingLevel>([
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+]);
+export function readPersistedThinkingLevel(entry: unknown): ThinkingLevel | undefined {
+	if (!entry || typeof entry !== "object") return undefined;
+	const raw = (entry as { thinking?: unknown }).thinking;
+	if (typeof raw !== "string") return undefined;
+	return VALID_THINKING_LEVELS.has(raw as ThinkingLevel) ? (raw as ThinkingLevel) : undefined;
+}
+
 export function pickInitialThinkingLevel(model: Model<any>): ThinkingLevel {
 	// Primary signal: the catalog's `reasoning` flag — reasoning → "low",
 	// else "off".

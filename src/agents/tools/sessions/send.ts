@@ -27,10 +27,13 @@ import { callGateway } from "../../gateway-call.js";
 import { nestedLane } from "../../../process/lanes.js";
 import { enqueueSystemEvent } from "../../session-inbox.js";
 import {
+	checkSessionToolAccess,
 	describeSessionsSendTool,
 	jsonToolResult,
 	SESSIONS_SEND_TOOL_DISPLAY_SUMMARY,
 	ToolInputError,
+	type AgentToAgentPolicy,
+	type SessionToolsVisibility,
 	type ToolResultEnvelope,
 } from "./shared.js";
 
@@ -40,7 +43,35 @@ export interface SessionsSendToolArgs {
 	timeoutSeconds?: number;
 }
 
-export interface SessionsSendToolOptions {
+/**
+ * Resolved per-turn access context for the session-tool guard. Threaded by
+ * the bundle factory so each tool's execute body can fail-closed BEFORE
+ * dispatching when the caller is not allowed to talk to the target session.
+ *
+ * Fail-closed contract: when the bundle was constructed without a complete
+ * access policy (any of `agentSessionKey` / `visibility` / `a2aPolicy`
+ * missing) the tool refuses every call. Callers that need to bypass the
+ * guard (internal boot/cron/heartbeat flows that prove the request is
+ * trusted) must opt in by setting `bypassAccessGuard: true`.
+ */
+export interface SessionToolAccessOptions {
+	/** Visibility scope for the caller's session: self/tree/agent/all. */
+	visibility?: SessionToolsVisibility;
+	/** A2A policy resolved from `cfg.session.agentToAgent`. */
+	a2aPolicy?: AgentToAgentPolicy;
+	/** Session keys the caller (transitively) spawned — used for tree-scope. */
+	spawnedKeys?: ReadonlySet<string>;
+	/**
+	 * When true, skip the access guard entirely. Reserved for internal
+	 * system pathways (boot wiring, cron lane, heartbeat) where the caller
+	 * has independently proven trust. Channel adapters / model-side dispatch
+	 * MUST NOT set this — leaving it unset means an unwired bundle fails
+	 * closed instead of accidentally allowing traffic.
+	 */
+	bypassAccessGuard?: boolean;
+}
+
+export interface SessionsSendToolOptions extends SessionToolAccessOptions {
 	agentSessionKey?: string;
 	agentChannel?: string;
 }
@@ -95,6 +126,35 @@ export function createSessionsSendTool(
 					status: "error",
 					error: "sessions_send cannot target the caller's own session",
 				});
+			}
+
+			// Access guard — fail-closed. When the bundle was built without a
+			// full policy (visibility + a2aPolicy + caller key) the tool
+			// refuses every call. Internal system pathways that must bypass
+			// the check explicitly opt in via `bypassAccessGuard: true`.
+			if (opts.bypassAccessGuard !== true) {
+				if (!opts.agentSessionKey || !opts.visibility || !opts.a2aPolicy) {
+					return jsonToolResult({
+						status: "forbidden",
+						sessionKey: parsed.sessionKey,
+						error: "sessions_send forbidden: session access policy not configured",
+					});
+				}
+				const access = checkSessionToolAccess({
+					action: "send",
+					requesterSessionKey: opts.agentSessionKey,
+					targetSessionKey: parsed.sessionKey,
+					visibility: opts.visibility,
+					a2aPolicy: opts.a2aPolicy,
+					...(opts.spawnedKeys ? { spawnedKeys: opts.spawnedKeys } : {}),
+				});
+				if (!access.allowed) {
+					return jsonToolResult({
+						status: "forbidden",
+						sessionKey: parsed.sessionKey,
+						error: access.error,
+					});
+				}
 			}
 
 			// Inject a system event into the target's inbox so the target's

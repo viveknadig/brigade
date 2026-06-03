@@ -26,6 +26,7 @@ const MOCK_RUNTIME: RuntimeParams = {
 	thinkingLevel: "off",
 	timezone: "UTC",
 	nowIso: "2026-05-08T00:00:00.000Z",
+	nowLocal: "Fri 2026-05-08 00:00",
 	repoRoot: undefined,
 };
 

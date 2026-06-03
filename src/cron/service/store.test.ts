@@ -183,3 +183,55 @@ describe("store — saveCronStore", () => {
 		assert.ok(!fs.existsSync(`${p}.bak`), "no .bak on the very first save");
 	});
 });
+
+describe("store — every-schedule anchor stability", () => {
+	it("stamps a stable anchor on a legacy anchor-less `every` job (self-heals drift)", () => {
+		const p = tmpStore("every-anchor-migrate");
+		fs.mkdirSync(path.dirname(p), { recursive: true });
+		const jobOnDisk = {
+			id: "every-legacy",
+			name: "hourly",
+			enabled: true,
+			schedule: { kind: "every", everyMs: 3_600_000 }, // legacy: no anchorMs
+			sessionTarget: "isolated",
+			payload: { kind: "agentTurn", message: "hi" },
+			state: { nextRunAtMs: 123 },
+			createdAtMs: 1_700_000_000_000,
+			updatedAtMs: 1_700_000_000_000,
+		};
+		fs.writeFileSync(p, JSON.stringify({ version: 1, jobs: [jobOnDisk] }), "utf8");
+		const result = loadCronStoreWithRepairFlag(p);
+		assert.equal(result.repaired, true, "anchor-less every job is repaired");
+		const sched = result.store.jobs[0]!.schedule as { kind: string; anchorMs?: number };
+		assert.equal(sched.kind, "every");
+		assert.equal(sched.anchorMs, 1_700_000_000_000, "anchor stamped from createdAtMs");
+	});
+
+	it("an already-anchored `every` job loads as a no-op and preserves nextRunAtMs", () => {
+		// Guards the value-compare fix: a canonical anchored job must NOT be
+		// re-"canonicalised" on every load (the old reference check re-persisted
+		// + recomputed nextRunAtMs every tick, spamming the log and clobbering
+		// stored fire-times).
+		const p = tmpStore("every-anchored-noop");
+		fs.mkdirSync(path.dirname(p), { recursive: true });
+		const jobOnDisk = {
+			id: "every-anchored",
+			name: "hourly",
+			enabled: true,
+			schedule: { kind: "every", everyMs: 3_600_000, anchorMs: 1_700_000_000_000 },
+			sessionTarget: "isolated",
+			payload: { kind: "agentTurn", message: "hi" },
+			state: { nextRunAtMs: 1_700_003_600_000 },
+			createdAtMs: 1_700_000_000_000,
+			updatedAtMs: 1_700_000_000_000,
+		};
+		fs.writeFileSync(p, JSON.stringify({ version: 1, jobs: [jobOnDisk] }), "utf8");
+		const result = loadCronStoreWithRepairFlag(p);
+		assert.equal(result.repaired, false, "canonical anchored every job is a no-op load");
+		assert.equal(
+			result.store.jobs[0]!.state.nextRunAtMs,
+			1_700_003_600_000,
+			"stored nextRunAtMs preserved (not clobbered)",
+		);
+	});
+});

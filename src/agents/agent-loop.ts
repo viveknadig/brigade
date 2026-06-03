@@ -75,7 +75,15 @@ import {
   drainPendingSystemEvents,
   formatPendingEventsPrefix,
 } from "./pending-system-events.js";
-import { drainFormattedSessionEvents } from "./session-event-prompt.js";
+import {
+  drainFormattedSessionEvents,
+  inspectPendingSessionEvents,
+} from "./session-event-prompt.js";
+import {
+  createAgentToAgentPolicy,
+  type SessionToolsVisibility,
+} from "./tools/sessions/shared.js";
+import { wrapStreamFnWithPayloadMutations } from "./payload-mutators.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
 import type { BrigadeBeforeToolCallHook } from "./tool-guard.js";
@@ -88,6 +96,7 @@ import {
 } from "./session-wiring.js";
 import { buildSessionContext } from "./session-context.js";
 import { getSubagentDepthFromSessionKey } from "./subagent-policy.js";
+import { getSpawnedKeysForSession } from "./subagent-registry.js";
 import { emitAgentEvent } from "./agent-event-bus.js";
 import { randomUUID } from "node:crypto";
 import { evaluateCompactionDecision } from "./smart-compaction.js";
@@ -102,6 +111,7 @@ import {
   recordProfileFailureLocked,
   recordProfileSuccessLocked,
 } from "../auth/profile-cooldown.js";
+import { PROVIDERS } from "../providers/catalog.js";
 import { orderProfilesForSelection } from "../auth/profile-cooldown.js";
 import {
   wrapStreamFnWithIdleTimeout,
@@ -458,6 +468,13 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     {
       applyAnthropicSweep:
         args.provider === "anthropic" || args.provider.startsWith("anthropic"),
+      // H5 — pass the active model so the message-level provider quirks
+      // (Mistral tool-id, OpenAI-Responses reasoning-pair, Anthropic
+      // thinking-strip) gate on the active provider. `model` is the resolved
+      // model object from `resolveModelNeverMiss` — falsy here means the
+      // quirks run in strip-everything defensive mode (safe for the wrap
+      // chain but more aggressive).
+      ...(model ? { activeModel: model as never } : {}),
     },
     {
       onTranscriptRepaired: (info) => {
@@ -480,7 +497,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // the persona assembler — avoids a duplicate brigade.json read and any
   // chance the two reads disagree if the file is rewritten mid-turn.
   const turnConfig = readConfigOrInit();
-  const skillDiscovery = discoverEligibleSkills({ workspaceDir, config: turnConfig });
+  const skillDiscovery = discoverEligibleSkills({ workspaceDir, config: turnConfig, agentId });
 
   // Extension layer: load Brigade modules (bundled now; user `~/.brigade/extensions`
   // later) into a registry. Agent-level registrations (tools/hooks/commands) are
@@ -524,11 +541,58 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // turns (e.g. `agent:main:subagent:<uuid>`) yield depth 1 — spawn_agent is
   // automatically filtered out at the leaf so recursion is impossible.
   const callerSubagentDepth = getSubagentDepthFromSessionKey(resolved.sessionKey);
+
+  // H2 + H3 — derive the EFFECTIVE owner flag for this turn's toolset.
+  // The caller's `args.senderIsOwner` (defaults to true for TUI/CLI) is the
+  // base; any UNTRUSTED pending event flips it to false so a model running
+  // with a poisoned third-party context cannot reach ownerOnly tools.
+  const senderIsOwnerArg = args.senderIsOwner !== false;
+  const pendingEventsInspection = inspectPendingSessionEvents(resolved.sessionKey);
+  const effectiveSenderIsOwner =
+    senderIsOwnerArg && !pendingEventsInspection.hasUntrusted;
+
+  // O0 — resolve the per-turn session-tool access policy from config so the
+  // four sessions tools fail-closed when the caller is not allowed to read /
+  // send to the target session. Defaults stay backward-compatible:
+  // visibility="self" (tool only sees the caller's own session) + A2A disabled.
+  const sessionToolsCfg = (turnConfig.session as { sessionTools?: { visibility?: SessionToolsVisibility } } | undefined)?.sessionTools;
+  const visibility: SessionToolsVisibility = sessionToolsCfg?.visibility ?? "self";
+  const a2aRaw = (turnConfig.session as { agentToAgent?: { enabled?: boolean; allow?: Array<{ from?: unknown; to?: unknown }> } } | undefined)?.agentToAgent;
+  // The shared policy factory takes a flat allow-list of agent ids;
+  // brigade.json stores `{from, to}` pairs. Flatten to the union of every
+  // id mentioned on either side — the matcher checks both sides anyway.
+  const a2aAllow: string[] = [];
+  if (Array.isArray(a2aRaw?.allow)) {
+    for (const pair of a2aRaw.allow) {
+      const from = typeof pair?.from === "string" ? pair.from.trim() : "";
+      const to = typeof pair?.to === "string" ? pair.to.trim() : "";
+      if (from) a2aAllow.push(from);
+      if (to) a2aAllow.push(to);
+    }
+  }
+  const a2aPolicy = createAgentToAgentPolicy({
+    enabled: !!a2aRaw?.enabled,
+    allow: a2aAllow,
+  });
+
+  // Wave O0.5 (fix #3): populate spawnedKeys so visibility="tree" actually
+  // permits the caller to reach its own sub-agents. The registry walk
+  // returns the transitive set of children for `resolved.sessionKey`; an
+  // empty set is the right answer when no children exist (the same-key
+  // fast path handles the parent's own session).
+  const spawnedKeys = getSpawnedKeysForSession(resolved.sessionKey);
+
   const toolset = assembleBrigadeToolset({
     workspaceDir,
     agentId,
     cwd,
     memoryCapability,
+    senderIsOwner: effectiveSenderIsOwner,
+    sessionToolAccess: {
+      visibility,
+      a2aPolicy,
+      spawnedKeys,
+    },
     subagentContext: {
       parentSessionKey: resolved.sessionKey,
       callerDepth: callerSubagentDepth,
@@ -787,6 +851,14 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   if (!session) {
     throw new Error("Pi createAgentSession returned no session.");
   }
+
+  // H4 — install the payload-level streamFn wrap so every outbound LLM
+  // payload runs the four provider-payload mutators (Anthropic cache hints,
+  // universal CACHE_BOUNDARY_MARKER strip, Gemini thinking-config reformat,
+  // SiliconFlow `thinking: "off"` swap, Minimax disable). Wraps OVER Pi's
+  // existing auth-aware streamFn so credentials still flow; never replaces
+  // it. Safe to call once per session — guards on the original being a fn.
+  wrapStreamFnWithPayloadMutations(session);
 
   // Install the composed beforeToolCall guard. Three layers run in order:
   //
@@ -1666,24 +1738,27 @@ interface ReadCredentialsResult {
   selectedProfileId?: string;
 }
 
-function readAuthProfilesAsCredentialMap(
+export function readAuthProfilesAsCredentialMap(
   authProfilesPath: string,
   cooldownFilter?: AuthStorageCooldownFilter,
 ): ReadCredentialsResult {
-  if (!fs.existsSync(authProfilesPath)) return { credentials: {} };
+  const out: Record<string, unknown> = {};
+  let selectedProfileId: string | undefined;
   let parsed: {
     profiles?: Record<
       string,
       { provider?: string; type?: string; key?: string; keyRef?: string; alias?: string }
     >;
-  };
-  try {
-    parsed = JSON.parse(fs.readFileSync(authProfilesPath, "utf8"));
-  } catch {
-    return { credentials: {} };
+  } = {};
+  if (fs.existsSync(authProfilesPath)) {
+    try {
+      parsed = JSON.parse(fs.readFileSync(authProfilesPath, "utf8"));
+    } catch {
+      // Treat a corrupt profile file the same as a missing one — env fallback
+      // below still gets a chance to surface a working key.
+      parsed = {};
+    }
   }
-  const out: Record<string, unknown> = {};
-  let selectedProfileId: string | undefined;
   // Bucket profiles by provider so we can apply the cooldown ordering before
   // collapsing to "first wins" per provider.
   const byProvider = new Map<
@@ -1723,6 +1798,19 @@ function readAuthProfilesAsCredentialMap(
       if (first) out[provider] = { type: "api_key", key: first.resolvedKey };
     }
   }
+
+  // C5: env-fallback. If no profile-stored key surfaced for a known provider
+  // but the user has e.g. `ANTHROPIC_API_KEY` exported in their shell, return
+  // that key so a fresh agent with no auth-profiles.json entry still boots
+  // instead of failing with a 401. Mirrors core/auth-bridge.ts:91-97.
+  for (const provider of PROVIDERS) {
+    if (!provider.envVar || provider.noAuth) continue;
+    if (out[provider.id] !== undefined) continue;
+    const apiKey = process.env[provider.envVar];
+    if (!apiKey) continue;
+    out[provider.id] = { type: "api_key", key: apiKey };
+  }
+
   return { credentials: out, selectedProfileId };
 }
 

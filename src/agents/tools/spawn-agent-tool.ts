@@ -27,6 +27,11 @@ import {
 	SubagentLimitError,
 } from "../subagent-policy.js";
 import { readNumberParam, readStringParam, textResult } from "./common.js";
+import {
+	checkSessionToolAccess,
+	type AgentToAgentPolicy,
+	type SessionToolsVisibility,
+} from "./sessions/shared.js";
 import type { BrigadeTool } from "./types.js";
 
 const SpawnAgentParams = Type.Object({
@@ -90,6 +95,26 @@ export interface MakeSpawnAgentToolOptions {
 	 */
 	parentProvider?: string;
 	parentModelId?: string;
+	/**
+	 * Wave O0.5 — visibility scope for the parent's session. The spawn
+	 * itself stays within the parent's own agent today, so the same-key
+	 * fast-path in `checkSessionToolAccess` keeps in-agent spawns flowing
+	 * through; the guard fires only when an extension wires a future
+	 * cross-agent override.
+	 */
+	visibility?: SessionToolsVisibility;
+	/** A2A policy resolved from `cfg.session.agentToAgent`. */
+	a2aPolicy?: AgentToAgentPolicy;
+	/** Transitive set of session keys the parent has already spawned. */
+	spawnedKeys?: ReadonlySet<string>;
+	/**
+	 * Wave O0.6 — fail-closed opt-out for trusted internal pathways (boot,
+	 * cron, heartbeat). Untrusted callers leave this unset so an unwired
+	 * bundle refuses every spawn by default instead of silently allowing
+	 * cross-agent dispatch when the session access policy was not threaded
+	 * through.
+	 */
+	bypassAccessGuard?: boolean;
 }
 
 /**
@@ -106,9 +131,10 @@ export function makeSpawnAgentTool(
 		label: "spawn sub-agent",
 		displaySummary: "spawning sub-agent",
 		description:
-			"Spawn a focused sub-agent. Use for parallel work, deep dives, or any " +
-			"scoped task you'd rather not fill the main conversation with. The sub-agent " +
-			"runs in its own session and returns its final reply as this tool's result.",
+			"SYNC blocking. Blocks the parent turn until the child agent returns its final assistant reply, " +
+			"which is delivered as the tool result string. Use this when you need the answer in the SAME turn " +
+			"(e.g. a quick research delegation or scoped task you do not want to fill the main conversation with). " +
+			"For background or parallel work where you do not need the result this turn, prefer sessions_spawn (async fire-and-forget).",
 		parameters: SpawnAgentParams,
 		async execute(
 			_toolCallId,
@@ -133,6 +159,48 @@ export function makeSpawnAgentTool(
 			// delete a child's transcript.
 
 			const combinedSignal = combineSignals(opts.parentSignal, signal);
+
+			// Wave O0.6 — fail-closed access guard. An unwired bundle
+			// (missing visibility OR a2aPolicy) refuses every spawn unless
+			// the caller explicitly opted out via `bypassAccessGuard:
+			// true` for trusted internal pathways. Previously this branch
+			// fell through silently when policy was unset, letting an
+			// unguarded spawn proceed against the parent's session.
+			if (opts.bypassAccessGuard !== true) {
+				if (!opts.visibility || !opts.a2aPolicy) {
+					return textResult(
+						"spawn_agent forbidden: session access policy not configured",
+						{
+							status: "limit-refused",
+							label,
+							reason: "access-denied",
+						},
+					);
+				}
+				// The same-key fast-path in `checkSessionToolAccess` allows
+				// in-agent spawns to flow through unchanged; the guard refuses
+				// only when the parent's visibility/A2A combo would forbid the
+				// targeted dispatch. Today the child key is derived inside the
+				// runner so we evaluate the check against the parent's own
+				// session — i.e. the spawn is treated as "send to self" for
+				// the purposes of the guard. Future cross-agent spawn
+				// overrides re-evaluate against the synthesised target there.
+				const verdict = checkSessionToolAccess({
+					action: "send",
+					requesterSessionKey: opts.parentSessionKey,
+					targetSessionKey: opts.parentSessionKey,
+					visibility: opts.visibility,
+					a2aPolicy: opts.a2aPolicy,
+					...(opts.spawnedKeys ? { spawnedKeys: opts.spawnedKeys } : {}),
+				});
+				if (!verdict.allowed) {
+					return textResult(verdict.error, {
+						status: "limit-refused",
+						label,
+						reason: "access-denied",
+					});
+				}
+			}
 
 			try {
 				const { runSubagent } = await import("../subagent-runner.js");

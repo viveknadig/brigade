@@ -21,10 +21,13 @@
 
 import { callGateway } from "../../gateway-call.js";
 import {
+	checkSessionToolAccess,
 	describeSessionsListTool,
 	jsonToolResult,
 	SESSIONS_LIST_TOOL_DISPLAY_SUMMARY,
 	ToolInputError,
+	type AgentToAgentPolicy,
+	type SessionToolsVisibility,
 	type ToolResultEnvelope,
 } from "./shared.js";
 
@@ -39,6 +42,18 @@ export interface SessionsListToolOptions {
 	agentSessionKey?: string;
 	/** Sandbox flag — when true, the gateway clamps visibility to spawned. */
 	sandboxed?: boolean;
+	/** Visibility scope for the caller's session: self/tree/agent/all. */
+	visibility?: SessionToolsVisibility;
+	/** A2A policy resolved from `cfg.session.agentToAgent`. */
+	a2aPolicy?: AgentToAgentPolicy;
+	/** Session keys the caller (transitively) spawned — used for tree-scope. */
+	spawnedKeys?: ReadonlySet<string>;
+	/**
+	 * Fail-closed opt-out — true ONLY for trusted internal pathways (boot,
+	 * cron, heartbeat). Untrusted callers leave this unset so an unwired
+	 * bundle returns zero rows by default instead of surfacing the registry.
+	 */
+	bypassAccessGuard?: boolean;
 }
 
 export interface SessionsListToolDescriptor {
@@ -92,6 +107,24 @@ export function createSessionsListTool(
 		parameters: SESSIONS_LIST_SCHEMA,
 		execute: async (args) => {
 			const parsed = coerceArgs(args);
+			// Wave O0.6 — fail-closed early-return. An unwired bundle
+			// (missing caller key OR visibility OR A2A policy) refuses
+			// every call. Internal trusted callers opt out via
+			// `bypassAccessGuard: true`. Previously the per-row filter
+			// fell through to the unfiltered `sessions` when any policy
+			// field was missing, leaking the full registry to unwired
+			// callers.
+			if (
+				opts.bypassAccessGuard !== true &&
+				(!opts.agentSessionKey || !opts.visibility || !opts.a2aPolicy)
+			) {
+				return jsonToolResult({
+					status: "forbidden",
+					error: "sessions_list forbidden: session access policy not configured",
+					count: 0,
+					sessions: [],
+				});
+			}
 			try {
 				const result = await callGateway<{
 					sessions: Array<Record<string, unknown>>;
@@ -112,9 +145,33 @@ export function createSessionsListTool(
 					timeoutMs: 10_000,
 				});
 				const sessions = Array.isArray(result?.sessions) ? result.sessions : [];
+				// Per-row access guard — drop rows the caller is not allowed
+				// to see. The gateway's sandbox flag clamps visibility on the
+				// server side; this is the tool-side enforcement that also
+				// applies to non-sandboxed paths (any caller's tool surface).
+				// Skipped only on the trusted-bypass branch (early-return
+				// above already refused the unwired-policy case).
+				const filtered =
+					opts.bypassAccessGuard === true
+						? sessions
+						: sessions.filter((row) => {
+								const targetKey = typeof (row as { sessionKey?: unknown }).sessionKey === "string"
+									? ((row as { sessionKey: string }).sessionKey)
+									: "";
+								if (!targetKey) return true;
+								const access = checkSessionToolAccess({
+									action: "list",
+									requesterSessionKey: opts.agentSessionKey as string,
+									targetSessionKey: targetKey,
+									visibility: opts.visibility as SessionToolsVisibility,
+									a2aPolicy: opts.a2aPolicy as AgentToAgentPolicy,
+									...(opts.spawnedKeys ? { spawnedKeys: opts.spawnedKeys } : {}),
+								});
+								return access.allowed;
+							});
 				return jsonToolResult({
-					count: sessions.length,
-					sessions,
+					count: filtered.length,
+					sessions: filtered,
 				});
 			} catch (err) {
 				return jsonToolResult({

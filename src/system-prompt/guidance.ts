@@ -67,6 +67,28 @@ export function shouldUseReasoningFormat(
 	return true;
 }
 
+/* ───────────────── Time grounding (always-on) ───────────────── */
+
+/**
+ * Always-on rule. The `now=` field in the Runtime line already carries the
+ * operator-local wall-clock time, so the model must NEVER do UTC-to-local
+ * math in its head — that was the root cause of a real "next at 11:18 AM IST
+ * when it was actually 3:46 PM IST" hallucination. Tool outputs that emit UTC
+ * milliseconds (e.g. cron `nextRunAtMs`) must be converted using the `tz=`
+ * field from the same Runtime line, and replies should always include the tz
+ * abbreviation so the operator can sanity-check.
+ *
+ * Wired unconditionally by the assembler — short enough that the cost is
+ * negligible and the failure mode is severe.
+ */
+export const TIME_GROUNDING_GUIDANCE = `## Time
+
+The \`now=\` field in the Runtime block is already in the operator's local timezone. State times to the user in that timezone — never compute UTC-to-local offsets in your head.
+
+If a tool returns UTC timestamps (e.g. cron \`nextRunAtMs\` / \`firedAtMs\`), convert them using the \`tz=\` field from the Runtime line.
+
+Always confirm the timezone explicitly when stating a time (e.g. "next at 4:46 PM IST") so the user can verify.`;
+
 /* ───────────────── Memory guidance (conditional on memory tool) ───────────────── */
 
 /**

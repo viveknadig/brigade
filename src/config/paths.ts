@@ -109,6 +109,15 @@ export function resolveSkillsDir(agentId: string, override?: string): string {
   return path.join(resolveAgentWorkspaceDir(agentId, override), "skills");
 }
 
+// Managed skills installed via the `skills.install` RPC live at
+// `~/.brigade/skills/`. The drop-zone for installer-managed skills (npm
+// global, brew, go install, uv pip install, raw download). Sits ABOVE the
+// bundled-shipped skills (so a managed install shadows a stale bundled
+// copy) but BELOW the workspace dir (so user-authored skills always win).
+export function resolveManagedSkillsDir(): string {
+  return path.join(resolveStateDir(), "skills");
+}
+
 // Bundled starter skills ship inside the package at `<packageRoot>/skills`.
 // This module sits at `<root>/src/config/paths.ts` in dev and
 // `<root>/dist/config/paths.js` once compiled — both are two levels under the

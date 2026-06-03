@@ -23,6 +23,7 @@
 
 import { callGateway } from "../../gateway-call.js";
 import {
+	checkSessionToolAccess,
 	describeSessionsHistoryTool,
 	enforceSessionsHistoryHardCap,
 	jsonToolResult,
@@ -32,6 +33,8 @@ import {
 	SESSIONS_HISTORY_TOOL_DISPLAY_SUMMARY,
 	stripToolMessages,
 	ToolInputError,
+	type AgentToAgentPolicy,
+	type SessionToolsVisibility,
 	type ToolResultEnvelope,
 } from "./shared.js";
 
@@ -43,6 +46,19 @@ export interface SessionsHistoryToolArgs {
 
 export interface SessionsHistoryToolOptions {
 	agentSessionKey?: string;
+	/** Visibility scope for the caller's session: self/tree/agent/all. */
+	visibility?: SessionToolsVisibility;
+	/** A2A policy resolved from `cfg.session.agentToAgent`. */
+	a2aPolicy?: AgentToAgentPolicy;
+	/** Session keys the caller (transitively) spawned — used for tree-scope. */
+	spawnedKeys?: ReadonlySet<string>;
+	/**
+	 * Fail-closed opt-out — set to true ONLY for trusted internal pathways
+	 * (boot wiring, cron lane, heartbeat). Channel adapters and the model
+	 * surface MUST leave this unset so unwired bundles refuse traffic by
+	 * default.
+	 */
+	bypassAccessGuard?: boolean;
 }
 
 export interface SessionsHistoryToolDescriptor {
@@ -79,7 +95,7 @@ function coerceArgs(args: unknown): SessionsHistoryToolArgs {
 }
 
 export function createSessionsHistoryTool(
-	_opts: SessionsHistoryToolOptions = {},
+	opts: SessionsHistoryToolOptions = {},
 ): SessionsHistoryToolDescriptor {
 	return {
 		name: "sessions_history",
@@ -88,6 +104,34 @@ export function createSessionsHistoryTool(
 		parameters: SESSIONS_HISTORY_SCHEMA,
 		execute: async (args) => {
 			const parsed = coerceArgs(args);
+			// Access guard — fail-closed. An unwired bundle (missing caller
+			// key OR visibility OR A2A policy) refuses every call; trusted
+			// internal pathways opt out via `bypassAccessGuard: true`.
+			if (opts.bypassAccessGuard !== true) {
+				if (!opts.agentSessionKey || !opts.visibility || !opts.a2aPolicy) {
+					return jsonToolResult({
+						status: "forbidden",
+						sessionKey: parsed.sessionKey,
+						error:
+							"sessions_history forbidden: session access policy not configured",
+					});
+				}
+				const access = checkSessionToolAccess({
+					action: "history",
+					requesterSessionKey: opts.agentSessionKey,
+					targetSessionKey: parsed.sessionKey,
+					visibility: opts.visibility,
+					a2aPolicy: opts.a2aPolicy,
+					...(opts.spawnedKeys ? { spawnedKeys: opts.spawnedKeys } : {}),
+				});
+				if (!access.allowed) {
+					return jsonToolResult({
+						status: "forbidden",
+						sessionKey: parsed.sessionKey,
+						error: access.error,
+					});
+				}
+			}
 			let raw: { messages?: unknown[] };
 			try {
 				raw = await callGateway<{ messages?: unknown[] }>({

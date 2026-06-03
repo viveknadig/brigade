@@ -124,6 +124,42 @@ export function listActiveSubagentRunsForController(
 	return out;
 }
 
+/**
+ * Collect the set of child session keys spawned by `parentSessionKey`,
+ * walking transitive descendants. Used by the agent loop to populate the
+ * `spawnedKeys` field on `sessionToolAccess` so visibility="tree" actually
+ * allows the parent to reach its own sub-agents.
+ *
+ * Returns an empty set when the parent has no recorded children. The walk
+ * caps at a defensive depth (32) so a malformed registry can never spin
+ * the caller forever.
+ */
+export function getSpawnedKeysForSession(parentSessionKey: string): Set<string> {
+	const out = new Set<string>();
+	if (!parentSessionKey) return out;
+	const state = getState();
+	if (state.runs.size === 0) return out;
+	const queue: string[] = [parentSessionKey];
+	let depth = 0;
+	while (queue.length > 0 && depth < 32) {
+		const next: string[] = [];
+		for (const requester of queue) {
+			for (const entry of state.runs.values()) {
+				if (entry.requesterSessionKey !== requester) continue;
+				const childKey = entry.childSessionKey;
+				if (!childKey || out.has(childKey)) continue;
+				out.add(childKey);
+				next.push(childKey);
+			}
+		}
+		if (next.length === 0) break;
+		queue.length = 0;
+		queue.push(...next);
+		depth += 1;
+	}
+	return out;
+}
+
 /** Active-run count for a requester session. */
 export function countActiveRunsForSession(requesterSessionKey: string): number {
 	if (!requesterSessionKey) return 0;

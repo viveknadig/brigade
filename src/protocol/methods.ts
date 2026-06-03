@@ -97,6 +97,15 @@ export interface SessionListRow {
 	contextTokens?: number;
 	totalTokens?: number;
 	estimatedCostUsd?: number;
+	/**
+	 * Wave O0.7 - spawn lineage surfaced on the list row so a caller doing
+	 * `sessions_list` can see, for each row, which parent spawned the
+	 * session and how deep the spawn tree is. Drives visibility=tree
+	 * filtering on the agent side and the connect TUI's "spawned by X"
+	 * label.
+	 */
+	spawnedBy?: string;
+	spawnDepth?: number;
 }
 
 export interface SessionsListResult {
