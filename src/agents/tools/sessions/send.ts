@@ -44,6 +44,16 @@ export interface SessionsSendToolArgs {
 }
 
 /**
+ * Build the canonical "main" session key for a target agent — used when
+ * the model passes `agentId` instead of `sessionKey`. Same shape as
+ * `buildBrigadeMainSessionKey` but inlined to avoid a routing import cycle.
+ */
+function buildAgentMainSessionKey(agentId: string): string {
+	const id = agentId.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").slice(0, 64);
+	return `agent:${id || "main"}:main`;
+}
+
+/**
  * Resolved per-turn access context for the session-tool guard. Threaded by
  * the bundle factory so each tool's execute body can fail-closed BEFORE
  * dispatching when the caller is not allowed to talk to the target session.
@@ -86,9 +96,10 @@ export interface SessionsSendToolDescriptor {
 
 const SESSIONS_SEND_SCHEMA: Record<string, unknown> = {
 	type: "object",
-	required: ["sessionKey", "message"],
+	required: ["message"],
 	properties: {
 		sessionKey: { type: "string", minLength: 1 },
+		agentId: { type: "string", minLength: 1, maxLength: 64 },
 		message: { type: "string", minLength: 1 },
 		timeoutSeconds: { type: "number", minimum: 0 },
 	},
@@ -100,8 +111,16 @@ function coerceArgs(args: unknown): SessionsSendToolArgs {
 		throw new ToolInputError("sessions_send requires an object argument");
 	}
 	const obj = args as Record<string, unknown>;
-	const sessionKey = typeof obj.sessionKey === "string" ? obj.sessionKey.trim() : "";
-	if (!sessionKey) throw new ToolInputError("sessions_send requires `sessionKey`");
+	// Mirror OC's shape — caller may pass `sessionKey` (explicit) OR
+	// `agentId` (shortcut for "send to <agentId>'s main session"). The
+	// shortcut is what the model uses for delegation to a named peer.
+	const sessionKeyRaw = typeof obj.sessionKey === "string" ? obj.sessionKey.trim() : "";
+	const agentIdRaw = typeof obj.agentId === "string" ? obj.agentId.trim() : "";
+	let sessionKey = sessionKeyRaw;
+	if (!sessionKey && agentIdRaw) sessionKey = buildAgentMainSessionKey(agentIdRaw);
+	if (!sessionKey) {
+		throw new ToolInputError("sessions_send requires `sessionKey` or `agentId`");
+	}
 	const message = typeof obj.message === "string" ? obj.message : "";
 	if (!message.trim()) throw new ToolInputError("sessions_send requires non-empty `message`");
 	const timeoutSeconds =

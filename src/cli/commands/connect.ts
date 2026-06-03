@@ -481,7 +481,7 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	// left guessing — they get the exact escape hatch.
 	tui.addChild(
 		new Text(
-			brand.dim("  connect-mode commands: /model · /thinking · /compact · /help (use 'brigade chat' on the gateway machine for /provider)"),
+			brand.dim("  connect-mode: /agent /agents /sessions · /model /thinking /reasoning · /abort /steer /compact · /usage /help (use 'brigade chat' on the gateway machine for /provider)"),
 			0,
 			0,
 		),

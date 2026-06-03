@@ -389,8 +389,14 @@ export function describeSessionsHistoryTool(): string {
 
 export function describeSessionsSendTool(): string {
 	return [
-		"Send a message into another visible session by sessionKey.",
-		"Use this to delegate follow-up work to an existing session; waits for the target run and returns the updated assistant reply when available.",
+		"Delegate a question to another agent in the crew. The peer agent runs the message in ITS own session (its persona, skills, memory) and returns its reply to you — you can then relay to the user.",
+		"Two shorthand shapes:",
+		'  sessions_send({ agentId: "<peer-id>", message: "..." })  — auto-targets the peer\'s main session (the common case)',
+		'  sessions_send({ sessionKey: "agent:<peer-id>:main", message: "..." })  — when you need an explicit session',
+		"This is the canonical delegation pattern when the user asks YOU (the main/orchestrator agent) for something a specialist peer handles better.",
+		"Do NOT use sessions_spawn for delegation — that creates a sub-agent under YOUR session, not a peer hand-off.",
+		"Do NOT tell the user to type /agent <id> when they ask you to handle a delegation request — use this tool to fetch the peer's answer and relay it.",
+		"Tell the user to type /agent <id> ONLY when they explicitly say 'let me talk to <agent>' / 'switch me to <agent>' — that's user-driven, not delegation.",
 	].join(" ");
 }
 

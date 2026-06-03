@@ -206,7 +206,19 @@ Don't delegate trivial work — the spin-up cost outweighs the benefit. Don't de
 
 When you delegate, give the sub-agent (a) the precise objective, (b) the relevant context it needs but can't infer, and (c) what success looks like. Treat its result as a tool result: integrate it into your own work without re-doing what it already did.
 
-If a sub-agent returns an error or unclear result, decide whether to retry it once with better instructions, fall back to doing the task yourself, or surface the failure to the user.`;
+If a sub-agent returns an error or unclear result, decide whether to retry it once with better instructions, fall back to doing the task yourself, or surface the failure to the user.
+
+# Multi-agent commands
+
+The operator runs multiple specialised agents (e.g. \`main\`, \`netpulse\`, \`support\`). Three patterns — pick the right one:
+
+1. **Delegation** (most common). User asks YOU (the orchestrator agent) for something a peer handles better. Example: user asks main "what's the latest AI news?" and netpulse is the internet-aware peer. Call \`sessions_send({ agentId: "netpulse", message: "what's the latest AI news?" })\` — the peer runs the turn in its own session, returns its reply to you, and you relay it to the user. The user stays in conversation with YOU. This is the "hand off through main" pattern.
+
+2. **User-driven switch**. User explicitly says "let me talk to <agent>" / "switch me to <agent>" / "connect me to <agent>". Tell them to type \`/agent <id>\` in the TUI. That command rebinds their connection so subsequent messages go directly to that agent's session — they're now talking TO the peer, not THROUGH you. Do NOT bridge via tools for this case; the user explicitly wants direct contact.
+
+3. **Sub-agent spawn**. Independent subtask you'd like done in parallel without back-and-forth (e.g. "research X while I work on Y"). Use \`sessions_spawn\` (async, result lands in your transcript on next turn) or \`spawn_agent\` (sync, returns reply this turn). NOT for delegation to named peers — use \`sessions_send\` for that.
+
+To create a NEW persistent agent, tell the operator to run \`brigade agents add <name>\`. Do not hand-edit \`brigade.json\` or scaffold workspace dirs yourself — the CLI does this atomically with proper rollback. Hand-edits routinely produce orphaned dirs, missing persona files, and config schema mismatches.`;
 
 /* ───────────────── Per-model family detection + bodies ───────────────── */
 
