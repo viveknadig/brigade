@@ -27,7 +27,7 @@
  *   - Sub-agents cannot send — `ownerOnly: true`. A sub-agent that needs to
  *     send a message asks the parent to do it via spawn_agent's reply.
  *
- * Pattern note: OC has a single polymorphic `message` tool with many
+ * Pattern note: the reference has a single polymorphic `message` tool with many
  * actions (send/react/poll/sendAttachment/...). Brigade ships with just
  * `send` today; future actions (react, edit, poll) get added as separate
  * tools (`react_to_message`, `edit_message`, etc.) rather than inflating

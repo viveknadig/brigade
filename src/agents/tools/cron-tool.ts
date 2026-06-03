@@ -274,6 +274,21 @@ export function makeCronTool(
 			"match absolute calendar slots and may resolve a year out (e.g. `43 13 1 6 *`\n" +
 			"interpreted on June 1 at 13:45 fires June 1 NEXT YEAR, not the 13:43 that\n" +
 			"already passed). For one-shots, ALWAYS use `at`.\n\n" +
+			"#### AM/PM + CLOCK TIME RULE — CRITICAL ####\n" +
+			"When the user names a clock time without an explicit DATE (e.g. \"12:27 AM\",\n" +
+			"\"9pm\", \"tomorrow at 8\"), compute the NEXT FUTURE instance of that time. If\n" +
+			"the named time has already passed today, the user means TOMORROW (or the\n" +
+			"next valid date). NEVER use a timestamp that's in the past or in the current\n" +
+			"minute. If you're uncertain whether 12:27 means AM or PM in the current\n" +
+			"operator timezone, ASK before scheduling — do NOT guess.\n\n" +
+			"Concrete worked example: at 12:27 PM, user says \"remind me at 12:27 AM\" →\n" +
+			"that already passed 12 hours ago → schedule for TOMORROW 12:27 AM (NOT today;\n" +
+			"add 24h to today's 12:27 AM).\n\n" +
+			"The scheduler validator REJECTS any `at` timestamp that's at or before now\n" +
+			"(or within 5 seconds of now). If you see an error like \"`at` schedule must\n" +
+			"be at least 5 seconds in the FUTURE; got <time> which is <delta> in the\n" +
+			"past\", you misinterpreted the clock time — recompute the NEXT future\n" +
+			"instance (almost always +24h) and retry.\n\n" +
 			"### `every` — RECURRING fixed interval ###\n" +
 			"USE THIS for:\n" +
 			"  • \"every N minutes/hours\" / \"check in every 10 minutes\"\n" +

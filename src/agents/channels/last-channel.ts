@@ -7,7 +7,7 @@
  * job with `{mode: "announce"}` and no `channel`/`to`. At fire time, the
  * timer's `maybeDeliverAnnounce` then has no obvious target.
  *
- * OC handles this by remembering the operator's most recently active
+ * The reference handles this by remembering the operator's most recently active
  * channel: every channel inbound updates a per-session `lastChannel` field
  * in session metadata. When a cron fires without an explicit channel, the
  * delivery resolver reads `lastChannel` and announces there — so a

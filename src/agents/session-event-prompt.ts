@@ -22,7 +22,7 @@
  * Naming note: Brigade already has `agents/pending-system-events.ts`,
  * which is the cron-only announce queue (Track 2 — see that file's
  * doc-comment). The orchestrator here works against the broader
- * SessionInbox queue from Step 11 and is OC-source-equivalent. The two
+ * SessionInbox queue from Step 11 and is reference-source-equivalent. The two
  * queues serve different paths and are NOT consolidated until the
  * Step 25 dispatcher arrives.
  *

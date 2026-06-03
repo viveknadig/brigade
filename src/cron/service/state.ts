@@ -41,6 +41,14 @@ import type { CronRunLogLimits } from "../run-log.js";
 export interface CronIsolatedRunOutcome {
 	status: "ok" | "error" | "skipped";
 	error?: string;
+	/**
+	 * Optional retry classification — `"permanent"` tells the scheduler to
+	 * disable the job rather than apply the normal backoff schedule. Set
+	 * by callers for known-unrecoverable failures (invalid model spec, 4xx
+	 * after retries on a delivery, unknown channel id, etc.). Omit (or
+	 * `"transient"`) for the default retry-with-backoff path.
+	 */
+	errorKind?: "permanent" | "transient";
 	/** Short text the operator sees in the run log + announce delivery. */
 	summary?: string;
 	sessionId?: string;

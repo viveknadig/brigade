@@ -198,10 +198,14 @@ export async function add(
 	input: CronJobCreate,
 	opts?: CronAddOpts,
 ): Promise<CronJob> {
-	const defaulted = defaultCronJobCreate(
-		input,
-		opts?.sessionContext ? { sessionContext: opts.sessionContext } : undefined,
-	);
+	// Thread the scheduler's virtual clock so `kind: "at"` future-time
+	// validation lines up with the same clock the timer uses (test harnesses
+	// inject `nowMs`; production calls back to `Date.now`).
+	const nowMs = state.deps.nowMs!();
+	const defaulted = defaultCronJobCreate(input, {
+		...(opts?.sessionContext ? { sessionContext: opts.sessionContext } : {}),
+		nowMs,
+	});
 	// Channel-target validation. When the operator (or the model on their
 	// behalf) sets `delivery.channel`, refuse the add if that channel id
 	// doesn't match a started adapter — typos like "whatapp" / "slak" would

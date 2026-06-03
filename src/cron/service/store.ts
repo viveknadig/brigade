@@ -16,6 +16,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { ensureDir } from "../../config/paths.js";
+import { renameWithRetry } from "../../infra/fs/atomic-rename.js";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import { coerceScheduleInput, normalizeSchedule } from "../normalize.js";
 import { computeNextRunAtMs } from "../schedule.js";
@@ -221,7 +222,11 @@ export function saveCronStore(storePath: string, store: CronStoreFile): void {
 	} catch {
 		/* best-effort */
 	}
-	fs.renameSync(tmp, storePath);
+	// `renameWithRetry` defends the Windows EPERM/EBUSY/EACCES window where
+	// antivirus / search-indexer / Defender briefly holds an open handle on
+	// the destination file as the tmp lands. Linux/macOS hit the success
+	// path on the first attempt.
+	renameWithRetry(tmp, storePath);
 }
 
 /** Persist the in-memory store under the per-instance lock. */

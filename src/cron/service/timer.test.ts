@@ -30,6 +30,7 @@ import {
 	MIN_REFIRE_GAP_MS,
 	armTimer,
 	onTimer,
+	planStartupCatchup,
 	stopTimer,
 } from "./timer.js";
 
@@ -97,7 +98,7 @@ describe("cron timer — own always-on tick (Bug #12)", () => {
 			const job = await cronAdd(h.state, {
 				name: "ping-now",
 				enabled: true,
-				schedule: { kind: "at", at: now + 1_000 },
+				schedule: { kind: "at", at: now + 10_000 },
 				sessionTarget: "main",
 				wakeMode: "now",
 				payload: { kind: "systemEvent", text: "wake up now" },
@@ -105,7 +106,7 @@ describe("cron timer — own always-on tick (Bug #12)", () => {
 			});
 			assert.equal(job.wakeMode, "now");
 			// Advance simulated time to just past the schedule.
-			now += 2_000;
+			now += 11_000;
 			// Drive the tick directly (in production armTimer's setTimeout
 			// fires; in test we invoke onTimer manually to avoid the timer).
 			await onTimer(h.state);
@@ -131,7 +132,7 @@ describe("cron timer — own always-on tick (Bug #12)", () => {
 			const job = await cronAdd(h.state, {
 				name: "wake-next",
 				enabled: true,
-				schedule: { kind: "at", at: now + 1_000 },
+				schedule: { kind: "at", at: now + 10_000 },
 				sessionTarget: "main",
 				wakeMode: "next-heartbeat",
 				payload: { kind: "systemEvent", text: "wake up at next tick" },
@@ -139,7 +140,7 @@ describe("cron timer — own always-on tick (Bug #12)", () => {
 			});
 			assert.equal(job.wakeMode, "next-heartbeat");
 			// Tick #1 — past-due → enqueue system event, queue pending wake.
-			now += 2_000;
+			now += 11_000;
 			await onTimer(h.state);
 
 			// System event was enqueued during tick #1.
@@ -189,12 +190,12 @@ describe("cron timer — own always-on tick (Bug #12)", () => {
 			await cronAdd(state, {
 				name: "wake-next-orphan",
 				enabled: true,
-				schedule: { kind: "at", at: now + 1_000 },
+				schedule: { kind: "at", at: now + 10_000 },
 				sessionTarget: "main",
 				wakeMode: "next-heartbeat",
 				payload: { kind: "systemEvent", text: "no-wake-dep" },
 			});
-			now += 2_000;
+			now += 11_000;
 			await onTimer(state);
 			assert.equal(systemEvents.length, 1, "system event enqueued");
 
@@ -245,7 +246,7 @@ describe("cron timer — concurrent-due dispatch (Bug #2)", () => {
 			await cronAdd(h.state, {
 				name: "burst-1",
 				enabled: true,
-				schedule: { kind: "at", at: now + 1_000 },
+				schedule: { kind: "at", at: now + 10_000 },
 				sessionTarget: "main",
 				wakeMode: "now",
 				payload: { kind: "systemEvent", text: "burst-1-fired" },
@@ -253,13 +254,13 @@ describe("cron timer — concurrent-due dispatch (Bug #2)", () => {
 			await cronAdd(h.state, {
 				name: "burst-2",
 				enabled: true,
-				schedule: { kind: "at", at: now + 1_000 },
+				schedule: { kind: "at", at: now + 10_000 },
 				sessionTarget: "main",
 				wakeMode: "now",
 				payload: { kind: "systemEvent", text: "burst-2-fired" },
 			});
 			// Past-due both jobs.
-			now += 2_000;
+			now += 11_000;
 			await onTimer(h.state);
 
 			const texts = h.systemEvents.map((e) => e.text).sort();
@@ -293,7 +294,7 @@ describe("cron timer — concurrent-due dispatch (Bug #2)", () => {
 			await cronAdd(state, {
 				name: "single-file-1",
 				enabled: true,
-				schedule: { kind: "at", at: now + 1_000 },
+				schedule: { kind: "at", at: now + 10_000 },
 				sessionTarget: "main",
 				wakeMode: "next-heartbeat",
 				payload: { kind: "systemEvent", text: "sf-1" },
@@ -301,12 +302,12 @@ describe("cron timer — concurrent-due dispatch (Bug #2)", () => {
 			await cronAdd(state, {
 				name: "single-file-2",
 				enabled: true,
-				schedule: { kind: "at", at: now + 1_000 },
+				schedule: { kind: "at", at: now + 10_000 },
 				sessionTarget: "main",
 				wakeMode: "next-heartbeat",
 				payload: { kind: "systemEvent", text: "sf-2" },
 			});
-			now += 2_000;
+			now += 11_000;
 			await onTimer(state);
 			const texts = systemEvents.map((e) => e.text).sort();
 			assert.deepEqual(
@@ -368,7 +369,7 @@ describe("cron delivery — TUI awareness fires regardless of channel delivery (
 				enabled: true,
 				agentId: "main",
 				sessionKey: "agent:main:main",
-				schedule: { kind: "at", at: now + 1_000 },
+				schedule: { kind: "at", at: now + 10_000 },
 				sessionTarget: "isolated",
 				payload: { kind: "agentTurn", message: "what's on today" },
 				delivery: {
@@ -381,7 +382,7 @@ describe("cron delivery — TUI awareness fires regardless of channel delivery (
 				// short-circuit the delivery branch in `runDueJob`.
 				deleteAfterRun: false,
 			});
-			now += 2_000;
+			now += 11_000;
 			await onTimer(state);
 
 			// Channel delivery DID happen.
@@ -449,7 +450,7 @@ describe("cron delivery — TUI awareness fires regardless of channel delivery (
 				enabled: true,
 				agentId: "main",
 				sessionKey: "agent:main:main",
-				schedule: { kind: "at", at: now + 1_000 },
+				schedule: { kind: "at", at: now + 10_000 },
 				sessionTarget: "isolated",
 				payload: { kind: "agentTurn", message: "evening" },
 				delivery: {
@@ -459,7 +460,7 @@ describe("cron delivery — TUI awareness fires regardless of channel delivery (
 				},
 				deleteAfterRun: false,
 			});
-			now += 2_000;
+			now += 11_000;
 			await onTimer(state);
 
 			assert.equal(systemEvents.length, 1, "awareness still fires on channel refusal");
@@ -665,7 +666,7 @@ describe("cron-scale — 20-job burst audit", () => {
 			);
 
 			// ADD a new job same-instant as the wave-2 (10s) batch.
-			const sameInstantTarget = now + 4_500; // wave-2 fires at +10s; now is 5.5s
+			const sameInstantTarget = now + 6_500; // wave-2 fires at +10s; now is 5.5s
 			const lateAdd = await cronAdd(state, {
 				name: "late-add-same-instant",
 				enabled: true,
@@ -677,7 +678,7 @@ describe("cron-scale — 20-job burst audit", () => {
 			});
 
 			// Wave 2: 10s slot + the late-add → 5 new events.
-			now += 5_000;
+			now += 7_000;
 			await onTimer(state);
 			const wave2New = systemEvents.slice(before + 1).map((e) => e.text).sort();
 			assert.ok(
@@ -733,6 +734,152 @@ describe("cron-scale — 20-job burst audit", () => {
 			} catch {
 				/* best-effort */
 			}
+		}
+	});
+});
+
+describe("cron timer — planStartupCatchup", () => {
+	it("recurring job with a missed past-due fire gets scheduled in the catchup slice", async () => {
+		let now = 1_800_000_000_000;
+		const h = makeHarness({ nowMs: () => now });
+		try {
+			// Past-due recurring job (manually mark nextRunAtMs as past).
+			const job = await cronAdd(h.state, {
+				name: "missed-recurring",
+				enabled: true,
+				schedule: { kind: "every", everyMs: 60_000 },
+				sessionTarget: "main",
+				payload: { kind: "systemEvent", text: "missed" },
+			});
+			const idx = h.state.store.jobs.findIndex((j) => j.id === job.id);
+			h.state.store.jobs[idx]!.state.nextRunAtMs = now - 30_000; // past-due
+			await planStartupCatchup(h.state);
+			const after = h.state.store.jobs.find((j) => j.id === job.id)!;
+			// Catchup put the next-fire at-or-after `now`, capped by the
+			// staggered offset window. The point is it's NOT still past-due.
+			assert.ok(after.state.nextRunAtMs !== undefined);
+			assert.ok(after.state.nextRunAtMs! >= now);
+		} finally {
+			h.cleanup();
+		}
+	});
+
+	it("maxMissedJobsPerRestart cap defers over-cap jobs to a later staggered slot", async () => {
+		let now = 1_800_000_000_000;
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-cron-catchup-test-"));
+		try {
+			const storePath = path.join(tempDir, "cron.json");
+			const state = createCronServiceState({
+				storePath,
+				config: {
+					enabled: true,
+					maxMissedJobsPerRestart: 2,
+					missedJobStaggerMs: 1_000,
+				},
+				deps: {
+					log: createSubsystemLogger("cron-test-catchup-cap"),
+					nowMs: () => now,
+				},
+			});
+			// Three past-due recurring jobs.
+			for (let i = 0; i < 3; i++) {
+				const job = await cronAdd(state, {
+					name: `over-cap-${i}`,
+					enabled: true,
+					schedule: { kind: "every", everyMs: 60_000 },
+					sessionTarget: "main",
+					payload: { kind: "systemEvent", text: `j-${i}` },
+				});
+				const idx = state.store.jobs.findIndex((j) => j.id === job.id);
+				state.store.jobs[idx]!.state.nextRunAtMs = now - 30_000;
+			}
+			await planStartupCatchup(state);
+			// All 3 still have a nextRunAtMs (none was silently dropped) and
+			// they're spread out across the stagger window so they don't
+			// stampede tick #1.
+			const nextFires = state.store.jobs
+				.map((j) => j.state.nextRunAtMs)
+				.filter((v): v is number => typeof v === "number")
+				.sort();
+			assert.equal(nextFires.length, 3);
+			// At least two distinct values → stagger spread is in effect.
+			assert.ok(new Set(nextFires).size >= 2);
+			stopTimer(state);
+		} finally {
+			try {
+				fs.rmSync(tempDir, { recursive: true, force: true });
+			} catch {
+				/* best-effort */
+			}
+		}
+	});
+
+	it("`at` job with stale runningAtMs marker has it cleared and is not replayed", async () => {
+		let now = 1_800_000_000_000;
+		const h = makeHarness({ nowMs: () => now });
+		try {
+			const job = await cronAdd(h.state, {
+				name: "stale-at",
+				enabled: true,
+				schedule: { kind: "at", at: now + 60_000 },
+				sessionTarget: "main",
+				payload: { kind: "systemEvent", text: "stale" },
+			});
+			// Simulate a prior crash mid-run: runningAtMs set but no lastStatus.
+			const idx = h.state.store.jobs.findIndex((j) => j.id === job.id);
+			h.state.store.jobs[idx]!.state.runningAtMs = now - 10 * 60_000;
+			await planStartupCatchup(h.state);
+			const after = h.state.store.jobs.find((j) => j.id === job.id)!;
+			assert.equal(after.state.runningAtMs, undefined, "stale marker cleared");
+			// At-job didn't pick up a replay — it stays as scheduled (one-shot
+			// + interrupted mid-run is presumed done by `planStartupCatchup`).
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+describe("cron timer — armTimer tight-loop floor (MIN_REFIRE_GAP_MS)", () => {
+	it("armTimer never schedules setTimeout below MIN_REFIRE_GAP_MS when delay rounds to 0", async () => {
+		// Manually inject a job whose `nextRunAtMs == nowMs` AND has a
+		// `runningAtMs` marker so `collectRunnableJobs` won't pick it up.
+		// That historically led armTimer to compute delay=0 and re-enter
+		// onTimer in a hot loop.
+		let now = 1_800_000_000_000;
+		const h = makeHarness({ nowMs: () => now });
+		try {
+			const job = await cronAdd(h.state, {
+				name: "tight-loop-defence",
+				enabled: true,
+				schedule: { kind: "every", everyMs: 60_000 },
+				sessionTarget: "main",
+				payload: { kind: "systemEvent", text: "tl" },
+			});
+			const idx = h.state.store.jobs.findIndex((j) => j.id === job.id);
+			h.state.store.jobs[idx]!.state.nextRunAtMs = now;
+			h.state.store.jobs[idx]!.state.runningAtMs = now;
+			// Patch setTimeout to capture the delay armTimer used.
+			const originalSetTimeout = globalThis.setTimeout;
+			let capturedDelay: number | undefined;
+			(globalThis as { setTimeout: unknown }).setTimeout = ((fn: () => void, delay: number) => {
+				if (capturedDelay === undefined) capturedDelay = delay;
+				return originalSetTimeout(fn, delay);
+			}) as typeof setTimeout;
+			try {
+				armTimer(h.state);
+			} finally {
+				(globalThis as { setTimeout: unknown }).setTimeout = originalSetTimeout;
+			}
+			assert.ok(
+				capturedDelay !== undefined,
+				"setTimeout must have been called",
+			);
+			assert.ok(
+				capturedDelay! >= MIN_REFIRE_GAP_MS,
+				`expected delay >= MIN_REFIRE_GAP_MS (${MIN_REFIRE_GAP_MS}), got ${capturedDelay}`,
+			);
+		} finally {
+			h.cleanup();
 		}
 	});
 });

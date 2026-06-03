@@ -17,7 +17,7 @@
  *   - `buildAgentMainSessionKey` (upstream name) is exported as
  *     `buildBrigadeMainSessionKey` per the locked design's R2 Leak #2 fix.
  *     `buildAgentMainSessionKey` is kept as a deprecated alias so any
- *     subsequent OC-port lift compiles without a rename pass.
+ *     subsequent upstream-port lift compiles without a rename pass.
  *   - `isAcpSessionKey` is NOT re-exported. Brigade is subagent-only;
  *     the ACP harness runtime is permanently dropped (R2 Leak #10).
  *
@@ -205,7 +205,7 @@ export function sanitizeAgentId(value: string | undefined | null): string {
  * Canonical main session key: `agent:<id>:main`. Renamed from the upstream
  * `buildAgentMainSessionKey` per the locked design's R2 Leak #2 brand-scrub
  * — Brigade callers should use this name. The deprecated alias below
- * accepts the upstream name for any future OC-port copy-paste.
+ * accepts the upstream name for any future upstream-port copy-paste.
  */
 export function buildBrigadeMainSessionKey(params: {
 	agentId: string;

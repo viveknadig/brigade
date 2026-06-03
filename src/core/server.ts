@@ -1488,7 +1488,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	//
 	// Within a lane, work is strictly FIFO — message 1 from a peer finishes
 	// before message 2 starts. Across lanes, work is concurrent. This shape
-	// matches OC's `enqueueCommandInLane` model and is what unblocks the
+	// matches the reference's `enqueueCommandInLane` model and is what unblocks the
 	// "two peers DM Brigade at the same time" case Brigade used to serialise.
 	//
 	// The per-turn singleton plumbing (`inFlightSession`, broadcast snapshot,

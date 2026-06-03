@@ -222,7 +222,7 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 	// `send_message` — register only when a channel manager is mounted AND
 	// at least one adapter actually started. Without that the tool would
 	// surface to the model but every call would fail validation; better to
-	// hide it until the operator has a working channel (per OC's pattern
+	// hide it until the operator has a working channel (per the reference's pattern
 	// of "no message tool when no channels are configured").
 	const channelManager = getActiveChannelManager();
 	if (channelManager && channelManager.started.length > 0) {

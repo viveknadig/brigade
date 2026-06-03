@@ -14,7 +14,7 @@
  * `GatewayCaller` interface; this file is the schema-level source of truth.
  *
  * Naming + shape match upstream verbatim so the dev-tools network panel
- * is portable between OC and Brigade reference traces.
+ * is portable between the reference and Brigade traces.
  */
 
 /** Structured error returned in `res.error`. */

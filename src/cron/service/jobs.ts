@@ -27,7 +27,7 @@
 import { randomUUID } from "node:crypto";
 
 import { computeJobStaggerOffsetMs } from "../stagger.js";
-import { computeNextRunAtMs } from "../schedule.js";
+import { computeNextRunAtMs, computePreviousRunAtMs } from "../schedule.js";
 import {
 	assertSafeCronSessionTargetId,
 	extractSessionTargetId,
@@ -56,6 +56,18 @@ export const DEFAULT_ERROR_BACKOFF_SCHEDULE_MS: readonly number[] = [
 
 /** Auto-disable a job after this many consecutive schedule-compute errors. */
 export const MAX_SCHEDULE_ERRORS = 3;
+
+/**
+ * Cap consecutive failures on a `kind: "at"` (one-shot) job before auto-
+ * disabling. A future-`at` job that hits a transient delivery error has no
+ * "next schedule slot" to fall back to (`computeNextRunAtMs` returns
+ * undefined for a past `at`), so without a cap the error-branch in
+ * `applyJobResult` would keep stacking backoffs onto `result.endedAtMs`
+ * and retry forever. After this many tries we treat the run as a permanent
+ * failure and disable the job. Recurring (`every` / `cron`) jobs are
+ * unaffected — they get the normal backoff schedule.
+ */
+export const MAX_AT_RETRIES = 3;
 
 /** Result of one execution — fed into `applyJobResult`. */
 export interface CronJobExecutionResult {
@@ -146,15 +158,73 @@ export function applyJobPatch(
  * Compute the next-fire timestamp for a job. Adds the stagger offset to the
  * canonical fire-time. Returns `undefined` when the job is disabled OR the
  * schedule has no future fires (one-shot already past).
+ *
+ * Cursor-shift pattern lifted from the upstream reference (src/cron/service/jobs.ts:86-112):
+ * the staggered branch uses a 4-attempt cursor-shift loop so a per-job
+ * offset can never produce a `shifted` value that lies before `nowMs`
+ * (the off-by-one stagger window). When the obvious "next base + offset"
+ * lands in the past, we shift the cursor back by the offset, recompute the
+ * next base from there, add the offset, and retry — up to 4 attempts
+ * before giving up.
  */
 export function computeJobNextRunAtMs(job: CronJob, nowMs: number): number | undefined {
 	if (!job.enabled) return undefined;
-	const base = computeNextRunAtMs(job.schedule, nowMs);
-	if (base === undefined) return undefined;
 	const staggerMs =
 		job.schedule.kind === "cron" ? job.schedule.staggerMs ?? 0 : 0;
-	if (staggerMs <= 0) return base;
-	return base + computeJobStaggerOffsetMs(job.id, staggerMs);
+	const offsetMs = staggerMs > 0 ? computeJobStaggerOffsetMs(job.id, staggerMs) : 0;
+	if (offsetMs <= 0) {
+		return computeNextRunAtMs(job.schedule, nowMs);
+	}
+	return computeStaggeredCronNextRunAtMs(job, nowMs, offsetMs);
+}
+
+/**
+ * Cursor-shift loop for the staggered-cron next-fire path. Shifts the
+ * schedule cursor backwards by the per-job offset so the CURRENT schedule
+ * window's staggered slot is still reachable when it has not yet passed.
+ * 4-attempt cap protects against pathological schedules that always
+ * produce a past `shifted` (would be a bug in the cron expression, not
+ * worth a hang).
+ */
+function computeStaggeredCronNextRunAtMs(
+	job: CronJob,
+	nowMs: number,
+	offsetMs: number,
+): number | undefined {
+	let cursorMs = Math.max(0, nowMs - offsetMs);
+	for (let attempt = 0; attempt < 4; attempt += 1) {
+		const baseNext = computeNextRunAtMs(job.schedule, cursorMs);
+		if (baseNext === undefined) return undefined;
+		const shifted = baseNext + offsetMs;
+		if (shifted > nowMs) return shifted;
+		cursorMs = Math.max(cursorMs + 1, baseNext + 1_000);
+	}
+	return undefined;
+}
+
+/**
+ * Companion to `computeJobNextRunAtMs` — the staggered version of
+ * `computePreviousRunAtMs`. Used by catchup math to find the most-recent
+ * scheduled slot whose `shifted` value is at-or-before `nowMs`. Same
+ * 4-attempt cursor-shift pattern as the next-run helper for symmetry.
+ */
+export function computeJobPreviousRunAtMs(job: CronJob, nowMs: number): number | undefined {
+	if (!job.enabled) return undefined;
+	const staggerMs =
+		job.schedule.kind === "cron" ? job.schedule.staggerMs ?? 0 : 0;
+	const offsetMs = staggerMs > 0 ? computeJobStaggerOffsetMs(job.id, staggerMs) : 0;
+	if (offsetMs <= 0) {
+		return computePreviousRunAtMs(job.schedule, nowMs);
+	}
+	let cursorMs = Math.max(0, nowMs - offsetMs);
+	for (let attempt = 0; attempt < 4; attempt += 1) {
+		const basePrevious = computePreviousRunAtMs(job.schedule, cursorMs);
+		if (basePrevious === undefined) return undefined;
+		const shifted = basePrevious + offsetMs;
+		if (shifted <= nowMs) return shifted;
+		cursorMs = Math.max(0, basePrevious - 1_000);
+	}
+	return undefined;
 }
 
 /**
@@ -215,6 +285,17 @@ export function applyJobResult(
 		next.state.lastError = result.error;
 		const count = (next.state.consecutiveErrorCount ?? 0) + 1;
 		next.state.consecutiveErrorCount = count;
+		// One-shot `at` jobs have no future schedule slot to fall back to —
+		// after `result.endedAtMs > schedule.at`, `computeJobNextRunAtMs`
+		// returns undefined and the error branch otherwise keeps stacking
+		// backoffs on top of `endedAtMs` forever (no auto-disable). Cap at
+		// MAX_AT_RETRIES so a transient outage doesn't leave a one-shot
+		// hammering the provider until an operator notices.
+		if (next.schedule.kind === "at" && count >= MAX_AT_RETRIES) {
+			next.enabled = false;
+			next.state.nextRunAtMs = undefined;
+			return { job: next, deleteAfterApply: false };
+		}
 		if (result.errorKind === "permanent") {
 			next.enabled = false;
 			next.state.nextRunAtMs = undefined;

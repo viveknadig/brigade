@@ -26,6 +26,7 @@
 import { parseAbsoluteTimeMs } from "./parse.js";
 import { assertSafeCronSessionTargetId } from "./session-target.js";
 import { defaultStaggerMsForCronExpression } from "./stagger.js";
+import { assertFutureAtTimestamp } from "./validate-timestamp.js";
 import type {
 	CronDelivery,
 	CronJobCreate,
@@ -134,6 +135,10 @@ export function coerceScheduleInput(raw: unknown): CronSchedule {
 						"OR epoch ms (number, or numeric/atMs string)",
 				);
 			}
+			// Future-time validation runs at the `defaultCronJobCreate` layer
+			// (NOT here) so the bare coerce remains a pure shape-coercer that
+			// callers can use to canonicalise a stored / historical schedule
+			// without tripping the grace-window guard.
 			return { kind: "at", at };
 		}
 		case "every": {
@@ -231,6 +236,12 @@ export interface CronJobCreateNormalizeOpts {
 		/** Caller's session key — used to resolve `sessionTarget: "current"`. */
 		sessionKey?: string;
 	};
+	/**
+	 * Optional scheduler-virtual clock for `kind: "at"` future-time validation.
+	 * Production callers pass `state.deps.nowMs!()`; tests that drive a
+	 * simulated clock pass their virtual time. Omit to use `Date.now()`.
+	 */
+	nowMs?: number;
 }
 
 /**
@@ -278,6 +289,17 @@ export function defaultCronJobCreate(
 	// `coerceScheduleInput` for the supported shapes.
 	const coerced = coerceScheduleInput(input.schedule);
 	const schedule = normalizeSchedule(coerced);
+	// Future-time validation on the create-path ONLY (not on the bare
+	// coercer, which is also used for shape-canonicalising stored / replayed
+	// schedules). Reject `at` jobs whose timestamp is past / current-minute
+	// / within the no-fire grace window so an AM/PM-ambiguous parse
+	// (e.g. "12:27 AM" at 12:27 PM) gets a clear retry signal instead of
+	// silently being persisted with `nextRunAtMs: undefined`. Threads
+	// `opts.nowMs` so simulated-clock tests use the scheduler's virtual
+	// time rather than wall-clock `Date.now()`.
+	if (schedule.kind === "at") {
+		assertFutureAtTimestamp(schedule.at, opts?.nowMs ?? Date.now());
+	}
 	const sessionTargetRaw =
 		input.sessionTarget ?? defaultSessionTargetForPayload(input.payload);
 	// Resolve `"current"` → `session:<id>` (or `"isolated"` when no session
@@ -286,6 +308,15 @@ export function defaultCronJobCreate(
 	const wakeMode = input.wakeMode ?? defaultWakeMode();
 	const delivery = normalizeDelivery(input.delivery, input.payload);
 	const deleteAfterRun = resolveDeleteAfterRun(input.deleteAfterRun, schedule);
+	// Stamp `sessionKey` from the caller's input OR from the session context.
+	// Without this, an agent-tool call that resolves `sessionTarget: "current"`
+	// to `session:<key>` leaves `job.sessionKey` undefined — downstream
+	// failure-alert / announce-fallback routing then can't find the caller's
+	// session and routes back to default-agent's main session instead.
+	const resolvedSessionKey =
+		typeof input.sessionKey === "string" && input.sessionKey.trim().length > 0
+			? input.sessionKey.trim()
+			: opts?.sessionContext?.sessionKey?.trim();
 	return {
 		...input,
 		schedule,
@@ -294,5 +325,6 @@ export function defaultCronJobCreate(
 		enabled: input.enabled ?? true,
 		...(delivery !== undefined ? { delivery } : {}),
 		...(deleteAfterRun !== undefined ? { deleteAfterRun } : {}),
+		...(resolvedSessionKey ? { sessionKey: resolvedSessionKey } : {}),
 	};
 }

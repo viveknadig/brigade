@@ -130,6 +130,12 @@ export async function executeCronAgentRun(
 	const payload = job.payload as CronPayloadAgentTurn;
 	const config = readConfigOrInit();
 	const agentId = job.agentId ?? DEFAULT_AGENT_ID;
+	// Self-identification prefix — lift from reference run-executor so the
+	// isolated turn's input clearly carries the cron id + name. Without this
+	// the model sees a bare prompt and may treat it as a normal operator
+	// turn, losing the "I am a scheduled job" context.
+	const cronPrefix = `[cron:${job.id} ${job.name}]\n`;
+	const messageWithPrefix = `${cronPrefix}${payload.message}`;
 	// Per-agent provider/model resolution — `cfg.agents.<agentId>` wins over
 	// `cfg.agents.defaults`. Without this multi-agent installs would always
 	// run cron fires under the default agent's model even when the cron was
@@ -158,7 +164,7 @@ export async function executeCronAgentRun(
 			agentId,
 			provider,
 			modelId,
-			message: payload.message,
+			message: messageWithPrefix,
 			sessionKey,
 			...(payload.thinking !== undefined ? { thinkingLevel: payload.thinking } : {}),
 			...(abortSignal ? { signal: abortSignal } : {}),
@@ -195,9 +201,27 @@ export async function executeCronAgentRun(
 		// AbortError → cron-side called this an abort; surface as a non-permanent
 		// error so the failure-alert path applies the normal backoff schedule.
 		log.warn("cron run threw", { jobId: job.id, error: message });
+		const errorKind = classifyAgentRunError(message);
 		return {
 			status: "error",
 			error: message,
+			...(errorKind ? { errorKind } : {}),
 		};
 	}
+}
+
+/**
+ * Map a runtime error message to a retry classification. Returns
+ * `"permanent"` for well-known unrecoverable shapes (model spec invalid,
+ * unknown provider, malformed config) so the scheduler disables the job
+ * rather than thrashing on backoff. Undefined falls back to the default
+ * `"transient"` retry path.
+ */
+function classifyAgentRunError(message: string): "permanent" | undefined {
+	const m = message.toLowerCase();
+	if (m.includes("unknown provider")) return "permanent";
+	if (m.includes("invalid model")) return "permanent";
+	if (m.includes("model not found")) return "permanent";
+	if (m.includes("no such agent")) return "permanent";
+	return undefined;
 }

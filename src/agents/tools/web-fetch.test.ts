@@ -26,7 +26,7 @@ describe("makeFetchUrlTool — schema + tool identity", () => {
 	});
 
 	it("description signals the browser-tool escalation path", () => {
-		// OC-style terseness: the half-clause "without browser automation"
+		// Reference-style terseness: the half-clause "without browser automation"
 		// implicitly tells the model that `browser` is the heavier
 		// alternative. The full untrusted-content posture lives in the
 		// `## Web` system-prompt block + the envelope markers inside

@@ -21,6 +21,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 import { resolveStateDir } from "../config/paths.js";
+import { renameWithRetryAsync } from "../infra/fs/atomic-rename.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import type { CronRunLogEntry } from "./types.js";
 
@@ -39,9 +40,43 @@ export function resolveCronRunLogDir(): string {
 	return path.join(resolveStateDir(), "cron", "runs");
 }
 
-/** Path to the per-job run-log file. */
+/**
+ * Guard against `..` / `/` / `\` / NUL in the jobId so a malicious or
+ * malformed id can never write OUTSIDE the runs/ directory. Lifted from
+ * the reference architecture (src/cron/run-log.ts:58-79); we keep the
+ * exact same `resolvedPath.startsWith(runsDir + sep)` re-validation as
+ * the belt-and-braces layer in case the trimmed id still resolves out
+ * of bounds on some exotic filesystem.
+ */
+function assertSafeCronRunLogJobId(jobId: string): string {
+	const trimmed = jobId.trim();
+	if (!trimmed) throw new Error("invalid cron run log job id");
+	if (trimmed.includes("/") || trimmed.includes("\\") || trimmed.includes("\0")) {
+		throw new Error("invalid cron run log job id");
+	}
+	return trimmed;
+}
+
+/** Path to the per-job run-log file. Throws on a malformed / traversal jobId. */
 export function resolveCronRunLogPath(jobId: string): string {
-	return path.join(resolveCronRunLogDir(), `${jobId}.jsonl`);
+	const runsDir = path.resolve(resolveCronRunLogDir());
+	const safeJobId = assertSafeCronRunLogJobId(jobId);
+	const resolvedPath = path.resolve(runsDir, `${safeJobId}.jsonl`);
+	if (!resolvedPath.startsWith(`${runsDir}${path.sep}`)) {
+		throw new Error("invalid cron run log job id");
+	}
+	return resolvedPath;
+}
+
+/**
+ * Best-effort chmod helper for the per-job JSONL file. Cron schedules can
+ * contain sensitive operator context (reminder text, recent message
+ * snippets) so the run history mirror the store's 0o600 posture. Windows
+ * doesn't honour POSIX modes — the chmod swallows there and the file
+ * keeps its NTFS ACL.
+ */
+async function setSecureRunLogFileMode(filePath: string): Promise<void> {
+	await fs.chmod(filePath, 0o600).catch(() => undefined);
 }
 
 /**
@@ -55,11 +90,25 @@ export async function appendCronRunLog(
 	limits?: CronRunLogLimits,
 ): Promise<void> {
 	const dir = resolveCronRunLogDir();
-	const filePath = resolveCronRunLogPath(entry.jobId);
+	let filePath: string;
 	try {
-		await fs.mkdir(dir, { recursive: true });
+		filePath = resolveCronRunLogPath(entry.jobId);
+	} catch (err) {
+		log.warn("append rejected — jobId failed traversal guard", {
+			jobId: entry.jobId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return;
+	}
+	try {
+		// `mode: 0o700` on the run-log dir mirrors the store's posix posture
+		// so sibling users on a shared box can't enumerate the operator's
+		// cron job ids by listing the runs/ directory.
+		await fs.mkdir(dir, { recursive: true, mode: 0o700 });
 		const line = `${JSON.stringify(entry)}\n`;
 		await fs.appendFile(filePath, line, "utf8");
+		// Tighten perms after the append (Linux/macOS); Windows swallows.
+		await setSecureRunLogFileMode(filePath);
 		await maybePruneCronRunLog(filePath, limits);
 	} catch (err) {
 		log.warn("append failed — run history may be missing this entry", {
@@ -108,7 +157,10 @@ async function maybePruneCronRunLog(
 async function atomicReplace(filePath: string, contents: string): Promise<void> {
 	const tmp = `${filePath}.tmp`;
 	await fs.writeFile(tmp, contents, "utf8");
-	await fs.rename(tmp, filePath);
+	// Retry rename for the Windows EPERM/EBUSY window — same defence the
+	// cron store uses on its tmp+rename hot path.
+	await renameWithRetryAsync(tmp, filePath);
+	await setSecureRunLogFileMode(filePath);
 }
 
 export interface ReadCronRunLogOpts {
@@ -126,7 +178,14 @@ export async function readCronRunLogEntries(
 	jobId: string,
 	opts: ReadCronRunLogOpts = {},
 ): Promise<CronRunLogEntry[]> {
-	const filePath = resolveCronRunLogPath(jobId);
+	// Path-traversal guard applies on read too — a malformed jobId from a
+	// caller that bypassed the store should still be rejected.
+	let filePath: string;
+	try {
+		filePath = resolveCronRunLogPath(jobId);
+	} catch {
+		return [];
+	}
 	let raw: string;
 	try {
 		raw = await fs.readFile(filePath, "utf8");

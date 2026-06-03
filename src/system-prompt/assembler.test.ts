@@ -383,7 +383,7 @@ describe("assembleSystemPrompt — subagent mode (Primitive #6)", () => {
 		assert.match(out.text, /# Sub-agent Context/);
 	});
 
-	it("includes the OC-style behavioural rules block", () => {
+	it("includes the reference-style behavioural rules block", () => {
 		const out = assembleSystemPrompt({
 			runtime: MOCK_RUNTIME,
 			personaFiles: [

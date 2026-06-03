@@ -76,7 +76,7 @@ export const MIN_REFIRE_GAP_MS = 2_000;
 const RUNNING_RECHECK_INTERVAL_MS = 60_000;
 /**
  * Per-execution wall-clock cap when the job didn't specify
- * `payload.timeoutSeconds`. 60 seconds matches OC's default and is well
+ * `payload.timeoutSeconds`. 60 seconds matches the reference's default and is well
  * above the slow-path tail of every realistic cron run (a reminder "say
  * hi" turn is sub-5s; even a research cron firing a web-search + reply
  * sits under 30s). Long-running crons MUST opt in by setting
@@ -356,7 +356,14 @@ export async function runDueJob(
 		startedAtMs,
 		endedAtMs,
 		...(outcome.error !== undefined ? { error: outcome.error } : {}),
-		errorKind: outcome.status === "error" ? "transient" : undefined,
+		// Honour outcome-classified errorKind so a downstream runner (or the
+		// executor's own permanent-error matcher) can disable the job rather
+		// than retry on backoff. Defaults to `"transient"` when status is
+		// error and the runner didn't classify it.
+		errorKind:
+			outcome.status === "error"
+				? (outcome.errorKind ?? "transient")
+				: undefined,
 	};
 
 	await withPerInstanceLock(state.op, async () => {
@@ -811,6 +818,12 @@ async function maybeSendFailureAlert(
 ): Promise<void> {
 	const resolved = resolveFailureAlertConfig(state, job);
 	if (!resolved) return;
+	// bestEffort jobs opted into "fire and forget" semantics — delivery errors
+	// are swallowed by design, so the failure-alert path must also stay
+	// silent. Without this gate, an operator who set `delivery.bestEffort:
+	// true` (e.g. for a low-priority WhatsApp ping) would still be paged on
+	// consecutive failures, defeating the contract.
+	if (job.delivery?.bestEffort === true) return;
 	const count = job.state.consecutiveErrorCount ?? 0;
 	if (count < resolved.after) return;
 	const lastSentAtMs = job.state.lastFailureAlertAtMs ?? 0;

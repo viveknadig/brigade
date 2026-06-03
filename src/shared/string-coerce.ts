@@ -1,5 +1,5 @@
 /**
- * OC-parity re-export of Brigade's string coercion helpers.
+ * Reference-parity re-export of Brigade's string coercion helpers.
  *
  * The upstream reference codebase puts these helpers under `src/shared/`.
  * Brigade's actual implementation lives in `src/utils/string-coerce.ts`.
