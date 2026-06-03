@@ -290,17 +290,20 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	const activeAssistants = new Map<number, Markdown>();
 	let activeLoader: CancellableLoader | null = null;
 	const pendingTools = new Map<string, Text>();
-	// Streaming render coalescer. pi-tui caps paints to ~60Hz internally, but
-	// firing `tui.requestRender()` on every model token still produces visible
-	// flicker on Windows Terminal and blocks scroll-back (the terminal can't
-	// process scroll input while a redraw is queued). Single-flight a 60ms
-	// timer instead: the first token of a burst schedules a paint, subsequent
-	// tokens just update the in-memory Markdown text (the `setText` call), and
-	// the paint that fires renders the latest text. Override the cadence with
-	// `BRIGADE_STREAM_RENDER_MS` if 60ms is wrong for some terminal.
+	// Streaming render coalescer. Every `setText()` on the streaming Markdown
+	// widget invalidates the parser cache, so each paint re-parses the FULL
+	// growing reply (Marked + line-wrap + ANSI styling). At 60Hz that's a
+	// continuous parse stall that blocks scroll events queued in the
+	// terminal's input buffer, causing the flicker + scroll-lock the operator
+	// sees on Windows Terminal. 150ms (~6–7 paints/sec while streaming) is the
+	// chosen default — slow enough that each paint's parse cost is small
+	// relative to the gap, fast enough that streaming still feels live.
+	// Override with `BRIGADE_STREAM_RENDER_MS` (clamped to ≥16). Raise to 250–400
+	// if a slow terminal still flickers; lower to 30–60 on a fast terminal
+	// (iTerm, Alacritty, recent Kitty) for snappier streaming.
 	const streamRenderMs = Math.max(
 		16,
-		Number(process.env.BRIGADE_STREAM_RENDER_MS) || 60,
+		Number(process.env.BRIGADE_STREAM_RENDER_MS) || 150,
 	);
 	let streamRenderTimer: NodeJS.Timeout | null = null;
 	const scheduleStreamingRender = (): void => {
