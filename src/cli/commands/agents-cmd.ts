@@ -241,6 +241,127 @@ export function applyAutoEnableA2AOnAgentCreate(cfg: BrigadeConfig): BrigadeConf
  * The companion `pruneAgentConfig` (in agents-config.ts) strips the id on
  * delete so add+delete are symmetric without a separate code path.
  */
+/**
+ * UX-bridge helper: implicit Pride-org init when `manage_agent({action:"add"})`
+ * is called with any org-position field (department / reportsTo / role / bio)
+ * AND `cfg.org` is absent.
+ *
+ * The operator should never have to run `brigade org init` separately just
+ * to say "create a CEO" or "create an engineer reporting to main" from chat.
+ * If the add carries an org seed, this helper:
+ *
+ *   1. Seeds `cfg.agents.<addedId>.org = { department?, reportsTo?, role?, bio? }`
+ *      from the provided fields.
+ *   2. If `cfg.org` is absent, initialises it:
+ *        - `cfg.org.topOrder` = the new agent's id IF its reportsTo === null
+ *          (operator said "make this one the top"); otherwise defaults to
+ *          `main` (the default agent id) and main is auto-seeded as
+ *          `{department:"executive", reportsTo:null, role:"Chief of Staff"}`.
+ *        - `cfg.org.a2a = { mode: "derived" }`.
+ *   3. If `cfg.org` is present, just merges the new agent's org block into
+ *      `cfg.agents.<id>.org` (does NOT touch topOrder / a2a / departmentHeads).
+ *
+ * Opt-out: `cfg.session.autoEnableOrgOnHierarchicalAdd === false` short-
+ * circuits the init step (the new agent's org seed still applies, but
+ * cfg.org stays absent — strict mode for operators who curate cfg.org
+ * by hand).
+ *
+ * Companion: when the agent is deleted, `pruneAgentConfig` already strips
+ * its `cfg.agents.<id>.org` block (cleared with the agent entry). No
+ * separate org-position teardown is needed.
+ */
+export function applyAutoEnableOrgOnHierarchicalAdd(
+	cfg: BrigadeConfig,
+	agentId: string,
+	orgSeed:
+		| {
+				department?: string;
+				reportsTo?: string | null;
+				role?: string;
+				bio?: string;
+		  }
+		| undefined,
+): BrigadeConfig {
+	if (!orgSeed) return cfg;
+	const hasAnyOrgField =
+		orgSeed.department !== undefined ||
+		orgSeed.reportsTo !== undefined ||
+		orgSeed.role !== undefined ||
+		orgSeed.bio !== undefined;
+	if (!hasAnyOrgField) return cfg;
+
+	const id = normalizeAgentId(agentId);
+	const sessionRaw = (cfg.session as Record<string, unknown> | undefined) ?? {};
+	const autoEnable = sessionRaw["autoEnableOrgOnHierarchicalAdd"];
+
+	const agentsRaw = (cfg.agents as Record<string, unknown> | undefined) ?? {};
+	const newAgentEntry = agentsRaw[id];
+	const newAgentObj =
+		newAgentEntry && typeof newAgentEntry === "object" && !Array.isArray(newAgentEntry)
+			? (newAgentEntry as Record<string, unknown>)
+			: {};
+
+	// Build the new agent's org block from the seed.
+	const newAgentOrg: Record<string, unknown> = {};
+	if (orgSeed.department !== undefined) newAgentOrg["department"] = orgSeed.department;
+	if (orgSeed.reportsTo !== undefined) newAgentOrg["reportsTo"] = orgSeed.reportsTo;
+	if (orgSeed.role !== undefined) newAgentOrg["role"] = orgSeed.role;
+	if (orgSeed.bio !== undefined) newAgentOrg["bio"] = orgSeed.bio;
+
+	const nextAgentObj = { ...newAgentObj, org: newAgentOrg };
+	let nextAgents: Record<string, unknown> = { ...agentsRaw, [id]: nextAgentObj };
+
+	// If cfg.org is already present, just seed the agent block and return.
+	const orgRaw = (cfg as { org?: unknown }).org;
+	if (orgRaw && typeof orgRaw === "object" && !Array.isArray(orgRaw)) {
+		return { ...cfg, agents: nextAgents as BrigadeConfig["agents"] };
+	}
+
+	// cfg.org is absent — should we auto-init? Operator opt-out wins.
+	if (autoEnable === false) {
+		return { ...cfg, agents: nextAgents as BrigadeConfig["agents"] };
+	}
+
+	// Decide topOrder. If the new agent has reportsTo === null, the
+	// operator clearly intends the new agent to BE the top. Otherwise
+	// default to "main" + seed main's org block as Chief of Staff if it
+	// doesn't have one already.
+	let topOrder: string;
+	if (orgSeed.reportsTo === null) {
+		topOrder = id;
+	} else {
+		topOrder = DEFAULT_AGENT_ID;
+		// Seed main's org block iff it's not already present.
+		const mainRaw = nextAgents[DEFAULT_AGENT_ID];
+		const mainObj =
+			mainRaw && typeof mainRaw === "object" && !Array.isArray(mainRaw)
+				? (mainRaw as Record<string, unknown>)
+				: {};
+		if (!mainObj["org"] || typeof mainObj["org"] !== "object") {
+			const mainOrg = {
+				department: "executive",
+				reportsTo: null,
+				role: "Chief of Staff",
+			};
+			nextAgents = {
+				...nextAgents,
+				[DEFAULT_AGENT_ID]: { ...mainObj, org: mainOrg },
+			};
+		}
+	}
+
+	const nextOrg = {
+		topOrder,
+		a2a: { mode: "derived" },
+	};
+
+	return {
+		...cfg,
+		agents: nextAgents as BrigadeConfig["agents"],
+		org: nextOrg,
+	} as BrigadeConfig;
+}
+
 export function applyAutoAllowOnCreate(cfg: BrigadeConfig, agentId: string): BrigadeConfig {
 	const id = normalizeAgentId(agentId);
 	const agentsRaw = (cfg.agents as Record<string, unknown> | undefined) ?? {};
@@ -617,6 +738,20 @@ export async function runAgentsAdd(
 		bind?: string[];
 		nonInteractive?: boolean;
 		json?: boolean;
+		/**
+		 * Optional ORG-position seed. When any field is set on add AND
+		 * cfg.org is absent, Brigade auto-initialises a minimal cfg.org
+		 * so the operator can stand up a virtual office implicitly from
+		 * chat / TUI / channels — without a separate `brigade org init`
+		 * step. `manage_agent({action:"add", department, reportsTo, role,
+		 * bio})` routes through here.
+		 */
+		org?: {
+			department?: string;
+			reportsTo?: string | null;
+			role?: string;
+			bio?: string;
+		};
 	} = {},
 ): Promise<number> {
 	const sink = defaultSink();
@@ -738,6 +873,15 @@ export async function runAgentsAdd(
 			// flow still refuses because the policy block is absent / disabled.
 			// Same opt-out story: `cfg.session.autoEnableA2AOnAgentCreate = false`.
 			staged = applyAutoEnableA2AOnAgentCreate(staged);
+			// UX-bridge (Pride org): when manage_agent was called with any
+			// org field (department / reportsTo / role / bio), seed the new
+			// agent's cfg.agents.<id>.org block AND auto-init cfg.org if
+			// it's absent. Lets the operator stand up a virtual office
+			// implicitly from chat — "create a CEO" or "create eng-lead
+			// reporting to main" works without a separate `brigade org
+			// init` step. Opt-out: cfg.session.autoEnableOrgOnHierarchicalAdd
+			// = false (operator curates cfg.org by hand).
+			staged = applyAutoEnableOrgOnHierarchicalAdd(staged, agentId, opts.org);
 			return staged as unknown as typeof cur;
 		});
 		await bootstrapWorkspace(workspaceDir);

@@ -39,6 +39,31 @@ describe("BRIGADE_TOOL_SUMMARIES — wake-word coverage", () => {
 		assert.ok(resolveToolSummary("cron"));
 	});
 
+	it("consolidated `org` tool is advertised (single-tool surface)", () => {
+		const s = resolveToolSummary("org");
+		assert.ok(s, "org tool must have a summary");
+		// The summary teaches the model the new action-dispatched surface:
+		// describe / show / delegate / init / set / explain.
+		assert.match(s!, /describe/);
+		assert.match(s!, /delegate/);
+		// And makes the consolidation explicit so the model doesn't try the
+		// retired two-tool names.
+		assert.match(s!, /Single tool/i);
+	});
+
+	it("retired `org_describe` and `delegate_to_department` names have no summary (consolidation regression guard)", () => {
+		assert.equal(
+			resolveToolSummary("org_describe"),
+			undefined,
+			"org_describe was consolidated into the `org` tool",
+		);
+		assert.equal(
+			resolveToolSummary("delegate_to_department"),
+			undefined,
+			"delegate_to_department was consolidated into the `org` tool",
+		);
+	});
+
 	it("recall_memory summary scopes recall away from live inventory", () => {
 		// Tightened from the old generic "search durable memory" — the new
 		// summary explicitly says NOT for live inventory, matching the

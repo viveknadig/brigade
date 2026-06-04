@@ -53,6 +53,8 @@ import {
 import { resolveSystemPromptOverride } from "../system-prompt/override.js";
 import { resolveRuntimeParams } from "../system-prompt/runtime-params.js";
 import { applyPersonaOverrideToSession } from "../system-prompt/pi-injection.js";
+import { deriveOrgGraph } from "./org/derive-graph.js";
+import { renderSubAgentAnchor } from "../system-prompt/org/sub-agent-anchor.js";
 import { bootstrapWorkspace } from "../workspace/bootstrap.js";
 import {
   evaluateBootstrapPhase,
@@ -83,6 +85,11 @@ import {
   createAgentToAgentPolicy,
   type SessionToolsVisibility,
 } from "./tools/sessions/shared.js";
+// Stage C — derived A2A adapter. Only activated when cfg.org is present
+// and `cfg.org.a2a.mode === "derived"` (or "open"); legacy installs see
+// the identical createAgentToAgentPolicy code path that shipped pre-org.
+// `deriveOrgGraph` is already imported above (for Stage B prompt rendering).
+import { orgGraphAsA2APolicy } from "./org/a2a-adapter.js";
 import { wrapStreamFnWithPayloadMutations } from "./payload-mutators.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
@@ -570,10 +577,22 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       if (to) a2aAllow.push(to);
     }
   }
-  const a2aPolicy = createAgentToAgentPolicy({
+  // Stage C additive-gate: when cfg.org is present AND mode === "derived"
+  // (or "open"), the derived a2a-adapter replaces the legacy
+  // flat-allowlist policy. ALL other branches (cfg.org absent / mode ===
+  // "explicit") keep the LEGACY createAgentToAgentPolicy code path
+  // unchanged so pre-org installs run bit-for-bit identical to today.
+  const orgCfg = (turnConfig as { org?: { a2a?: { mode?: string } } }).org;
+  let a2aPolicy = createAgentToAgentPolicy({
     enabled: !!a2aRaw?.enabled,
     allow: a2aAllow,
   });
+  if (orgCfg && orgCfg.a2a?.mode !== "explicit") {
+    const graph = deriveOrgGraph(turnConfig as never);
+    if (graph) {
+      a2aPolicy = orgGraphAsA2APolicy(graph);
+    }
+  }
 
   // Wave O0.5 (fix #3): populate spawnedKeys so visibility="tree" actually
   // permits the caller to reach its own sub-agents. The registry walk
@@ -1150,8 +1169,54 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // format them here so they prefix the user message alongside the cron-
   // specific Track-2 events drained above. Returns `undefined` when no
   // surface-able events are pending; the prompt body stays unchanged.
+  // Stage D additive-gate: PEEK the inbox BEFORE draining so the org
+  // layer can render receiver-side hints (per-event framing) and the
+  // top-of-org escalation inbox summary. Both helpers return `undefined`
+  // unless cfg.org is present AND an event in the batch carries
+  // `brigade-org-kind:` metadata on its contextKey — when cfg.org is
+  // absent, this block emits ZERO new bytes and the legacy combinedPrefix
+  // assembly is preserved bit-for-bit.
+  let orgEphemeralBlock: string | undefined;
+  try {
+    const orgConfig = turnConfig as { org?: unknown };
+    if (orgConfig.org) {
+      const inspected = inspectPendingSessionEvents(resolved.sessionKey);
+      if (inspected.events.length > 0) {
+        const orgBlocks: string[] = [];
+        // Per-event hint render (delegation / escalation / review framing).
+        const { renderReceiverHints } = await import(
+          "../system-prompt/org/receiver-hint.js"
+        );
+        const hints = renderReceiverHints(inspected.events);
+        if (hints) orgBlocks.push(hints);
+        // Top-of-org escalation inbox summary (only when caller is topOrder).
+        const orgGraph = deriveOrgGraph(turnConfig as never);
+        if (orgGraph) {
+          const { renderEscalationInbox } = await import(
+            "../system-prompt/org/escalation-inbox.js"
+          );
+          const inboxSummary = renderEscalationInbox({
+            callerAgentId: agentId,
+            graph: orgGraph,
+            events: inspected.events,
+          });
+          if (inboxSummary) orgBlocks.push(inboxSummary);
+        }
+        if (orgBlocks.length > 0) orgEphemeralBlock = orgBlocks.join("\n\n");
+      }
+    }
+  } catch (err) {
+    // Org peek failures are non-fatal: skip the block and keep the
+    // legacy combinedPrefix shape rather than crashing turn assembly.
+    log.warn("Stage D receiver-hint peek failed", {
+      sessionId: resolved.sessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
   const inboxBlock = drainFormattedSessionEvents({ sessionKey: resolved.sessionKey });
-  const combinedPrefix = [inboxBlock, pendingPrefix].filter(Boolean).join("\n\n");
+  const combinedPrefix = [orgEphemeralBlock, inboxBlock, pendingPrefix]
+    .filter(Boolean)
+    .join("\n\n");
   const scrubbedMessage = scrubAnthropicRefusalSentinel(
     combinedPrefix ? `${combinedPrefix}\n${args.message}` : args.message,
   );
@@ -1640,6 +1705,29 @@ async function buildPersonaPrompt(args: {
     thinkingLevel: args.thinkingLevel,
   });
 
+  // Stage-B virtual-office layer. ADDITIVE-CONDITIONAL: when
+  // `config.org` is absent (the default for every existing install),
+  // `deriveOrgGraph` returns `undefined` and the assembler's `## Org`
+  // block emits ZERO bytes. Sub-agent runs get a one-line anchor merged
+  // into `ephemeralSuffix` instead of the full block. Existing callers
+  // see no behavioural change when `cfg.org` is absent.
+  const orgGraph = config.org ? deriveOrgGraph(config) : undefined;
+
+  // Sub-agent anchor: when this turn IS a sub-agent run AND we have an
+  // org graph, append a one-line "Spawned by <id>, inheriting <dept>"
+  // anchor to the ephemeral suffix (below the cache boundary, so the
+  // sub-agent's cached prefix stays identical to the legacy shape).
+  let effectiveEphemeralSuffix = args.ephemeralSuffix;
+  if (subagentMode && orgGraph) {
+    const anchor = renderSubAgentAnchor(orgGraph, args.agentId);
+    if (anchor) {
+      effectiveEphemeralSuffix =
+        effectiveEphemeralSuffix && effectiveEphemeralSuffix.trim().length > 0
+          ? `${anchor}\n\n${effectiveEphemeralSuffix}`
+          : anchor;
+    }
+  }
+
   // OC mirror: the system prompt does NOT enumerate peers. The model
   // learns the agent catalog exclusively by calling `agents_list`
   // (allowlist-scoped) + the Runtime line's `agent=<id>` field. This is
@@ -1658,8 +1746,12 @@ async function buildPersonaPrompt(args: {
     thinkingLevel: args.thinkingLevel,
     capabilities: args.capabilities,
     skillsPromptBlock: args.skillsPromptBlock,
-    ephemeralSuffix: args.ephemeralSuffix,
+    ephemeralSuffix: effectiveEphemeralSuffix,
     ...(args.channels !== undefined ? { channels: args.channels } : {}),
+    // Stage-B: when `cfg.org` is present, hand the derived graph to the
+    // assembler so its conditional `## Org` block can render. Undefined
+    // in legacy mode → assembler skips the block (zero-cost no-op).
+    ...(orgGraph !== undefined ? { orgGraph } : {}),
   });
   return assembled.text;
 }

@@ -179,6 +179,95 @@ describe("Wave P1 — cron-triggered runs can spawn sub-agents", () => {
 	});
 });
 
+describe("createBrigadeTools — consolidated `org` tool gating", () => {
+	// Each test in this block scopes a fresh state dir so brigade.json
+	// can be written + torn down without polluting the suite's primary
+	// tmpWorkspace. We avoid `beforeEach`/`afterEach` here to keep the
+	// existing top-level tests untouched (additive only).
+	function withCfg<T>(cfg: unknown, fn: (workspaceDir: string) => T): T {
+		const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-registry-org-"));
+		fs.mkdirSync(path.join(stateDir, "agents"), { recursive: true });
+		fs.writeFileSync(path.join(stateDir, "brigade.json"), JSON.stringify(cfg, null, 2));
+		const prev = process.env.BRIGADE_STATE_DIR;
+		process.env.BRIGADE_STATE_DIR = stateDir;
+		try {
+			return fn(stateDir);
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
+			else process.env.BRIGADE_STATE_DIR = prev;
+			fs.rmSync(stateDir, { recursive: true, force: true });
+		}
+	}
+
+	it("ADDITIVE PROOF: when cfg.org is absent, the `org` tool is NOT registered (legacy install unchanged)", () => {
+		// No BRIGADE_STATE_DIR override — readConfigOrInit falls back to
+		// the user's real config, but createBrigadeTools wraps the load
+		// in a try/catch that defaults to legacy when org is missing.
+		const tools = createBrigadeTools({
+			workspaceDir: tmpWorkspace,
+			agentId: "main",
+			cwd: tmpWorkspace,
+		});
+		const names = tools.map((t) => t.name);
+		assert.ok(!names.includes("org"), "legacy install must not surface the org tool");
+		// Defensive: the old two-tool surface MUST also be gone (no shim).
+		assert.ok(!names.includes("org_describe"), "legacy org_describe must not surface");
+		assert.ok(!names.includes("delegate_to_department"), "legacy delegate_to_department must not surface");
+	});
+
+	it("when cfg.org is set, the `org` tool IS registered (single consolidated surface)", () => {
+		withCfg(
+			{
+				agents: {
+					defaults: { provider: "openrouter" },
+					main: { org: { department: "exec", reportsTo: null, role: "Chief of Staff" } },
+					logistics: { org: { department: "logistics", reportsTo: "main", role: "Head of Logistics" } },
+				},
+				org: { topOrder: "main", a2a: { mode: "derived" } },
+				// session.agentToAgent omitted entirely — the consolidated
+				// gate no longer cares; A2A-required actions (delegate)
+				// refuse closed inside the action body instead.
+			},
+			() => {
+				const tools = createBrigadeTools({
+					workspaceDir: tmpWorkspace,
+					agentId: "main",
+					cwd: tmpWorkspace,
+				});
+				const names = tools.map((t) => t.name);
+				assert.ok(names.includes("org"), "consolidated org tool surfaced when cfg.org is present");
+				assert.ok(!names.includes("org_describe"), "old org_describe no longer surfaced");
+				assert.ok(!names.includes("delegate_to_department"), "old delegate_to_department no longer surfaced");
+			},
+		);
+	});
+
+	it("when cfg.org AND cfg.session.agentToAgent.enabled are both set, the `org` tool is still the single surface", () => {
+		withCfg(
+			{
+				agents: {
+					defaults: { provider: "openrouter" },
+					main: { org: { department: "exec", reportsTo: null, role: "Chief of Staff" } },
+					logistics: { org: { department: "logistics", reportsTo: "main", role: "Head of Logistics" } },
+				},
+				org: { topOrder: "main", a2a: { mode: "derived" } },
+				session: { agentToAgent: { enabled: true, allow: ["*"] } },
+			},
+			() => {
+				const tools = createBrigadeTools({
+					workspaceDir: tmpWorkspace,
+					agentId: "main",
+					cwd: tmpWorkspace,
+				});
+				const names = tools.map((t) => t.name);
+				assert.ok(names.includes("org"), "consolidated org tool surfaced");
+				assert.ok(!names.includes("org_describe"), "old org_describe no longer surfaced");
+				assert.ok(!names.includes("delegate_to_department"), "old delegate_to_department no longer surfaced");
+			},
+		);
+	});
+});
+
 describe("listBrigadeToolNames", () => {
 	it("returns the memory tool names", () => {
 		assert.deepEqual(listBrigadeToolNames().sort(), ["read_memory", "recall_memory", "write_memory"]);

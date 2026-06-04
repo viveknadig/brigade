@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 
 import { assembleSystemPrompt } from "./assembler.js";
 import { CACHE_BOUNDARY_MARKER_LINE } from "./cache-boundary.js";
+import type { OrgGraph } from "../agents/org/types.js";
 
 const MOCK_RUNTIME = {
 	agentId: "default",
@@ -619,3 +620,223 @@ describe("assembleSystemPrompt — subagent mode (Primitive #6)", () => {
 		assert.doesNotMatch(explicitFalse.text, /SUB-AGENT/);
 	});
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// Virtual-office layer — single-line org anchor tests.
+//
+// Pin the additive-conditional contract:
+//   1. cfg.org absent (orgGraph undefined) → the assembled prompt is
+//      BYTE-IDENTICAL to a baseline assembled with no orgGraph at all.
+//      No new bytes are introduced when the feature is off.
+//   2. cfg.org defined (orgGraph present)  → a SINGLE-LINE anchor
+//      ("Org: you are <id>, ...") appears WITHOUT modifying any
+//      existing section.
+//   3. sub-agent mode + orgGraph defined   → the operator-facing anchor
+//      is NOT rendered (operator-only surface); upstream injects a
+//      one-line spawn anchor via the ephemeral suffix instead.
+// ─────────────────────────────────────────────────────────────────────
+
+const FIXTURE_ORG: OrgGraph = {
+	topOrder: "default",
+	mode: "derived",
+	members: {
+		default: {
+			department: "office",
+			reportsTo: null,
+			role: "Chief of Staff",
+			source: "explicit",
+		},
+		helper: {
+			department: "office",
+			reportsTo: "default",
+			role: "Assistant",
+			source: "explicit",
+		},
+	},
+	departments: { office: ["default", "helper"] },
+	edges: [],
+};
+
+describe("assembleSystemPrompt — org anchor (cfg.org absent → byte-identical)", () => {
+	it("cfg.org absent: omitting orgGraph produces the exact same text as before the org layer", () => {
+		// Two identical calls with no orgGraph; the result must be stable
+		// AND must not contain the anchor / org-tool vocabulary.
+		const a = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+		});
+		const b = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+		});
+		assert.equal(a.text, b.text, "two no-orgGraph calls must produce identical text");
+		// The anchor + any legacy multi-section vocabulary must be absent.
+		assert.doesNotMatch(a.text, /^## Org$/m);
+		assert.doesNotMatch(a.text, /^Org: you are /m);
+		assert.doesNotMatch(a.text, /Call org\(\{action:"describe"\}\)/);
+		assert.doesNotMatch(a.text, /Spawned by /);
+	});
+
+	it("orgGraph: undefined vs not-passed produce identical output (zero-cost no-op)", () => {
+		const omitted = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+		});
+		const explicitUndef = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			orgGraph: undefined as any,
+		});
+		assert.equal(omitted.text, explicitUndef.text);
+	});
+});
+
+describe("assembleSystemPrompt — org anchor (cfg.org defined → anchor appears, no existing sections mutated)", () => {
+	it("emits the single-line anchor exactly once, between existing sections", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+			orgGraph: FIXTURE_ORG,
+		});
+		// The single-line anchor appears.
+		assert.match(out.text, /^Org: you are default, Chief of Staff, top-of-org\. Call org\(\{action:"describe"\}\) for direct reports \+ departments\.$/m);
+		// And only once — defensive against an accidental double-render.
+		const occurrences = out.text.split(/^Org: you are /m).length - 1;
+		assert.equal(occurrences, 1, "anchor must render exactly once");
+		// Legacy `## Org` header must NOT appear (consolidation drops it).
+		assert.doesNotMatch(out.text, /^## Org$/m);
+	});
+
+	it("places the anchor line ABOVE the cache boundary (cached prefix)", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+			orgGraph: FIXTURE_ORG,
+		});
+		const anchorIdx = out.text.indexOf("\nOrg: you are ");
+		const boundaryIdx = out.text.indexOf(CACHE_BOUNDARY_MARKER_LINE);
+		assert.ok(anchorIdx > 0, "anchor line must appear in the output");
+		assert.ok(boundaryIdx > 0, "cache boundary must appear in the output");
+		assert.ok(anchorIdx < boundaryIdx, "anchor line must sit above the cache boundary");
+	});
+
+	it("does NOT modify any existing canonical section when orgGraph is added", () => {
+		// Snapshot a few load-bearing existing-section signatures with and
+		// without orgGraph; they should match byte-for-byte EXCEPT for the
+		// added anchor line.
+		const without = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+		});
+		const withOrg = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+			orgGraph: FIXTURE_ORG,
+		});
+		// Universal sections present in BOTH and unchanged.
+		for (const marker of [
+			"## Tooling",
+			"## Tool Call Style",
+			"## Execution Bias",
+			"## Safety",
+			"## Brigade CLI Quick Reference",
+			"## Workspace",
+			"# Project Context",
+			CACHE_BOUNDARY_MARKER_LINE,
+			"## Runtime",
+		]) {
+			assert.ok(without.text.includes(marker), `${marker} must exist in baseline`);
+			assert.ok(withOrg.text.includes(marker), `${marker} must still exist with orgGraph`);
+		}
+		// The with-org output is a strict super-sequence of the without-org
+		// output: removing the anchor line (the line itself + the assembler's
+		// trailing blank-line padding) brings the two back into alignment.
+		const anchorStart = withOrg.text.indexOf("Org: you are ");
+		assert.ok(anchorStart > 0);
+		// End is the next "\n\n" after the line — that pair is the blank-line
+		// separator the assembler appends. We strip up to and including ONE
+		// newline of that pair so the legacy single \n separator between the
+		// preceding section and the next section is what remains.
+		const blankPairIdx = withOrg.text.indexOf("\n\n", anchorStart);
+		assert.ok(blankPairIdx > anchorStart);
+		const stripped = withOrg.text.slice(0, anchorStart) + withOrg.text.slice(blankPairIdx + 2);
+		assert.equal(stripped, without.text, "removing the anchor line must yield the legacy text");
+	});
+});
+
+describe("assembleSystemPrompt — sub-agent mode (no operator-facing anchor; ephemeral spawn anchor)", () => {
+	it("does NOT emit the operator-facing anchor when subagentMode is true, even with orgGraph defined", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+			orgGraph: FIXTURE_ORG,
+			capabilities: { subagentMode: true },
+		});
+		// Operator-only anchor is suppressed in sub-agent mode.
+		assert.doesNotMatch(out.text, /^## Org$/m);
+		assert.doesNotMatch(out.text, /^Org: you are /m);
+	});
+
+	it("does NOT emit the operator-facing anchor in cron mode either (operator-only surface)", () => {
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+			orgGraph: FIXTURE_ORG,
+			capabilities: { cronMode: true },
+		});
+		assert.doesNotMatch(out.text, /^## Org$/m);
+		assert.doesNotMatch(out.text, /^Org: you are /m);
+	});
+
+	it("upstream-injected sub-agent anchor lands BELOW the cache boundary via ephemeralSuffix", () => {
+		// Mirrors how agent-loop.ts prepends `renderSubAgentAnchor(...)` to
+		// args.ephemeralSuffix when subagentMode + orgGraph are both set.
+		const out = assembleSystemPrompt({
+			runtime: MOCK_RUNTIME,
+			personaFiles: [
+				{ name: "AGENTS.md", path: "/x/AGENTS.md", content: "stub" },
+			],
+			toolDescriptions: [],
+			orgGraph: FIXTURE_ORG,
+			capabilities: { subagentMode: true },
+			ephemeralSuffix: "Spawned by default, inheriting office.",
+		});
+		const anchorIdx = out.text.indexOf("Spawned by default, inheriting office.");
+		const boundaryIdx = out.text.indexOf(CACHE_BOUNDARY_MARKER_LINE);
+		assert.ok(anchorIdx > 0, "anchor line must appear in the output");
+		assert.ok(boundaryIdx > 0);
+		assert.ok(anchorIdx > boundaryIdx, "sub-agent anchor must sit BELOW the cache boundary");
+	});
+});
+

@@ -48,6 +48,18 @@ import { summarizeToolResult } from "../../ui/tool-result.js";
 import { BrigadeClient } from "../../tui/client.js";
 import { ApprovalPrompt, type ApprovalResolution } from "../../tui/approval-prompt.js";
 import type { AgentSummary, ModelSummary, SessionStateSnapshot, SessionSummary } from "../../protocol.js";
+import {
+	computeExplain,
+	filterGraphToSubtree,
+	formatExplain,
+	parseOrgSlash,
+	renderDepartmentsOnly,
+} from "./org-slash.js";
+import {
+	renderPrideChartWithPins,
+	BRIGADE_FOOTER_RULE,
+} from "../../agents/org/pride-template.js";
+import type { OrgGraph } from "../../agents/org/types.js";
 
 // Commander wrapper — `brigade connect` is the thin TUI client that
 // connects to a running gateway. Same single-touch pattern the TUI /
@@ -502,6 +514,11 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 			name: "mute",
 			description: "unsubscribe from an agent id or session key",
 			argumentHint: "<agent-id|session-key>",
+		},
+		{
+			name: "org",
+			description: "show the Pride hierarchy chart (Higher Office / Departments)",
+			argumentHint: "[<agent-id>|--departments|--explain <from> <to>]",
 		},
 	];
 	editor.setAutocompleteProvider(new CombinedAutocompleteProvider(SLASH_COMMANDS, process.cwd()));
@@ -1141,6 +1158,10 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 						`- ${chalk.bold("/agents")} — list every agent the gateway knows about\n` +
 						`- ${chalk.bold("/sessions [--all]")} — list live sessions (bound agent or all)\n` +
 						`- ${chalk.bold("/mute <id|key>")} — unsubscribe from an agent id or session key\n` +
+						`- ${chalk.bold("/org")} — show the Pride hierarchy chart (Higher Office / Departments)\n` +
+						`- ${chalk.bold("/org <agent-id>")} — show a sub-tree of the chart\n` +
+						`- ${chalk.bold("/org --departments")} — chart without the Higher Office block\n` +
+						`- ${chalk.bold("/org --explain <from> <to>")} — why this edge exists (or does not)\n` +
 						`- ${chalk.bold("Ctrl+C")} — abort the current turn (same as /abort)\n` +
 						`- ${chalk.bold("Ctrl+D")} — quit\n\n` +
 						brand.dim("To add a new provider, run `brigade onboard` on the gateway machine."),
@@ -1375,6 +1396,107 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 			);
 			updateHeader();
 			void applySubscription();
+			return;
+		}
+
+		// /org — Pride hierarchy chart. Calls the gateway's `org.snapshot`
+		// RPC and renders the result inline. Four shapes:
+		//   /org                       → full chart (pre-rendered ANSI+emoji)
+		//   /org <agent-id>            → re-render the subtree rooted at <id>
+		//   /org --departments        → re-render without Higher Office
+		//   /org --explain <from> <to> → derived-graph edge explain
+		// When cfg.org is absent the gateway returns ok=false with the
+		// flat-crew redirect note; we print it verbatim (no chart frame).
+		if (trimmed === "/org" || trimmed.startsWith("/org ")) {
+			editor.setText("");
+			const rawArgs = trimmed === "/org" ? "" : trimmed.slice("/org ".length);
+			const parsed = parseOrgSlash(rawArgs);
+			if (parsed.kind === "error") {
+				insertBeforeEditor(new Text(`  ${brand.dim(parsed.message)}`, 0, 0));
+				return;
+			}
+			let snap: import("../../protocol/methods.js").OrgSnapshotResult;
+			try {
+				snap = await client.request("org.snapshot");
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				insertBeforeEditor(
+					new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0),
+				);
+				return;
+			}
+			if (snap.ok === false) {
+				insertBeforeEditor(new Markdown(snap.redirect, 1, 0, markdownTheme));
+				return;
+			}
+			const graph = snap.graph as OrgGraph;
+			// Read department-head pins from the snapshot graph caller side
+			// is fine for re-renders — the gateway already applied them
+			// when computing the pre-rendered `charts.tui` for the happy
+			// path. For client-side re-render branches (subtree /
+			// departments) we just pass `undefined` since the pin map
+			// isn't carried in the snapshot response today. The most-
+			// senior fallback path inside `flattenToThreeTiers` still
+			// produces a sensible chart.
+			const pins: Record<string, string> | undefined = undefined;
+			if (parsed.kind === "show") {
+				// Pre-shape: ensure the trailing footer rule sits on its
+				// own line so the rendered Markdown widget doesn't collapse
+				// it into the previous block.
+				let body = snap.charts.tui;
+				if (!body.endsWith("\n")) body += "\n";
+				if (!body.includes(BRIGADE_FOOTER_RULE + "\n")) {
+					body = body.replace(BRIGADE_FOOTER_RULE, BRIGADE_FOOTER_RULE + "\n");
+				}
+				insertBeforeEditor(new Text(body, 0, 0));
+				return;
+			}
+			if (parsed.kind === "explain") {
+				const outcome = computeExplain(graph, parsed.from, parsed.to);
+				insertBeforeEditor(new Text(formatExplain(outcome), 0, 0));
+				return;
+			}
+			if (parsed.kind === "subtree") {
+				const filtered = filterGraphToSubtree(graph, parsed.agentId);
+				if (!filtered) {
+					insertBeforeEditor(
+						new Text(
+							`  ${brand.error(`✗ Unknown agent "${parsed.agentId}". Run /org to see the full chart.`)}`,
+							0,
+							0,
+						),
+					);
+					return;
+				}
+				const body = renderPrideChartWithPins(filtered, pins, {
+					emoji: true,
+					ansi: true,
+				});
+				let withFooter = body;
+				if (!withFooter.endsWith("\n")) withFooter += "\n";
+				if (!withFooter.includes(BRIGADE_FOOTER_RULE + "\n")) {
+					withFooter = withFooter.replace(
+						BRIGADE_FOOTER_RULE,
+						BRIGADE_FOOTER_RULE + "\n",
+					);
+				}
+				insertBeforeEditor(new Text(withFooter, 0, 0));
+				return;
+			}
+			// parsed.kind === "departments"
+			const body = renderDepartmentsOnly(graph, pins, {
+				emoji: true,
+				ansi: true,
+			});
+			let withFooter = body;
+			if (!withFooter.endsWith("\n")) withFooter += "\n";
+			if (!withFooter.includes(BRIGADE_FOOTER_RULE + "\n")) {
+				withFooter = withFooter.replace(
+					BRIGADE_FOOTER_RULE,
+					BRIGADE_FOOTER_RULE + "\n",
+				);
+			}
+			insertBeforeEditor(new Text(withFooter, 0, 0));
 			return;
 		}
 

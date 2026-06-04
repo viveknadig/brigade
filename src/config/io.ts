@@ -48,7 +48,51 @@ export interface BrigadeConfig {
   // channel / account; the channel manager pre-evaluates user-authored
   // bindings into this shape at boot so the hot routing path stays O(n).
   bindings?: BrigadeBindings;
+  // ── OPTIONAL virtual-office layer (Stage A: inert).
+  // When this field is ABSENT (the default for every existing install),
+  // Brigade behaves identically to the pre-org runtime — no rendering,
+  // no A2A changes, no new tools, no new prompt sections. The full data
+  // model lives in `src/agents/org/types.ts`. Stage A only declares the
+  // type so consumers can take a typed reference; the actual derivation
+  // + lints + validation live in `src/agents/org/derive-graph.ts`,
+  // `lints.ts`, and `validate.ts`. NO existing runtime path reads this
+  // field at Stage A.
+  org?: BrigadeOrgConfig;
   [key: string]: unknown;
+}
+
+// Stage-A inert declaration of the org config block. This type is the
+// canonical surface for `cfg.org`; `src/agents/org/types.ts` re-exports
+// it alongside the derivation graph types so both the config layer and
+// the agents layer share a single source of truth without a cross-file
+// import cycle. The block is OPTIONAL — when `cfg.org` is absent the
+// derivation helper returns `undefined` and every consumer falls back
+// to legacy behaviour. See `src/agents/org/derive-graph.ts` for the
+// seven derivation rules and `src/agents/org/lints.ts` for warnings.
+export interface BrigadeOrgConfig {
+  /** Agent id at the top of the virtual office (e.g. "main"). Required
+   *  when `cfg.org` is present; defaults applied by derivation use
+   *  `cfg.defaults.agentId` or the literal `"main"` when omitted. The
+   *  top-of-org agent MUST have `reportsTo === null`. */
+  topOrder: string;
+  /** A2A policy mode. `derived` (default) computes the allow matrix
+   *  from the seven rules in `derive-graph.ts`; `explicit` returns
+   *  `undefined` from the deriver so the legacy A2A allowlist takes
+   *  effect; `open` derives an all-to-all matrix (useful for tests). */
+  a2a: {
+    mode: "derived" | "explicit" | "open";
+    /** Optional extra (from, to) pairs unioned into the derived matrix. */
+    extraAllow?: Array<{ from: string; to: string; reason?: string }>;
+    /** Optional (from, to) pairs subtracted from the derived matrix.
+     *  Deny wins last when an extraAllow + extraDeny collide on the
+     *  same edge. */
+    extraDeny?: Array<{ from: string; to: string; reason?: string }>;
+  };
+  /** Optional department-head pin. `departmentHeads[<dept>] === <agentId>`
+   *  marks one member as the canonical head of that department. Stage A
+   *  validates the references but no runtime path consumes them yet —
+   *  Stage C wires the lateral / escalation routing. */
+  departmentHeads?: Record<string, string>;
 }
 
 // `agents` carries both the canonical map of per-agent overrides
@@ -109,6 +153,25 @@ export interface AgentConfig {
    * Mirrors the reference codebase's per-agent `skills` field.
    */
   skills?: string[];
+  /**
+   * OPTIONAL virtual-office membership for this agent. Inert at Stage A —
+   * `agents/org/derive-graph.ts` reads it ONLY when the top-level
+   * `cfg.org` block is also present. When `cfg.org` is absent the field
+   * is type-checked but has zero runtime effect, preserving the legacy
+   * code path bit-for-bit. See `src/agents/org/types.ts` for the wider
+   * data model and `src/agents/org/derive-graph.ts` for consumption.
+   */
+  org?: {
+    /** Department slug this agent belongs to (e.g. "engineering"). */
+    department: string;
+    /** Agent id of this agent's manager. `null` only on the top-of-org
+     *  agent. Cycles are rejected by `agents/org/validate.ts`. */
+    reportsTo: string | null;
+    /** Optional human role label (e.g. "Backend Engineer"). Cosmetic. */
+    role?: string;
+    /** Optional short bio surfaced in the org-aware prompt sections. */
+    bio?: string;
+  };
   [key: string]: unknown;
 }
 

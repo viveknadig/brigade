@@ -499,3 +499,163 @@ describe("manage_agent — auto-A2A-policy seed on add", () => {
 		);
 	});
 });
+
+/**
+ * Implicit Pride-org init on `manage_agent({action:"add"})`:
+ *
+ * Operator should never have to run `brigade org init` separately. Saying
+ * "create a CEO" or "create an engineer reporting to main" in chat should
+ * auto-initialise `cfg.org` AND seed the new agent's `org` block in one
+ * atomic write.
+ *
+ * The companion `applyAutoEnableOrgOnHierarchicalAdd` helper in
+ * `cli/commands/agents-cmd.ts` does the work; these tests pin the contract.
+ */
+describe("manage_agent — implicit Pride-org init on hierarchical add", () => {
+	function readCfgOrg(): unknown {
+		return readCfg().org;
+	}
+	function readAgentOrg(id: string): unknown {
+		const cfg = readCfg();
+		const agents = cfg.agents as Record<string, { org?: unknown }> | undefined;
+		return agents?.[id]?.org;
+	}
+
+	it("(a) add with reportsTo:null → new agent becomes topOrder + cfg.org auto-init", async () => {
+		writeCfg({
+			agents: {
+				defaults: { provider: "openrouter", model: { primary: "anthropic/claude-sonnet-4.6" } },
+				main: {},
+			},
+		});
+
+		const tool = makeManageAgentTool();
+		const res = await tool.execute("call-ceo", {
+			action: "add",
+			id: "ceo",
+			department: "executive",
+			reportsTo: null,
+			role: "Chief Executive Officer",
+		});
+		assert.ok(res.content);
+
+		// cfg.org auto-initialised; new agent IS the topOrder.
+		const org = readCfgOrg() as { topOrder?: string; a2a?: { mode?: string } } | undefined;
+		assert.equal(org?.topOrder, "ceo", "new agent with reportsTo:null becomes topOrder");
+		assert.equal(org?.a2a?.mode, "derived");
+
+		// New agent's org block seeded from params.
+		assert.deepEqual(readAgentOrg("ceo"), {
+			department: "executive",
+			reportsTo: null,
+			role: "Chief Executive Officer",
+		});
+	});
+
+	it("(b) add with reportsTo:'main' → main becomes topOrder + main org auto-seeded", async () => {
+		writeCfg({
+			agents: {
+				defaults: { provider: "openrouter", model: { primary: "anthropic/claude-sonnet-4.6" } },
+				main: {},
+			},
+		});
+
+		const tool = makeManageAgentTool();
+		await tool.execute("call-eng", {
+			action: "add",
+			id: "eng_lead",
+			department: "engineering",
+			reportsTo: "main",
+			role: "Engineering Lead",
+		});
+
+		const org = readCfgOrg() as { topOrder?: string } | undefined;
+		assert.equal(org?.topOrder, "main", "main is topOrder when the new agent reports to it");
+
+		// main's org block was auto-seeded as Chief of Staff.
+		assert.deepEqual(readAgentOrg("main"), {
+			department: "executive",
+			reportsTo: null,
+			role: "Chief of Staff",
+		});
+
+		// New agent's org block seeded from params.
+		assert.deepEqual(readAgentOrg("eng_lead"), {
+			department: "engineering",
+			reportsTo: "main",
+			role: "Engineering Lead",
+		});
+	});
+
+	it("(c) add with org fields when cfg.org ALREADY present → seed new agent only, don't touch cfg.org", async () => {
+		writeCfg({
+			agents: {
+				defaults: { provider: "openrouter", model: { primary: "anthropic/claude-sonnet-4.6" } },
+				main: { org: { department: "executive", reportsTo: null, role: "Chief of Staff" } },
+				ceo: { org: { department: "executive", reportsTo: null, role: "CEO" } },
+			},
+			org: { topOrder: "ceo", a2a: { mode: "derived" } },
+		});
+
+		const tool = makeManageAgentTool();
+		await tool.execute("call-cto", {
+			action: "add",
+			id: "cto",
+			department: "engineering",
+			reportsTo: "ceo",
+			role: "CTO",
+		});
+
+		const org = readCfgOrg() as { topOrder?: string } | undefined;
+		assert.equal(org?.topOrder, "ceo", "existing topOrder is NOT replaced");
+		assert.deepEqual(readAgentOrg("cto"), {
+			department: "engineering",
+			reportsTo: "ceo",
+			role: "CTO",
+		});
+	});
+
+	it("(d) add WITHOUT any org field → cfg.org stays absent (no implicit init)", async () => {
+		writeCfg({
+			agents: {
+				defaults: { provider: "openrouter", model: { primary: "anthropic/claude-sonnet-4.6" } },
+				main: {},
+			},
+		});
+
+		const tool = makeManageAgentTool();
+		await tool.execute("call-plain", { action: "add", id: "plain" });
+
+		// cfg.org must remain absent — only the explicit org-field add triggers init.
+		assert.equal(readCfgOrg(), undefined, "no org seed when no org field passed");
+		assert.equal(readAgentOrg("plain"), undefined, "new agent has no org block");
+	});
+
+	it("(e) autoEnableOrgOnHierarchicalAdd=false → opt-out keeps cfg.org absent", async () => {
+		writeCfg({
+			agents: {
+				defaults: { provider: "openrouter", model: { primary: "anthropic/claude-sonnet-4.6" } },
+				main: {},
+			},
+			session: { autoEnableOrgOnHierarchicalAdd: false },
+		});
+
+		const tool = makeManageAgentTool();
+		await tool.execute("call-strict", {
+			action: "add",
+			id: "strict_agent",
+			department: "engineering",
+			reportsTo: null,
+			role: "Strict Lead",
+		});
+
+		// cfg.org stays absent — operator manages it by hand under strict mode.
+		assert.equal(readCfgOrg(), undefined, "opt-out short-circuits init");
+		// New agent's org block IS still seeded (it's per-agent state, not the global init).
+		assert.deepEqual(readAgentOrg("strict_agent"), {
+			department: "engineering",
+			reportsTo: null,
+			role: "Strict Lead",
+		});
+	});
+});

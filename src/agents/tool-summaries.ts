@@ -39,6 +39,8 @@ export const BRIGADE_TOOL_SUMMARIES: Record<string, string> = {
     "List EVERY configured Brigade agent with canSpawn/canSend reachability flags. Call this — don't enumerate agents from memory.",
   manage_agent: "Owner-only: create, delete, or update an agent's identity. Use this for any agent-catalog mutation — never hand-edit brigade.json.",
   manage_skill: "Owner-only: create or delete a skill (agent-scoped or shared). Never write SKILL.md by hand; this tool handles the catalog atomically.",
+  // Consolidated virtual-office surface (only present when cfg.org is set).
+  org: "Org tool: describe your position + peers, show the full chart, delegate cross-dept, init/set/explain. Single tool for everything org-shaped.",
   // Session / sub-agent surface — terse summaries mirroring the
   // reference codebase.
   sessions_list: "List other sessions (incl. sub-agents) with filters/last",

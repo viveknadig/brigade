@@ -127,6 +127,7 @@ import {
 	type CronHandlerContext,
 } from "./server-methods/cron.js";
 import { handleHealthMethod } from "./server-methods/health.js";
+import { handleOrgSnapshot } from "./server-methods/org.js";
 import { buildSkillStatusReport } from "../agents/skills/status.js";
 import { installSkill } from "../agents/skills/install.js";
 import type { SkillInstallSpec } from "../agents/skills/install-spec.js";
@@ -3479,6 +3480,20 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			await saveConfig(nextCfg);
 			return { ok: true, name, entry };
 		}),
+	);
+
+	// `org.snapshot` — operator-only read of the current org topology + every
+	// pre-rendered Pride chart format (TUI / channel / ASCII / JSON). Sits
+	// next to `agents.list` and the other operator-side snapshot RPCs: read-
+	// only, no per-session targeting, no agentId/sessionKey in the params. The
+	// guard-sweep CI test allowlists this method explicitly for that reason
+	// (see `ALLOWLIST_NO_GUARD_NEEDED` in `server.guard-sweep.test.ts`).
+	disposeHandlers.push(
+		registerGatewayHandler("org.snapshot", (_params: unknown) =>
+			handleOrgSnapshot(undefined, {
+				loadConfig: () => loadConfig() as never,
+			}),
+		),
 	);
 
 	// Wave O0.8 GAP 11 — opt the session inbox into JSONL persistence at

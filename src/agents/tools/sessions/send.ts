@@ -36,6 +36,12 @@ import {
 	type SessionToolsVisibility,
 	type ToolResultEnvelope,
 } from "./shared.js";
+// Stage C — structured A2A denial wrapping. Only invoked when the
+// legacy denial path runs AND cfg.org is present AND mode === "derived".
+// Otherwise the legacy error message stays untouched.
+import { buildOrgDeniedMessage } from "../../org/structured-errors.js";
+import { deriveOrgGraph } from "../../org/derive-graph.js";
+import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
 
 export interface SessionsSendToolArgs {
 	sessionKey: string;
@@ -222,10 +228,37 @@ export function createSessionsSendTool(
 					...(opts.spawnedKeys ? { spawnedKeys: opts.spawnedKeys } : {}),
 				});
 				if (!access.allowed) {
+					// Stage C additive-gate: when cfg.org is present AND mode ===
+					// "derived", wrap the legacy denial message with the
+					// structured-errors helper so the model gets an actionable
+					// remediation suggestion (e.g. delegate_to_department or
+					// escalate via <manager>). When cfg.org is absent OR mode is
+					// "explicit", the LEGACY error message is returned untouched.
+					let wrappedError = access.error;
+					try {
+						const cfg = (require("../../../core/config.js") as {
+							loadConfig: () => unknown;
+						}).loadConfig() as { org?: { a2a?: { mode?: string } } };
+						if (cfg.org && cfg.org.a2a?.mode !== "explicit") {
+							const graph = deriveOrgGraph(cfg as never);
+							if (graph && opts.agentSessionKey) {
+								const fromAgentId = resolveAgentIdFromSessionKey(opts.agentSessionKey);
+								const toAgentId = resolveAgentIdFromSessionKey(parsed.sessionKey);
+								wrappedError = buildOrgDeniedMessage({
+									originalMessage: access.error,
+									fromAgentId,
+									toAgentId,
+									graph,
+								});
+							}
+						}
+					} catch {
+						// Fall through to the legacy error text on any failure.
+					}
 					return jsonToolResult({
 						status: "forbidden",
 						sessionKey: parsed.sessionKey,
-						error: access.error,
+						error: wrappedError,
 					});
 				}
 			}

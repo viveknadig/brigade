@@ -37,6 +37,7 @@ import type {
 	CronUpdateResultV2,
 	CronWakeParams,
 } from "./core/server-methods/cron.js";
+import type { OrgSnapshotResult } from "./protocol/methods.js";
 
 /* ─────────────────────────── frame types ─────────────────────────── */
 
@@ -157,7 +158,13 @@ export type RequestMethod =
 	/** Read run-log history (scope: per-job or all). */
 	| "cron.runs"
 	/** Inject a system event into a session (heartbeat-driven). */
-	| "wake";
+	| "wake"
+	/**
+	 * Pride hierarchy snapshot. Returns the derived OrgGraph plus pre-
+	 * rendered chart formats (tui/channel/ascii/json). Used by the
+	 * connect TUI's `/org` slash command. Reply: OrgSnapshotResult.
+	 */
+	| "org.snapshot";
 
 /* ─────────────────────────── event names ─────────────────────────── */
 
@@ -288,6 +295,7 @@ export interface RequestParams {
 	"cron.run": CronRunParamsV2;
 	"cron.runs": CronRunsParamsV2 | void;
 	wake: CronWakeParams;
+	"org.snapshot": void;
 }
 
 /** Payload for each request method's response. `void` = no payload. */
@@ -317,6 +325,7 @@ export interface ResponseFor {
 	"cron.run": CronRunResultV2;
 	"cron.runs": CronRunsResultV2;
 	wake: void;
+	"org.snapshot": OrgSnapshotResult;
 }
 
 /** Payload shape for each event. */

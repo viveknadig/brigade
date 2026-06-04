@@ -33,4 +33,6 @@ export type {
 	AgentToAgentPolicy,
 	BindingEntry,
 	BrigadeBindings,
+	// Org / virtual-office additions (Stage A: inert):
+	BrigadeOrgConfig,
 } from "./io.js";

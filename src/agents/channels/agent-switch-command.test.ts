@@ -22,6 +22,7 @@ import { __resetConfigParseCacheForTests } from "../../config/io.js";
 import { loadConfig } from "../../core/config.js";
 import { buildAgentSwitchCommands } from "./agent-switch-command.js";
 import type { ChannelCommandContext } from "../extensions/types.js";
+import { BRIGADE_FOOTER_RULES } from "../org/pride-taunts.js";
 
 let stateDir: string;
 let prevStateDir: string | undefined;
@@ -66,7 +67,7 @@ function makeCtx(
 }
 
 async function runCommand(
-	name: "agent" | "agents" | "whoami",
+	name: "agent" | "agents" | "whoami" | "org",
 	args: string,
 	ctxOverrides: Partial<ChannelCommandContext> = {},
 ): Promise<string> {
@@ -352,6 +353,133 @@ describe("/whoami — debug aid", () => {
 		assert.match(out, /Peer:\s+\+12025550100/);
 		assert.match(out, /Agent:\s+ops/);
 		assert.match(out, /Tier:\s+binding\.peer/);
+	});
+});
+
+describe("/org channel command — Pride chart over channels", () => {
+	it("/org appears in the bundled command set", () => {
+		const commands = buildAgentSwitchCommands();
+		const names = commands.map((c) => c.name);
+		assert.ok(names.includes("org"), "buildAgentSwitchCommands must surface /org");
+	});
+
+	it("/org with cfg.org absent → channel reply has the redirect (not an empty chart)", async () => {
+		writeConfig({ agents: { main: {}, ops: {} } });
+		const out = await runCommand("org", "");
+		// Redirect surfaces verbatim — points at `brigade org init` AND `/agents`.
+		assert.match(out, /brigade org init/);
+		assert.match(out, /\/agents/);
+		// Specifically must NOT be a chart frame — no triple-backtick / chart markers.
+		assert.doesNotMatch(out, /Higher Office/);
+		assert.doesNotMatch(out, /^```/);
+	});
+
+	it("/org with cfg.org present → channel reply contains the Brigade footer rule + is wrapped in triple-backtick", async () => {
+		writeConfig({
+			agents: {
+				main: {
+					org: {
+						department: "exec",
+						reportsTo: null,
+						role: "Chief of Staff",
+					},
+				},
+				eng_lead: {
+					org: {
+						department: "engineering",
+						reportsTo: "main",
+						role: "Engineering Lead",
+					},
+				},
+				eng_ic: {
+					org: {
+						department: "engineering",
+						reportsTo: "eng_lead",
+						role: "Engineer",
+					},
+				},
+			},
+			org: {
+				topOrder: "main",
+				a2a: { mode: "derived" },
+				departmentHeads: { engineering: "eng_lead" },
+			},
+		});
+		const out = await runCommand("org", "");
+		// Triple-backtick wrap for mobile monospace rendering.
+		assert.match(out, /^```/);
+		assert.match(out, /```$/);
+		// Brigade footer rule survives the channel render. Bank rotates per-call,
+		// so assert ANY footer rule from the bank rather than a frozen literal.
+		assert.ok(
+			BRIGADE_FOOTER_RULES.some((f) => out.includes(f)),
+			"chart must contain a footer rule from the bank",
+		);
+		// Both Higher Office + Departments sections render.
+		assert.match(out, /Higher Office/);
+		assert.match(out, /Departments/);
+	});
+
+	it("/org <agent-id> filters the chart to the subtree", async () => {
+		writeConfig({
+			agents: {
+				main: {
+					org: { department: "exec", reportsTo: null, role: "Chief of Staff" },
+				},
+				eng_lead: {
+					org: {
+						department: "engineering",
+						reportsTo: "main",
+						role: "Engineering Lead",
+					},
+				},
+				eng_ic: {
+					org: {
+						department: "engineering",
+						reportsTo: "eng_lead",
+						role: "Engineer",
+					},
+				},
+				ops_lead: {
+					org: {
+						department: "ops",
+						reportsTo: "main",
+						role: "Operations Lead",
+					},
+				},
+			},
+			org: {
+				topOrder: "main",
+				a2a: { mode: "derived" },
+			},
+		});
+		const out = await runCommand("org", "eng_lead");
+		assert.match(out, /eng_lead/);
+		assert.match(out, /eng_ic/);
+		// ops_lead is NOT in the engineering subtree.
+		assert.doesNotMatch(out, /ops_lead/);
+	});
+
+	it("/org --explain <from> <to> returns a plain-text explain (no chart wrapper)", async () => {
+		writeConfig({
+			agents: {
+				main: {
+					org: { department: "exec", reportsTo: null, role: "Chief of Staff" },
+				},
+				eng_lead: {
+					org: {
+						department: "engineering",
+						reportsTo: "main",
+						role: "Engineering Lead",
+					},
+				},
+			},
+			org: { topOrder: "main", a2a: { mode: "derived" } },
+		});
+		const out = await runCommand("org", "--explain main eng_lead");
+		assert.match(out, /main → eng_lead: ALLOWED/);
+		// Explain is NOT wrapped in backticks (it's prose, not a chart).
+		assert.doesNotMatch(out, /^```/);
 	});
 });
 

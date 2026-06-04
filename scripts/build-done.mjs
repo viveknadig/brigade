@@ -16,7 +16,13 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import {
+	copyFileSync,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 
 import chalk from "chalk";
@@ -53,6 +59,28 @@ function countJs(dir) {
 	return n;
 }
 
+/**
+ * Recursively copy a directory tree (best-effort, returns file count).
+ * Used for non-TS assets — tsc compiles .ts → .js but ignores .png, .svg,
+ * .woff, etc. that live alongside source modules.
+ */
+function copyTree(src, dst) {
+	if (!existsSync(src)) return 0;
+	let n = 0;
+	mkdirSync(dst, { recursive: true });
+	for (const e of readdirSync(src, { withFileTypes: true })) {
+		const s = join(src, e.name);
+		const d = join(dst, e.name);
+		if (e.isDirectory()) {
+			n += copyTree(s, d);
+		} else if (e.isFile()) {
+			copyFileSync(s, d);
+			n++;
+		}
+	}
+	return n;
+}
+
 // 1. Build stamp — best-effort.
 let head = null;
 try {
@@ -63,7 +91,23 @@ try {
 	// Stamp is optional — a build without it just reports the bare version.
 }
 
-// 2. Banner — best-effort, never fails the build.
+// 2. Asset copy — mirror non-TS files under src/**/assets/ into dist/.
+// tsc only emits .js for .ts inputs; binary assets (PNG mascots,
+// brand SVGs, fonts) need a separate copy step to end up in the
+// shipped package. The `files: ["dist/**\/*"]` package glob then
+// picks them up automatically.
+try {
+	const ASSET_TREES = [
+		// Pride org-chart mascot PNGs + any other org-chart static assets.
+		["src/agents/org/assets", "dist/agents/org/assets"],
+	];
+	for (const [src, dst] of ASSET_TREES) copyTree(src, dst);
+} catch {
+	// Asset copy is best-effort; missing assets just produce a chart
+	// without the mascot (text fallback still works).
+}
+
+// 3. Banner — best-effort, never fails the build.
 try {
 	const gold = chalk.hex(GOLD);
 	const files = countJs("dist");

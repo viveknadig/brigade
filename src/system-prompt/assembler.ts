@@ -6,6 +6,7 @@ import { formatRuntimeLine, type RuntimeParams } from "./runtime-params.js";
 import {
   DELEGATION_CASCADE_GUIDANCE,
   MEMORY_GUIDANCE,
+  ORG_AWARENESS_GUIDANCE,
   pickModelFamilyGuidance,
   REASONING_FORMAT_GUIDANCE,
   SKILLS_GUIDANCE,
@@ -14,8 +15,10 @@ import {
   TIME_GROUNDING_GUIDANCE,
   WEB_TOOLS_GUIDANCE,
 } from "./guidance.js";
+import { renderOrgBlock } from "./org/render-org-block.js";
 import type { ContextFile } from "./types.js";
 import type { BootstrapPhase } from "../workspace/state.js";
+import type { OrgGraph } from "../agents/org/types.js";
 
 // Top-level assembler.
 //
@@ -148,6 +151,20 @@ export interface AssembleArgs {
       threadId?: string;
     };
   };
+  /**
+   * Stage-B virtual-office layer. The derived org graph from
+   * `deriveOrgGraph(cfg)` — UNDEFINED in legacy mode (cfg.org absent),
+   * in which case the assembler emits ZERO new bytes. When defined,
+   * the assembler renders a `## Org` section (or, in sub-agent mode,
+   * a one-line anchor inside the ephemeral suffix) so the model knows
+   * its place in the operator's org chart.
+   *
+   * The graph is computed UPSTREAM (in agent-loop.ts) so the assembler
+   * stays pure — no config-reads inside the render path. When the
+   * caller passes `orgGraph: undefined`, this is a zero-cost no-op
+   * (the additive-conditional invariant the Stage-B contract pins).
+   */
+  orgGraph?: OrgGraph;
 }
 
 export interface ToolDescription {
@@ -572,6 +589,22 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   lines.push(TIME_GROUNDING_GUIDANCE);
   lines.push("");
 
+  // 8c. ## Organization (always-on awareness).
+  // Tells the model that Brigade has an OPTIONAL virtual-office / org
+  // layer, when to suggest enabling it, and the natural-language patterns
+  // that signal org intent ("agent X reports to Y", "co-founder", "CEO",
+  // etc.). The block is short (~14 lines) — small token cost in exchange
+  // for the model knowing the org concept exists even on installs that
+  // have NEVER opted in (cfg.org absent).
+  //
+  // The branching inside the block ("if ## Org is visible above ... else
+  // ...") covers both opt-in states without needing the assembler to fork
+  // here. Sub-agent / cron modes still get the awareness — they may need
+  // to refuse hand-editing brigade.json or surface the org concept when
+  // delegating.
+  lines.push(ORG_AWARENESS_GUIDANCE);
+  lines.push("");
+
   // 7b. ## Memory (conditional on the memory capability).
   // Primitive #4. Emitted only when the session has the memory tools
   // (recall_memory / read_memory) wired — gated on `capabilities.memory`.
@@ -774,6 +807,27 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   if (shouldUseReasoningFormat(args.modelId, args.thinkingLevel)) {
     lines.push(REASONING_FORMAT_GUIDANCE);
     lines.push("");
+  }
+
+  // 9b. Org anchor (virtual-office layer — conditional).
+  // ADDITIVE-CONDITIONAL gate. When `args.orgGraph` is undefined (the
+  // default for every install without `cfg.org`), this block emits ZERO
+  // bytes — the assembled prompt is byte-identical to the pre-org-layer
+  // shape. When defined, `renderOrgBlock` returns a SINGLE-LINE anchor
+  // ("Org: you are <id>, <role> in <dept>, reports to <Y>. Call
+  // org({action:\"describe\"}) for peers + reachability.") pointing the
+  // model at the consolidated `org` tool for the full peer / reachability
+  // picture; the prompt itself stays lean.
+  //
+  // Skipped in minimal mode (sub-agent / cron). Sub-agent runs get a
+  // ONE-LINE anchor injected via `ephemeralSuffix` upstream so their
+  // cached prefix stays identical to the legacy sub-agent prompt.
+  if (!isMinimalMode && args.orgGraph) {
+    const block = renderOrgBlock(args.orgGraph, args.runtime.agentId);
+    if (block) {
+      lines.push(block);
+      lines.push("");
+    }
   }
 
   // 10. # Project Context — STABLE persona files (above the cache boundary).

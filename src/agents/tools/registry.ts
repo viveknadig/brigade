@@ -35,6 +35,13 @@ import { makeAgentsListTool } from "./agents-list-tool.js";
 import { makeCronTool } from "./cron-tool.js";
 import { makeManageAgentTool } from "./manage-agent-tool.js";
 import { makeManageSkillTool } from "./manage-skill-tool.js";
+// Consolidated `org` tool — only registered when cfg.org is present
+// (gate is below). Replaces the prior two-tool surface
+// (`org_describe` + `delegate_to_department`). Per-action capability
+// checks (e.g. delegate requiring cfg.session.agentToAgent.enabled)
+// happen inside the action body.
+import { makeOrgTool } from "./org-tool.js";
+import { loadConfig as _loadConfigForOrgGate } from "../../core/config.js";
 import { makeReadMemoryTool, makeRecallMemoryTool, makeWriteMemoryTool } from "./memory-tools.js";
 import { makeSendMessageTool } from "./send-message-tool.js";
 import { makeSpawnAgentTool } from "./spawn-agent-tool.js";
@@ -196,6 +203,35 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// `~/.brigade/skills/` managed) for the user.
 		makeManageSkillTool(opts.agentId !== undefined ? { requesterAgentId: opts.agentId } : {}),
 	];
+	// Consolidated org tool additive-gate: the single `org` tool is
+	// registered ONLY when cfg.org is present in the loaded config. When
+	// cfg.org is absent (the default for every existing install), NO org
+	// tool surfaces to the model — pre-org installs see the legacy tool
+	// list bit-for-bit unchanged.
+	//
+	// Per-action capability checks (e.g. `delegate` requiring
+	// `cfg.session.agentToAgent.enabled`) live INSIDE the action body, not
+	// the registry, so the action surface stays forward-compatible and a
+	// disabled action returns a structured refusal envelope instead of
+	// disappearing from the surface.
+	try {
+		const cfgForOrgGate = _loadConfigForOrgGate() as { org?: unknown };
+		if (cfgForOrgGate && cfgForOrgGate.org) {
+			tools.push(
+				makeOrgTool({
+					...(opts.agentId !== undefined
+						? { requesterAgentId: opts.agentId }
+						: {}),
+					...(opts.sessionContext?.key !== undefined
+						? { agentSessionKey: opts.sessionContext.key }
+						: {}),
+				}),
+			);
+		}
+	} catch {
+		// loadConfig failures are non-fatal: skip the gate and keep the
+		// legacy tool list rather than crashing tool assembly.
+	}
 	// Primitive #6 — register `spawn_agent` (sync, single child) AND
 	// `spawn_agents` (sync, parallel fan-out) only when the caller supplied a
 	// parent context AND the child wouldn't be a leaf. `filterToolsForSubagentDepth`

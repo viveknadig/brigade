@@ -1093,6 +1093,70 @@ export function buildProgram(): Command {
       );
     });
 
+  /* ─────────────────────────────── org ─────────────────────────────── */
+  // Stage C — `brigade org <init|show|explain|doctor>`. ADDITIVE: when
+  // cfg.org is absent these commands either print a friendly "no org"
+  // banner (show/explain/doctor) or seed a starter file (init). The
+  // existing CLI surface is untouched; the four subcommands sit beside
+  // `brigade agents` rather than replacing any field.
+  const org = program
+    .command("org")
+    .description(
+      "Manage the optional virtual-office layer (cfg.org). When unset, Brigade behaves exactly as before.",
+    );
+
+  org
+    .command("init")
+    .description("Write a starter cfg.org block + open $EDITOR on brigade.json")
+    .option(
+      "--template <id>",
+      "starter template: solo | family | company | custom (default: solo)",
+      "solo",
+    )
+    .option("--skip-editor", "do not spawn $EDITOR after writing", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { template: string; skipEditor?: boolean; json?: boolean }) => {
+      const { runOrgInit } = await import("../commands/org-cmd.js");
+      process.exit(
+        await runOrgInit({
+          template: opts.template,
+          ...(opts.skipEditor !== undefined ? { skipEditor: opts.skipEditor } : {}),
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+        }),
+      );
+    });
+
+  org
+    .command("show")
+    .description("Print an ASCII tree of the current org (cfg.org)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runOrgShow } = await import("../commands/org-cmd.js");
+      process.exit(await runOrgShow({ ...(opts.json !== undefined ? { json: opts.json } : {}) }));
+    });
+
+  org
+    .command("explain <from> <to>")
+    .description(
+      "Show whether `from` can talk to `to` and why (derivation chain or denial reason)",
+    )
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (from: string, to: string, opts: { json?: boolean }) => {
+      const { runOrgExplain } = await import("../commands/org-cmd.js");
+      process.exit(
+        await runOrgExplain({ from, to, ...(opts.json !== undefined ? { json: opts.json } : {}) }),
+      );
+    });
+
+  org
+    .command("doctor")
+    .description("Run the org lints (single-member dept, dangling overrides, depth > 5, …)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runOrgDoctor } = await import("../commands/org-cmd.js");
+      process.exit(await runOrgDoctor({ ...(opts.json !== undefined ? { json: opts.json } : {}) }));
+    });
+
   return program;
 }
 

@@ -62,6 +62,9 @@ const ALLOWLIST_NO_GUARD_NEEDED = new Set<string>([
 	"refresh-models",
 	"get-state",
 	"agents.list",
+	// `org.snapshot` — read-only org topology + every Pride chart format.
+	// Takes no per-session params; the handler derives from cfg + renders.
+	"org.snapshot",
 	// Boot/lifecycle methods.
 	"shutdown",
 	"health",

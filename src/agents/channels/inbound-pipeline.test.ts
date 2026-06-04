@@ -88,7 +88,7 @@ function makeFakeChannel(overrides: Partial<ChannelAdapter> = {}): {
 }
 
 describe("inbound-pipeline: bundled commands include /agent /agents /whoami", () => {
-	it("buildBundledCommands surfaces the four legacy + three new commands", () => {
+	it("buildBundledCommands surfaces the four legacy + four new commands", () => {
 		const fake = makeFakeChannel();
 		const commands = buildBundledCommands(fake.adapter);
 		const names = commands.map((c) => c.name);
@@ -98,9 +98,10 @@ describe("inbound-pipeline: bundled commands include /agent /agents /whoami", ()
 		assert.ok(names.includes("agent"));
 		assert.ok(names.includes("agents"));
 		assert.ok(names.includes("whoami"));
+		assert.ok(names.includes("org"));
 	});
 
-	it("/help mentions the three new commands", () => {
+	it("/help mentions the four new commands", () => {
 		const fake = makeFakeChannel();
 		const commands = buildBundledCommands(fake.adapter);
 		const helpCmd = commands.find((c) => c.name === "help");
@@ -118,6 +119,7 @@ describe("inbound-pipeline: bundled commands include /agent /agents /whoami", ()
 		assert.match(out, /\/agent /);
 		assert.match(out, /\/agents /);
 		assert.match(out, /\/whoami/);
+		assert.match(out, /\/org /);
 	});
 });
 

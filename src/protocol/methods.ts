@@ -247,6 +247,36 @@ export interface HealthResult {
 	channels?: Record<string, { state?: string }>;
 }
 
+/* ─── Org methods ────────────────────────────────────────────────── */
+
+/** Params for `org.snapshot` — no-op today, reserved for future filtering. */
+export type OrgSnapshotParams = Record<string, never> | undefined;
+
+/** Per-format Pride chart bundle returned when cfg.org is present. */
+export interface OrgSnapshotCharts {
+	/** ANSI + emoji — for the TUI. */
+	tui: string;
+	/** Emoji + plain text wrapped in a triple-backtick code block. */
+	channel: string;
+	/** Plain ASCII (no emoji, no ANSI). */
+	ascii: string;
+	/** Raw OrgGraph for downstream re-rendering. */
+	json: unknown;
+}
+
+/** Discriminated result envelope — `ok: true` carries every render format. */
+export type OrgSnapshotResult =
+	| {
+		ok: true;
+		graph: unknown;
+		charts: OrgSnapshotCharts;
+	}
+	| {
+		ok: false;
+		reason: "flat-crew";
+		redirect: string;
+	};
+
 /* ─── Authoritative catalogue ───────────────────────────────────── */
 
 export interface GatewayMethodSignatures {
@@ -267,6 +297,7 @@ export interface GatewayMethodSignatures {
 	wake: { params: WakeParams; result: WakeResult };
 	"approvals.respond": { params: ApprovalsRespondParams; result: ApprovalsRespondResult };
 	health: { params: HealthParams; result: HealthResult };
+	"org.snapshot": { params: OrgSnapshotParams; result: OrgSnapshotResult };
 }
 
 export type GatewayMethodName = keyof GatewayMethodSignatures;

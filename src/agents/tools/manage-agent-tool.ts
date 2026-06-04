@@ -65,6 +65,36 @@ const ManageAgentParams = Type.Object({
 	emoji: Type.Optional(Type.String({ description: "Emoji (set-identity only)." })),
 	theme: Type.Optional(Type.String({ description: "Theme tag (set-identity only)." })),
 	avatar: Type.Optional(Type.String({ description: "Avatar path / URL (set-identity only)." })),
+	// `add`-time ORG-position params (Pride hierarchy, optional). When ANY
+	// of these is set on action=add AND cfg.org is absent, Brigade auto-
+	// initialises a minimal cfg.org so the operator never has to run
+	// `brigade org init` separately. "Create a CEO" / "create eng-lead
+	// reporting to main" / "set up a strategy department" all just work
+	// from chat. See `applyAutoEnableOrgOnHierarchicalAdd`.
+	department: Type.Optional(
+		Type.String({
+			description:
+				"Org department slug (e.g. \"engineering\", \"strategy\", \"executive\"). Setting this on action=add auto-initialises cfg.org if absent — no separate `brigade org init` needed.",
+		}),
+	),
+	reportsTo: Type.Optional(
+		Type.Union([Type.String(), Type.Null()], {
+			description:
+				"Org parent agent id. Pass null to make the NEW agent the top-of-org (Higher Office); pass an existing agent id to place the new agent under it. Setting this on action=add auto-initialises cfg.org if absent.",
+		}),
+	),
+	role: Type.Optional(
+		Type.String({
+			description:
+				"Org role title (e.g. \"Chief of Staff\", \"Engineering Lead\", \"Inventory Specialist\"). Used in the Pride chart anchor + ## Org block. Setting this on action=add auto-initialises cfg.org if absent.",
+		}),
+	),
+	bio: Type.Optional(
+		Type.String({
+			description:
+				"Optional 1-line org-position description (\"Routes work across the org.\", \"Reviews diffs for correctness.\"). Setting this on action=add auto-initialises cfg.org if absent.",
+		}),
+	),
 });
 
 interface ManageAgentResult {
@@ -112,12 +142,29 @@ export function makeManageAgentTool(): BrigadeTool<typeof ManageAgentParams, Man
 				try {
 					if (action === "add") {
 						const { runAgentsAdd } = await import("../../cli/commands/agents-cmd.js");
+						// Org-position params are threaded through to runAgentsAdd
+						// so the underlying mutateConfigAtomic callback can
+						// (a) seed the new agent's cfg.agents.<id>.org block AND
+						// (b) auto-init cfg.org when it's absent — both atomic
+						// with the agent creation itself. See
+						// `applyAutoEnableOrgOnHierarchicalAdd` in agents-cmd.ts.
+						const orgFields: {
+							department?: string;
+							reportsTo?: string | null;
+							role?: string;
+							bio?: string;
+						} = {};
+						if (args.department !== undefined) orgFields.department = args.department;
+						if (args.reportsTo !== undefined) orgFields.reportsTo = args.reportsTo;
+						if (args.role !== undefined) orgFields.role = args.role;
+						if (args.bio !== undefined) orgFields.bio = args.bio;
 						exitCode = await runAgentsAdd({
 							name: id,
 							nonInteractive: true,
 							...(args.workspace !== undefined ? { workspace: args.workspace } : {}),
 							...(args.provider !== undefined ? { provider: args.provider } : {}),
 							...(args.model !== undefined ? { model: args.model } : {}),
+							...(Object.keys(orgFields).length > 0 ? { org: orgFields } : {}),
 						});
 					} else if (action === "delete") {
 						const { runAgentsDelete } = await import("../../cli/commands/agents-cmd.js");

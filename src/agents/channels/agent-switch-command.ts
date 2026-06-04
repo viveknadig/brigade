@@ -51,6 +51,15 @@ import {
 } from "../../cli/commands/agents-bindings.js";
 import { hasAgentEntry, listAgentEntries } from "../../cli/commands/agents-config.js";
 import type { ChannelCommand, ChannelCommandContext } from "../extensions/types.js";
+import { handleOrgSnapshot } from "../../core/server-methods/org.js";
+import {
+	computeExplain,
+	filterGraphToSubtree,
+	formatExplain,
+	parseOrgSlash,
+	renderDepartmentsOnly,
+} from "../../cli/commands/org-slash.js";
+import { renderPrideChartWithPins } from "../org/pride-template.js";
 
 /** Sentinel an operator types to clear the peer pin. */
 const MAIN_KEYWORD = "main";
@@ -286,11 +295,76 @@ function handleWhoAmI(ctx: ChannelCommandContext): string {
 }
 
 /**
- * Build the three `ChannelCommand` entries (`/agent`, `/agents`, `/whoami`)
- * with no external dependency — the handlers read everything they need from
- * `ChannelCommandContext` (which already carries `config` + the sender
- * identity). The returned commands plug straight into the channel
- * manager's command map alongside `/help` / `/status` / `/allowlist`.
+ * `/org` channel handler — render the Pride chart for the current crew.
+ *
+ * Forms (mirrors the TUI `/org` slash command — same parser, same
+ * filters, same template):
+ *
+ *   /org                       → full chart
+ *   /org <agent-id>            → subtree rooted at <agent-id>
+ *   /org --departments         → departments-only (skip Higher Office)
+ *   /org --explain <from> <to> → why this edge exists (or doesn't)
+ *
+ * When `cfg.org` is absent the redirect note is returned UN-wrapped (no
+ * code block) — the redirect is prose, not a chart, and wrapping it in
+ * monospace makes it harder to read on mobile.
+ */
+function handleOrg(ctx: ChannelCommandContext): string {
+	const parsed = parseOrgSlash(ctx.args);
+	if (parsed.kind === "error") return parsed.message;
+
+	const snap = handleOrgSnapshot(undefined, {
+		loadConfig: () => ctx.config as never,
+	});
+	if (snap.ok === false) return snap.redirect;
+
+	// Explain — uses the snapshot graph directly, plain text reply (no
+	// code-block wrap, the chain is short and reads cleaner inline).
+	if (parsed.kind === "explain") {
+		const outcome = computeExplain(snap.graph, parsed.from, parsed.to);
+		return formatExplain(outcome);
+	}
+
+	const pins = (ctx.config as { org?: { departmentHeads?: Record<string, string> } }).org
+		?.departmentHeads;
+
+	// Show — happy path. Use the pre-rendered channel chart from the
+	// snapshot so the byte-for-byte shape matches what every other
+	// caller sees.
+	if (parsed.kind === "show") {
+		return snap.charts.channel;
+	}
+
+	// Sub-tree — filter the graph then re-render via the SAME template
+	// engine (emoji on, ANSI off, triple-backtick wrap).
+	if (parsed.kind === "subtree") {
+		const filtered = filterGraphToSubtree(snap.graph, parsed.agentId);
+		if (!filtered) {
+			return `Unknown agent "${parsed.agentId}". Run /org to see the full chart.`;
+		}
+		const inner = renderPrideChartWithPins(filtered, pins, {
+			emoji: true,
+			ansi: false,
+		});
+		return ["```", inner, "```"].join("\n");
+	}
+
+	// Departments-only — render the chart with the Higher Office block
+	// elided. Re-uses the same template engine + monospace wrap.
+	const inner = renderDepartmentsOnly(snap.graph, pins, {
+		emoji: true,
+		ansi: false,
+	});
+	return ["```", inner, "```"].join("\n");
+}
+
+/**
+ * Build the channel `ChannelCommand` entries (`/agent`, `/agents`,
+ * `/whoami`, `/org`) with no external dependency — the handlers read
+ * everything they need from `ChannelCommandContext` (which already carries
+ * `config` + the sender identity). The returned commands plug straight
+ * into the channel manager's command map alongside `/help` / `/status`
+ * / `/allowlist`.
  *
  * Keeping the factory shape (rather than exporting bare constants) gives
  * the wiring layer a single place to inject test stubs later (e.g. a fake
@@ -313,6 +387,12 @@ export function buildAgentSwitchCommands(): ChannelCommand[] {
 			name: "whoami",
 			description: "Show which agent this peer currently routes to.",
 			handler: (ctx) => handleWhoAmI(ctx),
+		},
+		{
+			name: "org",
+			description:
+				"Show the Pride hierarchy chart (or a sub-tree / explain).",
+			handler: (ctx) => handleOrg(ctx),
 		},
 	];
 }

@@ -89,6 +89,32 @@ If a tool returns UTC timestamps (e.g. cron \`nextRunAtMs\` / \`firedAtMs\`), co
 
 Always confirm the timezone explicitly when stating a time (e.g. "next at 4:46 PM IST") so the user can verify.`;
 
+/* ───────────────── Organization awareness (always-on) ───────────────── */
+
+/**
+ * Always-on. Tells the model that Brigade has an OPTIONAL virtual-office /
+ * org layer, when to suggest enabling it, and how to act on natural-language
+ * "create agent that reports to X" / "get me a co-founder" / "make a CEO"
+ * patterns. Critically: org is OFF by default, and most users never need it.
+ * The block is short (~14 lines) so the always-on cost is small; the failure
+ * mode without it is the model not knowing the org concept exists at all.
+ *
+ * Inspired by Paperclip's framing ("if OpenClaw is an employee, Paperclip
+ * is the company") but adapted for Brigade's opt-in personal-AI-crew model.
+ * When the `## Org` block is rendered above (cfg.org is set), this block's
+ * "you're in org mode" branch applies; otherwise the "ask before activating"
+ * branch applies.
+ */
+export const ORG_AWARENESS_GUIDANCE = `## Organization (optional)
+
+Brigade supports an OPTIONAL virtual-office layer (departments, reports-to, top-of-org). It's OFF by default — most users have a flat crew where every agent is a peer. The operator opts in either by editing \`cfg.org\` directly, by running \`brigade org init\`, or implicitly by passing org fields to \`manage_agent\` (the new agent's \`department\` / \`reportsTo\` / \`role\` auto-initialises a minimal \`cfg.org\` the first time it's used).
+
+When the user signals org intent — "create an agent that reports to X" / "get me a co-founder" / "make a CEO/CTO/department head" / "set up an engineering team" / "build a company around this" — call \`manage_agent({action:"add", id, reportsTo?, role?, department?, bio?})\`. Pass the org fields directly; the tool auto-enables the virtual-office layer on first hierarchical add. For a simple peer agent without hierarchy, omit the org fields and the install stays in flat-crew mode.
+
+If a single-line \`Org:\` anchor is visible above this section, the operator has already opted in. Use \`org({action:"describe"})\` to inspect your position and reachable peers, and \`org({action:"delegate", department, message})\` for cross-dept work. The same \`org\` tool also exposes \`show\` (full chart), \`init\` (bootstrap cfg.org from a template), \`set\` (update an agent's org block), and \`explain\` (why an edge exists). If no \`Org:\` anchor is visible, you're in flat-crew mode and the org tool is not surfaced — that's fine, suggest org-mode ONLY when the user's request actually requires hierarchy.
+
+Never edit \`brigade.json\` by hand to change org structure. The path-write guard will refuse it. Configuration mutations go through \`manage_agent\` or \`brigade org init\`.`;
+
 /* ───────────────── Memory guidance (conditional on memory tool) ───────────────── */
 
 /**

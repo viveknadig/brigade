@@ -33,6 +33,8 @@ import { Type } from "typebox";
 
 import { listAgentEntries } from "../../cli/commands/agents-config.js";
 import { loadConfig } from "../../core/config.js";
+import { orgGraphAsA2APolicy } from "../org/a2a-adapter.js";
+import { deriveOrgGraph } from "../org/derive-graph.js";
 import { DEFAULT_AGENT_ID, normalizeAgentId } from "../routing/session-key.js";
 import { jsonResult } from "./common.js";
 import { createAgentToAgentPolicy } from "./sessions/shared.js";
@@ -118,10 +120,21 @@ export function makeAgentsListTool(
 					if (to) a2aAllow.push(to);
 				}
 			}
-			const a2aPolicy = createAgentToAgentPolicy({
+			// Stage C — when cfg.org is present AND mode === "derived" (or
+			// "open"), derived A2A drives canSend reasoning. Otherwise the
+			// LEGACY policy path runs unchanged (cfg.org absent → identical
+			// behaviour to pre-org installs).
+			const orgCfg = (cfg as { org?: { a2a?: { mode?: string } } }).org;
+			let a2aPolicy = createAgentToAgentPolicy({
 				enabled: !!a2aRaw?.enabled,
 				allow: a2aAllow,
 			});
+			if (orgCfg && orgCfg.a2a?.mode !== "explicit") {
+				const graph = deriveOrgGraph(cfg as never);
+				if (graph) {
+					a2aPolicy = orgGraphAsA2APolicy(graph);
+				}
+			}
 
 			// Build the caller row first so it leads the output and so its
 			// `configured` flag accounts for the "default agent always exists"
