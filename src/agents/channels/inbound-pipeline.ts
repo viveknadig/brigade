@@ -36,6 +36,7 @@ import {
 	upsertPairingRequest,
 } from "./access-control/index.js";
 import { isAbortTrigger } from "./abort-triggers.js";
+import { buildAgentSwitchCommands } from "./agent-switch-command.js";
 import {
 	type ChannelApprovalRoute,
 	tryConsumeChannelApprovalReply,
@@ -210,6 +211,10 @@ export function buildBundledCommands(adapter: ChannelAdapter): ChannelCommand[] 
 					"  /status          — show your access state on this channel",
 					"  /allowlist list  — operator-only: show approved senders",
 					"  /allowlist add <id> | /allowlist remove <id> — operator-only",
+					"  /agent <id>      — pin future messages from you to that agent",
+					"  /agent main      — clear the pin",
+					"  /agents          — list peer pins on this channel",
+					"  /whoami          — show which agent answers you right now",
 					"  stop / cancel / abort — kill the current turn",
 				].join("\n"),
 		},
@@ -256,6 +261,12 @@ export function buildBundledCommands(adapter: ChannelAdapter): ChannelCommand[] 
 				return "Usage: /allowlist [list | add <id> | remove <id>]";
 			},
 		},
+		// Channel direct-talk pinning: `/agent <id>` lets the sender pin
+		// future messages from THIS peer on THIS channel+account to a
+		// specific agent. Brigade-personal-first → no authorize gate; the
+		// sender of the message owns the pin (the binding records `boundBy`
+		// for the future multi-tenant cut).
+		...buildAgentSwitchCommands(),
 	];
 }
 
@@ -502,6 +513,11 @@ export async function runChannelInboundPipeline(
 					fromName: msg.fromName,
 					args: space === -1 ? "" : text.slice(space + 1).trim(),
 					config: cfg,
+					// Additive scope: handlers like `/agent` need accountId +
+					// isGroup to build a peer-scoped binding. Legacy handlers
+					// (`/help`, `/status`, `/allowlist`) ignore these fields.
+					...(msg.accountId !== undefined ? { accountId: msg.accountId } : {}),
+					isGroup,
 				};
 				const opts = buildSendOpts(msg.threadId, msg.accountId);
 				if (command.authorize && !command.authorize(cmdCtx)) {

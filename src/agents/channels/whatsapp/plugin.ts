@@ -29,11 +29,13 @@ import {
 	removeChannelApprovalDispatcher,
 } from "../approval-router.js";
 import {
+	buildBundledCommands,
 	createInboundPipelineContext,
 	runChannelInboundPipeline,
 	type InboundPipelineContext,
 	type RunChannelTurnFn,
 } from "../inbound-pipeline.js";
+import type { ChannelCommand } from "../../extensions/types.js";
 import type { StartChannelsArgs } from "../manager.js";
 import type {
 	ChannelGatewayContext,
@@ -152,11 +154,20 @@ export function createWhatsAppPlugin(
 		}
 
 		const pipelineRunTurn: RunChannelTurnFn = (turn) => deps.runTurn(turn);
+		// Bundled channel commands (`/help`, `/status`, `/allowlist`,
+		// `/agent`, `/agents`, `/whoami`). The legacy single-account
+		// `startChannels` path already wires this map; without it on the
+		// multi-account plugin path every slash command silently no-ops.
+		const commandMap = new Map<string, ChannelCommand>();
+		for (const c of buildBundledCommands(adapter)) {
+			commandMap.set(c.name.toLowerCase(), c);
+		}
 		const pipeline = createInboundPipelineContext({
 			adapter,
 			config: deps.loadConfig(),
 			agentId: deps.defaultAgentId,
 			runTurn: pipelineRunTurn,
+			commandMap,
 			parentAbort: accountAbort.signal,
 		});
 

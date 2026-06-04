@@ -60,6 +60,7 @@ import {
 // — no session lives between turns. The in-flight
 // session is surfaced for the turn's lifetime via `onSessionReady` so the
 // gateway can steer / abort / switch-model mid-stream.
+import { applyAutoEnableA2AAtBoot } from "../agents/a2a-policy-canonicalize.js";
 import { runResilientTurn, type RunSingleTurnResult } from "../agents/agent-loop.js";
 import { BrigadeExtensionRegistry, BUNDLED_MODULES, clearDiscoveryCache, loadModules } from "../agents/extensions/index.js";
 import type { GatewayCaller, GatewayMethodHandler, HttpRoute, Service } from "../agents/extensions/index.js";
@@ -497,6 +498,35 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		resetAllLanes();
 	} catch {
 		// best-effort — lane reset never blocks boot
+	}
+
+	// A2A boot-default — canonicalise `cfg.session.agentToAgent` at boot
+	// so personal installs work out of the box (the sessions-access guard,
+	// `sessions_send` policy, and every other A2A consumer downstream read
+	// the canonical shape). Default-on; operators set
+	// `cfg.session.autoEnableA2AAtBoot = false` for strict-allowlist
+	// installs where every (from, to) pair is hand-authored.
+	//
+	// Mutates the local `args.bootConfig` (every downstream reader sees the
+	// canonicalised shape) and best-effort persists the canonical form back
+	// to disk via `mutateConfigAtomic` so the on-disk shape stabilises in
+	// one write per boot. Disk-write failure is non-fatal — the in-memory
+	// shape still wins.
+	{
+		const canonicalized = applyAutoEnableA2AAtBoot(args.bootConfig as unknown as BrigadeConfig);
+		if (canonicalized !== (args.bootConfig as unknown as BrigadeConfig)) {
+			bootLog("canonicalizing cfg.session.agentToAgent at boot…");
+			args.bootConfig = canonicalized as unknown as Config;
+			try {
+				await mutateConfigAtomic(
+					(cur) => applyAutoEnableA2AAtBoot(cur as BrigadeConfig) as unknown as typeof cur,
+				);
+			} catch (err) {
+				bootLog(
+					`a2a canonicalize disk write failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+		}
 	}
 
 	/**

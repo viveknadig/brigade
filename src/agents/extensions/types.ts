@@ -425,6 +425,22 @@ export interface ChannelCommandContext {
 	args: string;
 	/** Active config (for the handler to read its own settings / owner list). */
 	config: BrigadeConfig;
+	/**
+	 * Optional: channel account id this command arrived on (for adapters
+	 * that run multiple accounts of the same channel — e.g. WhatsApp
+	 * personal + work). Legacy adapters that don't carry the field default
+	 * to `"default"` at the consumer side. Additive — handlers that don't
+	 * need account scoping can ignore it.
+	 */
+	accountId?: string;
+	/**
+	 * Optional: `true` when the message arrived in a group/room rather
+	 * than a 1:1 DM. Mirrors `InboundMessage.isGroup`. Handlers that
+	 * scope bindings by peer kind read this; legacy adapters that don't
+	 * surface a group/direct distinction leave it undefined and the
+	 * consumer treats that as `direct`.
+	 */
+	isGroup?: boolean;
 }
 
 /**

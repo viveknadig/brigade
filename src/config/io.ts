@@ -163,6 +163,16 @@ export interface BrigadeSessionConfig {
    *  operator authors every A2A pair by hand. Mirrors the
    *  `agents.defaults.subagents.autoAllowOnCreate` toggle. */
   autoEnableA2AOnAgentCreate?: boolean;
+  /** When `true` (default), gateway boot canonicalises
+   *  `cfg.session.agentToAgent` to the wide-open `{ enabled: true, allow:
+   *  [{ from: "*", to: "*" }] }` shape so A2A messaging via `sessions_send`
+   *  works out of the box on personal installs. Operators set this to
+   *  `false` for strict-allowlist installs where every A2A pair is hand-
+   *  authored in `brigade.json`. Sibling of `autoEnableA2AOnAgentCreate`
+   *  (which fires inside `agents add` / `manage_agent`); this one fires
+   *  inside `continueBoot()` immediately after `loadConfig()`. The two
+   *  toggles are independent. */
+  autoEnableA2AAtBoot?: boolean;
   /** Visibility gate for the `sessions_list` / `sessions_history` tools. */
   sessionTools?: { visibility?: SessionToolsVisibility };
   [key: string]: unknown;
@@ -193,6 +203,16 @@ export type BindingEntry = {
     teamId?: string;
     /** Role-id allowlist (Discord). Matches if member has ANY of these. */
     roles?: string[];
+    /** Sender id who pinned this peer to the agent via the in-channel
+     *  `/agent <id>` slash command. Display-only — the resolver never
+     *  reads it, so the binding still routes by agent + match.peer. */
+    boundBy?: string;
+    /** ISO timestamp the binding was created (channel-command flow). */
+    boundAt?: string;
+    /** Provenance of the binding: `"channel-command"` for `/agent` writes,
+     *  `"cli"` for `brigade agents bind`, `"manual"` for hand-edited
+     *  `brigade.json`. Display-only. */
+    source?: "channel-command" | "cli" | "manual";
   };
 };
 

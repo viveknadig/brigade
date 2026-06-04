@@ -30,6 +30,7 @@
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import path from "node:path";
 
+import { applyAutoEnableA2AOnAgentCreate as canonicalizedApplyAutoEnableA2AOnAgentCreate } from "../../agents/a2a-policy-canonicalize.js";
 import { BUNDLED_MODULES, loadModules } from "../../agents/extensions/index.js";
 import { resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import { listBindings } from "../../agents/routing/bindings.js";
@@ -210,51 +211,18 @@ function formatSummary(summary: AgentSummary): string {
  * `sessions_send` still refuses because the policy block is missing /
  * disabled — the model can spawn but cannot ping-pong.
  *
- * Seeds the canonical wide-open default when no usable policy exists:
- *   `{ enabled: true, allow: [{ from: "*", to: "*" }] }`
- *
- * Behaviour by current state of `cfg.session.agentToAgent`:
- *   1. Missing or not a plain object  → write the canonical default
- *   2. The literal boolean `true` (broken legacy shape) → coerce to canonical
- *   3. Object with `enabled` missing/false → set `enabled: true`, preserve
- *      `allow` (and any other operator-authored fields) untouched
- *   4. Object with `enabled: true` already → no change (idempotent)
- *
- * Gated by `cfg.session.autoEnableA2AOnAgentCreate` (default `true`). Set
- * that flag to `false` to opt out — mirrors the
- * `agents.defaults.subagents.autoAllowOnCreate` opt-out for the allowlist.
+ * Thin wrapper around the shared `canonicalizeA2APolicy` helper
+ * (`agents/a2a-policy-canonicalize.ts`) — see that module for the full
+ * semantics matrix. Gated by `cfg.session.autoEnableA2AOnAgentCreate`
+ * (default `true`); sibling boot-time variant `applyAutoEnableA2AAtBoot`
+ * fires inside `continueBoot()`.
  *
  * The companion `pruneAgentConfig` (in agents-config.ts) strips the deleted
  * agent id from any `allow` pair on `agents delete`, so add+delete stay
  * symmetric without a separate code path.
  */
 export function applyAutoEnableA2AOnAgentCreate(cfg: BrigadeConfig): BrigadeConfig {
-	const sessionRaw = (cfg.session as Record<string, unknown> | undefined) ?? {};
-	// Operator opted out — leave the policy alone.
-	if (sessionRaw["autoEnableA2AOnAgentCreate"] === false) return cfg;
-
-	const a2aRaw = sessionRaw["agentToAgent"];
-
-	const canonical = { enabled: true, allow: [{ from: "*", to: "*" }] };
-
-	// (1) Missing → write the canonical default.
-	// (3 broken legacy) The literal boolean `true` → coerce to canonical.
-	const isPlainObject =
-		a2aRaw !== null && typeof a2aRaw === "object" && !Array.isArray(a2aRaw);
-	if (a2aRaw === undefined || a2aRaw === null || !isPlainObject) {
-		const nextSession: Record<string, unknown> = { ...sessionRaw, agentToAgent: canonical };
-		return { ...cfg, session: nextSession as BrigadeConfig["session"] };
-	}
-
-	const a2aObj = a2aRaw as Record<string, unknown>;
-	const currentEnabled = a2aObj["enabled"];
-	// (4) Already enabled — idempotent no-op.
-	if (currentEnabled === true) return cfg;
-
-	// (2) Object with `enabled` missing/false → set enabled:true, preserve allow + other fields.
-	const nextA2A: Record<string, unknown> = { ...a2aObj, enabled: true };
-	const nextSession: Record<string, unknown> = { ...sessionRaw, agentToAgent: nextA2A };
-	return { ...cfg, session: nextSession as BrigadeConfig["session"] };
+	return canonicalizedApplyAutoEnableA2AOnAgentCreate(cfg);
 }
 
 /**
