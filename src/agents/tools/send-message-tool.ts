@@ -1,11 +1,20 @@
 /**
- * `send_message` — agent-callable channel outbound. Owner-only.
+ * `send_message` — agent-callable channel outbound.
  *
  * Lets the agent send a text message via any started channel adapter mid-
  * turn. Before this tool existed, the only way for the agent to "send
  * Bhasvanth a WhatsApp" was to schedule a cron — which is the wrong
  * primitive for "do it right now". This tool covers the immediate path;
  * `cron` covers the scheduled path.
+ *
+ * Ownership: per-call gate, NOT a blanket refusal.
+ *   - Workspace owner (TUI / `connect` / CLI) keeps full access including
+ *     cross-channel and cross-conversation sends.
+ *   - Channel-routed peer (e.g. an approved WhatsApp DM): may send only to
+ *     their own chat. Explicit `channel`/`to` that match the inbound are
+ *     allowed; anything pointing elsewhere is refused. Omitting both
+ *     auto-routes back to the same chat. Mirrors the `send_media`
+ *     posture.
  *
  * Defaults:
  *   - When `channel`/`to` aren't passed AND the calling turn came from a
@@ -24,8 +33,9 @@
  *     manager's `adapter(id)` lookup — `whatapp` returns undefined and the
  *     tool refuses with a clear message including the started-channel
  *     list).
- *   - Sub-agents cannot send — `ownerOnly: true`. A sub-agent that needs to
- *     send a message asks the parent to do it via spawn_agent's reply.
+ *   - Sub-agents do not currently get this tool — they reply via the
+ *     parent's spawn_agent return path. (If we ever expose `send_message`
+ *     to sub-agents, the same per-call gate above applies.)
  *
  * Pattern note: the reference has a single polymorphic `message` tool with many
  * actions (send/react/poll/sendAttachment/...). Brigade ships with just
@@ -97,6 +107,15 @@ type SendMessageDetails = {
 export interface MakeSendMessageToolOptions {
 	/** Active channel context for this turn — used for auto-fill defaults. */
 	channelContext?: ChannelApprovalRoute;
+	/**
+	 * Whether the calling turn is the workspace owner. When `false`, the
+	 * turn was routed in from an approved channel peer — they can still
+	 * `send_message` BUT only with target = their own chat (same shape as
+	 * `send_media`). Cross-conversation / cross-channel sends require
+	 * workspace-owner privilege. Defaults to `true` when omitted so legacy
+	 * paths (TUI, tests) keep full access without opting in.
+	 */
+	senderIsOwner?: boolean;
 }
 
 /**
@@ -109,6 +128,7 @@ export function makeSendMessageTool(
 	opts: MakeSendMessageToolOptions = {},
 ): BrigadeTool<typeof SendMessageParams, SendMessageDetails> {
 	const channelContext = opts.channelContext;
+	const senderIsOwner = opts.senderIsOwner !== false;
 	return {
 		name: "send_message",
 		label: "send_message",
@@ -127,7 +147,11 @@ export function makeSendMessageTool(
 			"Validation: `channel` MUST match a started channel adapter. The " +
 			"`## Channels` section of your system prompt lists what's available.",
 		parameters: SendMessageParams,
-		ownerOnly: true,
+		// NOTE: no blanket `ownerOnly: true`. Same shape as `send_media` —
+		// a non-owner-routed turn (approved channel peer) may still call
+		// this tool but the per-call gate below pins their target to their
+		// own chat. Cross-channel / cross-conversation sends require the
+		// workspace-owner privilege.
 		async execute(_toolCallId, params): Promise<AgentToolResult<SendMessageDetails>> {
 			const manager = getActiveChannelManager();
 			if (!manager) {
@@ -142,6 +166,35 @@ export function makeSendMessageTool(
 			const toRaw = readStringParam(params, "to");
 			const threadIdParam = readStringParam(params, "threadId");
 			const accountId = readStringParam(params, "accountId");
+			// Per-call non-owner gate. A channel-routed peer may only
+			// reply-to-their-own-chat: BOTH `channel` and `to` either
+			// (a) unset (auto-fill from channelContext below), OR
+			// (b) set explicitly but EQUAL to channelContext's channelId +
+			//     conversationId (so the LLM can request the same chat
+			//     explicitly without it being a refusal).
+			// Anything else — cross-channel, cross-conversation, or any
+			// non-owner call with NO channelContext — is refused. Owners
+			// (TUI / connect / CLI) bypass this gate entirely.
+			if (!senderIsOwner) {
+				if (!channelContext) {
+					return failedTextResult(
+						"send_message: as a non-owner-routed turn you must be reached through an approved channel.",
+						{ channel: channelRaw ?? "", to: toRaw ?? "", textPreview: text.slice(0, 80) } as never,
+					);
+				}
+				const channelMatchesCtx =
+					channelRaw === undefined || channelRaw === channelContext.channelId;
+				const toMatchesCtx =
+					toRaw === undefined || toRaw === channelContext.conversationId;
+				if (!channelMatchesCtx || !toMatchesCtx) {
+					return failedTextResult(
+						"send_message: as a non-owner-routed turn you may only send to your own chat. " +
+							"Cross-conversation sends require workspace-owner privilege. " +
+							"Omit `channel`/`to` to auto-route back to the inbound's own chat.",
+						{ channel: channelRaw ?? "", to: toRaw ?? "", textPreview: text.slice(0, 80) } as never,
+					);
+				}
+			}
 			// Auto-fill from the active channel context when EITHER target field
 			// is missing AND we have one. Strict pairing: if the caller set
 			// `channel` but not `to`, we DON'T auto-fill just `to` from context

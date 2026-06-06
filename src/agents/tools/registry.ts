@@ -186,13 +186,27 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 	const fileStore = isDefaultMemoryCapability(capability)
 		? capability.fileStore
 		: new FileMemoryStore(opts.workspaceDir);
+	// Per-turn memory scope — threads the caller's senderIsOwner +
+	// channelContext + sessionKey into the recall + write tools so peer
+	// memories stay session-scoped and the operator's view stays clean
+	// of peer state. Same shape as `cron` / `send_media` / `send_message`.
+	const memoryScope = {
+		...(opts.senderIsOwner !== undefined ? { senderIsOwner: opts.senderIsOwner } : {}),
+		...(opts.channelContext !== undefined ? { channelContext: opts.channelContext } : {}),
+		...(typeof opts.sessionContext?.key === "string" && opts.sessionContext.key.length > 0
+			? { sessionKey: opts.sessionContext.key }
+			: {}),
+	};
 	const tools: AnyBrigadeTool[] = [
 		// recall routes through the capability (rich render for the default,
-		// minimal SDK render for plugins).
-		makeRecallMemoryTool(capability),
+		// minimal SDK render for plugins). Origin filter is applied inside
+		// the tool so peer + operator state stay isolated.
+		makeRecallMemoryTool(capability, undefined, memoryScope),
 		makeReadMemoryTool(fileStore),
-		// write_memory persists distilled structured facts through the capability.
-		makeWriteMemoryTool(capability),
+		// write_memory persists distilled structured facts through the
+		// capability. The per-call gate inside the tool stamps the right
+		// MemoryRecordOrigin so subsequent recalls can filter to caller-own.
+		makeWriteMemoryTool(capability, memoryScope),
 		// agents_list — read-only enumeration of agents the caller can target.
 		// Mirrors the reference codebase's posture: the model can SEE the agent
 		// catalog without any privilege check.
@@ -377,9 +391,15 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 	const channelManager = getActiveChannelManager();
 	if (channelManager && channelManager.started.length > 0) {
 		tools.push(
-			makeSendMessageTool(
-				opts.channelContext !== undefined ? { channelContext: opts.channelContext } : {},
-			),
+			makeSendMessageTool({
+				...(opts.channelContext !== undefined ? { channelContext: opts.channelContext } : {}),
+				// Same shape as `send_media` — channel turns from approved
+				// non-owner peers thread `senderIsOwner: false` so the
+				// per-call gate inside `send_message` enforces "own chat only".
+				...(opts.senderIsOwner !== undefined
+					? { senderIsOwner: opts.senderIsOwner }
+					: {}),
+			}),
 		);
 		// `send_media` — same gating as send_message. The tool itself
 		// refuses cleanly when the chosen channel adapter happens to be

@@ -35,6 +35,37 @@ export type MemoryTier = "short" | "long" | "permanent";
 /** Active = live, archived = superseded/decayed-but-kept, pruned = dead. */
 export type MemoryLifecycle = "active" | "archived" | "pruned";
 
+/**
+ * Who wrote this memory record — used by the recall path to keep peer
+ * memories isolated from the operator's view (and isolated per-session
+ * from each other). Mirrors the `CronJobOrigin` shape from the cron tool
+ * so the audit trail vocabulary stays consistent across primitives.
+ *
+ *   - `{ kind: "owner" }` — workspace owner (TUI / `connect` / CLI).
+ *     Recallable by the owner across every owner session. NOT recalled
+ *     by channel peers so the operator's private notes can't leak into
+ *     an approved peer's chat.
+ *   - `{ kind: "channel", channelId, conversationId, sessionKey }` —
+ *     written from an approved channel peer's chat. Recallable ONLY
+ *     when the calling turn matches all three (channel + conversation
+ *     + session). Different chats from the same peer don't see each
+ *     other; the operator never sees them in auto-recall.
+ *
+ * `accountId` is captured opportunistically for multi-account channels.
+ *
+ * Records persisted before this field existed have `createdBy: undefined`
+ * — the recall path treats them as owner-origin for back-compat.
+ */
+export type MemoryRecordOrigin =
+	| { kind: "owner" }
+	| {
+			kind: "channel";
+			channelId: string;
+			conversationId: string;
+			sessionKey: string;
+			accountId?: string;
+	  };
+
 export interface MemoryRecord {
 	memoryId: string;
 	/** One clear declarative sentence. */
@@ -56,6 +87,13 @@ export interface MemoryRecord {
 	/** memoryIds this record archives (corrections/updates). */
 	supersedes?: string[];
 	lifecycle: MemoryLifecycle;
+	/**
+	 * Origin of this record (see {@link MemoryRecordOrigin}). `undefined`
+	 * ⇔ legacy record persisted before ownership tracking shipped —
+	 * treated as `{ kind: "owner" }` by the recall path so existing
+	 * facts keep their previous owner-visible behaviour.
+	 */
+	createdBy?: MemoryRecordOrigin;
 	/** Optional JSON sidecar, e.g. {"corrects":"the prior belief"}. */
 	metadata?: Record<string, unknown>;
 }
@@ -122,6 +160,63 @@ export function makeMemoryId(): string {
 	return `mem_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/**
+ * Treat a missing origin as owner (back-compat with records persisted
+ * before ownership tracking shipped). All recall + dedup logic should
+ * route through this helper rather than reading `createdBy` directly so
+ * the legacy default stays in one place.
+ */
+export function resolveRecordOrigin(
+	origin: MemoryRecordOrigin | undefined,
+): MemoryRecordOrigin {
+	return origin ?? { kind: "owner" };
+}
+
+/** Two origins are the same when both fields-by-fields match. */
+export function sameOrigin(
+	a: MemoryRecordOrigin | undefined,
+	b: MemoryRecordOrigin | undefined,
+): boolean {
+	const resolvedA = resolveRecordOrigin(a);
+	const resolvedB = resolveRecordOrigin(b);
+	if (resolvedA.kind !== resolvedB.kind) return false;
+	if (resolvedA.kind === "owner") return true;
+	const channelA = resolvedA;
+	const channelB = resolvedB as Extract<MemoryRecordOrigin, { kind: "channel" }>;
+	return (
+		channelA.channelId === channelB.channelId &&
+		channelA.conversationId === channelB.conversationId &&
+		channelA.sessionKey === channelB.sessionKey
+	);
+}
+
+/**
+ * Recall-side filter. Per the design:
+ *   - An owner caller's filter is `{ kind: "owner" }` — they recall ONLY
+ *     owner-written records (and legacy `undefined`-origin records, which
+ *     resolve to owner). The operator's view stays clean of peer-written
+ *     state.
+ *   - A channel-peer caller's filter is `{ kind: "channel", … }` matching
+ *     their channelId + conversationId + sessionKey. They recall ONLY
+ *     records whose origin matches exactly. Different sessions from the
+ *     same peer don't see each other; the operator's records are
+ *     invisible to them too.
+ *
+ * `undefined` filter = no filtering (used by maintenance paths like
+ * decay GC, consolidation, doctor diagnostics — anything that legitimately
+ * needs the whole store).
+ */
+export type RecordOriginFilter = MemoryRecordOrigin | undefined;
+
+/** True if the record matches the filter. `undefined` filter matches every record. */
+export function recordMatchesOriginFilter(
+	record: { createdBy?: MemoryRecordOrigin },
+	filter: RecordOriginFilter,
+): boolean {
+	if (filter === undefined) return true;
+	return sameOrigin(record.createdBy, filter);
+}
+
 /** Clamp to [0,1], falling back to `fallback` when not a finite number. */
 export function clampImportance(value: unknown, fallback: number): number {
 	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
@@ -136,6 +231,12 @@ export interface NewFact {
 	sourceTurn?: string;
 	supersedes?: string[];
 	metadata?: Record<string, unknown>;
+	/**
+	 * Stamped by the `write_memory` per-call gate (owner default; channel
+	 * peer = their session origin). The store persists it verbatim onto
+	 * the resulting record so the recall path can filter by it.
+	 */
+	createdBy?: MemoryRecordOrigin;
 }
 
 export interface ListFilter {
@@ -143,6 +244,14 @@ export interface ListFilter {
 	lifecycle?: MemoryLifecycle;
 	/** Cap the number returned (most-recent-first). */
 	limit?: number;
+	/**
+	 * Restrict to records matching this origin. Omit to return EVERY
+	 * record regardless of origin (the maintenance default — used by
+	 * decay GC, consolidation, doctor diagnostics). Tool-facing callers
+	 * (`read_memory` / `recall_memory` / auto-recall) MUST pass an
+	 * explicit filter so peer + operator state stay isolated.
+	 */
+	origin?: RecordOriginFilter;
 }
 
 /**
@@ -192,6 +301,9 @@ export class FactStore {
 		const lifecycle = filter.lifecycle ?? "active";
 		let recs = this.readAll().filter((r) => r.lifecycle === lifecycle);
 		if (filter.segment) recs = recs.filter((r) => r.segment === filter.segment);
+		if (filter.origin !== undefined) {
+			recs = recs.filter((r) => recordMatchesOriginFilter(r, filter.origin));
+		}
 		recs.sort((a, b) => b.createdAt - a.createdAt);
 		return filter.limit && filter.limit > 0 ? recs.slice(0, filter.limit) : recs;
 	}
@@ -217,6 +329,7 @@ export class FactStore {
 			sourceTurn: fact.sourceTurn,
 			supersedes: fact.supersedes && fact.supersedes.length > 0 ? fact.supersedes : undefined,
 			lifecycle: "active",
+			...(fact.createdBy !== undefined ? { createdBy: fact.createdBy } : {}),
 			metadata: fact.metadata,
 		};
 
@@ -229,10 +342,20 @@ export class FactStore {
 		// sourceTurn if it lacked one. Skipped for explicit corrections/updates
 		// (they carry `supersedes` and intentionally replace prior beliefs). This
 		// is the cheap layer; semantic contradictions are handled by consolidation.
+		//
+		// Origin guard: dedup ONLY merges with records of the same origin. A
+		// peer's "I prefer dark mode" must not merge into an owner's identical
+		// note (which would lift the peer's fact to owner-visible) or into
+		// another peer's identical note (which would cross-pollinate
+		// session-scoped state). Different-origin facts stay separate even if
+		// the text matches.
 		if (!record.supersedes) {
 			const incoming = tokenSet(record.content);
 			const dup = all.find(
-				(r) => r.lifecycle === "active" && jaccard(incoming, tokenSet(r.content)) >= DEDUP_SIMILARITY,
+				(r) =>
+					r.lifecycle === "active" &&
+					sameOrigin(r.createdBy, record.createdBy) &&
+					jaccard(incoming, tokenSet(r.content)) >= DEDUP_SIMILARITY,
 			);
 			if (dup) {
 				dup.importance = Math.max(dup.importance, record.importance);
@@ -263,7 +386,10 @@ export class FactStore {
 	 * accessed (recall reinforcement) unless `markAccessed: false`. Returns
 	 * at most `limit` hits (default 8), each with its score.
 	 */
-	search(query: string, opts: { limit?: number; markAccessed?: boolean } = {}): Array<MemoryRecord & { score: number }> {
+	search(
+		query: string,
+		opts: { limit?: number; markAccessed?: boolean; origin?: RecordOriginFilter } = {},
+	): Array<MemoryRecord & { score: number }> {
 		const tokens = query
 			.toLowerCase()
 			.split(/[^a-z0-9]+/)
@@ -273,6 +399,12 @@ export class FactStore {
 		const scored: Array<MemoryRecord & { score: number }> = [];
 		for (const r of this.readAll()) {
 			if (r.lifecycle !== "active") continue;
+			// Origin filter: peer + operator state are isolated by default.
+			// `undefined` filter is the maintenance default (whole store) —
+			// tool callers always pass an explicit filter.
+			if (opts.origin !== undefined && !recordMatchesOriginFilter(r, opts.origin)) {
+				continue;
+			}
 			const hay = r.content.toLowerCase();
 			const matched = tokens.filter((t) => hay.includes(t)).length;
 			if (matched === 0) continue;

@@ -26,7 +26,7 @@
 import type { BrigadeConfig } from "../../config/io.js";
 import type { BrigadeExtensionRegistry } from "../extensions/registry.js";
 import type { MemoryCapability } from "../extensions/types.js";
-import { FactStore, type MemoryRecord } from "./records.js";
+import { FactStore, type MemoryRecord, type RecordOriginFilter } from "./records.js";
 import { FileMemoryStore, type MemorySearchResult } from "./storage.js";
 
 /**
@@ -64,10 +64,16 @@ export interface DefaultMemoryCapability extends MemoryCapability {
 	readonly id: "brigade.memory.default";
 	readonly fileStore: FileMemoryStore;
 	readonly factStore: FactStore;
-	/** Same as `search` but returns the rich rows the built-in tool renders. */
+	/**
+	 * Same as `search` but returns the rich rows the built-in tool renders.
+	 * `origin` filters facts by `MemoryRecord.createdBy` so peer + operator
+	 * state stay isolated. Notes (markdown files) are NOT origin-filtered
+	 * because the underlying file store has no per-record origin concept —
+	 * they're shared workspace state and have always been treated that way.
+	 */
 	searchRich(
 		query: string,
-		opts?: { limit?: number },
+		opts?: { limit?: number; origin?: RecordOriginFilter },
 	): Promise<{ notes: MemorySearchResult[]; facts: Array<MemoryRecord & { score: number }> }>;
 }
 
@@ -90,8 +96,12 @@ export function createDefaultMemoryCapability(args: {
 
 	const searchRich: DefaultMemoryCapability["searchRich"] = async (query, opts) => {
 		const limit = opts?.limit;
+		const origin = opts?.origin;
 		const notes = await fileStore.search(query, limit !== undefined ? { maxResults: limit } : {});
-		const facts = factStore.search(query, limit !== undefined ? { limit } : {});
+		const factOpts: { limit?: number; origin?: RecordOriginFilter } = {};
+		if (limit !== undefined) factOpts.limit = limit;
+		if (origin !== undefined) factOpts.origin = origin;
+		const facts = factStore.search(query, factOpts);
 		return { notes, facts };
 	};
 

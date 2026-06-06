@@ -33,7 +33,14 @@ import {
 	type MemoryReadResult,
 	type MemorySearchResult,
 } from "../memory/storage.js";
-import { type FactStore, MEMORY_SEGMENTS, type MemorySegment } from "../memory/records.js";
+import {
+	type FactStore,
+	MEMORY_SEGMENTS,
+	type MemorySegment,
+	type MemoryRecordOrigin,
+	type RecordOriginFilter,
+} from "../memory/records.js";
+import type { ChannelApprovalRoute } from "../channels/approval-router.js";
 import {
 	createDefaultMemoryCapability,
 	type DefaultMemoryHit,
@@ -41,6 +48,74 @@ import {
 } from "../memory/plugin-runtime.js";
 import { readNumberParam, readStringParam, textResult } from "./common.js";
 import type { BrigadeTool } from "./types.js";
+
+/**
+ * Per-turn caller scope threaded into every memory tool. Mirrors the
+ * shape used by the cron tool's per-call gate — the registry stamps
+ * these onto each tool factory so the tool body can compute the right
+ * `MemoryRecordOrigin` for writes + the matching recall filter.
+ *
+ * `senderIsOwner` defaults to `true` (legacy / TUI / tests). When the
+ * gateway routes an approved channel peer's turn, it sets
+ * `senderIsOwner: false`, supplies the `channelContext`, and threads
+ * the channel-derived `sessionKey` so writes get stamped with the
+ * peer's session-scoped origin and recalls filter to the same.
+ */
+export interface MemoryToolScope {
+	senderIsOwner?: boolean;
+	channelContext?: ChannelApprovalRoute;
+	sessionKey?: string;
+}
+
+/**
+ * Compute the {@link MemoryRecordOrigin} the per-call gate should stamp
+ * onto every new fact for this turn. Owner turns produce `{ kind:
+ * "owner" }`; channel-routed peer turns produce a session-scoped
+ * channel origin. A non-owner turn without a `channelContext` is a
+ * malformed path — we return `undefined` so the caller can refuse the
+ * write with a clear message rather than silently writing an
+ * unattributable record.
+ */
+export function resolveWriterOrigin(
+	scope: MemoryToolScope,
+): MemoryRecordOrigin | undefined {
+	if (scope.senderIsOwner !== false) return { kind: "owner" };
+	const ctx = scope.channelContext;
+	if (!ctx || !scope.sessionKey) return undefined;
+	return {
+		kind: "channel",
+		channelId: ctx.channelId,
+		conversationId: ctx.conversationId,
+		sessionKey: scope.sessionKey,
+		...(ctx.accountId !== undefined ? { accountId: ctx.accountId } : {}),
+	};
+}
+
+/**
+ * Compute the recall-side {@link RecordOriginFilter} for this turn.
+ * Owners recall ONLY owner-origin records (peer state is invisible to
+ * the operator's auto-recall by design — keeps the operator's view of
+ * memory clean of peer-written content). Non-owners recall only their
+ * own session's records.
+ *
+ * `undefined` means the caller is in a state where we can't safely
+ * decide a filter (non-owner without channelContext) — callers treat
+ * this as "no results" rather than leaking the whole store.
+ */
+export function resolveRecallFilter(
+	scope: MemoryToolScope,
+): RecordOriginFilter | "no-results" {
+	if (scope.senderIsOwner !== false) return { kind: "owner" };
+	const ctx = scope.channelContext;
+	if (!ctx || !scope.sessionKey) return "no-results";
+	return {
+		kind: "channel",
+		channelId: ctx.channelId,
+		conversationId: ctx.conversationId,
+		sessionKey: scope.sessionKey,
+		...(ctx.accountId !== undefined ? { accountId: ctx.accountId } : {}),
+	};
+}
 
 /* ───────────────────────── recall_memory (search) ───────────────────────── */
 
@@ -105,6 +180,7 @@ interface RecallMemoryDetails {
 export function makeRecallMemoryTool(
 	storeOrCapability: BrigadeStorage | MemoryCapability,
 	factStoreOrNothing?: FactStore,
+	scope: MemoryToolScope = {},
 ): BrigadeTool<typeof RecallMemoryParams, RecallMemoryDetails> {
 	// Resolve the capability up front. Three calling shapes:
 	//   1. `(capability)`              — production path (registry passes one).
@@ -135,13 +211,37 @@ export function makeRecallMemoryTool(
 				integer: true,
 				label: "maxResults",
 			});
+			// Resolve the per-turn recall scope BEFORE searching. A non-
+			// owner caller with no channelContext returns "no-results" — we
+			// must not leak the whole store, but we also don't want to
+			// surface this as a hard error (the LLM might fall back to
+			// asking the user). Empty result + a neutral message.
+			const recallFilter = resolveRecallFilter(scope);
+			if (recallFilter === "no-results") {
+				const details: RecallMemoryDetails = {
+					query,
+					resultCount: 0,
+					results: [],
+					facts: [],
+					backend: capability.id,
+				};
+				return textResult(
+					`No memory matched "${query}". Nothing is visible to this turn — ` +
+						"the turn doesn't have an approved channel context, so peer-scoped " +
+						"memory can't be searched.",
+					details,
+				);
+			}
 			// Default backend → render the rich notes+facts layout (file:line
 			// citations, segment + importance). Plugin backend → render the
 			// minimal SDK shape (id / content / score / source).
 			if (isDefaultMemoryCapability(capability)) {
 				const { notes, facts } = await capability.searchRich(
 					query,
-					maxResults !== undefined ? { limit: maxResults } : {},
+					{
+						...(maxResults !== undefined ? { limit: maxResults } : {}),
+						origin: recallFilter,
+					},
 				);
 				const factHits = facts.map((f) => ({
 					memoryId: f.memoryId,
@@ -358,8 +458,10 @@ interface WriteMemoryDetails {
  */
 export function makeWriteMemoryTool(
 	capabilityOrFactStore: MemoryCapability | FactStore,
+	scope: MemoryToolScope = {},
 ): BrigadeTool<typeof WriteMemoryParams, WriteMemoryDetails> {
 	const capability = resolveWriteCapability(capabilityOrFactStore);
+	const senderIsOwner = scope.senderIsOwner !== false;
 	return {
 		name: "write_memory",
 		label: "write memory",
@@ -383,16 +485,36 @@ export function makeWriteMemoryTool(
 				? (p.supersedes as unknown[]).filter((x): x is string => typeof x === "string")
 				: undefined;
 
+			// Resolve the writer's origin BEFORE touching the store. A
+			// non-owner turn without a channelContext or sessionKey is a
+			// malformed routing path — refuse rather than silently writing
+			// an unattributable record that no one could ever recall.
+			const writerOrigin = resolveWriterOrigin(scope);
+			if (!senderIsOwner && !writerOrigin) {
+				return textResult(
+					"write_memory: as a non-owner-routed turn you must be reached through an approved channel.",
+					{
+						memoryId: "",
+						segment,
+						importance: 0,
+						backend: capability.id,
+					},
+				);
+			}
+
 			// Default backend → speak directly to FactStore so we keep the rich
-			// per-segment defaults + supersedes archiving. Plugin backend →
-			// route through the SDK contract; pass segment / importance /
-			// supersedes via the `meta` bag (plugins may honour them or not).
+			// per-segment defaults + supersedes archiving + the new
+			// session-scoped origin stamp. Plugin backend → route through
+			// the SDK contract; pass segment / importance / supersedes via
+			// the `meta` bag, and stringify `createdBy` so plugins that
+			// want to honour it can.
 			if (isDefaultMemoryCapability(capability)) {
 				const rec = capability.factStore.write({
 					content,
 					segment,
 					...(importance !== undefined ? { importance } : {}),
 					...(supersedes && supersedes.length > 0 ? { supersedes } : {}),
+					...(writerOrigin !== undefined ? { createdBy: writerOrigin } : {}),
 				});
 				return textResult(
 					`Remembered [${rec.segment}, importance ${rec.importance.toFixed(2)}]: ${rec.content}`,
@@ -410,6 +532,11 @@ export function makeWriteMemoryTool(
 			const meta: Record<string, string> = { segment };
 			if (importance !== undefined) meta.importance = String(importance);
 			if (supersedes && supersedes.length > 0) meta.supersedes = supersedes.join(",");
+			if (writerOrigin !== undefined) {
+				// Plugins that want to honour origin can parse this JSON;
+				// the bundled FactStore does it natively via `createdBy`.
+				meta.createdBy = JSON.stringify(writerOrigin);
+			}
 			const { id } = await capability.recordFact(content, { meta });
 			return textResult(
 				`Remembered [${segment}] via ${capability.id}: ${content}`,
@@ -456,11 +583,14 @@ function resolveToolCapability(
 		// capability comes back through resolveToolCapability.
 		fileStore,
 		factStore: factStore ?? undefinedFactStoreSentinel(),
-		async searchRich(query: string, opts?: { limit?: number }) {
+		async searchRich(query: string, opts?: { limit?: number; origin?: RecordOriginFilter }) {
 			const limit = opts?.limit;
+			const origin = opts?.origin;
 			const notes = await fileStore.search(query, limit !== undefined ? { maxResults: limit } : {});
-			const facts =
-				factStore?.search(query, limit !== undefined ? { limit } : {}) ?? [];
+			const factOpts: { limit?: number; origin?: RecordOriginFilter } = {};
+			if (limit !== undefined) factOpts.limit = limit;
+			if (origin !== undefined) factOpts.origin = origin;
+			const facts = factStore?.search(query, factOpts) ?? [];
 			return { notes, facts };
 		},
 		async search(query: string, opts?: { limit?: number }) {

@@ -26,7 +26,7 @@
 import type { MemoryCapability } from "../extensions/types.js";
 import { wrapUntrustedDataBlock } from "../../system-prompt/sanitize.js";
 import { isDefaultMemoryCapability } from "./plugin-runtime.js";
-import { FactStore } from "./records.js";
+import { FactStore, type RecordOriginFilter } from "./records.js";
 
 /** Max facts to surface — keep the injection small + high-signal. */
 const MAX_AUTO_RECALL_FACTS = 5;
@@ -49,20 +49,26 @@ const MAX_AUTO_RECALL_FACTS = 5;
  *     (production agent loop passes the resolved `MemoryCapability`). Async
  *     because plugin backends may need to await a network/db round-trip.
  */
-export function buildAutoRecallBlock(workspaceDir: string, query: string): string | undefined;
+export function buildAutoRecallBlock(
+	workspaceDir: string,
+	query: string,
+	opts?: { origin?: RecordOriginFilter },
+): string | undefined;
 export function buildAutoRecallBlock(
 	capability: MemoryCapability,
 	query: string,
+	opts?: { origin?: RecordOriginFilter },
 ): Promise<string | undefined>;
 export function buildAutoRecallBlock(
 	workspaceDirOrCapability: string | MemoryCapability,
 	query: string,
+	opts: { origin?: RecordOriginFilter } = {},
 ): string | undefined | Promise<string | undefined> {
 	// Capability path — handles both the bundled default (we still want
 	// `markAccessed: false` so auto-recall doesn't reinforce decay) and any
 	// plugin backend (the plugin's `search` is the source of truth).
 	if (typeof workspaceDirOrCapability !== "string") {
-		return buildBlockFromCapability(workspaceDirOrCapability, query);
+		return buildBlockFromCapability(workspaceDirOrCapability, query, opts);
 	}
 	// Legacy workspace-dir path — synchronous FactStore search. Preserved
 	// because some test surfaces still call it that way, and a synchronous
@@ -70,6 +76,7 @@ export function buildAutoRecallBlock(
 	const hits = new FactStore(workspaceDirOrCapability).search(query, {
 		limit: MAX_AUTO_RECALL_FACTS,
 		markAccessed: false,
+		...(opts.origin !== undefined ? { origin: opts.origin } : {}),
 	});
 	if (hits.length === 0) return undefined;
 	const facts = hits.map((f) => `- [${f.segment}] ${f.content}`).join("\n");
@@ -86,16 +93,22 @@ export function buildAutoRecallBlock(
 async function buildBlockFromCapability(
 	capability: MemoryCapability,
 	query: string,
+	opts: { origin?: RecordOriginFilter } = {},
 ): Promise<string | undefined> {
 	if (isDefaultMemoryCapability(capability)) {
 		const hits = capability.factStore.search(query, {
 			limit: MAX_AUTO_RECALL_FACTS,
 			markAccessed: false,
+			...(opts.origin !== undefined ? { origin: opts.origin } : {}),
 		});
 		if (hits.length === 0) return undefined;
 		const facts = hits.map((f) => `- [${f.segment}] ${f.content}`).join("\n");
 		return renderBlock(facts);
 	}
+	// Plugin backends don't have the origin contract (yet). The SDK
+	// `search` method ignores it; plugins that want per-origin scoping
+	// can read the createdBy field from the `meta` write payload and
+	// honour it themselves.
 	const hits = await capability.search(query, { limit: MAX_AUTO_RECALL_FACTS });
 	if (hits.length === 0) return undefined;
 	// Plugin backend — we don't know segments, so surface source + content.

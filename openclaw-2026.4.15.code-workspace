@@ -7,6 +7,10 @@
 		{
 			"name": "Brigade",
 			"path": "."
+		},
+		{
+			"name": "MetaHuman Dashboard",
+			"path": "../brigade-metahuman-dashboard"
 		}
 	],
 	"settings": {

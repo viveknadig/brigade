@@ -1118,9 +1118,30 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // parent-injected task — auto-recalling parent-scoped memory facts there
     // would pollute the bounded context with content the task didn't ask for.
     // Gate on `!subagentMode` so the suffix stays clean for delegated runs.
+    //
+    // Origin filter: owner turns recall only owner-origin facts; channel-
+    // routed peers recall only their own session's facts. Without this
+    // filter, an approved peer's auto-recall would surface the operator's
+    // private memory (and vice versa). A non-owner turn missing a
+    // channelContext or sessionKey falls back to `undefined` — auto-recall
+    // sees no records (consistent with the recall_memory tool's behaviour).
     ephemeralSuffix: mergeEphemeralSuffix(
       promptCapabilities?.memory && !promptCapabilities.subagentMode && !promptCapabilities.cronMode
-        ? await buildAutoRecallBlock(memoryCapability, args.message)
+        ? await buildAutoRecallBlock(memoryCapability, args.message, {
+            origin: senderIsOwner
+              ? { kind: "owner" }
+              : args.channelApprovalRoute
+                ? {
+                    kind: "channel",
+                    channelId: args.channelApprovalRoute.channelId,
+                    conversationId: args.channelApprovalRoute.conversationId,
+                    sessionKey: resolved.sessionKey,
+                    ...(args.channelApprovalRoute.accountId !== undefined
+                      ? { accountId: args.channelApprovalRoute.accountId }
+                      : {}),
+                  }
+                : { kind: "owner" },
+          })
         : undefined,
       contextEngineAddition,
     ),
