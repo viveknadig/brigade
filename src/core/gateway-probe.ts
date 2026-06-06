@@ -30,6 +30,91 @@ import type { SessionStateSnapshot } from "../protocol.js";
 export const GATEWAY_PID_PATH = path.join(BRIGADE_DIR, "gateway.pid");
 
 /**
+ * Out-of-process supervisor heartbeat. The gateway writes the file every
+ * tick (atomic via write-tempfile + rename) and an external supervisor
+ * (`brigade supervisor`) reads its mtime to detect a wedged process — one
+ * where the OS thinks the gateway is alive (PID file still present) but
+ * the Node event loop is starved or deadlocked and can't update the file.
+ *
+ * The PID file proves the process EXISTS; the heartbeat proves it's
+ * ALIVE and SERVICING. Both together let an external watcher distinguish
+ * "crashed clean" from "hung process".
+ */
+export const GATEWAY_HEARTBEAT_PATH = path.join(BRIGADE_DIR, "gateway.heartbeat");
+
+/**
+ * Maximum age (ms) the heartbeat file can have before the supervisor
+ * considers the gateway wedged. Default 90s gives the gateway up to two
+ * missed tick intervals (TICK_INTERVAL_MS is 30s) before triggering a
+ * restart — generous enough to absorb GC pauses + disk hiccups, tight
+ * enough to recover within ~1.5 min of a real hang.
+ */
+export const GATEWAY_HEARTBEAT_STALE_MS = 90_000;
+
+/** Payload shape written to GATEWAY_HEARTBEAT_PATH on every tick. */
+export interface GatewayHeartbeat {
+  /** Epoch ms when the gateway last wrote the file. */
+  ts: number;
+  /** Gateway's process PID; cross-check against gateway.pid. */
+  pid: number;
+  /** Process uptime in ms (process.uptime() * 1000) when written. */
+  uptimeMs: number;
+}
+
+/**
+ * Atomically write the heartbeat file. Tempfile + rename so a partial
+ * write on a crashed process can never leave a half-parsed file behind.
+ */
+export async function writeHeartbeatFile(): Promise<void> {
+  const payload: GatewayHeartbeat = {
+    ts: Date.now(),
+    pid: process.pid,
+    uptimeMs: Math.round(process.uptime() * 1000),
+  };
+  await fsAsync.mkdir(path.dirname(GATEWAY_HEARTBEAT_PATH), { recursive: true });
+  const tmp = `${GATEWAY_HEARTBEAT_PATH}.tmp`;
+  await fsAsync.writeFile(tmp, JSON.stringify(payload), "utf8");
+  await fsAsync.rename(tmp, GATEWAY_HEARTBEAT_PATH);
+}
+
+/**
+ * Synchronously read the heartbeat file. Returns `undefined` when missing
+ * or unparseable — callers (supervisor + doctor) treat both as "no heartbeat".
+ * `pathOverride` is for tests; production callers leave it omitted so the
+ * canonical `~/.brigade/gateway.heartbeat` is consulted.
+ */
+export function readHeartbeatFile(pathOverride?: string): GatewayHeartbeat | undefined {
+  try {
+    const raw = fs.readFileSync(pathOverride ?? GATEWAY_HEARTBEAT_PATH, "utf8");
+    const parsed = JSON.parse(raw) as Partial<GatewayHeartbeat>;
+    if (
+      typeof parsed.ts === "number" &&
+      typeof parsed.pid === "number" &&
+      typeof parsed.uptimeMs === "number" &&
+      Number.isFinite(parsed.ts) &&
+      Number.isFinite(parsed.pid) &&
+      Number.isFinite(parsed.uptimeMs)
+    ) {
+      return parsed as GatewayHeartbeat;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Delete the heartbeat file. Called on graceful shutdown. */
+export async function clearHeartbeatFile(): Promise<void> {
+  try {
+    await fsAsync.unlink(GATEWAY_HEARTBEAT_PATH);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw err;
+    }
+  }
+}
+
+/**
  * Categorised reason a probe failed — callers (status, doctor, error
  * formatters) can surface specific recovery hints instead of dumping a
  * raw error string.
@@ -180,11 +265,12 @@ export async function clearPidFile(): Promise<void> {
 /**
  * Read the PID file. Returns `undefined` when the file is missing or
  * unparseable — callers fall back to "no gateway running" without
- * surfacing an error.
+ * surfacing an error. `pathOverride` is for tests; production leaves it
+ * omitted so the canonical `~/.brigade/gateway.pid` is consulted.
  */
-export function readPidFile(): number | undefined {
+export function readPidFile(pathOverride?: string): number | undefined {
   try {
-    const raw = fs.readFileSync(GATEWAY_PID_PATH, "utf8").trim();
+    const raw = fs.readFileSync(pathOverride ?? GATEWAY_PID_PATH, "utf8").trim();
     const pid = Number(raw);
     return Number.isInteger(pid) && pid > 0 ? pid : undefined;
   } catch {

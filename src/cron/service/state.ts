@@ -238,6 +238,21 @@ export interface CronServiceState {
 	 * hammer the filesystem on every tick — it only fires every ~5 min.
 	 */
 	lastReapAtMs?: number;
+	/**
+	 * Wall-clock timestamp captured the last time `armTimer` scheduled the
+	 * next tick, paired with the delay it requested. Used by `onTimer` to
+	 * detect "we expected the next tick in 30s but it fired 8 hours later"
+	 * — the classic laptop-sleep / system-suspend pattern where setTimeout
+	 * pauses while the OS sleeps. Logged as a clock-skew warning so the
+	 * operator can correlate missed crons with the underlying suspend.
+	 */
+	lastTickArmedAt?: number;
+	/**
+	 * The delay (ms) `armTimer` last asked for. Compared against the actual
+	 * elapsed wall-clock between arm and fire to surface skew + missed
+	 * sleeps. `undefined` if the timer has never been armed.
+	 */
+	lastTickExpectedDelayMs?: number;
 }
 
 /** Resolve the canonical store path: `~/.brigade/cron.json`. */

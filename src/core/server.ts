@@ -187,7 +187,7 @@ import { loadBrigadeAuthStorage } from "./auth-bridge.js";
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, loadConfig, saveConfig, type Config } from "./config.js";
 import { mutateConfigAtomic } from "../config/io.js";
 import { acquireGatewayLock, type GatewayLockHandle } from "./gateway-lock.js";
-import { clearPidFile, writePidFile } from "./gateway-probe.js";
+import { clearHeartbeatFile, clearPidFile, writeHeartbeatFile, writePidFile } from "./gateway-probe.js";
 
 // Persist a model selection to brigade.json's new wizard-shape (the lifted
 // code expected the older flat `defaultProvider`/`defaultModelId` fields).
@@ -820,6 +820,23 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	/** Agents currently mid-extraction. Replaces the process-wide `extracting`
 	 * boolean so N agents can sweep concurrently without blocking each other. */
 	const extractingAgents = new Set<string>();
+	/**
+	 * When each in-flight extraction started, paired with `extractingAgents`.
+	 * Lets the stuck-flag watchdog (run on every armed sweep) detect entries
+	 * held for longer than a reasonable bound and force-clear them. Without
+	 * this, an extraction whose driver promise never settles (a deadlocked
+	 * disk write, a Pi session that abort()'d silently without resolving)
+	 * would leave the agent's slot permanently blocked — every later
+	 * scheduleExtraction call would observe the set membership and re-queue
+	 * forever.
+	 *
+	 * The watchdog threshold is 2.5× BRIGADE_MEMORY_LLM_TIMEOUT_MS plus a
+	 * 30s buffer for cursor + persistence I/O, so a legitimately-slow sweep
+	 * is never reaped while a genuinely-wedged one is recovered well before
+	 * the operator notices missing memory updates.
+	 */
+	const extractingSince = new Map<string, number>();
+	const extractionStuckBufferMs = 30_000;
 
 	const armExtractTimer = (): void => {
 		if (serverStopped) return; // never re-arm after shutdown
@@ -830,6 +847,31 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 
 	const runExtractionNow = async (): Promise<void> => {
 		if (pendingExtracts.size === 0 || serverStopped) return;
+		// Stuck-flag watchdog. Before we look at the pending batches, sweep
+		// any extractingAgents entry that's been held longer than the
+		// configured bound — that's an in-flight extraction whose driver
+		// promise never settled (deadlocked I/O, an abort that resolved
+		// without finally{} reaching us, etc.). Force-clearing the flag
+		// here lets the next pendingExtracts batch for that agent actually
+		// run instead of being silently re-queued forever.
+		if (extractingSince.size > 0) {
+			const llmTimeoutMs = (() => {
+				const raw = process.env.BRIGADE_MEMORY_LLM_TIMEOUT_MS;
+				const parsed = raw ? Number(raw) : NaN;
+				return Number.isFinite(parsed) && parsed >= 5_000 ? parsed : 60_000;
+			})();
+			const stuckThresholdMs = Math.round(2.5 * llmTimeoutMs) + extractionStuckBufferMs;
+			const now = Date.now();
+			for (const [agentId, startedAt] of extractingSince) {
+				if (now - startedAt >= stuckThresholdMs) {
+					opts.consoleStream?.info?.(
+						`memory extraction stuck-flag cleared (agent=${agentId}, ageMs=${now - startedAt})`,
+					);
+					extractingAgents.delete(agentId);
+					extractingSince.delete(agentId);
+				}
+			}
+		}
 		// Defer while ANY turn is active — never compete with the user-facing
 		// call. Per-agent sweeps run concurrently below, but the in-flight
 		// check is global (any agent's live turn defers all sweeps).
@@ -858,6 +900,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					return;
 				}
 				extractingAgents.add(targetAgentId);
+				extractingSince.set(targetAgentId, Date.now());
 				try {
 					const workspaceDir = resolveAgentWorkspaceDir(targetAgentId);
 					const agentDir = resolveAgentDir(targetAgentId);
@@ -902,6 +945,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					);
 				} finally {
 					extractingAgents.delete(targetAgentId);
+					extractingSince.delete(targetAgentId);
 				}
 			}),
 		);
@@ -2496,8 +2540,26 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	const RATE_LIMIT_WINDOW_MS = 10_000;
 	const RATE_LIMIT_MAX = 60;
 
+	// Server-side dead-client detection. The client already runs its own
+	// tick-watchdog (closes after 2× TICK_INTERVAL_MS without an inbound
+	// frame) — but on a half-open TCP (laptop carried into a tunnel, NAT
+	// router silently dropped, OS suspended the client's process) the
+	// SERVER has no way to know the client is gone until it tries to send.
+	// Stale clients accumulate, broadcasts pile up in their send buffers,
+	// and `clients.size` reports a phantom audience. The ws library
+	// supports WebSocket-protocol PING/PONG frames; we send a PING every
+	// tick interval and terminate any client that didn't respond before
+	// the next round.
+	const wsIsAlive = new WeakMap<WebSocket, boolean>();
+
 	wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
 		clients.add(ws);
+		// Mark alive on connect; the next ping cycle will set it false until
+		// the client's PONG arrives. ws emits `pong` for the protocol-level
+		// PONG control frame (not user-level messages), so this can't be
+		// faked by a half-open TCP.
+		wsIsAlive.set(ws, true);
+		ws.on("pong", () => wsIsAlive.set(ws, true));
 		// P1#3 (Wave H) — per-connection id used to key subscription
 		// filters. Cheap UUID; client never sees it.
 		const connId = crypto.randomUUID();
@@ -2662,10 +2724,52 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// Push an empty `state` snapshot every TICK_INTERVAL_MS so clients can
 	// detect a dead server (no frames in 2× this interval = close + reconnect).
 	// Sending the snapshot doubles as keep-alive AND consistency check.
+	//
+	// The tick is also the heartbeat-file beat: refreshing the heartbeat from
+	// inside the event-loop tick proves the loop is healthy. A process whose
+	// loop is starved (deadlock, runaway sync compute, exhausted FDs) misses
+	// the refresh and the external supervisor restarts it.
 	const tickTimer = setInterval(() => {
 		broadcastStateAllBindings();
+		void writeHeartbeatFile().catch(() => {
+			/* best-effort */
+		});
 	}, TICK_INTERVAL_MS);
 	tickTimer.unref(); // don't block process exit on timer
+
+	// Server-side dead-client reaper. Pattern (mirrors the `ws` library's
+	// own example): on each cycle, terminate any client that didn't ACK
+	// the previous round's PING; then mark every survivor as "needs an
+	// ACK before next round" and send a fresh PING. A half-open TCP that
+	// can't deliver the PONG ends up reaped within one cycle of the next.
+	// Same cadence as the tick timer so a stale client gets caught within
+	// ~one full tick interval of going silent.
+	const pingTimer = setInterval(() => {
+		for (const ws of clients) {
+			const alive = wsIsAlive.get(ws);
+			if (alive === false) {
+				// Last round's PING never got a PONG. Reap.
+				opts.consoleStream?.clientDisconnected(
+					`${(ws as unknown as { _socket?: { remoteAddress?: string } })._socket?.remoteAddress ?? "?"}`,
+					clients.size - 1,
+				);
+				try {
+					ws.terminate();
+				} catch {
+					/* best-effort */
+				}
+				continue;
+			}
+			wsIsAlive.set(ws, false);
+			try {
+				ws.ping();
+			} catch {
+				// If `ping()` throws (very unusual — the socket is in an odd
+				// state), the next cycle's alive-check will reap it.
+			}
+		}
+	}, TICK_INTERVAL_MS);
+	pingTimer.unref();
 
 	/* ──────────────── multi-routing spine wiring (Step 1-27) ──────────────── */
 
@@ -4215,6 +4319,13 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		// + `gateway status` lose discoverability when the file is missing.
 	}
 
+	// Initial heartbeat write so an out-of-process supervisor that starts
+	// alongside us (or right after) sees a fresh timestamp before the first
+	// tick fires; otherwise the first 30 s would look like a stale gateway.
+	void writeHeartbeatFile().catch(() => {
+		/* best-effort — supervisor degrades to "no heartbeat present" */
+	});
+
 	const handle: ServerHandle = {
 		port,
 		host,
@@ -4275,6 +4386,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				/* best-effort */
 			}
 			clearInterval(tickTimer);
+			clearInterval(pingTimer);
 			if (extractTimer) clearTimeout(extractTimer);
 			pendingExtracts.clear();
 			// Detach the approval bridge so a late-arriving exec-gate call
@@ -4334,9 +4446,17 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			}
 			wss.close();
 			await new Promise<void>((resolve) => httpServer.close(() => resolve()));
-			// Clean up the PID pointer last so concurrent `gateway status`
-			// calls during shutdown still see a sensible (alive) PID until
-			// the listening socket is actually closed.
+			// Clean up the PID + heartbeat pointers last so concurrent
+			// `gateway status` calls during shutdown still see sensible
+			// (alive) values until the listening socket is actually closed.
+			// Heartbeat removed BEFORE pid so a supervisor watching both
+			// can never read "fresh heartbeat + missing pid" (an impossible
+			// state that would indicate a torn shutdown).
+			try {
+				await clearHeartbeatFile();
+			} catch {
+				/* best-effort */
+			}
 			try {
 				await clearPidFile();
 			} catch {

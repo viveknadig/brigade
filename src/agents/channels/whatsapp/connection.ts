@@ -103,6 +103,20 @@ export interface WhatsAppConnection {
 	selfId(): string | null;
 	/** Epoch ms of the most recent successful `connection: "open"` event; `null` pre-connect. */
 	connectedAt(): number | null;
+	/**
+	 * Epoch ms of the last raw `messages.upsert notify` frame the socket
+	 * received — including status broadcasts and other passthrough traffic.
+	 * Useful as a coarse "transport-is-alive" signal for doctor + health
+	 * surfaces. The watchdog deliberately does NOT use this (broadcasts
+	 * would falsely keep it warm); see `lastActivityAt()`.
+	 */
+	lastInboundAt(): number;
+	/**
+	 * Epoch ms of the last REAL DM/group message that survived the
+	 * status/broadcast filter. This is the signal the watchdog reads —
+	 * it proves conversational traffic is flowing, not just metadata.
+	 */
+	lastActivityAt(): number;
 	/** Send a text message to a chat JID. */
 	sendText(conversationId: string, text: string): Promise<void>;
 	/** Send a media attachment (image / video / audio / voice / document / sticker). */
@@ -302,6 +316,85 @@ function backoffDelay(attempt: number): number {
 	return Math.max(0, Math.round(base + jitter));
 }
 
+// How often to send an outbound "available" presence ping while the link is
+// otherwise idle. WhatsApp's servers can silently mark a long-idle linked
+// device offline (queueing inbound until the next reconnect) — a periodic
+// nudge keeps the link warm. Defaults to 5 minutes; tune with the env var
+// when debugging suspicious overnight stalls.
+const PRESENCE_PING_MS_DEFAULT = 5 * 60 * 1_000;
+function presencePingMs(): number {
+	const raw = process.env.BRIGADE_WHATSAPP_PRESENCE_PING_MS;
+	const parsed = raw ? Number(raw) : NaN;
+	return Number.isFinite(parsed) && parsed >= 30_000 ? parsed : PRESENCE_PING_MS_DEFAULT;
+}
+
+/**
+ * Cold-start presence nudges. After EVERY `connection: "open"` event we
+ * fire `sendPresenceUpdate("available")` once immediately, then again at
+ * these offsets. WhatsApp's server has a "is the device really ready"
+ * debounce — one presence ping is often not enough to convince it to
+ * flush a queued message backlog, leaving the operator staring at a
+ * silent chat for ~60s on first connect. Three quick re-pings during
+ * the cold-start window pull that floor down to ~5-15 s. Cheap (one
+ * outbound stanza each) and cancelled the moment a real inbound flows.
+ *
+ * Tuning rationale: 5s catches the case where the first presence beat
+ * the server's "device-ready" decision; 15s catches the case where the
+ * server held the queue waiting for a steady-state signal; 30s is the
+ * outer envelope before the regular 5-min ping cadence takes over.
+ */
+const COLD_START_NUDGES_MS = [5_000, 15_000, 30_000] as const;
+
+// Long-lived sessions accumulate Signal-protocol state drift; a clean recycle
+// every N hours costs one reconnect and avoids a midnight stall against a
+// session the server has quietly invalidated. 6h default — long enough to
+// avoid churn during a normal workday, short enough to recover before the
+// next morning.
+const MAX_SESSION_AGE_MS_DEFAULT = 6 * 60 * 60 * 1_000;
+function maxSessionAgeMs(): number {
+	const raw = process.env.BRIGADE_WHATSAPP_MAX_SESSION_AGE_MS;
+	const parsed = raw ? Number(raw) : NaN;
+	// Minimum 10 min so a misconfigured "0" doesn't reconnect-storm.
+	return Number.isFinite(parsed) && parsed >= 10 * 60_000 ? parsed : MAX_SESSION_AGE_MS_DEFAULT;
+}
+
+// Baileys DisconnectReason value emitted when a NEW WhatsApp Web session opens
+// against the same number — another linked Brigade or a manual Web login. Two
+// sessions reconnecting on the same number get into a 440-conflict ping-pong
+// loop, so this code is treated as terminal (same as logged-out) instead of
+// retried.
+const MULTI_DEVICE_CONFLICT_CODE = 440;
+
+/**
+ * Detect Signal-protocol crypto errors that bubble up from Baileys as
+ * unhandled promise rejections instead of through the `connection.update`
+ * event (the protocol library throws inside its own async ratchet). When a
+ * pre-key rotation goes wrong or a session entry desyncs we'd otherwise wait
+ * for the watchdog to time out; trapping the rejection lets us force-reconnect
+ * immediately and recover the link in seconds.
+ *
+ * The attribution-keyword list is deliberately narrow: only stack-frame
+ * markers unique to Baileys' WhatsApp transport. Broader markers (e.g. the
+ * generic "signal" token, which can appear in unrelated libsignal builds,
+ * crypto-library stacks, or even our own log lines) would cause false
+ * positives that force-reconnect a healthy socket on unrelated rejections.
+ */
+export function isWaCryptoError(reason: unknown): boolean {
+	const message = String(
+		(reason as { message?: unknown } | null | undefined)?.message ?? reason ?? "",
+	).toLowerCase();
+	const cryptoHit =
+		message.includes("unsupported state or unable to authenticate data") ||
+		message.includes("bad mac");
+	if (!cryptoHit) return false;
+	return (
+		message.includes("baileys") ||
+		message.includes("noise-handler") ||
+		message.includes("aesdecryptgcm") ||
+		message.includes("@whiskeysockets")
+	);
+}
+
 /**
  * Extract plain text from a Baileys message, unwrapping the common envelopes
  * (`ephemeralMessage`, `viewOnceMessage*`, `documentWithCaptionMessage`) and
@@ -489,20 +582,114 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 	// who messaged Brigade since the last shutdown gets a code in a burst
 	// the moment the gateway reconnects).
 	let connectedAtMs: number | null = null;
-	// Watchdog state — `lastInboundAt` is bumped on every inbound (text, media,
-	// presence; anything that proves the link is alive). A 60s timer checks
-	// elapsed time and force-reconnects when WhatsApp has gone silent past the
-	// stale threshold. Defends against the classic Baileys "open but silent"
-	// failure mode (operator's home network blips, WhatsApp tear down stream
-	// without telling us). Disabled in linkMode (link command is a one-shot).
+	// How long a "healthy" session must run before its next disconnect is
+	// treated as a fresh flap rather than another retry inside an existing
+	// failure sequence. Without this guard a link that ran fine for 2 hours
+	// then blipped would consume all 12 reconnect attempts in a few minutes;
+	// every flap mid-cycle would count as one more retry against a budget
+	// that should have been considered fresh.
+	const LONG_SESSION_RESET_MS = 60_000;
+	// Watchdog state. Two clocks:
+	//   `lastInboundAt` — bumped on ANY notify frame (incl. status@broadcast).
+	//     Coarse "transport seeing traffic" signal; kept for telemetry + back-
+	//     compat with consumers that may already read it.
+	//   `lastActivityAt` — bumped ONLY after per-message filtering rejects the
+	//     broadcast / dedupe / LID-unresolvable cases, so the watchdog wakes
+	//     up when REAL DM/group inbound stops flowing — not when story updates
+	//     happen to keep the socket warm.
+	// The watchdog reads `lastActivityAt`. Disabled in linkMode (one-shot).
 	let lastInboundAt = Date.now();
+	let lastActivityAt = Date.now();
 	let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+	// Periodic outbound presence ping — keeps WhatsApp's server convinced the
+	// device is online even during long idle windows. Armed when the link
+	// opens, cleared on teardown.
+	let presencePingTimer: ReturnType<typeof setInterval> | null = null;
+	// Cold-start presence nudge timers — extra presence-updates fired in the
+	// first ~30s after each `connection.open` to convince WhatsApp's server
+	// the device is genuinely ready and trigger immediate queue flush.
+	// Cleared on teardown AND cancelled the moment real conversational
+	// traffic starts flowing (no need to keep nagging once we know the
+	// queue is open).
+	let coldStartNudgeTimers: Array<ReturnType<typeof setTimeout>> = [];
+	const clearColdStartNudges = (): void => {
+		for (const t of coldStartNudgeTimers) clearTimeout(t);
+		coldStartNudgeTimers = [];
+	};
+	// Max-session-age guard — preventively recycles the socket every N hours
+	// so accumulated Signal-state drift can't silently kill inbound delivery.
+	let sessionAgeTimer: ReturnType<typeof setTimeout> | null = null;
 	const WATCHDOG_CHECK_MS = 60_000;
 	const WATCHDOG_STALE_MS = 10 * 60 * 1_000;
 
+	// Signal-protocol crypto errors don't reach `connection.update` — they
+	// surface as unhandled rejections from inside Baileys' async ratchet.
+	// Trap them per-connection and force a fast reconnect; the handler is
+	// idempotent (the `closed` + `linkMode` guards keep multi-account
+	// processes safe) and is removed on `close()`. The actual `process.on`
+	// registration happens at the bottom of `connectWhatsApp` once
+	// `teardownSocket` and `scheduleReconnect` have been declared.
+	const onUnhandledRejection = (reason: unknown): void => {
+		if (closed || args.linkMode) return;
+		if (!isWaCryptoError(reason)) return;
+		args.log("WhatsApp Signal-crypto error — force-reconnecting", {
+			error: String((reason as { message?: unknown } | null | undefined)?.message ?? reason ?? ""),
+		});
+		const dying = sock;
+		sock = null;
+		teardownSocket(dying);
+		reconnectAttempts = 0;
+		scheduleReconnect({ immediate: true });
+	};
+
 	/** Detach every listener from a socket and end it — no zombie emits. */
+	// Per-socket detach callbacks. Every listener attached inside `buildSocket`
+	// pushes its `() => emitter.off(event, handler)` here so `teardownSocket`
+	// can detach each one explicitly before falling back to the coarse
+	// `removeAllListeners()`. Explicit detach is the principled path —
+	// `removeAllListeners` would also drop any listener a future Brigade
+	// subsystem (a doctor probe, a sub-agent, an extension) might have
+	// attached to the same emitter.
+	const socketDetach = new Map<WASocket, Array<() => void>>();
+	const registerDetach = (s: WASocket, off: () => void): void => {
+		let list = socketDetach.get(s);
+		if (!list) {
+			list = [];
+			socketDetach.set(s, list);
+		}
+		list.push(off);
+	};
+
 	const teardownSocket = (s: WASocket | null): void => {
+		// Per-socket timers go down with the socket — a fresh `buildSocket`
+		// re-arms them in the next open handler. Clearing here keeps a
+		// reconnect from leaving zombie pings firing against a dead socket.
+		if (presencePingTimer) {
+			clearInterval(presencePingTimer);
+			presencePingTimer = null;
+		}
+		if (sessionAgeTimer) {
+			clearTimeout(sessionAgeTimer);
+			sessionAgeTimer = null;
+		}
+		clearColdStartNudges();
 		if (!s) return;
+		// Detach our own listeners explicitly first so we never drop
+		// listeners owned by callers (defense against a future cross-cutting
+		// subsystem subscribing to the same emitter).
+		const detaches = socketDetach.get(s);
+		if (detaches) {
+			for (const off of detaches) {
+				try {
+					off();
+				} catch {
+					/* best-effort — keep going on the next detach */
+				}
+			}
+			socketDetach.delete(s);
+		}
+		// Belt-and-braces fallback: in case a Baileys-internal listener slipped
+		// past our register helper, the coarse removeAllListeners catches it.
 		try {
 			(s.ev as unknown as { removeAllListeners?: () => void }).removeAllListeners?.();
 		} catch {
@@ -573,6 +760,18 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 			browser: ["Brigade", "Chrome", "1.0.0"],
 			syncFullHistory: false,
 			markOnlineOnConnect: false,
+			// Explicit timeouts + keepalive. Baileys' defaults work in
+			// well-connected environments but leave the door open to slow
+			// silent failures over flaky networks: keepalive at 25s sits
+			// under WhatsApp's typical 30s server-side idle threshold so
+			// the link gets nudged before the server marks it offline; the
+			// 60s connect/query timeouts give Baileys enough headroom on
+			// the initial handshake without dragging shutdown.
+			keepAliveIntervalMs: 25_000,
+			connectTimeoutMs: 60_000,
+			defaultQueryTimeoutMs: 60_000,
+			retryRequestDelayMs: 250,
+			qrTimeout: 60_000,
 			auth: {
 				creds: state.creds,
 				// biome-ignore lint/suspicious/noExplicitAny: pino-shaped stub logger
@@ -580,13 +779,17 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 			},
 		});
 
-		s.ev.on("creds.update", () => {
+		const credsUpdateHandler = (): void => {
 			pendingCredsSave = Promise.resolve(saveCreds()).catch((err) => {
 				args.log("failed saving WhatsApp creds", { error: err instanceof Error ? err.message : String(err) });
 			});
+		};
+		s.ev.on("creds.update", credsUpdateHandler);
+		registerDetach(s, () => {
+			(s.ev as unknown as { off?: (e: string, h: () => void) => void }).off?.("creds.update", credsUpdateHandler);
 		});
 
-		s.ev.on("connection.update", (update: Partial<ConnectionState>) => {
+		const connectionUpdateHandler = (update: Partial<ConnectionState>): void => {
 			// Wrap the whole handler — a throw inside a Baileys event emit would
 			// otherwise surface as an unhandled rejection and could crash the daemon.
 			try {
@@ -602,13 +805,96 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 					reconnectAttempts = 0; // healthy link — reset backoff
 					lastQr = null; // any future QR is genuinely a re-pair
 					const now = Date.now();
-					lastInboundAt = now; // reset watchdog clock on fresh link
+					lastInboundAt = now; // coarse "frames flowing" reset on fresh link
+					lastActivityAt = now; // watchdog clock reset on fresh link
 					connectedAtMs = now; // anchor the pairing-grace window
 					// Gateway mode: always log the structured event.
 					// Link mode: the CLI renders the polished success card itself,
 					//   so suppress the duplicate "connected" log here.
 					if (!args.linkMode) args.log("connected to WhatsApp");
 					args.onConnected?.();
+					// Tell WhatsApp's server we're online and ready for queued
+					// messages. Without this nudge the server can sit on queued
+					// inbound for hours (boot connection silent until a later
+					// reconnect happens to push the queue) — exactly the overnight
+					// "connected but no messages" failure mode. Fires on EVERY
+					// fresh `open`, not just the first connect, so watchdog-
+					// triggered reconnects also reannounce presence. `queueMicrotask`
+					// so `onConnected` callers see the connection before any
+					// outbound traffic.
+					if (!args.linkMode) {
+						queueMicrotask(() => {
+							const live = sock;
+							if (!live) return;
+							void Promise.resolve()
+								.then(() => live.sendPresenceUpdate?.("available"))
+								.catch((err) => {
+									args.log("WhatsApp presence-update on open failed", {
+										error: err instanceof Error ? err.message : String(err),
+									});
+								});
+						});
+						// Cold-start nudges. The single presence-update above is
+						// often not enough to convince WhatsApp's server the device
+						// is "really" ready — there's a server-side debounce that
+						// otherwise holds the queue for ~60s before flushing. Three
+						// quick re-pings during the cold window pull that floor
+						// down to ~5-15s. Self-cancel as soon as real inbound
+						// flows (see the per-message loop). New nudges replace any
+						// stale ones from a prior `open` event in the same lifetime.
+						clearColdStartNudges();
+						for (const offset of COLD_START_NUDGES_MS) {
+							const timer = setTimeout(() => {
+								if (closed) return;
+								const live = sock;
+								if (!live) return;
+								void Promise.resolve()
+									.then(() => live.sendPresenceUpdate?.("available"))
+									.catch((err) => {
+										args.log("WhatsApp cold-start presence-nudge failed", {
+											offsetMs: offset,
+											error: err instanceof Error ? err.message : String(err),
+										});
+									});
+							}, offset);
+							timer.unref?.();
+							coldStartNudgeTimers.push(timer);
+						}
+						// Arm the periodic presence ping (idle keepalive nudge).
+						// Cleared by `teardownSocket` on the next reconnect / close.
+						if (presencePingTimer) clearInterval(presencePingTimer);
+						const pingInterval = presencePingMs();
+						presencePingTimer = setInterval(() => {
+							if (closed) return;
+							const live = sock;
+							if (!live) return;
+							void Promise.resolve()
+								.then(() => live.sendPresenceUpdate?.("available"))
+								.catch((err) => {
+									args.log("WhatsApp presence-ping failed", {
+										error: err instanceof Error ? err.message : String(err),
+									});
+								});
+						}, pingInterval);
+						presencePingTimer.unref?.();
+						// Arm the max-session-age recycle. After N hours we force a
+						// clean reconnect regardless of how healthy the link looks —
+						// preventive defense against accumulated Signal state drift.
+						if (sessionAgeTimer) clearTimeout(sessionAgeTimer);
+						const sessionAge = maxSessionAgeMs();
+						sessionAgeTimer = setTimeout(() => {
+							if (closed) return;
+							args.log("WhatsApp forced reconnect after max session age", {
+								maxAgeMs: sessionAge,
+							});
+							const dying = sock;
+							sock = null;
+							teardownSocket(dying);
+							reconnectAttempts = 0; // preventive recycle isn't a failure
+							scheduleReconnect();
+						}, sessionAge);
+						sessionAgeTimer.unref?.();
+					}
 				}
 				if (connection === "close") {
 					const status = (lastDisconnect?.error as { output?: { statusCode?: number } } | undefined)?.output
@@ -617,10 +903,38 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 					// listeners can't fire again (no leak, no duplicate inbound).
 					teardownSocket(s);
 					if (sock === s) sock = null;
+					// If this socket lived for more than LONG_SESSION_RESET_MS, the
+					// close is a fresh flap — not the continuation of a failing
+					// reconnect sequence. Reset the attempt counter so the new
+					// flap gets the full 12-retry budget instead of inheriting a
+					// burned-down one from earlier in the day. Without this guard,
+					// a single transient blip after a healthy 2-hour session can
+					// exhaust the budget within minutes.
+					if (
+						connectedAtMs !== null &&
+						Date.now() - connectedAtMs >= LONG_SESSION_RESET_MS &&
+						reconnectAttempts > 0
+					) {
+						reconnectAttempts = 0;
+					}
 					if (status === loggedOutCode) {
 						args.log("WhatsApp session logged out — re-link required");
 						args.onLoggedOut?.();
 						return; // dead creds — never reconnect
+					}
+					if (status === MULTI_DEVICE_CONFLICT_CODE) {
+						// A new WhatsApp Web session opened against the same number
+						// (another linked Brigade, a manual Web login, or the
+						// operator scanning the QR somewhere else). Reconnecting
+						// here would put us into a 440-conflict ping-pong with the
+						// other session — both reconnect, both see 440, both
+						// reconnect, forever. Treat as terminal; the operator must
+						// resolve which session keeps the link.
+						args.log(
+							"WhatsApp multi-device conflict — another linked Web session took over; not reconnecting",
+						);
+						args.onLoggedOut?.();
+						return;
 					}
 					if (status === restartRequiredCode) {
 						// Expected immediately after first-link; reconnect promptly
@@ -656,16 +970,23 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 					error: err instanceof Error ? err.message : String(err),
 				});
 			}
+		};
+		s.ev.on("connection.update", connectionUpdateHandler);
+		registerDetach(s, () => {
+			(s.ev as unknown as { off?: (e: string, h: typeof connectionUpdateHandler) => void }).off?.(
+				"connection.update",
+				connectionUpdateHandler,
+			);
 		});
 
-		s.ev.on("messages.upsert", (payload: { messages: WAMessage[]; type: string }) => {
+		const messagesUpsertHandler = (payload: { messages: WAMessage[]; type: string }): void => {
 			// `notify` = live messages; `append`/history-sync are ignored so we
 			// never replay old chats on reconnect.
 			if (payload.type !== "notify") return;
-			// Bump the watchdog timestamp — even a heartbeat-shaped notify (no
-			// messages we ultimately surface) proves the link is alive. We do
-			// this BEFORE the per-message filtering so status / system frames
-			// also keep the watchdog satisfied.
+			// Coarse "frames are flowing" clock — bumped on ANY notify, including
+			// status broadcasts and other passthrough traffic. This proves the
+			// transport is alive but says nothing about real inbound delivery,
+			// so the watchdog does NOT read it. Telemetry / back-compat only.
 			lastInboundAt = Date.now();
 			// Process each message in its own async task so media download (a
 			// network round-trip) doesn't block the next message's dedupe claim.
@@ -676,8 +997,17 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 						if (!jid) return;
 						// Status/broadcast feeds — both legacy (`status@broadcast`) and
 						// the suffix variants (`…@status`, `…@broadcast`) — are story
-						// updates, never DMs to react to.
+						// updates, never DMs to react to. They must NOT bump the
+						// watchdog clock: if a contact posts a story every few
+						// minutes, those notifies would otherwise keep the watchdog
+						// satisfied while real DMs were silently queued server-side.
 						if (jid === "status@broadcast" || jid.endsWith("@status") || jid.endsWith("@broadcast")) return;
+						// Real DM/group inbound — bump the watchdog clock. From this
+						// point on we know we've got actual conversational traffic.
+						lastActivityAt = Date.now();
+						// Cancel any pending cold-start nudges — the queue is open
+						// and flowing, no need to keep nagging the server.
+						if (coldStartNudgeTimers.length > 0) clearColdStartNudges();
 						const isGroup = jid.endsWith("@g.us");
 						const msgId = m.key.id;
 						// `fromMe` handling. WhatsApp surfaces TWO distinct flavours of
@@ -810,26 +1140,38 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 					}
 				})();
 			}
+		};
+		s.ev.on("messages.upsert", messagesUpsertHandler);
+		registerDetach(s, () => {
+			(s.ev as unknown as { off?: (e: string, h: typeof messagesUpsertHandler) => void }).off?.(
+				"messages.upsert",
+				messagesUpsertHandler,
+			);
 		});
 
 		// Surface socket-level WS errors instead of crashing the process.
-		const ws = (s as unknown as { ws?: { on?: (e: string, cb: (err: Error) => void) => void } }).ws;
-		ws?.on?.("error", (err) => args.log("WhatsApp socket error", { error: String(err) }));
+		const ws = (s as unknown as { ws?: { on?: (e: string, cb: (err: Error) => void) => void; off?: (e: string, cb: (err: Error) => void) => void } }).ws;
+		const wsErrorHandler = (err: Error): void => args.log("WhatsApp socket error", { error: String(err) });
+		ws?.on?.("error", wsErrorHandler);
+		registerDetach(s, () => {
+			ws?.off?.("error", wsErrorHandler);
+		});
 
 		return s;
 	};
 
 	sock = buildSocket();
 
-	// Watchdog — once-a-minute check that WhatsApp is still delivering. If the
-	// socket sits "open" but goes silent past the stale threshold (typical
-	// flaky-home-network failure mode where Baileys never gets the stream
-	// teardown), force a reconnect so the operator doesn't sit there wondering
-	// why nothing arrives. Disabled in linkMode (one-shot pair, no daemon).
+	// Watchdog — once-a-minute check that WhatsApp is still delivering REAL
+	// inbound. Reads `lastActivityAt` (post-filter) so a stream of story-
+	// broadcast notifies on an otherwise-silent link can't keep us asleep.
+	// If we go past the stale threshold, force a reconnect so the operator
+	// doesn't sit there wondering why nothing arrives. Disabled in linkMode
+	// (one-shot pair, no daemon).
 	if (!args.linkMode) {
 		watchdogTimer = setInterval(() => {
 			if (closed || !sock) return;
-			const elapsed = Date.now() - lastInboundAt;
+			const elapsed = Date.now() - lastActivityAt;
 			if (elapsed < WATCHDOG_STALE_MS) return;
 			args.log("WhatsApp watchdog — no inbound activity, forcing reconnect", {
 				elapsedMs: elapsed,
@@ -841,9 +1183,19 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 			scheduleReconnect();
 			// Reset the clock so a flapping link doesn't trigger another forced
 			// reconnect before the new socket has a chance to open.
+			lastActivityAt = Date.now();
 			lastInboundAt = Date.now();
 		}, WATCHDOG_CHECK_MS);
 		watchdogTimer.unref?.();
+	}
+
+	// Trap Signal-protocol crypto rejections (declared earlier in this
+	// function; see `onUnhandledRejection`). Registered here, AFTER
+	// `teardownSocket` and `scheduleReconnect` are in scope, and removed in
+	// `close()` so a torn-down connection's handler doesn't survive past
+	// the lifecycle that armed it.
+	if (!args.linkMode) {
+		process.on("unhandledRejection", onUnhandledRejection);
 	}
 
 	const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref?.());
@@ -937,6 +1289,8 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 		current: () => sock,
 		selfId: () => canonicalWhatsAppId(sock?.user?.id) || null,
 		connectedAt: () => connectedAtMs,
+		lastInboundAt: () => lastInboundAt,
+		lastActivityAt: () => lastActivityAt,
 		async sendText(conversationId: string, text: string): Promise<void> {
 			// Convert agent-style markdown (**bold**, headings, tables, [links])
 			// into WhatsApp's sparse formatting (*bold*, • bullets, "label (url)")
@@ -1067,8 +1421,14 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 				clearInterval(watchdogTimer);
 				watchdogTimer = null;
 			}
+			// Remove the process-level crypto-rejection trap — otherwise a
+			// torn-down connection's handler survives and could touch a `sock`
+			// that's been nulled out (the `closed` guard catches that, but it's
+			// cleaner to deregister).
+			process.off("unhandledRejection", onUnhandledRejection);
 			// `logout()` would invalidate creds; we want a clean disconnect that
-			// keeps the link, so just tear the socket down.
+			// keeps the link, so just tear the socket down. (presencePingTimer
+			// + sessionAgeTimer are cleared inside teardownSocket.)
 			teardownSocket(sock);
 			sock = null;
 			// Let a final creds write flush so the link survives a restart.

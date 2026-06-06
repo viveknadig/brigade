@@ -75,6 +75,18 @@ export const MIN_REFIRE_GAP_MS = 2_000;
 /** How long to wait between watchdog-driven rearms during execution. */
 const RUNNING_RECHECK_INTERVAL_MS = 60_000;
 /**
+ * Threshold for surfacing "the next tick fired much later than we asked".
+ * If the actual delay between arming and firing exceeds the requested delay
+ * by MORE than this, it almost certainly means the host slept / suspended
+ * (laptop closed overnight, container paused, VM frozen). Logged so the
+ * operator can correlate missed crons with the underlying suspend instead
+ * of chasing a phantom scheduler bug. 60s gives normal scheduling jitter
+ * room to breathe (a backed-up event loop can land a tick a few seconds
+ * late under load) while still catching real multi-minute / multi-hour
+ * sleep events.
+ */
+const TICK_SKEW_THRESHOLD_MS = 60_000;
+/**
  * Per-execution wall-clock cap when the job didn't specify
  * `payload.timeoutSeconds`. 60 seconds matches the reference's default and is well
  * above the slow-path tail of every realistic cron run (a reminder "say
@@ -134,6 +146,12 @@ export function armTimer(state: CronServiceState): void {
 	// 2-hour STUCK_RUN_MS sweep clears the marker. MIN_REFIRE_GAP_MS=2s gives
 	// the watchdog room to act without saturating the loop.
 	if (delay === 0) delay = MIN_REFIRE_GAP_MS;
+	// Record the arm in `state` so the next `onTimer` can compute actual-vs-
+	// expected delay and surface clock-skew / host-suspend events. Captured
+	// BEFORE `setTimeout` so a race where the timer fires immediately still
+	// sees populated fields.
+	state.lastTickArmedAt = now;
+	state.lastTickExpectedDelayMs = delay;
 	state.timer = setTimeout(() => {
 		void onTimer(state);
 	}, delay);
@@ -165,6 +183,30 @@ function armRunningRecheckTimer(state: CronServiceState): void {
  */
 export async function onTimer(state: CronServiceState): Promise<void> {
 	if (state.running) return; // re-entry guard (shouldn't happen, but cheap)
+	// Clock-skew / host-suspend detection — surfaces "the OS slept, we're
+	// waking up well past our scheduled fire" events to the log so a missed
+	// 09:00 reminder after an overnight laptop sleep doesn't look like a
+	// scheduler bug. Computed against `lastTickArmedAt` captured by the
+	// PREVIOUS `armTimer` call, so the first tick (no prior arm) never
+	// reports a skew. We compute BEFORE setting `running=true` so the
+	// observation is still logged on a re-entry race (rare, but cheap).
+	if (state.lastTickArmedAt !== undefined && state.lastTickExpectedDelayMs !== undefined) {
+		const armed = state.lastTickArmedAt;
+		const expected = state.lastTickExpectedDelayMs;
+		const actual = state.deps.nowMs!() - armed;
+		const skewMs = actual - expected;
+		if (skewMs >= TICK_SKEW_THRESHOLD_MS) {
+			state.deps.log.warn(
+				"cron tick fired much later than scheduled (host likely slept/suspended)",
+				{
+					expectedDelayMs: expected,
+					actualDelayMs: actual,
+					skewMs,
+					thresholdMs: TICK_SKEW_THRESHOLD_MS,
+				},
+			);
+		}
+	}
 	state.running = true;
 	armRunningRecheckTimer(state);
 	try {

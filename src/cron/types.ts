@@ -130,6 +130,31 @@ export interface CronJobState {
 	lastDeliveryError?: string;
 }
 
+/**
+ * Who created this cron job — used by the `cron` tool's per-call gate to
+ * decide whether a non-owner channel peer can modify / fire / read it.
+ *
+ *   - `{ kind: "owner" }` — the operator (TUI / connect / CLI). Default
+ *     for any job whose origin is missing (back-compat with jobs persisted
+ *     before this field existed).
+ *   - `{ kind: "channel", channelId, conversationId }` — an approved
+ *     channel peer scheduled this from their own DM. Only THAT peer's
+ *     future turns (channelId + conversationId match) can modify, fire,
+ *     or read the job; the operator can always do anything.
+ *
+ * `accountId` is captured opportunistically when the channel adapter
+ * surfaces it (multi-account channels) so future per-account scoping
+ * works without a schema migration.
+ */
+export type CronJobOrigin =
+	| { kind: "owner" }
+	| {
+			kind: "channel";
+			channelId: string;
+			conversationId: string;
+			accountId?: string;
+	  };
+
 export interface CronJob {
 	id: string;
 	name: string;
@@ -145,6 +170,12 @@ export interface CronJob {
 	failureAlert?: CronFailureAlert;
 	/** Auto-delete after `status: "ok"`. Defaults to `true` for `kind: "at"`. */
 	deleteAfterRun?: boolean;
+	/**
+	 * Origin of this job. `undefined` ⇔ legacy job created before ownership
+	 * tracking shipped — treated as `{ kind: "owner" }` so existing jobs
+	 * keep their previous accessibility.
+	 */
+	createdBy?: CronJobOrigin;
 	createdAtMs: number;
 	updatedAtMs: number;
 	state: CronJobState;
@@ -225,6 +256,13 @@ export interface CronJobCreate {
 	delivery?: CronDelivery;
 	failureAlert?: CronFailureAlert;
 	deleteAfterRun?: boolean;
+	/**
+	 * Stamped by the cron tool's per-call gate. Omit on operator-routed
+	 * paths (defaults to owner). Channel-routed turns must set this so
+	 * later `update` / `remove` / `run` calls from the same peer pass
+	 * the ownership check.
+	 */
+	createdBy?: CronJobOrigin;
 }
 
 /** Patch shape accepted by `ops.update`. */

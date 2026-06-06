@@ -119,6 +119,7 @@ export function createJob(input: CronJobCreate, nowMs: number): CronJob {
 		...(input.delivery !== undefined ? { delivery: input.delivery } : {}),
 		...(input.failureAlert !== undefined ? { failureAlert: input.failureAlert } : {}),
 		...(input.deleteAfterRun !== undefined ? { deleteAfterRun: input.deleteAfterRun } : {}),
+		...(input.createdBy !== undefined ? { createdBy: input.createdBy } : {}),
 		createdAtMs: nowMs,
 		updatedAtMs: nowMs,
 		state: {},

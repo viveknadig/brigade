@@ -258,11 +258,41 @@ export interface MakeExtractionLlmArgs {
 }
 
 /**
+ * Default wall-clock cap on a single isolated-LLM call (extraction or
+ * consolidation sweep). 60s is generous for distillation prompts that return
+ * ≤ a few hundred tokens; without a cap, a stuck provider (a hung Anthropic
+ * request, a wedged local-Ollama, an unresponsive OpenRouter route) would
+ * leave the sweep flag set forever and silently kill all future extraction
+ * for that agent. Tunable via env for slower hosted models / debug runs.
+ */
+const MEMORY_LLM_TIMEOUT_MS_DEFAULT = 60_000;
+function getMemoryLlmTimeoutMs(): number {
+	const raw = process.env.BRIGADE_MEMORY_LLM_TIMEOUT_MS;
+	const parsed = raw ? Number(raw) : NaN;
+	// 5s floor so a misconfigured "0" / "1" doesn't preemptively kill every call.
+	return Number.isFinite(parsed) && parsed >= 5_000 ? parsed : MEMORY_LLM_TIMEOUT_MS_DEFAULT;
+}
+
+/** Marker thrown when a memory sweep LLM call exceeds its wall-clock cap. */
+export class MemoryLlmTimeoutError extends Error {
+	readonly code = "memory-llm:timeout" as const;
+	constructor(timeoutMs: number) {
+		super(`memory LLM call exceeded ${timeoutMs}ms timeout`);
+		this.name = "MemoryLlmTimeoutError";
+	}
+}
+
+/**
  * Build an ISOLATED, tool-less subagent runner: a one-shot LLM call with
  * `systemPrompt` pinned, run against a throwaway transcript (deleted after) so
  * it never pollutes the real session. Reuses the resolved model/auth (inherits
  * Pi's auth-aware streamFn — never replaced). Shared by the extraction sweep
  * and the consolidation sweep; both cost one extra call per SWEEP, not per turn.
+ *
+ * Each call is bounded by `BRIGADE_MEMORY_LLM_TIMEOUT_MS` (default 60s) — on
+ * timeout the underlying session is aborted and `MemoryLlmTimeoutError` is
+ * thrown so the caller's existing catch path (which leaves the cursor put)
+ * surfaces a silent stall as a recoverable log line on the next sweep.
  */
 export function makeIsolatedLlm(
 	systemPrompt: string,
@@ -288,7 +318,27 @@ export function makeIsolatedLlm(
 			} as never);
 			if (!session) return "";
 			applyPersonaOverrideToSession(session as AgentSession, systemPrompt);
-			await (session as AgentSession).prompt(input);
+			// Race the LLM call against a wall-clock timeout. On timeout we
+			// call `session.abort()` (Pi cancels the in-flight stream) and
+			// reject so the caller's existing catch path triggers (cursor
+			// stays put, throttle stamp unchanged, next sweep retries).
+			const timeoutMs = getMemoryLlmTimeoutMs();
+			let timer: ReturnType<typeof setTimeout> | null = null;
+			const timeoutPromise = new Promise<never>((_, reject) => {
+				timer = setTimeout(() => {
+					// Best-effort abort — Pi's abort() is documented to never
+					// throw, but we defensively swallow so the rejection below
+					// is what surfaces to the caller.
+					void (session as AgentSession).abort?.().catch(() => {});
+					reject(new MemoryLlmTimeoutError(timeoutMs));
+				}, timeoutMs);
+				timer.unref?.();
+			});
+			try {
+				await Promise.race([(session as AgentSession).prompt(input), timeoutPromise]);
+			} finally {
+				if (timer) clearTimeout(timer);
+			}
 			return lastAssistantText(session as AgentSession);
 		} finally {
 			try {

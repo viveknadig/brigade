@@ -184,6 +184,60 @@ export function buildProgram(): Command {
       process.exit(await runGatewayRestart({ json: opts.json }));
     });
 
+  // Out-of-process watchdog. Reads the gateway's heartbeat file every N
+  // seconds; if the gateway's event loop is wedged (alive process, stale
+  // heartbeat), kills + respawns it. Use `--once` for a single check; use
+  // the looping form under `nohup` / systemd / launchd for continuous
+  // supervision.
+  gw.command("supervise")
+    .description(
+      "Watch the gateway heartbeat and respawn on wedge (use --once for a single check)",
+    )
+    .option(
+      "--interval <ms>",
+      "polling interval (default: 30000ms)",
+      (v) => parseInt(v, 10),
+    )
+    .option(
+      "--max-stale <ms>",
+      "max heartbeat age before treating gateway as wedged (default: 90000ms)",
+      (v) => parseInt(v, 10),
+    )
+    .option(
+      "--max-respawns <n>",
+      "respawn cap inside --respawn-window (default: 12)",
+      (v) => parseInt(v, 10),
+    )
+    .option(
+      "--respawn-window <ms>",
+      "rolling window for the respawn cap (default: 3600000ms / 1h)",
+      (v) => parseInt(v, 10),
+    )
+    .option("--once", "run a single check then exit (default: loop forever)", false)
+    .option("--json", "emit JSON lines instead of human-readable text", false)
+    .action(
+      async (opts: {
+        interval?: number;
+        maxStale?: number;
+        maxRespawns?: number;
+        respawnWindow?: number;
+        once?: boolean;
+        json?: boolean;
+      }) => {
+        const { runGatewaySupervise } = await import("../commands/gateway-supervise.js");
+        process.exit(
+          await runGatewaySupervise({
+            intervalMs: opts.interval,
+            maxStaleMs: opts.maxStale,
+            maxRespawnsPerWindow: opts.maxRespawns,
+            respawnWindowMs: opts.respawnWindow,
+            once: opts.once,
+            json: opts.json,
+          }),
+        );
+      },
+    );
+
   /* ─────────────────────────────── connect ─────────────────────────────── */
 
   program

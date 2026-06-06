@@ -8,7 +8,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { canonicalWhatsAppId, resolveJidToE164 } from "./connection.js";
+import { canonicalWhatsAppId, isWaCryptoError, resolveJidToE164 } from "./connection.js";
 
 describe("canonicalWhatsAppId", () => {
 	it("returns empty for null/undefined/empty inputs", () => {
@@ -206,5 +206,78 @@ describe("resolveJidToE164", () => {
 		} finally {
 			rmSync(authDir, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("isWaCryptoError", () => {
+	// Locks the haystack used by the process-level unhandled-rejection trap
+	// that force-reconnects on a stuck Signal-protocol ratchet. Two-part
+	// check: (a) one of the two crypto-error signatures, AND (b) at least one
+	// stack-frame keyword identifying it as a Baileys/Signal call (so we
+	// don't react to unrelated AES errors from other parts of the agent).
+
+	it("returns false for null / undefined / non-string nonsense", () => {
+		assert.equal(isWaCryptoError(null), false);
+		assert.equal(isWaCryptoError(undefined), false);
+		assert.equal(isWaCryptoError(""), false);
+		assert.equal(isWaCryptoError({}), false);
+		assert.equal(isWaCryptoError(42), false);
+	});
+
+	it("returns false for an unrelated error (no crypto signature)", () => {
+		assert.equal(isWaCryptoError(new Error("connection closed")), false);
+		assert.equal(isWaCryptoError(new Error("Bad request from server")), false);
+		// Crypto signature WITHOUT a Baileys/Signal stack-frame hint — still
+		// false, because we only want to react when we're confident it came
+		// from the WhatsApp transport.
+		assert.equal(isWaCryptoError(new Error("Unsupported state or unable to authenticate data")), false);
+		assert.equal(isWaCryptoError(new Error("Bad MAC in some other library")), false);
+	});
+
+	it("returns true for the canonical 'Unsupported state' rejection from a Baileys frame", () => {
+		const err = new Error(
+			"Unsupported state or unable to authenticate data\n    at baileys/Signal/Session.js:99:11",
+		);
+		assert.equal(isWaCryptoError(err), true);
+	});
+
+	it("returns true for a 'bad mac' rejection from a noise-handler frame", () => {
+		const err = new Error("Bad MAC\n    at noise-handler.js:42:9");
+		assert.equal(isWaCryptoError(err), true);
+	});
+
+	it("returns true for 'aesdecryptgcm' stack-frame hint", () => {
+		const err = new Error("unsupported state or unable to authenticate data\n    at aesDecryptGCM.js:11:1");
+		assert.equal(isWaCryptoError(err), true);
+	});
+
+	it("returns true for a Baileys '@whiskeysockets' stack-frame hint", () => {
+		const err = new Error("bad mac\n    at @whiskeysockets/baileys/lib/Signal/repository.js:42:9");
+		assert.equal(isWaCryptoError(err), true);
+	});
+
+	it("returns false for bare 'signal' in unrelated stack-frames (no Baileys attribution)", () => {
+		// Catches the false-positive class: a libsignal build used by a
+		// different package (Matrix, a Pi extension, etc.) producing
+		// "bad mac" + a "signal" stack frame. Without Baileys/noise-
+		// handler/aesdecryptgcm/@whiskeysockets attribution it must NOT
+		// force-reconnect the WhatsApp socket.
+		const err = new Error("bad mac\n    at libsignal-other/SessionCipher.js:55:5");
+		assert.equal(isWaCryptoError(err), false);
+	});
+
+	it("matches regardless of case (real WhatsApp rejections vary by Baileys release)", () => {
+		const upper = new Error("UNSUPPORTED STATE OR UNABLE TO AUTHENTICATE DATA at Baileys/X");
+		const mixed = new Error("Bad Mac at Noise-Handler");
+		assert.equal(isWaCryptoError(upper), true);
+		assert.equal(isWaCryptoError(mixed), true);
+	});
+
+	it("accepts a plain string as well (some rejections aren't Error instances)", () => {
+		assert.equal(
+			isWaCryptoError("Unsupported state or unable to authenticate data at baileys"),
+			true,
+		);
+		assert.equal(isWaCryptoError("something else entirely"), false);
 	});
 });

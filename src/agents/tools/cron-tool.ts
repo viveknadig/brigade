@@ -1,5 +1,5 @@
 /**
- * `cron` — agent-callable scheduler control tool. Owner-only.
+ * `cron` — agent-callable scheduler control tool.
  *
  * Lets the operator (via the chat/connect TUI) manage scheduled jobs:
  *   - `status`  — service-level snapshot (job count, next wake, running).
@@ -16,9 +16,18 @@
  * (so unit tests + standalone CLI invocations get a clear error rather
  * than a confusing exception).
  *
- * Ownership: `ownerOnly: true` — sub-agents and non-operator senders cannot
- * mutate the cron set. Their `cron` calls return a 403-class refusal at
- * the ownership wrapper layer, before the action even runs.
+ * Ownership model (per-action, not blanket):
+ *   - Workspace owner (TUI / `connect` / CLI) gets full access to every
+ *     action.
+ *   - Channel-routed callers (e.g. an approved WhatsApp peer) can `add`
+ *     reminders that fire back to THEIR OWN chat, plus read `status` /
+ *     `list` / `runs`. Mutating / firing / waking another agent's jobs
+ *     refuses with a 403-class error.
+ *
+ * The narrow surface for non-owner callers means an operator-allowed peer
+ * can ask "remind me to call mom in 1 hour" over WhatsApp and the cron
+ * fires back into THEIR DM, but can't reach the operator's main session
+ * or other peers' chats.
  */
 
 import { Type } from "typebox";
@@ -131,6 +140,17 @@ export interface MakeCronToolOptions {
 	visibility?: import("./sessions/shared.js").SessionToolsVisibility;
 	a2aPolicy?: import("./sessions/shared.js").AgentToAgentPolicy;
 	spawnedKeys?: ReadonlySet<string>;
+	/**
+	 * Whether the caller of this turn is the workspace owner (operator on
+	 * the TUI / `connect` / a CLI path). When `false`, the turn was routed
+	 * in from an approved channel peer — they may still schedule reminders
+	 * that fire back to THEIR OWN chat, but the tool refuses any action
+	 * that would mutate, run, or read someone else's jobs.
+	 *
+	 * Defaults to `true` when omitted so legacy callers (TUI, tests) keep
+	 * the previous full-access behaviour without having to opt in.
+	 */
+	senderIsOwner?: boolean;
 }
 
 /**
@@ -263,6 +283,10 @@ export function makeCronTool(
 	const callerVisibility = opts.visibility;
 	const callerA2aPolicy = opts.a2aPolicy;
 	const callerSpawnedKeys = opts.spawnedKeys;
+	// Default to owner-access when omitted so legacy paths (TUI/tests) keep
+	// the previous full-access behaviour. Channel-routed callers must set
+	// this explicitly to `false` to opt into the narrow surface below.
+	const senderIsOwner = opts.senderIsOwner !== false;
 	return {
 		name: "cron",
 		label: "cron",
@@ -467,7 +491,11 @@ export function makeCronTool(
 			"      payload: {kind: \"agentTurn\", message: \"Render today's morning checklist.\"}\n" +
 			"    }}",
 		parameters: CronToolParams,
-		ownerOnly: true,
+		// NOTE: no blanket `ownerOnly: true`. The cron surface is gated per-
+		// action below so an approved channel peer (e.g. a WhatsApp DM the
+		// operator allow-listed) can still schedule reminders that fire
+		// back to THEIR OWN chat — anything cross-chat / cross-agent /
+		// mutating-someone-else's-jobs is refused individually instead.
 		async execute(
 			_toolCallId,
 			params,
@@ -481,6 +509,144 @@ export function makeCronTool(
 			}
 			const action = readStringParam(params, "action", { required: true }) as
 				| "status" | "list" | "add" | "update" | "remove" | "run" | "runs" | "wake";
+
+			// Per-call non-owner gate. The workspace owner (TUI / connect /
+			// CLI paths) keeps full access. A channel-routed caller (e.g.
+			// approved WhatsApp peer) can schedule reminders for their own
+			// chat AND manage the reminders they previously created — but
+			// can't touch the operator's jobs, fire jobs they didn't
+			// schedule, or inject system-events into the operator's main
+			// session.
+			//
+			// Ownership is tracked via `CronJob.createdBy`. The first time
+			// a non-owner adds a job, this gate stamps a `channel` origin
+			// onto the create input; subsequent update/remove/run calls
+			// look up the job and match its origin against the calling
+			// channel + conversation. Jobs predating ownership tracking
+			// (createdBy undefined) are treated as owner-created — the
+			// safe default that preserves legacy behaviour.
+			//
+			// `wake` stays owner-only because its target IS the operator's
+			// main session by definition; there's no per-peer wake.
+			const callerOrigin =
+				!senderIsOwner && channelContext
+					? ({
+							kind: "channel" as const,
+							channelId: channelContext.channelId,
+							conversationId: channelContext.conversationId,
+							...(channelContext.accountId !== undefined
+								? { accountId: channelContext.accountId }
+								: {}),
+						})
+					: undefined;
+			/**
+			 * Does the given persisted job belong to the non-owner caller
+			 * that's making this turn? Used to gate update/remove/run/runs.
+			 * Operators bypass this entirely and the helper is never called
+			 * for them.
+			 */
+			const jobIsOwnedByCaller = (job: {
+				createdBy?: import("../../cron/types.js").CronJobOrigin;
+			}): boolean => {
+				if (!callerOrigin) return false;
+				const origin = job.createdBy;
+				if (!origin || origin.kind === "owner") return false;
+				return (
+					origin.kind === "channel" &&
+					origin.channelId === callerOrigin.channelId &&
+					origin.conversationId === callerOrigin.conversationId
+				);
+			};
+			if (!senderIsOwner) {
+				if (!channelContext) {
+					// Defensive — a non-owner caller with no channelContext is
+					// an unrecognised path. Refuse rather than guess.
+					return failedTextResult(
+						"cron: a non-owner-routed turn must arrive via an approved channel.",
+						{ action } as never,
+					);
+				}
+				if (action === "wake") {
+					// `wake` injects into the OPERATOR's main session — there
+					// is no per-peer wake target, so this is unconditionally
+					// owner-only.
+					return failedTextResult(
+						"cron: action \"wake\" requires workspace-owner privilege — " +
+							"it injects system events into the operator's main session and has no per-peer equivalent.",
+						{ action } as never,
+					);
+				}
+				if (action === "update" || action === "remove" || action === "run" || action === "runs") {
+					// Per-job ownership check: read the target job from the
+					// in-memory store and verify the caller created it. The
+					// store is a small Array.find — cheap. Reading does NOT
+					// race with concurrent mutation because the per-instance
+					// lock serialises writes; the worst we'd see is a stale
+					// `createdBy` on a job that's about to be removed, which
+					// the downstream op call handles cleanly.
+					const jobId = readStringParam(params, "jobId", { required: true });
+					if (typeof jobId !== "string" || jobId.length === 0) {
+						return failedTextResult(
+							`cron: action "${action}" requires a jobId parameter`,
+							{ action } as never,
+						);
+					}
+					const target = state.store.jobs.find((j) => j.id === jobId);
+					if (!target) {
+						return failedTextResult(
+							`cron: no job with id ${jobId}`,
+							{ action } as never,
+						);
+					}
+					if (!jobIsOwnedByCaller(target)) {
+						return failedTextResult(
+							`cron: action "${action}" refused — that job was not scheduled by this chat.`,
+							{ action } as never,
+						);
+					}
+				}
+				if (action === "add") {
+					// For `add`: pin the delivery target to the caller's own
+					// channel/conversation. If the LLM tried to specify a
+					// different channel or `to`, refuse — that's a
+					// cross-chat escape attempt. Missing delivery is fine;
+					// the auto-fill helper below will set it from the
+					// channelContext.
+					const jobIn = (params as { job?: unknown }).job;
+					const delivery =
+						jobIn && typeof jobIn === "object"
+							? ((jobIn as { delivery?: { channel?: unknown; to?: unknown } }).delivery ?? undefined)
+							: undefined;
+					const channelMatchesCtx =
+						delivery?.channel === undefined || delivery.channel === channelContext.channelId;
+					const toMatchesCtx =
+						delivery?.to === undefined || delivery.to === channelContext.conversationId;
+					if (!channelMatchesCtx || !toMatchesCtx) {
+						return failedTextResult(
+							"cron: as a non-owner-routed turn you may only schedule reminders that fire back to your own chat. " +
+								"Cross-conversation delivery requires workspace-owner privilege.",
+							{ action } as never,
+						);
+					}
+					// Also pin the job's agentId: a non-owner caller may not
+					// schedule jobs against a DIFFERENT agent than the one
+					// answering them now. Mirrors the per-action gate above.
+					const jobAgentId =
+						jobIn && typeof jobIn === "object"
+							? (jobIn as { agentId?: unknown }).agentId
+							: undefined;
+					if (
+						typeof jobAgentId === "string" &&
+						callerAgentId !== undefined &&
+						jobAgentId !== callerAgentId
+					) {
+						return failedTextResult(
+							"cron: as a non-owner-routed turn you may only schedule jobs for the agent answering you now.",
+							{ action } as never,
+						);
+					}
+				}
+			}
 			switch (action) {
 				case "status": {
 					const status = await cronStatus(state);
@@ -497,6 +663,25 @@ export function makeCronTool(
 						...(offset !== undefined ? { offset } : {}),
 						...(query !== undefined ? { query } : {}),
 					});
+					// Non-owner callers see only the jobs they scheduled
+					// from this chat — never the operator's jobs nor jobs
+					// scheduled from other peers' chats. Keeps cron a
+					// per-chat surface for approved peers.
+					if (!senderIsOwner) {
+						const ownJobs = result.jobs.filter((j) => jobIsOwnedByCaller(j));
+						return payloadTextResult({
+							action,
+							result: {
+								...result,
+								jobs: ownJobs,
+								// Re-derive `total` so the page footer doesn't
+								// imply other people's jobs are visible-just-
+								// paginated-elsewhere. The store-wide total is
+								// for owners only.
+								total: ownJobs.length,
+							},
+						});
+					}
 					return payloadTextResult({ action, result });
 				}
 				case "add": {
@@ -604,6 +789,18 @@ export function makeCronTool(
 						callerAgentId && typeof jobWithDelivery.agentId !== "string"
 							? { ...jobWithDelivery, agentId: callerAgentId }
 							: jobWithDelivery;
+					// Stamp `createdBy` so future `update` / `remove` / `run`
+					// calls from THIS channel + conversation are recognised
+					// as the legitimate owner of the job. Operator-routed
+					// turns omit it (defaults to owner). Caller-supplied
+					// `createdBy` is ignored — the gate is the only source
+					// of truth, otherwise a non-owner could lie their way
+					// into impersonating the operator.
+					const jobWithOrigin: Record<string, unknown> = callerOrigin
+						? { ...jobWithAgent, createdBy: callerOrigin }
+						: senderIsOwner
+							? { ...jobWithAgent, createdBy: { kind: "owner" } }
+							: jobWithAgent;
 					// `contextMessages` is a top-level cron-tool param (NOT a job
 					// field). For systemEvent reminders, append the caller's last
 					// N messages to payload.text. Silent no-op for agentTurn,
@@ -614,7 +811,7 @@ export function makeCronTool(
 							? (params as { contextMessages: number }).contextMessages
 							: 0;
 					const finalJob = await maybeAttachReminderContext({
-						job: jobWithAgent,
+						job: jobWithOrigin,
 						contextMessages,
 						...(agentSessionKey !== undefined ? { agentSessionKey } : {}),
 					});

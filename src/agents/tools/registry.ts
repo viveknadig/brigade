@@ -360,6 +360,12 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 				...(opts.sessionToolAccess?.spawnedKeys !== undefined
 					? { spawnedKeys: opts.sessionToolAccess.spawnedKeys }
 					: {}),
+				// Same shape as `send_media` — channel turns from approved
+				// non-owner peers thread `senderIsOwner: false` so the
+				// per-call gate inside `cron` enforces "own chat only".
+				...(opts.senderIsOwner !== undefined
+					? { senderIsOwner: opts.senderIsOwner }
+					: {}),
 			}),
 		);
 	}
