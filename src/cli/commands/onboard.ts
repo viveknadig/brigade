@@ -26,7 +26,7 @@ import chalk from "chalk";
 import type { Command } from "commander";
 
 import { initAuthProfiles, upsertApiKeyProfile } from "../../auth/profiles.js";
-import { DEFAULT_AGENT_ID, resolveAuthProfilesPath } from "../../config/paths.js";
+import { DEFAULT_AGENT_ID, resolveAuthProfilesPath, resolveModelsPath } from "../../config/paths.js";
 import { BRIGADE_DIR, loadConfig, saveConfig } from "../../core/config.js";
 import { EXIT_CONFIG_ERROR } from "../../protocol.js";
 import { writeSentinelNow } from "../../storage/sentinel.js";
@@ -119,7 +119,7 @@ export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promi
 	// as a string, so it doesn't read authStorage; but `ModelRegistry` does
 	// when discovering provider models for the picker).
 	const authStorage = AuthStorage.inMemory();
-	const modelRegistry = ModelRegistry.create(authStorage, `${BRIGADE_DIR}/models.json`);
+	const modelRegistry = ModelRegistry.create(authStorage, resolveModelsPath(DEFAULT_AGENT_ID));
 
 	try {
 		const result = await runOnboarding(tui, authStorage, modelRegistry, {

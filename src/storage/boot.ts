@@ -54,6 +54,7 @@ export async function bootRuntimeContext(): Promise<RuntimeContext> {
 					hydrateCronCache(ctx.store),
 					hydrateFactsCaches(ctx.store, cfg as Record<string, unknown>),
 					hydrateAuthCaches(ctx.store, cfg as Record<string, unknown>),
+					materialiseModelsCatalog(ctx.store),
 				]);
 			}
 			setRuntimeContext(ctx);
@@ -252,6 +253,30 @@ async function hydrateAuthCaches(
 			}
 		}),
 	);
+}
+
+/** Convex mode boot — materialise the models.json catalog (custom providers
+ *  — Ollama etc.) from its sealed blob into the OS cache dir, where
+ *  `resolveModelsPath` points in convex mode. Pi's ModelRegistry reads the
+ *  file with sync fs, so a real file is unavoidable — but it's a
+ *  regenerable mirror OUTSIDE ~/.brigade; the blob is the source of
+ *  truth. No blob (the common case — no custom providers) → no file, and
+ *  Pi treats the absent file as an empty catalog. */
+async function materialiseModelsCatalog(store: BrigadeStore): Promise<void> {
+	try {
+		const blob = await store.auth.readAuthFileBlob("main", "models");
+		if (!blob) return;
+		const { mkdirSync, writeFileSync } = await import("node:fs");
+		const path = await import("node:path");
+		const { resolveModelsPath } = await import("../config/paths.js");
+		const target = resolveModelsPath("main");
+		mkdirSync(path.dirname(target), { recursive: true });
+		writeFileSync(target, JSON.stringify(blob, null, 2), "utf8");
+	} catch (err) {
+		console.error(
+			`brigade: models catalog materialisation failed — ${(err as Error).message}`,
+		);
+	}
 }
 
 let _configLiveUnsub: (() => void) | undefined;

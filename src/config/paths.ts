@@ -57,6 +57,15 @@ export function resolveModelsPath(_agentId: string): string {
   // ~/.brigade/models.json) but the turn failed "Model not registered"
   // (reading an empty ~/.brigade/agents/<id>/agent/models.json). Auth
   // profiles stay per-agent; the provider catalog is shared per-user.
+  //
+  // Convex mode: Pi's ModelRegistry.create reads this path with sync fs, so
+  // a real file is unavoidable — but it lives in the OS cache dir (NOT under
+  // ~/.brigade). Boot materialises the catalog from its Convex blob there;
+  // catalog writers push the blob back after every file write so the file
+  // is a regenerable cache, never the source of truth.
+  if (tryGetRuntimeContext()?.mode === "convex") {
+    return path.join(resolveOsCacheDir(), "models.json");
+  }
   return path.join(resolveStateDir(), "models.json");
 }
 

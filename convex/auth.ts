@@ -137,7 +137,11 @@ export const loadState = query({
 // authFiles (whole-file state blobs — auth-state.json / profile-state.json)
 // ============================================================================
 
-const AuthFileKind = v.union(v.literal("auth-state"), v.literal("profile-state"));
+const AuthFileKind = v.union(
+	v.literal("auth-state"),
+	v.literal("profile-state"),
+	v.literal("models"),
+);
 
 export const readAuthFile = query({
 	args: { ownerId: v.string(), agentId: v.string(), kind: AuthFileKind },

@@ -95,6 +95,7 @@ import {
 	resolveAgentDir,
 	resolveAgentWorkspaceDir,
 	resolveConfigPath,
+	resolveModelsPath,
 } from "../config/paths.js";
 import { resolveDefaultAgentId } from "../agents/agent-scope.js";
 import type { BrigadeConfig } from "../config/types.js";
@@ -432,7 +433,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<ServerHandl
 		// `${BRIGADE_DIR}/auth.json`. Without this bridge the gateway would
 		// never see keys that onboarding produced.
 		const authStorage = loadBrigadeAuthStorage() as AuthStorage;
-		const modelRegistry = ModelRegistry.create(authStorage, `${BRIGADE_DIR}/models.json`);
+		const modelRegistry = ModelRegistry.create(authStorage, resolveModelsPath(DEFAULT_AGENT_ID));
 
 		// F:\Brigade's brigade.json (post-2026-05-02 wizard refactor) stores
 		// the default model under `agents.defaults.{provider, model.primary}`.
@@ -451,7 +452,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<ServerHandl
 				modelRegistry,
 				provider,
 				modelId,
-				modelsFile: `${BRIGADE_DIR}/models.json`,
+				modelsFile: resolveModelsPath(DEFAULT_AGENT_ID),
 				authStorage,
 			})) as Model<string> | undefined);
 		if (!model) {
@@ -502,7 +503,7 @@ interface BootContinueArgs {
 
 async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	const { opts, port, host, startupStartedAt, lockHandle, modelRegistry, authStorage, bootLog } = args;
-	const modelsFile = `${BRIGADE_DIR}/models.json`;
+	const modelsFile = resolveModelsPath(DEFAULT_AGENT_ID);
 
 	// Wave L P2#3 — clear stale lane state from any prior in-process boot
 	// (test harness double-boots, dev hot-reload). `markGatewayDraining`

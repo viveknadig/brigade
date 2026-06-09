@@ -306,7 +306,7 @@ export class LocalAuthStore implements AuthStore {
 
 	async readAuthFileBlob(
 		agentId: string,
-		kind: "auth-state" | "profile-state",
+		kind: "auth-state" | "profile-state" | "models",
 	): Promise<Record<string, unknown> | undefined> {
 		// Filesystem mode reads the real files — used by `brigade store
 		// migrate` to export the verbatim shapes.
@@ -318,7 +318,7 @@ export class LocalAuthStore implements AuthStore {
 
 	async writeAuthFileBlob(
 		agentId: string,
-		kind: "auth-state" | "profile-state",
+		kind: "auth-state" | "profile-state" | "models",
 		payload: Record<string, unknown>,
 	): Promise<void> {
 		if (kind === "auth-state") {

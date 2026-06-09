@@ -20,7 +20,7 @@ import type { AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
 import { CancellableLoader, Input, type SelectItem, SelectList, Text, TUI } from "@mariozechner/pi-tui";
 
 import { upsertApiKeyProfile, upsertApiKeyRefProfile } from "../auth/profiles.js";
-import { DEFAULT_AGENT_ID, resolveAuthProfilesPath } from "../config/paths.js";
+import { DEFAULT_AGENT_ID, resolveAuthProfilesPath, resolveModelsPath } from "../config/paths.js";
 import { BRIGADE_DIR, saveConfig } from "../core/config.js";
 import { discoverOllamaModels, writeOllamaToModelsJson } from "../integrations/ollama.js";
 import {
@@ -677,7 +677,7 @@ async function ensureLocalOllama(
 		}
 
 		// Persist the provider entry so Pi sees the models from now on.
-		const modelsJsonPath = path.join(BRIGADE_DIR, "models.json");
+		const modelsJsonPath = resolveModelsPath(DEFAULT_AGENT_ID);
 		try {
 			await writeOllamaToModelsJson(modelsJsonPath, baseUrl, discovered);
 			modelRegistry.refresh();

@@ -470,7 +470,13 @@ export default defineSchema({
   authFiles: defineTable({
     ownerId: v.string(),
     agentId: v.string(),
-    kind: v.union(v.literal("auth-state"), v.literal("profile-state")),
+    // "models" is the per-USER models.json (custom provider catalog —
+    // Ollama etc.); stored under agentId "main" since the file is global.
+    kind: v.union(
+      v.literal("auth-state"),
+      v.literal("profile-state"),
+      v.literal("models"),
+    ),
     payload: v.bytes(),
     updatedAt: v.number(),
   }).index("by_owner_agent_kind", ["ownerId", "agentId", "kind"]),

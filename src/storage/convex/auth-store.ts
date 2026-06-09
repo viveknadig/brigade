@@ -266,7 +266,7 @@ export class ConvexAuthStore implements AuthStore {
 
 	async readAuthFileBlob(
 		agentId: string,
-		kind: "auth-state" | "profile-state",
+		kind: "auth-state" | "profile-state" | "models",
 	): Promise<Record<string, unknown> | undefined> {
 		const row = (await this.deps.client.query(api.auth.readAuthFile, {
 			ownerId: this.deps.ownerId,
@@ -279,7 +279,7 @@ export class ConvexAuthStore implements AuthStore {
 
 	async writeAuthFileBlob(
 		agentId: string,
-		kind: "auth-state" | "profile-state",
+		kind: "auth-state" | "profile-state" | "models",
 		payload: Record<string, unknown>,
 	): Promise<void> {
 		await this.deps.client.mutation(api.auth.writeAuthFile, {

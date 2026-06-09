@@ -515,11 +515,11 @@ export interface AuthStore {
 	 *  per-row flattening without semantic drift. */
 	readAuthFileBlob(
 		agentId: string,
-		kind: "auth-state" | "profile-state",
+		kind: "auth-state" | "profile-state" | "models",
 	): Promise<Record<string, unknown> | undefined>;
 	writeAuthFileBlob(
 		agentId: string,
-		kind: "auth-state" | "profile-state",
+		kind: "auth-state" | "profile-state" | "models",
 		payload: Record<string, unknown>,
 	): Promise<void>;
 }
