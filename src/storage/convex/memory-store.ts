@@ -32,7 +32,83 @@ function stringToBytes(s: string): ArrayBuffer {
 
 function rowToRecord(row: Record<string, unknown>): MemoryRecord {
 	const content = bytesToString(row.content as ArrayBuffer);
-	return { ...row, content } as unknown as MemoryRecord;
+	// Rebuild the filesystem shape: nested `createdBy` from the flattened
+	// columns (origin filters read record.createdBy — without this, recall
+	// scoping silently never matches), and strip convex bookkeeping.
+	const {
+		_id,
+		_creationTime,
+		workspaceId,
+		createdByKind,
+		createdByChannelId,
+		createdByConversationId,
+		createdBySessionKey,
+		createdByAccountId,
+		content: _rawContent,
+		...rest
+	} = row as Record<string, unknown> & { content?: unknown };
+	void _id;
+	void _creationTime;
+	void workspaceId;
+	void _rawContent;
+	const record = { ...rest, content } as unknown as MemoryRecord;
+	if (createdByKind !== undefined) {
+		(record as Record<string, unknown>).createdBy = {
+			kind: createdByKind,
+			...(createdByChannelId !== undefined ? { channelId: createdByChannelId } : {}),
+			...(createdByConversationId !== undefined
+				? { conversationId: createdByConversationId }
+				: {}),
+			...(createdBySessionKey !== undefined ? { sessionKey: createdBySessionKey } : {}),
+			...(createdByAccountId !== undefined ? { accountId: createdByAccountId } : {}),
+		};
+	}
+	return record;
+}
+
+/** Filesystem-shaped record → upsertFactRecord mutation args. */
+function recordToRowArgs(workspaceId: string, r: MemoryRecord): Record<string, unknown> {
+	const rec = r as MemoryRecord & {
+		createdBy?: {
+			kind?: string;
+			channelId?: string;
+			conversationId?: string;
+			sessionKey?: string;
+			accountId?: string;
+		};
+		metadata?: unknown;
+		embedding?: number[];
+	};
+	return {
+		workspaceId,
+		memoryId: rec.memoryId,
+		content: stringToBytes(String(rec.content ?? "")),
+		segment: rec.segment,
+		tier: rec.tier,
+		importance: rec.importance,
+		decayRate: rec.decayRate,
+		accessCount: rec.accessCount,
+		lastAccessedAt: rec.lastAccessedAt,
+		createdAt: rec.createdAt,
+		lifecycle: rec.lifecycle,
+		...(rec.sourceTurn !== undefined ? { sourceTurn: rec.sourceTurn } : {}),
+		...(rec.supersedes !== undefined ? { supersedes: rec.supersedes } : {}),
+		...(rec.createdBy?.kind !== undefined ? { createdByKind: rec.createdBy.kind } : {}),
+		...(rec.createdBy?.channelId !== undefined
+			? { createdByChannelId: rec.createdBy.channelId }
+			: {}),
+		...(rec.createdBy?.conversationId !== undefined
+			? { createdByConversationId: rec.createdBy.conversationId }
+			: {}),
+		...(rec.createdBy?.sessionKey !== undefined
+			? { createdBySessionKey: rec.createdBy.sessionKey }
+			: {}),
+		...(rec.createdBy?.accountId !== undefined
+			? { createdByAccountId: rec.createdBy.accountId }
+			: {}),
+		...(rec.metadata !== undefined ? { metadata: rec.metadata } : {}),
+		...(rec.embedding !== undefined ? { embedding: rec.embedding } : {}),
+	};
 }
 
 /** Same as `rowToRecord` but returns `null` when the row was sealed with a
@@ -274,5 +350,26 @@ export class ConvexMemoryStore implements MemoryStore {
 				// Idempotent.
 			}
 		};
+	}
+
+	async listAllFactRecordsRaw(workspaceId: string): Promise<MemoryRecord[]> {
+		const rows = (await this.deps.client.query(api.memory.listAllFacts, {
+			workspaceId,
+		})) as Array<Record<string, unknown>>;
+		return rows.map(rowToRecordOrNull).filter((r): r is MemoryRecord => r !== null);
+	}
+
+	async upsertFactRecordRaw(workspaceId: string, record: MemoryRecord): Promise<void> {
+		await this.deps.client.mutation(
+			api.memory.upsertFactRecord,
+			recordToRowArgs(workspaceId, record) as never,
+		);
+	}
+
+	async deleteFactRecordRaw(workspaceId: string, memoryId: string): Promise<void> {
+		await this.deps.client.mutation(api.memory.deleteFactRecord, {
+			workspaceId,
+			memoryId,
+		});
 	}
 }

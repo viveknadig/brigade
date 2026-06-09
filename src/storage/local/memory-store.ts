@@ -210,4 +210,18 @@ export class LocalMemoryStore implements MemoryStore {
 			}
 		});
 	}
+
+	async listAllFactRecordsRaw(workspaceId: string): Promise<MemoryRecord[]> {
+		return new FactStore(resolveAgentWorkspaceDir(workspaceId)).readAll() as unknown as MemoryRecord[];
+	}
+
+	async upsertFactRecordRaw(_workspaceId: string, _record: MemoryRecord): Promise<void> {
+		// Filesystem mode persists via FactStore.writeAll directly — the raw
+		// per-record surface only exists for the convex dispatch + migrate.
+		throw new NotImplementedYet("memory.upsertFactRecordRaw (filesystem persists via FactStore)");
+	}
+
+	async deleteFactRecordRaw(_workspaceId: string, _memoryId: string): Promise<void> {
+		throw new NotImplementedYet("memory.deleteFactRecordRaw (filesystem persists via FactStore)");
+	}
 }

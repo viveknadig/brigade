@@ -4416,6 +4416,18 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			} catch {
 				/* best-effort */
 			}
+			try {
+				const { awaitFactsFlush } = await import("../storage/facts-cache.js");
+				await awaitFactsFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitCursorFlush } = await import("../agents/memory/extract.js");
+				await awaitCursorFlush();
+			} catch {
+				/* best-effort */
+			}
 			// Dispose the agent-events bridge + every registered handler +
 			// the in-process gateway caller. Order: bridge → handlers →
 			// caller so a late `callGateway()` after shutdown gets a clean

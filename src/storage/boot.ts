@@ -52,6 +52,7 @@ export async function bootRuntimeContext(): Promise<RuntimeContext> {
 					hydrateApprovalCaches(ctx.store, cfg as Record<string, unknown>),
 					hydrateAccessCaches(ctx.store),
 					hydrateCronCache(ctx.store),
+					hydrateFactsCaches(ctx.store, cfg as Record<string, unknown>),
 				]);
 			}
 			setRuntimeContext(ctx);
@@ -162,6 +163,35 @@ async function hydrateCronCache(store: BrigadeStore): Promise<void> {
 	} catch (err) {
 		console.error(`brigade: cron hydration failed — ${(err as Error).message}`);
 	}
+}
+
+/** Convex mode boot — fill the per-workspace facts caches ("main" + every
+ *  config agent) so the synchronous FactStore surface serves from memory. */
+async function hydrateFactsCaches(
+	store: BrigadeStore,
+	cfg: Record<string, unknown>,
+): Promise<void> {
+	const { primeFactsCache } = await import("./facts-cache.js");
+	const agents = cfg.agents as Record<string, unknown> | undefined;
+	const ids = new Set<string>(["main"]);
+	if (agents && typeof agents === "object") {
+		for (const key of Object.keys(agents)) {
+			if (key === "defaults" || !key.trim()) continue;
+			ids.add(key.trim());
+		}
+	}
+	await Promise.all(
+		Array.from(ids, async (workspaceId) => {
+			try {
+				const records = await store.memory.listAllFactRecordsRaw(workspaceId);
+				primeFactsCache(workspaceId, records as never[]);
+			} catch (err) {
+				console.error(
+					`brigade: memory hydration failed for workspace ${workspaceId} — ${(err as Error).message}`,
+				);
+			}
+		}),
+	);
 }
 
 let _configLiveUnsub: (() => void) | undefined;

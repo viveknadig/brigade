@@ -26,6 +26,7 @@ import type { AgentSession } from "@mariozechner/pi-coding-agent";
 
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import { pickInitialThinkingLevel } from "../../core/model-caps.js";
+import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { applyPersonaOverrideToSession } from "../../system-prompt/pi-injection.js";
 import { FactStore, MEMORY_SEGMENTS, type MemorySegment } from "./records.js";
 
@@ -131,6 +132,23 @@ function cursorPath(workspaceDir: string): string {
 	return path.join(workspaceDir, CURSOR_RELATIVE_PATH);
 }
 
+// Convex-mode cursor cache — keyed `${workspaceDir}|${sessionId}` and primed
+// lazily on first read (cursor misses default to 0, which is safe: the sweep
+// simply re-distils from the start and write-time dedup absorbs repeats).
+const convexCursorCache = new Map<string, number>();
+let cursorFlushChain: Promise<void> = Promise.resolve();
+
+/** Resolves when every cursor write enqueued so far reached the backend. */
+export function awaitCursorFlush(): Promise<void> {
+	return cursorFlushChain;
+}
+
+/** Test-only. */
+export function __resetCursorCacheForTests(): void {
+	convexCursorCache.clear();
+	cursorFlushChain = Promise.resolve();
+}
+
 function readCursors(workspaceDir: string): CursorFile {
 	try {
 		const parsed = JSON.parse(fs.readFileSync(cursorPath(workspaceDir), "utf8")) as CursorFile;
@@ -142,6 +160,20 @@ function readCursors(workspaceDir: string): CursorFile {
 }
 
 function writeCursor(workspaceDir: string, sessionId: string, processedCount: number): void {
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") {
+		convexCursorCache.set(`${workspaceDir}|${sessionId}`, processedCount);
+		const store = rctx.store;
+		cursorFlushChain = cursorFlushChain
+			.then(() => store.memory.setExtractCursor(sessionId, processedCount))
+			.catch((err) => {
+				console.error(
+					`brigade: extract-cursor write to convex failed — ${(err as Error).message}`,
+				);
+			});
+		return;
+	}
+
 	const file = readCursors(workspaceDir);
 	file.cursors[sessionId] = processedCount;
 	const p = cursorPath(workspaceDir);
@@ -152,6 +184,22 @@ function writeCursor(workspaceDir: string, sessionId: string, processedCount: nu
 }
 
 export function getCursor(workspaceDir: string, sessionId: string): number {
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") {
+		// Lazy: a miss reads as 0 and the async backfill primes the cache for
+		// the NEXT sweep. Re-distilling from 0 once is safe — write-time
+		// dedup absorbs repeated facts.
+		const key = `${workspaceDir}|${sessionId}`;
+		const cached = convexCursorCache.get(key);
+		if (cached !== undefined) return cached;
+		void rctx.store.memory
+			.getExtractCursor(sessionId)
+			.then((n) => {
+				if (!convexCursorCache.has(key)) convexCursorCache.set(key, n);
+			})
+			.catch(() => {});
+		return 0;
+	}
 	return readCursors(workspaceDir).cursors[sessionId] ?? 0;
 }
 

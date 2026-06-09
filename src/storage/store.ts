@@ -234,6 +234,14 @@ export interface MemoryStore {
 
 	decay(now?: number): Promise<{ archived: number; pruned: number }>;
 	subscribe(scope: Scope, cb: (delta: MemoryDelta) => void): Unsub;
+
+	/** Raw per-record surface for the FactStore dispatch (whole-file diffs
+	 *  realised as authoritative row ops) + boot hydration. `workspaceId`
+	 *  is explicit because facts are per-workspace ("main" for the shared
+	 *  top-level workspace, agent id for per-agent workspaces). */
+	listAllFactRecordsRaw(workspaceId: string): Promise<MemoryRecord[]>;
+	upsertFactRecordRaw(workspaceId: string, record: MemoryRecord): Promise<void>;
+	deleteFactRecordRaw(workspaceId: string, memoryId: string): Promise<void>;
 }
 
 // =============================================================================

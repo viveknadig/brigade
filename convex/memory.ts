@@ -79,6 +79,72 @@ export const writeFact = mutation({
 	},
 });
 
+/** Every fact row for a workspace across all lifecycles — boot hydration of
+ *  the in-process facts cache. */
+export const listAllFacts = query({
+	args: { workspaceId: v.string() },
+	handler: async (ctx, args) => {
+		return ctx.db
+			.query("memoryFacts")
+			.withIndex("by_workspace_memoryId", (q) => q.eq("workspaceId", args.workspaceId))
+			.collect();
+	},
+});
+
+/** Authoritative single-record upsert — every field caller-supplied
+ *  (accessCount, lifecycle, timestamps included). The FactStore dispatch
+ *  realises its whole-file diffs through this. */
+export const upsertFactRecord = mutation({
+	args: {
+		workspaceId: v.string(),
+		memoryId: v.string(),
+		content: v.bytes(),
+		segment: Segment,
+		tier: Tier,
+		importance: v.number(),
+		decayRate: v.number(),
+		accessCount: v.number(),
+		lastAccessedAt: v.number(),
+		createdAt: v.number(),
+		lifecycle: Lifecycle,
+		sourceTurn: v.optional(v.string()),
+		supersedes: v.optional(v.array(v.string())),
+		createdByKind: v.optional(Origin),
+		createdByChannelId: v.optional(v.string()),
+		createdByConversationId: v.optional(v.string()),
+		createdBySessionKey: v.optional(v.string()),
+		createdByAccountId: v.optional(v.string()),
+		metadata: v.optional(v.any()),
+		embedding: v.optional(v.array(v.number())),
+	},
+	handler: async (ctx, args) => {
+		const existing = await ctx.db
+			.query("memoryFacts")
+			.withIndex("by_workspace_memoryId", (q) =>
+				q.eq("workspaceId", args.workspaceId).eq("memoryId", args.memoryId),
+			)
+			.first();
+		if (existing) {
+			await ctx.db.replace(existing._id, args);
+			return;
+		}
+		await ctx.db.insert("memoryFacts", args);
+	},
+});
+
+export const deleteFactRecord = mutation({
+	args: { workspaceId: v.string(), memoryId: v.string() },
+	handler: async (ctx, args) => {
+		const existing = await ctx.db
+			.query("memoryFacts")
+			.withIndex("by_workspace_memoryId", (q) =>
+				q.eq("workspaceId", args.workspaceId).eq("memoryId", args.memoryId),
+			)
+			.first();
+		if (existing) await ctx.db.delete(existing._id);
+	},
+});
+
 export const markAccessed = mutation({
 	args: { workspaceId: v.string(), memoryIds: v.array(v.string()) },
 	handler: async (ctx, args) => {
