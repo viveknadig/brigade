@@ -24,11 +24,13 @@ import {
 	initAuthProfiles,
 	profileId as buildProfileId,
 	readProfiles,
+	readState,
 	upsertApiKeyProfile,
 	upsertApiKeyRefProfile,
 	upsertTokenProfile,
 	upsertTokenRefProfile,
 	writeProfiles,
+	writeState,
 } from "../../auth/profiles.js";
 import {
 	loadProfileState,
@@ -300,5 +302,29 @@ export class LocalAuthStore implements AuthStore {
 
 	async withProfileLock<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
 		return withProfileCooldownLock(agentId, fn);
+	}
+
+	async readAuthFileBlob(
+		agentId: string,
+		kind: "auth-state" | "profile-state",
+	): Promise<Record<string, unknown> | undefined> {
+		// Filesystem mode reads the real files — used by `brigade store
+		// migrate` to export the verbatim shapes.
+		if (kind === "auth-state") {
+			return readState(agentId) as unknown as Record<string, unknown>;
+		}
+		return loadProfileState(agentId) as unknown as Record<string, unknown>;
+	}
+
+	async writeAuthFileBlob(
+		agentId: string,
+		kind: "auth-state" | "profile-state",
+		payload: Record<string, unknown>,
+	): Promise<void> {
+		if (kind === "auth-state") {
+			writeState(agentId, payload as never);
+			return;
+		}
+		saveProfileState(agentId, payload as never);
 	}
 }

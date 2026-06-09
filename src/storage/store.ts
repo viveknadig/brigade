@@ -508,6 +508,20 @@ export interface AuthStore {
 	}): Promise<ProfileStateSnapshot>;
 	setExplicitOrder(agentId: string, provider: string, order: string[]): Promise<void>;
 	withProfileLock<T>(agentId: string, fn: () => Promise<T>): Promise<T>;
+
+	/** Whole-file auth state blobs — auth-state.json / profile-state.json
+	 *  round-trip VERBATIM (sealed at rest). Blob-per-file because the
+	 *  failover `order` array and `lastGood` map can't be represented by
+	 *  per-row flattening without semantic drift. */
+	readAuthFileBlob(
+		agentId: string,
+		kind: "auth-state" | "profile-state",
+	): Promise<Record<string, unknown> | undefined>;
+	writeAuthFileBlob(
+		agentId: string,
+		kind: "auth-state" | "profile-state",
+		payload: Record<string, unknown>,
+	): Promise<void>;
 }
 
 // =============================================================================

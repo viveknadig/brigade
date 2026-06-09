@@ -459,6 +459,22 @@ export default defineSchema({
     .index("by_owner_agent_profileId", ["ownerId", "agentId", "profileId"])
     .index("by_cooldown_until", ["ownerId", "agentId", "cooldownUntil"]),
 
+  // Whole-file auth state blobs — auth-state.json / profile-state.json
+  // round-trip VERBATIM as sealed payloads. Blob-per-file (not per-row
+  // flattening) is deliberate: the failover `order` field is a per-provider
+  // ARRAY (`{provider: [profileId…]}`) that a per-row `explicitOrder` rank
+  // cannot represent without semantic drift, and `lastGood` reconstruction
+  // from per-row flags proved fragile (two winners on a race). The
+  // per-row `profileState` table above stays for queryable cooldown views;
+  // the blob is the source of truth the runtime round-trips.
+  authFiles: defineTable({
+    ownerId: v.string(),
+    agentId: v.string(),
+    kind: v.union(v.literal("auth-state"), v.literal("profile-state")),
+    payload: v.bytes(),
+    updatedAt: v.number(),
+  }).index("by_owner_agent_kind", ["ownerId", "agentId", "kind"]),
+
   // ===========================================================================
   // 10. EXEC APPROVALS  (REPORT 8)
   // ===========================================================================

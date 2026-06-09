@@ -39,7 +39,7 @@ interface Deps {
 // into a `*Enc` column gets AES-256-GCM sealed. Read path decrypts
 // transparently. When the key is absent, payloads pass through as plain
 // bytes (no behaviour change). See [encryption.ts](../encryption.ts).
-import { open, sealString } from "../encryption.js";
+import { open, openJson, sealJson, sealString } from "../encryption.js";
 
 function plaintextToBytes(value: string | undefined): ArrayBuffer | undefined {
 	if (value === undefined || value === "") return undefined;
@@ -241,10 +241,20 @@ export class ConvexAuthStore implements AuthStore {
 		return this.loadProfileState(args.agentId);
 	}
 
-	async setExplicitOrder(_agentId: string, _provider: string, _order: string[]): Promise<void> {
-		throw new NotImplementedYet(
-			"auth.setExplicitOrder (Convex-side order persistence is a follow-up)",
-		);
+	async setExplicitOrder(agentId: string, provider: string, order: string[]): Promise<void> {
+		// The failover order array lives VERBATIM inside the auth-state blob —
+		// read-modify-write it there. (The per-row `explicitOrder` rank column
+		// could not represent a per-provider array; this closes that gap.)
+		const current = (await this.readAuthFileBlob(agentId, "auth-state")) ?? {
+			version: 1,
+			order: {},
+			lastGood: {},
+			usageStats: {},
+		};
+		const orderMap = (current.order as Record<string, string[]> | undefined) ?? {};
+		orderMap[provider] = [...order];
+		current.order = orderMap;
+		await this.writeAuthFileBlob(agentId, "auth-state", current);
 	}
 
 	async withProfileLock<T>(_agentId: string, fn: () => Promise<T>): Promise<T> {
@@ -252,6 +262,32 @@ export class ConvexAuthStore implements AuthStore {
 		// lock needed. Filesystem mode uses an explicit FIFO mutex; convex
 		// mode achieves the same property via the mutation's OCC.
 		return fn();
+	}
+
+	async readAuthFileBlob(
+		agentId: string,
+		kind: "auth-state" | "profile-state",
+	): Promise<Record<string, unknown> | undefined> {
+		const row = (await this.deps.client.query(api.auth.readAuthFile, {
+			ownerId: this.deps.ownerId,
+			agentId,
+			kind,
+		})) as { payload?: ArrayBuffer } | null;
+		if (!row?.payload) return undefined;
+		return openJson<Record<string, unknown>>(row.payload);
+	}
+
+	async writeAuthFileBlob(
+		agentId: string,
+		kind: "auth-state" | "profile-state",
+		payload: Record<string, unknown>,
+	): Promise<void> {
+		await this.deps.client.mutation(api.auth.writeAuthFile, {
+			ownerId: this.deps.ownerId,
+			agentId,
+			kind,
+			payload: sealJson(payload),
+		});
 	}
 
 	// =================================================================

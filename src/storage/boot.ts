@@ -53,6 +53,7 @@ export async function bootRuntimeContext(): Promise<RuntimeContext> {
 					hydrateAccessCaches(ctx.store),
 					hydrateCronCache(ctx.store),
 					hydrateFactsCaches(ctx.store, cfg as Record<string, unknown>),
+					hydrateAuthCaches(ctx.store, cfg as Record<string, unknown>),
 				]);
 			}
 			setRuntimeContext(ctx);
@@ -188,6 +189,65 @@ async function hydrateFactsCaches(
 			} catch (err) {
 				console.error(
 					`brigade: memory hydration failed for workspace ${workspaceId} — ${(err as Error).message}`,
+				);
+			}
+		}),
+	);
+}
+
+/** Convex mode boot — install every config agent's auth profiles (decrypted
+ *  by the adapter) + auth-state + profile-state blobs into the in-process
+ *  caches so the synchronous credential surface (Pi's AuthStorage boot,
+ *  the failover ladder, cooldown bookkeeping) works without disk. */
+async function hydrateAuthCaches(
+	store: BrigadeStore,
+	cfg: Record<string, unknown>,
+): Promise<void> {
+	const [{ primeAuthCaches }, { primeProfileStateCache }] = await Promise.all([
+		import("../auth/profiles.js"),
+		import("../auth/profile-cooldown.js"),
+	]);
+	const agents = cfg.agents as Record<string, unknown> | undefined;
+	const ids = new Set<string>(["main"]);
+	if (agents && typeof agents === "object") {
+		for (const key of Object.keys(agents)) {
+			if (key === "defaults" || !key.trim()) continue;
+			ids.add(key.trim());
+		}
+	}
+	await Promise.all(
+		Array.from(ids, async (agentId) => {
+			try {
+				const [profiles, authState, profileState] = await Promise.all([
+					store.auth.listProfiles(agentId),
+					store.auth.readAuthFileBlob(agentId, "auth-state"),
+					store.auth.readAuthFileBlob(agentId, "profile-state"),
+				]);
+				const profilesFile: { version: number; profiles: Record<string, unknown> } = {
+					version: 1,
+					profiles: {},
+				};
+				for (const p of profiles as Array<Record<string, unknown>>) {
+					const { profileId, ...rest } = p;
+					if (typeof profileId === "string") profilesFile.profiles[profileId] = rest;
+				}
+				primeAuthCaches(
+					agentId,
+					profilesFile as never,
+					(authState ?? {
+						version: 1,
+						order: {},
+						lastGood: {},
+						usageStats: {},
+					}) as never,
+				);
+				primeProfileStateCache(
+					agentId,
+					(profileState ?? { version: 1, usageStats: {} }) as never,
+				);
+			} catch (err) {
+				console.error(
+					`brigade: auth hydration failed for agent ${agentId} — ${(err as Error).message}`,
 				);
 			}
 		}),
