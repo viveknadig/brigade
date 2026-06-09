@@ -11,6 +11,12 @@ import {
   resolveSessionsDir,
 } from "../config/paths.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+import {
+  getCachedSessionFile,
+  primeSessionCache,
+  writeThroughSessionCache,
+} from "../storage/session-cache.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 
 /**
  * Wave L P2#11 — cross-process advisory file lock for `sessions.json`.
@@ -260,6 +266,21 @@ export interface SessionStoreFile {
 const CURRENT_VERSION = 1;
 
 export function readSessionStore(agentId: string): SessionStoreFile {
+  // Convex mode — serve from the boot-hydrated cache. All higher helpers
+  // (resolveOrCreateSession, upsert/update/delete, listers) are built on
+  // this function + writeSessionStore, so the dispatch pair covers every
+  // session caller in the codebase. An agent without a cache slot (created
+  // after boot) genuinely has no rows; start it from the empty shape and
+  // prime so later writes diff against it.
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    const cached = getCachedSessionFile(agentId);
+    if (cached) return structuredClone(cached);
+    const empty: SessionStoreFile = { version: CURRENT_VERSION, sessions: {} };
+    primeSessionCache(agentId, empty);
+    return empty;
+  }
+
   const storePath = resolveSessionStorePath(agentId);
   if (!fs.existsSync(storePath)) {
     return { version: CURRENT_VERSION, sessions: {} };
@@ -275,6 +296,16 @@ export function readSessionStore(agentId: string): SessionStoreFile {
 }
 
 export function writeSessionStore(agentId: string, file: SessionStoreFile): void {
+  // Convex mode — prime the cache synchronously (the next read sees this
+  // write) and enqueue the per-key Convex mutations realising the diff.
+  // Callers sit inside the per-agent sync lock, so cache mutations are
+  // serialised in-process; the backend linearises the rest.
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    writeThroughSessionCache(rctx.store, agentId, file);
+    return;
+  }
+
   const storePath = resolveSessionStorePath(agentId);
   ensureDir(path.dirname(storePath));
   const tmp = `${storePath}.tmp`;

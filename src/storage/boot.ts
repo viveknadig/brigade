@@ -11,12 +11,14 @@
 // back up) can succeed instead of replaying a cached rejection.
 
 import { primeConfigCache } from "./config-cache.js";
+import { primeSessionCache } from "./session-cache.js";
 import {
 	createRuntimeContext,
 	setRuntimeContext,
 	tryGetRuntimeContext,
 	type RuntimeContext,
 } from "./runtime-context.js";
+import type { BrigadeStore } from "./store.js";
 
 let _inflight: Promise<RuntimeContext> | undefined;
 
@@ -45,6 +47,7 @@ export async function bootRuntimeContext(): Promise<RuntimeContext> {
 						? ({ agents: {} } as typeof value)
 						: value;
 				primeConfigCache(cfg);
+				await hydrateSessionCaches(ctx.store, cfg as Record<string, unknown>);
 			}
 			setRuntimeContext(ctx);
 			return ctx;
@@ -56,6 +59,45 @@ export async function bootRuntimeContext(): Promise<RuntimeContext> {
 		});
 	}
 	return _inflight;
+}
+
+/** Convex mode boot — fill the per-agent session caches so the codebase's
+ *  synchronous sessions.json helpers serve from memory. Every agent in the
+ *  config gets a slot (parallel queries — one wall-clock round-trip);
+ *  agents added at runtime start from the empty shape, which is correct
+ *  for a brand-new agent. */
+async function hydrateSessionCaches(
+	store: BrigadeStore,
+	cfg: Record<string, unknown>,
+): Promise<void> {
+	const agents = cfg.agents as Record<string, unknown> | undefined;
+	const ids = new Set<string>(["main"]);
+	if (agents && typeof agents === "object") {
+		for (const key of Object.keys(agents)) {
+			if (key === "defaults" || !key.trim()) continue;
+			ids.add(key.trim());
+		}
+	}
+	await Promise.all(
+		Array.from(ids, async (agentId) => {
+			try {
+				const rows = await store.sessions.listEntries(agentId);
+				const sessions: Record<string, unknown> = {};
+				for (const { sessionKey, entry } of rows) sessions[sessionKey] = entry;
+				primeSessionCache(agentId, {
+					version: 1,
+					sessions: sessions as never,
+				});
+			} catch (err) {
+				// A failed hydration for one agent must not block boot; the
+				// empty-slot fallback in readSessionStore covers reads, and the
+				// error is loud enough for the operator to investigate.
+				console.error(
+					`brigade: session hydration failed for agent ${agentId} — ${(err as Error).message}`,
+				);
+			}
+		}),
+	);
 }
 
 let _configLiveUnsub: (() => void) | undefined;

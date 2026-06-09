@@ -1,10 +1,27 @@
 // src/storage/convex/session-store.ts
+//
+// ConvexSessionStore — sessions.json equivalent backed by the `sessions`
+// table. The filesystem shape (src/sessions/session-store.ts SessionEntry)
+// and the Convex row shape differ in two load-bearing ways, so every read
+// and write goes through the marshalling pair below:
+//
+//   • timestamps — filesystem entries carry ISO-8601 STRINGS
+//     (`createdAt: "2026-06-08T05:14:46.065Z"`); the table stores epoch-ms
+//     NUMBERS. Sending a string at the mutation boundary fails Convex's
+//     `v.number()` validator outright.
+//   • open fields — SessionEntry is `[key: string]: unknown`; operators and
+//     subsystems hang extra fields off entries (compactionCount,
+//     authProfileSource, …). The mutation validator declares exactly the
+//     known columns, so unknown keys are packed into the `extra` bytes
+//     column (sealed) and unpacked on read. Nothing is dropped.
+
 import { randomUUID } from "node:crypto";
 
 import type { ConvexHttpClient } from "convex/browser";
 
 import { api } from "../../../convex/_generated/api.js";
 
+import { openJson, sealJson } from "../encryption.js";
 import { getReactiveConvexClient } from "./client.js";
 
 import type {
@@ -17,6 +34,83 @@ import type {
 
 interface Deps { client: ConvexHttpClient }
 
+/** Entry fields with dedicated columns; everything else rides `extra`. */
+const KNOWN_FIELDS = new Set([
+	"sessionId",
+	"createdAt",
+	"lastUsedAt",
+	"provider",
+	"modelId",
+	"authProfile",
+	"thinkingLevel",
+	"subagent",
+]);
+
+function isoToMs(value: unknown): number | undefined {
+	if (typeof value === "number") return value;
+	if (typeof value === "string") {
+		const ms = Date.parse(value);
+		if (Number.isFinite(ms)) return ms;
+	}
+	return undefined;
+}
+
+function msToIso(value: unknown): string {
+	if (typeof value === "number" && Number.isFinite(value)) {
+		return new Date(value).toISOString();
+	}
+	if (typeof value === "string") return value;
+	return new Date(0).toISOString();
+}
+
+/** Filesystem-shaped entry (or partial patch) → upsertEntry mutation args. */
+function entryToMutationArgs(patch: Partial<SessionEntry>): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	const createdAt = isoToMs(patch.createdAt);
+	if (createdAt !== undefined) out.createdAt = createdAt;
+	const lastUsedAt = isoToMs(patch.lastUsedAt);
+	if (lastUsedAt !== undefined) out.lastUsedAt = lastUsedAt;
+	if (patch.provider !== undefined) out.provider = patch.provider;
+	if (patch.modelId !== undefined) out.modelId = patch.modelId;
+	if (patch.authProfile !== undefined) out.authProfile = patch.authProfile;
+	if (patch.thinkingLevel !== undefined) out.thinkingLevel = patch.thinkingLevel;
+	if (patch.subagent !== undefined) out.subagent = patch.subagent;
+	const extras: Record<string, unknown> = {};
+	let hasExtras = false;
+	for (const [key, value] of Object.entries(patch)) {
+		if (KNOWN_FIELDS.has(key) || value === undefined) continue;
+		extras[key] = value;
+		hasExtras = true;
+	}
+	if (hasExtras) out.extra = sealJson(extras);
+	return out;
+}
+
+/** Convex row → filesystem-shaped SessionEntry. */
+function rowToEntry(row: Record<string, unknown>): SessionEntry {
+	const entry: SessionEntry = {
+		sessionId: row.sessionId as string,
+		createdAt: msToIso(row.createdAt),
+		lastUsedAt: msToIso(row.lastUsedAt),
+	};
+	if (row.provider !== undefined) entry.provider = row.provider as string;
+	if (row.modelId !== undefined) entry.modelId = row.modelId as string;
+	if (row.authProfile !== undefined) entry.authProfile = row.authProfile as string;
+	if (row.thinkingLevel !== undefined) entry.thinkingLevel = row.thinkingLevel as string;
+	if (row.subagent !== undefined) {
+		entry.subagent = row.subagent as unknown as SessionEntry["subagent"];
+	}
+	if (row.extra !== undefined) {
+		const extras = openJson<Record<string, unknown>>(row.extra as ArrayBuffer);
+		if (extras) {
+			for (const [key, value] of Object.entries(extras)) {
+				if (!KNOWN_FIELDS.has(key)) entry[key] = value;
+			}
+		}
+	}
+	return entry;
+}
+
 export class ConvexSessionStore implements SessionStore {
 	constructor(private readonly deps: Deps) {}
 
@@ -26,37 +120,45 @@ export class ConvexSessionStore implements SessionStore {
 		overrides?: Partial<SessionEntry>;
 		freshnessMs?: number;
 	}): Promise<ResolvedSession> {
-		const existing = (await this.deps.client.query(api.sessions.getEntry, {
+		const existingRow = (await this.deps.client.query(api.sessions.getEntry, {
 			agentId: args.agentId,
 			sessionKey: args.sessionKey,
 		})) as Record<string, unknown> | null;
 
 		const now = Date.now();
-		if (existing && args.freshnessMs && args.freshnessMs > 0) {
-			const lastUsedAt = (existing.lastUsedAt as number | undefined) ?? 0;
+		const overrideArgs = entryToMutationArgs(args.overrides ?? {});
+
+		if (existingRow && args.freshnessMs && args.freshnessMs > 0) {
+			const lastUsedAt = (existingRow.lastUsedAt as number | undefined) ?? 0;
 			if (now - lastUsedAt > args.freshnessMs) {
-				const sessionId = randomUUID();
+				// Stale — roll a new sessionId. Mirrors the filesystem path:
+				// subagent metadata is deliberately dropped on roll (the merge
+				// mutation only ADDS subagent when the row has none, so a roll
+				// must delete + reinsert to clear it).
+				await this.deps.client.mutation(api.sessions.deleteEntry, {
+					agentId: args.agentId,
+					sessionKey: args.sessionKey,
+				});
 				const row = (await this.deps.client.mutation(api.sessions.upsertEntry, {
 					agentId: args.agentId,
 					sessionKey: args.sessionKey,
-					sessionId,
+					sessionId: randomUUID(),
 					createdAt: now,
 					lastUsedAt: now,
-					...((args.overrides as Record<string, unknown> | undefined) ?? {}),
+					...overrideArgs,
 				})) as Record<string, unknown>;
-				return { entry: row as unknown as SessionEntry, created: true };
+				return { entry: rowToEntry(row), created: true };
 			}
 		}
-		if (existing) {
+		if (existingRow) {
 			const row = (await this.deps.client.mutation(api.sessions.upsertEntry, {
 				agentId: args.agentId,
 				sessionKey: args.sessionKey,
-				sessionId: existing.sessionId as string,
-				createdAt: existing.createdAt as number,
+				sessionId: existingRow.sessionId as string,
 				lastUsedAt: now,
-				...((args.overrides as Record<string, unknown> | undefined) ?? {}),
+				...overrideArgs,
 			})) as Record<string, unknown>;
-			return { entry: row as unknown as SessionEntry, created: false };
+			return { entry: rowToEntry(row), created: false };
 		}
 		const row = (await this.deps.client.mutation(api.sessions.upsertEntry, {
 			agentId: args.agentId,
@@ -64,9 +166,9 @@ export class ConvexSessionStore implements SessionStore {
 			sessionId: randomUUID(),
 			createdAt: now,
 			lastUsedAt: now,
-			...((args.overrides as Record<string, unknown> | undefined) ?? {}),
+			...overrideArgs,
 		})) as Record<string, unknown>;
-		return { entry: row as unknown as SessionEntry, created: true };
+		return { entry: rowToEntry(row), created: true };
 	}
 
 	async getEntry(agentId: string, sessionKey: string): Promise<SessionEntry | undefined> {
@@ -74,7 +176,7 @@ export class ConvexSessionStore implements SessionStore {
 			agentId,
 			sessionKey,
 		})) as Record<string, unknown> | null;
-		return row ? (row as unknown as SessionEntry) : undefined;
+		return row ? rowToEntry(row) : undefined;
 	}
 
 	async upsertEntry(
@@ -86,10 +188,13 @@ export class ConvexSessionStore implements SessionStore {
 		const row = (await this.deps.client.mutation(api.sessions.upsertEntry, {
 			agentId,
 			sessionKey,
-			sessionId: (existing as { sessionId?: string })?.sessionId ?? randomUUID(),
-			...((patch as Record<string, unknown> | undefined) ?? {}),
+			sessionId:
+				(patch.sessionId as string | undefined) ??
+				(existing as { sessionId?: string } | undefined)?.sessionId ??
+				randomUUID(),
+			...entryToMutationArgs(patch),
 		})) as Record<string, unknown>;
-		return row as unknown as SessionEntry;
+		return rowToEntry(row);
 	}
 
 	async updateEntry(
@@ -130,7 +235,7 @@ export class ConvexSessionStore implements SessionStore {
 				const last = (r.lastUsedAt as number | undefined) ?? 0;
 				return last < cutoff;
 			})
-			.map((r) => ({ sessionKey: r.sessionKey as string, entry: r as unknown as SessionEntry }));
+			.map((r) => ({ sessionKey: r.sessionKey as string, entry: rowToEntry(r) }));
 	}
 
 	async readSubagentMetadata(
@@ -151,11 +256,14 @@ export class ConvexSessionStore implements SessionStore {
 			agentId,
 			subagentOnly: true,
 		})) as Array<Record<string, unknown>>;
-		return rows.map((r) => ({
-			sessionKey: r.sessionKey as string,
-			entry: r as unknown as SessionEntry,
-			subagent: (r.subagent ?? {}) as unknown as SubagentSessionMetadata,
-		}));
+		return rows.map((r) => {
+			const entry = rowToEntry(r);
+			return {
+				sessionKey: r.sessionKey as string,
+				entry,
+				subagent: (entry.subagent ?? {}) as unknown as SubagentSessionMetadata,
+			};
+		});
 	}
 
 	subscribe(agentId: string, cb: (entries: SessionEntry[]) => void): Unsub {
@@ -165,7 +273,7 @@ export class ConvexSessionStore implements SessionStore {
 			{ agentId },
 			(rows) => {
 				try {
-					cb(rows as unknown as SessionEntry[]);
+					cb((rows as Array<Record<string, unknown>>).map(rowToEntry));
 				} catch {
 					// Subscriber threw — stay alive.
 				}
@@ -180,3 +288,6 @@ export class ConvexSessionStore implements SessionStore {
 		};
 	}
 }
+
+/** Exported for the session-cache dispatcher + tests. */
+export const __sessionMarshalling = { entryToMutationArgs, rowToEntry };
