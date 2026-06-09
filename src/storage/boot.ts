@@ -47,7 +47,10 @@ export async function bootRuntimeContext(): Promise<RuntimeContext> {
 						? ({ agents: {} } as typeof value)
 						: value;
 				primeConfigCache(cfg);
-				await hydrateSessionCaches(ctx.store, cfg as Record<string, unknown>);
+				await Promise.all([
+					hydrateSessionCaches(ctx.store, cfg as Record<string, unknown>),
+					hydrateApprovalCaches(ctx.store, cfg as Record<string, unknown>),
+				]);
 			}
 			setRuntimeContext(ctx);
 			return ctx;
@@ -94,6 +97,36 @@ async function hydrateSessionCaches(
 				// error is loud enough for the operator to investigate.
 				console.error(
 					`brigade: session hydration failed for agent ${agentId} — ${(err as Error).message}`,
+				);
+			}
+		}),
+	);
+}
+
+/** Convex mode boot — fill the exec-approvals module cache so the
+ *  synchronous bash gate (`decideApproval`) never touches disk or network
+ *  on the hot path. Same agent set as the session hydration. */
+async function hydrateApprovalCaches(
+	store: BrigadeStore,
+	cfg: Record<string, unknown>,
+): Promise<void> {
+	const { primeApprovalsCache } = await import("../core/exec-approvals.js");
+	const agents = cfg.agents as Record<string, unknown> | undefined;
+	const ids = new Set<string>(["main"]);
+	if (agents && typeof agents === "object") {
+		for (const key of Object.keys(agents)) {
+			if (key === "defaults" || !key.trim()) continue;
+			ids.add(key.trim());
+		}
+	}
+	await Promise.all(
+		Array.from(ids, async (agentId) => {
+			try {
+				const contents = await store.execApprovals.list(agentId);
+				primeApprovalsCache(agentId, contents);
+			} catch (err) {
+				console.error(
+					`brigade: approvals hydration failed for agent ${agentId} — ${(err as Error).message}`,
 				);
 			}
 		}),

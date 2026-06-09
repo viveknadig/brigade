@@ -79,6 +79,28 @@ export class ConvexExecApprovalStore implements ExecApprovalStore {
 		return { commandCount, patternCount };
 	}
 
+	/** Full allowlist contents, ordered by insertion time so re-reads are
+	 *  deterministic (filesystem arrays preserve append order; Convex query
+	 *  order is undefined without an explicit sort). */
+	async list(agentId: string): Promise<{ commands: string[]; patterns: string[] }> {
+		const rows = (await this.deps.client.query(api.execApprovals.list, {
+			ownerId: this.deps.ownerId,
+			agentId,
+		})) as Array<{
+			kind: "exact" | "pattern";
+			value: string;
+			createdAt?: number;
+		}>;
+		const sorted = [...rows].sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+		const commands: string[] = [];
+		const patterns: string[] = [];
+		for (const r of sorted) {
+			if (r.kind === "exact") commands.push(r.value);
+			else patterns.push(r.value);
+		}
+		return { commands, patterns };
+	}
+
 	watch(agentId: string, onChange: (snap: ApprovalsSnapshot) => void): () => void {
 		const reactive = getReactiveConvexClient();
 		const unsub = reactive.onUpdate(

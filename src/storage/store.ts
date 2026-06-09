@@ -486,6 +486,10 @@ export interface ExecApprovalStore {
 		value: string,
 	): Promise<{ removedCommands: number; removedPatterns: number }>;
 	readSummary(agentId: string): Promise<{ commandCount: number; patternCount: number; error?: string }>;
+	/** Full allowlist contents in insertion order — boot hydration + listing
+	 *  surfaces. Local: the exec-approvals.json arrays verbatim. Convex: rows
+	 *  ordered by createdAt so re-reads are deterministic. */
+	list(agentId: string): Promise<{ commands: string[]; patterns: string[] }>;
 	/** Local: chokidar mtime watch. Convex: live-query subscription. */
 	watch(agentId: string, onChange: (snap: ApprovalsSnapshot) => void): () => void;
 }

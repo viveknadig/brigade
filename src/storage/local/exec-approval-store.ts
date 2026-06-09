@@ -64,6 +64,11 @@ export class LocalExecApprovalStore implements ExecApprovalStore {
 		};
 	}
 
+	/** Full allowlist contents (interface surface). */
+	async list(agentId: string): Promise<{ commands: string[]; patterns: string[] }> {
+		return listApprovals(agentId);
+	}
+
 	/** Enumerate approvals — used by `brigade store migrate` to copy entries
 	 *  (not just the count) into the destination store. */
 	async listAll(agentId: string): Promise<{ commands: string[]; patterns: string[] }> {
