@@ -28,6 +28,22 @@ coverage/
 # Local-only state (brigade writes here in dev)
 .brigade-local/
 
+# Convex local backend — binaries auto-downloaded by scripts/install-convex.mjs,
+# data is per-machine, types are auto-generated
+bin/convex-local-backend
+bin/convex-local-backend.exe
+bin/dashboard/
+bin/LICENSE.md
+bin/_backend.zip
+bin/_dashboard.zip
+.convex-data/
+.convex/
+.convex-tmp/
+convex/_generated/
+.agents/
+CLAUDE.md
+skills-lock.json
+
 # Misc
 test.txt
 

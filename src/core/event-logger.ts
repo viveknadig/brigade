@@ -206,6 +206,98 @@ export function getTodayLogPath(): string {
 	return todayFile();
 }
 
+// ============================================================================
+// Public append + tail helpers (added in Phase 2 PR4 so the BrigadeStore
+// `LogStore` adapter can wrap event-logging through a typed seam instead of
+// only writing via `attachEventLogger`). The on-disk format is unchanged —
+// these helpers just expose the same JSONL pattern the existing subscribe
+// path uses.
+// ============================================================================
+
+/** Resolve which log file a day-anchored read should target. */
+function logPathFor(day: string | undefined): string {
+	if (!day) return todayFile();
+	// Defensive: only allow YYYY-MM-DD (8 digits with dashes). Anything else
+	// falls back to today so a malformed `day` arg can't escape the logs dir.
+	if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return todayFile();
+	return path.join(LOGS_DIR, `${day}.jsonl`);
+}
+
+/**
+ * Append a single event record to today's log JSONL. Same write path used
+ * by `attachEventLogger` (best-effort, swallowed on FS errors, rotated
+ * when the daily file exceeds the size cap).
+ *
+ * The record SHOULD carry at minimum `ts` (ISO 8601) + `type` (string), but
+ * we don't enforce — log readers tolerate missing fields and skip malformed
+ * lines individually.
+ */
+export function appendSessionEvent(record: Record<string, unknown>): void {
+	try {
+		if (!existsSync(LOGS_DIR)) mkdirSync(LOGS_DIR, { recursive: true });
+	} catch {
+		return; // dir unwritable — drop the line
+	}
+	const filePath = todayFile();
+	rotateIfTooLarge(filePath);
+	try {
+		appendFileSync(filePath, JSON.stringify(record) + "\n", "utf8");
+	} catch {
+		/* drop the line — never crash on a log write */
+	}
+}
+
+/**
+ * Tail-read JSONL records from a day's log file.
+ *
+ *   opts.day      — YYYY-MM-DD; default today
+ *   opts.maxBytes — only the LAST N bytes of the file are parsed (default 64 KiB)
+ *
+ * Returns the parsed records in file order (oldest-first within the tail
+ * slice). Malformed lines are skipped silently — one bad line never breaks
+ * the read.
+ */
+export function readSessionEventTail(opts: {
+	day?: string;
+	maxBytes?: number;
+} = {}): Record<string, unknown>[] {
+	const filePath = logPathFor(opts.day);
+	let stat;
+	try {
+		stat = statSync(filePath);
+	} catch {
+		return [];
+	}
+	const lookback = Math.max(1, opts.maxBytes ?? 64 * 1024);
+	const start = Math.max(0, stat.size - lookback);
+	let chunk: Buffer;
+	try {
+		const fs = require("node:fs") as typeof import("node:fs");
+		const fd = fs.openSync(filePath, "r");
+		try {
+			const len = stat.size - start;
+			chunk = Buffer.alloc(len);
+			fs.readSync(fd, chunk, 0, len, start);
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return [];
+	}
+	const out: Record<string, unknown>[] = [];
+	for (const raw of chunk.toString("utf8").split("\n")) {
+		const line = raw.trim();
+		if (!line) continue;
+		try {
+			out.push(JSON.parse(line) as Record<string, unknown>);
+		} catch {
+			// Malformed line — could be a truncated mid-write from a crash.
+			// Skip rather than poisoning the whole tail read.
+		}
+	}
+	return out;
+}
+
 /**
  * Pull the most recent error-shaped event out of today's JSONL log. Used by
  * `brigade gateway status` (and friends) to surface a "last error" hint when

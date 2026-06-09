@@ -558,6 +558,27 @@ export function getApprovalsFilePath(
  * `error` field instead of throwing so `brigade doctor` can render a
  * remediation hint without crashing.
  */
+/**
+ * Enumerate every approval row for an agent. Returned in a stable shape:
+ *   { commands: string[], patterns: string[] }
+ *
+ * Used by the `brigade store migrate` engine — earlier versions only had
+ * `readApprovalsSummary` (counts), which forced operators to copy entries
+ * by hand. This enumerator exposes the underlying data without leaking
+ * the on-disk file shape.
+ */
+export function listApprovals(
+	agentId: string | undefined = DEFAULT_AGENT_ID,
+): { commands: string[]; patterns: string[] } {
+	const id = normaliseAgentId(agentId);
+	maybeMigrateLegacyApprovals(id);
+	const file = loadApprovals(id);
+	return {
+		commands: [...(file.commands ?? [])],
+		patterns: [...(file.patterns ?? [])],
+	};
+}
+
 export function readApprovalsSummary(
 	agentId: string | undefined = DEFAULT_AGENT_ID,
 ): {

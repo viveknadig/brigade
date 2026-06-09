@@ -2,6 +2,56 @@ import { Command } from "commander";
 
 import { formatVersion } from "../../version.js";
 
+// ─────────────────────────── storage boot hook ───────────────────────────
+// One preAction hook initialises the RuntimeContext (mode sentinel → store →
+// `store.init()`) before ANY command action runs. Subsystems then reach
+// storage via `getRuntimeContext().store` without re-resolving mode.
+//
+// Three tiers:
+//   • BOOT_SKIP     — commands that must run BEFORE a context exists.
+//                     `onboard` creates the mode sentinel; it builds its own
+//                     store after the wizard picks a mode.
+//   • BOOT_OPTIONAL — diagnostic / repair / reconfigure commands. They boot
+//                     when the backend is healthy but keep working when it
+//                     isn't — a broken convex deployment must never brick
+//                     the tools an operator uses to fix it (`doctor`,
+//                     `status`, `gateway stop`, `store mode set`, `migrate`).
+//   • everything else — workloads (tui, agent, gateway run, connect, config,
+//                     channels, cron, agents, org, exec). Boot failure is
+//                     fatal with the storage layer's operator-facing error.
+
+const BOOT_SKIP = new Set(["onboard"]);
+
+const BOOT_OPTIONAL_PREFIXES = [
+  "doctor",
+  "status",
+  "gateway status",
+  "gateway stop",
+  "gateway install",
+  "gateway uninstall",
+  "gateway restart",
+  "gateway supervise",
+  "store",
+  "encrypt",
+  "migrate",
+  "backup",
+];
+
+/** "gateway status"-style path for the action command (root name elided). */
+function commandPath(cmd: Command): string {
+  const parts: string[] = [];
+  let cur: Command | null = cmd;
+  while (cur && cur.name() !== "brigade") {
+    parts.unshift(cur.name());
+    cur = cur.parent;
+  }
+  return parts.join(" ");
+}
+
+function isBootOptional(path: string): boolean {
+  return BOOT_OPTIONAL_PREFIXES.some((p) => path === p || path.startsWith(`${p} `));
+}
+
 // Lazy command-registration pattern. Each subcommand's real body (action
 // handler) lives in a separate module under `src/cli/commands/`. Commander
 // still needs each command DECLARED at the program level so `brigade
@@ -32,6 +82,27 @@ export function buildProgram(): Command {
   // exitOverride lets runMain decide how to surface help/no-args, instead of
   // Commander killing the process directly with exit(1).
   program.exitOverride();
+
+  // Storage boot — fires for every action in the command tree (Commander
+  // propagates program-level hooks to subcommands). Help/version never reach
+  // an action, so they stay storage-free. The import is dynamic to keep the
+  // `brigade --help` fast-path from paying for the storage layer.
+  program.hook("preAction", async (_thisCommand, actionCommand) => {
+    const path = commandPath(actionCommand);
+    if (BOOT_SKIP.has(path)) return;
+    const { bootRuntimeContext } = await import("../../storage/boot.js");
+    try {
+      await bootRuntimeContext();
+    } catch (err) {
+      if (isBootOptional(path)) {
+        process.stderr.write(
+          `brigade: storage backend unavailable — continuing without it (${(err as Error).message})\n`,
+        );
+        return;
+      }
+      throw err;
+    }
+  });
 
   // Each command does the same dance:
   //   1. Declare the subcommand + its options (synchronous; cheap).
@@ -1209,6 +1280,112 @@ export function buildProgram(): Command {
     .action(async (opts: { json?: boolean }) => {
       const { runOrgDoctor } = await import("../commands/org-cmd.js");
       process.exit(await runOrgDoctor({ ...(opts.json !== undefined ? { json: opts.json } : {}) }));
+    });
+
+  /* ─────────────────────────────── store ─────────────────────────────── */
+  // Phase 2 storage toggle — inspect or flip the mode.sentinel that pins
+  // Brigade to filesystem vs convex. `brigade store mode show` reports the
+  // active mode (and probes the URL on convex mode in `brigade doctor`).
+  // `brigade store mode set <mode>` rewrites the sentinel. Data migration
+  // between modes lands as `brigade store migrate` in a later PR.
+  const store = program
+    .command("store")
+    .description("Inspect or flip Brigade's storage backend (filesystem / convex)");
+
+  const storeMode = store.command("mode").description("Manage the storage-mode sentinel");
+
+  storeMode
+    .command("show")
+    .description("Print the active storage mode (and Convex URL if applicable)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runStoreModeShow } = await import("../commands/store-cmd.js");
+      process.exit(await runStoreModeShow({ ...(opts.json !== undefined ? { json: opts.json } : {}) }));
+    });
+
+  storeMode
+    .command("set <mode>")
+    .description(
+      "Pin the storage mode for this machine.\n" +
+        "  Examples:\n" +
+        "    brigade store mode set filesystem\n" +
+        "    brigade store mode set convex --convex-url http://127.0.0.1:3210",
+    )
+    .option("--convex-url <url>", "deployment URL (required when <mode> is convex)")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (mode: string, opts: { convexUrl?: string; json?: boolean }) => {
+      const { runStoreModeSet } = await import("../commands/store-cmd.js");
+      process.exit(
+        await runStoreModeSet({
+          mode,
+          ...(opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {}),
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+        }),
+      );
+    });
+
+  /* ───────────────────────────── encrypt ───────────────────────────── */
+  // At-rest encryption for Convex byte columns. Operator-supplied master
+  // key via `BRIGADE_ENCRYPTION_KEY` (hex). When unset, payloads pass
+  // through unencrypted; when set, every credential / persona / memory
+  // fact / cron payload / transcript record is sealed before it hits the
+  // backend. See src/storage/encryption.ts.
+  const encrypt = program
+    .command("encrypt")
+    .description("Manage Brigade's at-rest encryption key (AES-256-GCM)");
+
+  encrypt
+    .command("status")
+    .description("Report whether the encryption key is configured + run a self-check")
+    .option("--json", "emit JSON instead of human text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runEncryptStatus } = await import("../commands/encrypt-cmd.js");
+      process.exit(await runEncryptStatus(opts));
+    });
+
+  encrypt
+    .command("init")
+    .description("Generate a fresh 32-byte master key")
+    .option("--json", "emit JSON instead of human text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runEncryptInit } = await import("../commands/encrypt-cmd.js");
+      process.exit(await runEncryptInit(opts));
+    });
+
+  encrypt
+    .command("test")
+    .description("Round-trip a sample string through seal/open to verify the key")
+    .option("--json", "emit JSON instead of human text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runEncryptTest } = await import("../commands/encrypt-cmd.js");
+      process.exit(await runEncryptTest(opts));
+    });
+
+  store
+    .command("migrate")
+    .description(
+      "Copy your Brigade data between storage backends.\n" +
+        "  Examples:\n" +
+        "    brigade store migrate --to convex --convex-url http://127.0.0.1:3210\n" +
+        "    brigade store migrate --to filesystem\n" +
+        "    brigade store migrate --to convex --dry-run",
+    )
+    .requiredOption("--to <mode>", "destination mode: filesystem | convex")
+    .option("--convex-url <url>", "deployment URL")
+    .option("--dry-run", "report what would be copied without writing", false)
+    .option("--skip-verify", "skip sha256 verification (faster)", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { to: string; convexUrl?: string; dryRun?: boolean; skipVerify?: boolean; json?: boolean }) => {
+      const { runStoreMigrateCmd } = await import("../commands/store-cmd.js");
+      process.exit(
+        await runStoreMigrateCmd({
+          to: opts.to,
+          ...(opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {}),
+          ...(opts.dryRun !== undefined ? { dryRun: opts.dryRun } : {}),
+          ...(opts.skipVerify !== undefined ? { skipVerify: opts.skipVerify } : {}),
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+        }),
+      );
     });
 
   return program;

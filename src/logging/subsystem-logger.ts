@@ -375,3 +375,146 @@ export function __resetLoggerStateForTests(): void {
   logFilePathInitialised = false;
   suppressFileWrites = false;
 }
+
+// ============================================================================
+// Public append + read + prune helpers (added in Phase 2 PR4 so the
+// BrigadeStore `LogStore` adapter can read+write subsystem records through
+// a typed seam. The existing per-callsite logger API
+// (`createSubsystemLogger().info(...)`) keeps working unchanged.
+// ============================================================================
+
+/**
+ * Append a structured record directly to the daily log file. Same write
+ * path as the standard logger emit — honours the size cap, no-ops if the
+ * level filter would drop it.
+ *
+ * Record MUST contain `level` + `subsystem`; everything else is structured
+ * metadata that gets serialised verbatim.
+ */
+export function appendSubsystemRecord(record: {
+  level: LogLevel;
+  subsystem: string;
+  message: string;
+  time?: string;
+  fields?: Record<string, unknown>;
+}): void {
+  if (LEVEL_ORDER[record.level] < LEVEL_ORDER[activeLevel]) return;
+  const out = {
+    time: record.time ?? new Date().toISOString(),
+    level: record.level,
+    subsystem: sanitiseSubsystem(record.subsystem),
+    message: record.message,
+    ...(record.fields ? sanitiseFields(record.fields) : {}),
+  };
+  writeFileLine(safeStringify(out));
+  if (consoleEnabled) writeConsoleLine(record.level, record.subsystem, record.message, record.fields);
+}
+
+/**
+ * Read records from today's subsystem log file, optionally filtered by
+ * `level` / `subsystem` / `tail` byte budget. Malformed lines are skipped.
+ *
+ *   filter.level     — minimum LogLevel (records below the threshold are dropped)
+ *   filter.subsystem — exact-match string OR a prefix (when ending in "/")
+ *   filter.day       — YYYY-MM-DD; default today
+ *   filter.tailBytes — only parse the last N bytes (default 256 KiB)
+ *
+ * Returns records in file order (oldest-first within the tail slice).
+ */
+export function readSubsystemRecords(
+  filter: {
+    level?: LogLevel;
+    subsystem?: string;
+    day?: string;
+    tailBytes?: number;
+  } = {},
+): Array<{
+  time: string;
+  level: LogLevel;
+  subsystem: string;
+  message: string;
+  [field: string]: unknown;
+}> {
+  const dir = resolveLogsDir();
+  const file = filter.day && /^\d{4}-\d{2}-\d{2}$/.test(filter.day)
+    ? path.join(dir, `brigade-${filter.day}.log`)
+    : resolveLogFilePath(dir);
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(file);
+  } catch {
+    return [];
+  }
+  const tailBytes = Math.max(1, filter.tailBytes ?? 256 * 1024);
+  const start = Math.max(0, stat.size - tailBytes);
+  let chunk: Buffer;
+  try {
+    const fd = fs.openSync(file, "r");
+    try {
+      const len = stat.size - start;
+      chunk = Buffer.alloc(len);
+      fs.readSync(fd, chunk, 0, len, start);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return [];
+  }
+
+  const minRank = filter.level ? LEVEL_ORDER[filter.level] : 0;
+  const subFilter = filter.subsystem;
+  const wantPrefix = subFilter !== undefined && subFilter.endsWith("/");
+
+  const out: ReturnType<typeof readSubsystemRecords> = [];
+  for (const line of chunk.toString("utf8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let row: { level?: LogLevel; subsystem?: string; time?: string; message?: string; [k: string]: unknown };
+    try {
+      row = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!row.level || !row.subsystem || !row.time || row.message === undefined) continue;
+    if (filter.level && LEVEL_ORDER[row.level] < minRank) continue;
+    if (subFilter !== undefined) {
+      if (wantPrefix) {
+        if (!row.subsystem.startsWith(subFilter)) continue;
+      } else if (row.subsystem !== subFilter) continue;
+    }
+    out.push(row as ReturnType<typeof readSubsystemRecords>[number]);
+  }
+  return out;
+}
+
+/**
+ * Drop log files older than `olderThanMs`. Returns the count actually
+ * removed. The standard daily-roll prune already runs on the first emit
+ * of each process; this exposes the same logic for explicit cleanup
+ * (`brigade doctor --prune-logs`, store-level maintenance, tests).
+ */
+export function pruneSubsystemLogs(olderThanMs: number): { removed: number } {
+  const dir = resolveLogsDir();
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return { removed: 0 };
+  }
+  const cutoff = Date.now() - olderThanMs;
+  let removed = 0;
+  for (const name of entries) {
+    if (!name.startsWith("brigade-") || !name.endsWith(".log")) continue;
+    const full = path.join(dir, name);
+    try {
+      const stat = fs.statSync(full);
+      if (stat.mtimeMs < cutoff) {
+        fs.rmSync(full, { force: true });
+        removed += 1;
+      }
+    } catch {
+      // Skip unreadable entries.
+    }
+  }
+  return { removed };
+}

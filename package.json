@@ -111,7 +111,13 @@
     "logs": "node scripts/run-brigade.mjs logs",
     "logs:follow": "node scripts/run-brigade.mjs logs --follow",
     "secrets:audit": "node scripts/run-brigade.mjs secrets audit",
-    "exec:list": "node scripts/run-brigade.mjs exec list"
+    "exec:list": "node scripts/run-brigade.mjs exec list",
+    "store:mode": "node scripts/run-brigade.mjs store mode show",
+    "store:mode:show": "node scripts/run-brigade.mjs store mode show",
+    "store:mode:set": "node scripts/run-brigade.mjs store mode set",
+    "convex:install": "node scripts/install-convex.mjs",
+    "convex:dev": "node scripts/install-convex.mjs && node scripts/convex-dev.mjs",
+    "convex:codegen": "convex codegen --admin-key \"$(node -e \"process.stdout.write(require('node:fs').readFileSync('.convex-data/admin-key.txt', 'utf8').trim())\")\" --url http://127.0.0.1:3210"
   },
   "engines": {
     "node": ">=22.12"

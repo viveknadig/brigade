@@ -186,6 +186,50 @@ export function removeAllowFrom(channelId: string, senderId: string, accountId?:
 	});
 }
 
+/** Add `groupId` to the GROUP allow-from list. Idempotent; returns true when
+ *  the list was modified, false when the id was already present. */
+export function addGroupAllowFrom(
+	channelId: string,
+	groupId: string,
+	accountId?: string | null,
+): boolean {
+	const id = normalizeId(groupId);
+	if (!id) return false;
+	const acct = (accountId ?? "").trim();
+	const filePath = resolveChannelGroupAllowFromPath(channelId, acct || null);
+	return withFileLock(filePath, () => {
+		const current = readGroupAllowFrom(channelId, acct || null);
+		if (current.includes(id)) return false;
+		writeJsonAtomic(filePath, {
+			version: 1,
+			allowFrom: [...current, id],
+		} satisfies AllowFromFile);
+		return true;
+	});
+}
+
+/** Remove `groupId` from the GROUP allow-from list. Returns true when the id
+ *  was present and removed. */
+export function removeGroupAllowFrom(
+	channelId: string,
+	groupId: string,
+	accountId?: string | null,
+): boolean {
+	const id = normalizeId(groupId);
+	if (!id) return false;
+	const acct = (accountId ?? "").trim();
+	const filePath = resolveChannelGroupAllowFromPath(channelId, acct || null);
+	return withFileLock(filePath, () => {
+		const current = readGroupAllowFrom(channelId, acct || null);
+		if (!current.includes(id)) return false;
+		writeJsonAtomic(filePath, {
+			version: 1,
+			allowFrom: current.filter((x) => x !== id),
+		} satisfies AllowFromFile);
+		return true;
+	});
+}
+
 /** Read the deduped, normalized GROUP allow-from list for a channel account. */
 export function readGroupAllowFrom(channelId: string, accountId?: string | null): string[] {
 	const acct = (accountId ?? "").trim();

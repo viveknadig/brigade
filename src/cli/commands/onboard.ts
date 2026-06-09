@@ -29,6 +29,8 @@ import { initAuthProfiles, upsertApiKeyProfile } from "../../auth/profiles.js";
 import { DEFAULT_AGENT_ID, resolveAuthProfilesPath } from "../../config/paths.js";
 import { BRIGADE_DIR, loadConfig, saveConfig } from "../../core/config.js";
 import { EXIT_CONFIG_ERROR } from "../../protocol.js";
+import { writeSentinelNow } from "../../storage/sentinel.js";
+import type { StorageModeResult } from "../../ui/onboard-storage-mode.js";
 import { runOnboarding } from "../../ui/onboarding.js";
 import { markTuiActive, restoreTerminal } from "../../ui/terminal-cleanup.js";
 import { applyOnboardingSessionDefaults, ONBOARDING_DEFAULT_DM_SCOPE } from "./onboard-config.js";
@@ -147,13 +149,24 @@ export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promi
 			authStorage,
 		});
 
+		// Persist the storage-mode pick. AFTER the credential bridge so the
+		// sentinel is only written when the rest of onboarding succeeded — a
+		// partial install in convex mode would refuse to boot.
+		persistStorageMode(result.storage);
+
 		// Web-tools setup is now Step 4 of the Pi-TUI wizard above — runs
 		// inside `runOnboarding` against the same TUI, so its look matches
 		// the provider picker exactly. No post-wizard prompt here.
 
+		const modeLine =
+			result.storage.mode === "convex"
+				? `Storage:     ${chalk.bold("convex")} (${chalk.bold(result.storage.convexUrl)})`
+				: `Storage:     ${chalk.bold("filesystem")} (~/.brigade)`;
+
 		console.error(
 			chalk.dim(
 				`\n✓ onboarded — provider: ${chalk.bold(result.provider)} · model: ${chalk.bold(result.modelId)}\n` +
+					`${modeLine}\n` +
 					`Next: run ${chalk.bold("brigade gateway")} (then ${chalk.bold("brigade connect")} in a second terminal),\n` +
 					`      or ${chalk.bold("brigade")} for the in-process TUI.\n` +
 					`Web tools:   ${chalk.bold("brigade onboard web")} to (re-)pick a search backend.\n` +
@@ -177,6 +190,33 @@ export async function runOnboardCommand(opts: OnboardCommandOptions = {}): Promi
 		}
 		console.error(chalk.red(`Onboarding failed: ${msg}`));
 		return 1;
+	}
+}
+
+/**
+ * Persist the storage-mode choice into `~/.brigade/mode.sentinel`. Idempotent —
+ * writes the sentinel regardless of whether it already existed (a re-onboard
+ * with the same answer is a no-op, a re-onboard that switches modes flips
+ * the pin). Doesn't migrate data; that's a separate `brigade store migrate`
+ * command.
+ *
+ * Failure here is non-fatal: the user has already burned wizard time, so we
+ * log a yellow warning and let them re-run `brigade store mode set <mode>`
+ * to retry.
+ */
+function persistStorageMode(storage: StorageModeResult): void {
+	try {
+		writeSentinelNow(storage.mode, {
+			...(storage.convexUrl !== undefined ? { convexUrl: storage.convexUrl } : {}),
+		});
+	} catch (err) {
+		process.stderr.write(
+			chalk.yellow(
+				`\nbrigade: warning — couldn't write ~/.brigade/mode.sentinel: ${(err as Error).message}\n` +
+					`  Retry with: brigade store mode set ${storage.mode}` +
+					(storage.convexUrl ? ` --convex-url ${storage.convexUrl}\n` : "\n"),
+			),
+		);
 	}
 }
 

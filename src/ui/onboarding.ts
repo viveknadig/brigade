@@ -33,11 +33,15 @@ import {
 import { validateApiKeyOnline } from "../providers/validate-key.js";
 import { renderBrandHeader } from "./brand.js";
 import { brand, selectListTheme } from "./theme.js";
+import { pickStorageMode, type StorageModeResult } from "./onboard-storage-mode.js";
 import { SearchableSelectList } from "./searchable-select.js";
 
 export interface OnboardingResult {
 	provider: string;
 	modelId: string;
+	/** Storage backend the operator picked in Step 0. The caller writes the
+	 *  mode.sentinel after the rest of the wizard finishes. */
+	storage: StorageModeResult;
 }
 
 /* ────────────────────────────── public API ────────────────────────────── */
@@ -111,13 +115,31 @@ export async function runOnboarding(
 	// → "Use existing X?" Yes/No prompt (with default = Yes). Skipping
 	// silently to "we picked for you" was explicitly rejected because it
 	// removes the explicit choice the user expects.
+
+	// Step 0 — storage mode. Throws "onboarding-cancelled" if the user Escs
+	// the mode picker (we treat that as bail-out, same as Esc on provider).
+	// The storage-mode UI handles its own retry loop for the convex URL probe
+	// and throws a special "storage-mode-revert-to-filesystem" when the user
+	// Escs the convex sub-flow — we catch and default to filesystem so the
+	// rest of the wizard always sees a settled choice.
+	let storage: StorageModeResult;
+	try {
+		storage = await pickStorageMode(tui);
+	} catch (err) {
+		if ((err as Error).message === "storage-mode-revert-to-filesystem") {
+			storage = { mode: "filesystem" };
+		} else {
+			throw err; // "onboarding-cancelled" propagates to caller
+		}
+	}
+
 	let step: "provider" | "key" | "model" = "provider";
 	let provider = "";
 	let modelId = "";
 
 	while (true) {
 		if (step === "provider") {
-			renderScreen(tui, "Step 1 of 4 · Pick a provider");
+			renderScreen(tui, "Step 1 of 5 · Pick a provider");
 			provider = await pickProvider(tui); // throws "onboarding-cancelled" on Esc
 			step = "key";
 			continue;
@@ -152,7 +174,7 @@ export async function runOnboarding(
 		}
 
 		// step === "model"
-		renderScreen(tui, "Step 3 of 4 · Default model");
+		renderScreen(tui, "Step 3 of 5 · Default model");
 		const result = await pickModel(tui, modelRegistry, provider);
 		if (result === "back") {
 			step = "provider"; // go all the way back so they can change provider too
@@ -168,12 +190,12 @@ export async function runOnboarding(
 	// agent boot via `buildAgent → seedDefaultPrompts`.
 	await saveConfig({ defaultProvider: provider, defaultModelId: modelId });
 
-	// Step 4 of 4 — web-search backend. Same Pi-TUI components, same brand
+	// Step 4 of 5 — web-search backend. Same Pi-TUI components, same brand
 	// header. Re-runnable via `brigade onboard web`.
 	try {
 		const { runWebSetupStep } = await import("../cli/flows/web-setup.js");
 		await runWebSetupStep(tui, {
-			stepLabel: "Step 4 of 4 · Web search",
+			stepLabel: "Step 4 of 5 · Web search",
 			secretInputMode: opts.secretInputMode,
 		});
 	} catch {
@@ -186,7 +208,7 @@ export async function runOnboarding(
 	await delay(900);
 	clear(tui);
 
-	return { provider, modelId };
+	return { provider, modelId, storage };
 }
 
 /* ────────────────────────── screen scaffolding ────────────────────────── */
@@ -310,7 +332,7 @@ export async function ensureApiKey(
 		// OPENROUTER_API_KEY, sk-o…52b5)?`. Single line, default = Yes.
 		// No explanatory paragraphs.
 		const envVar = provider.envVar ?? "the env var";
-		renderScreen(tui, `Step 2 of 4 · ${provider.name}`);
+		renderScreen(tui, `Step 2 of 5 · ${provider.name}`);
 		tui.addChild(
 			new Text(
 				`  ${brand.amber("?")} Use existing ${envVar} (env: ${envVar}, ${formatApiKeyPreview(envKey)})?`,
@@ -351,7 +373,7 @@ export async function ensureApiKey(
 			// and let them paste their own. The typed-key loop below treats
 			// `lastError === null` as a clean first iteration, so no stale
 			// error text leaks in.
-			renderScreen(tui, `Step 2 of 4 · ${provider.name}`);
+			renderScreen(tui, `Step 2 of 5 · ${provider.name}`);
 			// Fall through to typed-key loop without `lastError` set.
 			// (Variable declared just below the env block.)
 			return await promptTypedKey(tui, authStorage, provider, providerId, null);
@@ -471,7 +493,7 @@ async function promptTypedKey(
 	let lastError: string | null = seedError;
 
 	while (true) {
-		renderScreen(tui, `Step 2 of 4 · ${provider.name}`);
+		renderScreen(tui, `Step 2 of 5 · ${provider.name}`);
 
 		if (lastError) {
 			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
@@ -608,7 +630,7 @@ async function ensureLocalOllama(
 	let lastError: string | null = null;
 
 	while (true) {
-		renderScreen(tui, "Step 2 of 4 · Connect Ollama");
+		renderScreen(tui, "Step 2 of 5 · Connect Ollama");
 
 		if (lastError) {
 			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));

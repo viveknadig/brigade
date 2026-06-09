@@ -683,6 +683,215 @@ export function __resetConfigParseCacheForTests(): void {
   lastParsedConfig = undefined;
 }
 
+// ============================================================================
+// Public config-audit + config-health helpers (added in Phase 2 PR4 so the
+// BrigadeStore `LogStore` adapter wraps the audit chain through a typed
+// seam). The internal `appendConfigAudit` + `writeConfigHealth` keep firing
+// from `writeConfigSafe` unchanged — these public siblings are for explicit
+// audit-line writes (test fixtures, recovery flows, the future store layer).
+//
+// Audit-chain integrity: each new line carries a `prevHash` referencing
+// the previous line's `lineHash`. `verifyConfigAuditChain()` walks the
+// file and reports the first break, if any. Backward-compatible: pre-PR4
+// lines without `prevHash` are treated as the start of a new chain.
+// ============================================================================
+
+export interface ConfigAuditInput {
+  /** ISO timestamp; defaults to `new Date().toISOString()` when omitted. */
+  ts?: string;
+  /** Path the audit row refers to (defaults to the active config path). */
+  path?: string;
+  /** SHA-256 of the contents this row records. Required. */
+  sha256: string;
+  /** Byte length of the recorded contents. Optional but recommended. */
+  bytes?: number;
+  /** Free-form tag (e.g. "write", "restore", "migrate"). Optional. */
+  kind?: string;
+  /** Arbitrary structured fields the operator wants to capture alongside. */
+  fields?: Record<string, unknown>;
+}
+
+export interface ConfigAuditRecord {
+  ts: string;
+  path: string;
+  sha256: string;
+  bytes?: number;
+  kind?: string;
+  prevHash?: string;
+  /** sha256 of the canonical-stringified row excluding `lineHash`. */
+  lineHash: string;
+  /** Monotonic sequence (1-indexed). */
+  seq: number;
+  [field: string]: unknown;
+}
+
+function readAuditLinesRaw(): string[] {
+  const p = resolveConfigAuditLogPath();
+  if (!fs.existsSync(p)) return [];
+  try {
+    return fs
+      .readFileSync(p, "utf8")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+function computeLineHash(payload: Record<string, unknown>): string {
+  // Canonical serialisation: keys sorted alphabetically so equivalent
+  // payloads always hash to the same digest. The hash NEVER includes
+  // `lineHash` itself.
+  const filtered: Record<string, unknown> = {};
+  for (const key of Object.keys(payload).sort()) {
+    if (key === "lineHash") continue;
+    filtered[key] = payload[key];
+  }
+  return createHash("sha256").update(JSON.stringify(filtered)).digest("hex");
+}
+
+/**
+ * Append one row to the config-audit JSONL. Chains via `prevHash` →
+ * `lineHash`. Returns the persisted record so callers can hand it back
+ * to the storage layer.
+ */
+export function appendConfigAuditLine(entry: ConfigAuditInput): ConfigAuditRecord {
+  ensureDir(resolveLogsDir());
+  const lines = readAuditLinesRaw();
+  let prevHash: string | undefined;
+  let nextSeq = 1;
+  if (lines.length > 0) {
+    const last = lines[lines.length - 1];
+    if (last) {
+      try {
+        const parsed = JSON.parse(last) as Partial<ConfigAuditRecord>;
+        if (typeof parsed.lineHash === "string") prevHash = parsed.lineHash;
+        if (typeof parsed.seq === "number" && Number.isFinite(parsed.seq)) {
+          nextSeq = parsed.seq + 1;
+        }
+      } catch {
+        // Treat malformed tail as "start a new chain from here".
+      }
+    }
+  }
+  const payload: Record<string, unknown> = {
+    ts: entry.ts ?? new Date().toISOString(),
+    path: entry.path ?? resolveConfigPath(),
+    sha256: entry.sha256,
+    seq: nextSeq,
+    ...(entry.bytes !== undefined ? { bytes: entry.bytes } : {}),
+    ...(entry.kind !== undefined ? { kind: entry.kind } : {}),
+    ...(entry.fields ?? {}),
+    ...(prevHash !== undefined ? { prevHash } : {}),
+  };
+  const lineHash = computeLineHash(payload);
+  const record: ConfigAuditRecord = { ...payload, lineHash } as ConfigAuditRecord;
+  try {
+    fs.appendFileSync(resolveConfigAuditLogPath(), `${JSON.stringify(record)}\n`, "utf8");
+  } catch {
+    // Best-effort — surface the record to the caller so an in-memory
+    // chain can keep advancing even when disk writes fail.
+  }
+  return record;
+}
+
+/**
+ * Walk the config-audit chain and verify each row's `lineHash` matches
+ * the canonical hash of its own payload + that its `prevHash` matches
+ * the previous row's `lineHash`. Returns the seq number of the first
+ * broken row, or `undefined` when the chain is intact.
+ *
+ * Pre-PR4 rows without a `lineHash` are tolerated — they're treated as
+ * the start of a new chain, so existing audit files stay valid.
+ */
+export function verifyConfigAuditChain(): { ok: boolean; brokenAt?: number } {
+  const lines = readAuditLinesRaw();
+  let previousLineHash: string | undefined;
+  let expectedSeq: number | undefined;
+  for (const raw of lines) {
+    let row: Partial<ConfigAuditRecord>;
+    try {
+      row = JSON.parse(raw) as Partial<ConfigAuditRecord>;
+    } catch {
+      return { ok: false, brokenAt: expectedSeq ?? 0 };
+    }
+    // Legacy row (no lineHash) → reset the chain from here.
+    if (typeof row.lineHash !== "string") {
+      previousLineHash = undefined;
+      expectedSeq = typeof row.seq === "number" ? row.seq + 1 : undefined;
+      continue;
+    }
+    // prevHash must match
+    if (previousLineHash !== undefined && row.prevHash !== previousLineHash) {
+      return { ok: false, brokenAt: typeof row.seq === "number" ? row.seq : 0 };
+    }
+    // lineHash must match the canonical hash of the rest of the row
+    const recomputed = computeLineHash(row as Record<string, unknown>);
+    if (recomputed !== row.lineHash) {
+      return { ok: false, brokenAt: typeof row.seq === "number" ? row.seq : 0 };
+    }
+    // seq must be monotonic
+    if (
+      expectedSeq !== undefined &&
+      typeof row.seq === "number" &&
+      row.seq !== expectedSeq
+    ) {
+      return { ok: false, brokenAt: row.seq };
+    }
+    previousLineHash = row.lineHash;
+    expectedSeq = typeof row.seq === "number" ? row.seq + 1 : undefined;
+  }
+  return { ok: true };
+}
+
+export interface ConfigHealthRecord {
+  ts: string;
+  configPath: string;
+  bytes: number;
+  sha256: string;
+  mtimeMs: number;
+  pid: number;
+  ownerId?: string;
+  [field: string]: unknown;
+}
+
+/**
+ * Atomically write a config-health snapshot. The internal writer fired by
+ * `writeConfigSafe` keeps doing its own write — this sibling is for
+ * explicit snapshots from the storage layer / tests / `brigade doctor`.
+ */
+export function writeConfigHealthSnapshot(snapshot: ConfigHealthRecord): void {
+  try {
+    ensureDir(resolveLogsDir());
+    const out = resolveConfigHealthPath();
+    const tmp = `${out}.tmp-${process.pid}-${Date.now().toString(36)}`;
+    fs.writeFileSync(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+    fs.renameSync(tmp, out);
+  } catch {
+    // Best-effort — same discipline as the internal writer.
+  }
+}
+
+/** Read the latest config-health snapshot, or `undefined` when none exists. */
+export function readConfigHealthSnapshot(): ConfigHealthRecord | undefined {
+  const p = resolveConfigHealthPath();
+  if (!fs.existsSync(p)) return undefined;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(p, "utf8")) as Partial<ConfigHealthRecord>;
+    if (
+      typeof parsed.ts === "string" &&
+      typeof parsed.configPath === "string" &&
+      typeof parsed.sha256 === "string"
+    ) {
+      return parsed as ConfigHealthRecord;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // Top-level key order mirroring the reference's onboard output:
 //   agents, gateway, session, tools, auth, wizard, meta, plugins
 // Keys not in this list are appended in their existing insertion order

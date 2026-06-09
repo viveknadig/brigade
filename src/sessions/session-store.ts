@@ -556,3 +556,42 @@ export function listSubagentSessionEntries(
   out.sort((a, b) => a.subagent.spawnedAt.localeCompare(b.subagent.spawnedAt));
   return out;
 }
+
+/**
+ * Generic filter-aware session entry lister. Used by the BrigadeStore
+ * adapter to satisfy `SessionStore.listEntries(agentId, filter?)`.
+ *
+ *   filter.isolatedCronRunOlderThanMs — keep only `isolated:cron:` keys
+ *     whose `lastUsedAt` is older than `now - ms`. Used by the cron-store
+ *     adapter to drive `listIsolatedCronSessions` (a follow-up will route
+ *     `src/cron/session-reaper.ts` through this instead of duplicating
+ *     iteration).
+ *   filter.subagentOnly — keep only entries with a `subagent` metadata block.
+ *
+ * Returns entries in insertion order (matches `Object.entries` on the
+ * underlying sessions map). Callers that need a different ordering re-sort.
+ */
+export function listSessionEntries(
+  agentId: string,
+  filter: { isolatedCronRunOlderThanMs?: number; subagentOnly?: boolean } = {},
+): Array<{ sessionKey: string; entry: SessionEntry }> {
+  const store = readSessionStore(agentId);
+  const now = Date.now();
+  const cutoffMs =
+    filter.isolatedCronRunOlderThanMs !== undefined
+      ? now - filter.isolatedCronRunOlderThanMs
+      : undefined;
+  const out: Array<{ sessionKey: string; entry: SessionEntry }> = [];
+  for (const [sessionKey, entry] of Object.entries(store.sessions)) {
+    if (filter.subagentOnly && !entry.subagent) continue;
+    if (cutoffMs !== undefined) {
+      // Lazy import to avoid cron/session-reaper depending on this file
+      // (which would create a cycle); the helper is a pure string predicate.
+      if (!sessionKey.startsWith("isolated:cron:")) continue;
+      const lastUsedAt = Date.parse(entry.lastUsedAt ?? "");
+      if (!Number.isFinite(lastUsedAt) || lastUsedAt > cutoffMs) continue;
+    }
+    out.push({ sessionKey, entry });
+  }
+  return out;
+}

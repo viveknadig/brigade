@@ -88,6 +88,7 @@ import { getActiveCronService, setActiveCronService } from "../cron/active-servi
 import { runCronIsolatedAgentJob } from "../cron/isolated-agent/run.js";
 import { createCronServiceState } from "../cron/service/state.js";
 import { start as cronStart, stop as cronStop } from "../cron/service/ops.js";
+import { bootRuntimeContext } from "../storage/boot.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import {
 	DEFAULT_AGENT_ID,
@@ -335,6 +336,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<ServerHandl
 	// Capture the boot start time so the `ready (Xs)` line can report total
 	// startup duration. Threaded through the boot chain.
 	const startupStartedAt = Date.now();
+
+	// Phase 0 — storage layer. Idempotent: the CLI preAction hook normally
+	// booted it already; this covers embedded/test paths that call
+	// `startServer` directly. After this line every subsystem may reach
+	// storage via `getRuntimeContext().store`. Convex mode with an
+	// unreachable deployment fails HERE, before the lock/port are touched.
+	await bootRuntimeContext();
 
 	// Phase logger — emits to the verbose console-stream when present, falls
 	// back to plain stderr lines so the bare-mode boot still surfaces
