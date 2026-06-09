@@ -88,7 +88,7 @@ import { getActiveCronService, setActiveCronService } from "../cron/active-servi
 import { runCronIsolatedAgentJob } from "../cron/isolated-agent/run.js";
 import { createCronServiceState } from "../cron/service/state.js";
 import { start as cronStart, stop as cronStop } from "../cron/service/ops.js";
-import { bootRuntimeContext } from "../storage/boot.js";
+import { bootRuntimeContext, enableConfigLiveRefresh } from "../storage/boot.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import {
 	DEFAULT_AGENT_ID,
@@ -343,6 +343,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<ServerHandl
 	// storage via `getRuntimeContext().store`. Convex mode with an
 	// unreachable deployment fails HERE, before the lock/port are touched.
 	await bootRuntimeContext();
+	// Convex mode: keep the config cache hot via the live-query subscription
+	// (the convex-mode counterpart of the brigade.json hot-reload watcher).
+	// No-op in filesystem mode. The gateway is the only long-lived process,
+	// so this is the only call site; handle.stop() disables it.
+	enableConfigLiveRefresh();
 
 	// Phase logger — emits to the verbose console-stream when present, falls
 	// back to plain stderr lines so the bare-mode boot still surfaces
@@ -4367,6 +4372,21 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			try {
 				if (configReloadTimer) clearTimeout(configReloadTimer);
 				configWatcher?.close();
+			} catch {
+				/* best-effort */
+			}
+			// Convex mode: stop the config live-query subscription and drain
+			// any config writes still on the flush chain so a save made just
+			// before shutdown isn't lost. Both are no-ops in filesystem mode.
+			try {
+				const { disableConfigLiveRefresh } = await import("../storage/boot.js");
+				disableConfigLiveRefresh();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitConfigFlush } = await import("../config/io.js");
+				await awaitConfigFlush();
 			} catch {
 				/* best-effort */
 			}

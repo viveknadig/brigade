@@ -10,6 +10,8 @@ import {
   resolveConfigPath,
   resolveLogsDir,
 } from "./paths.js";
+import { getCachedConfigRaw, primeConfigCache } from "../storage/config-cache.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 
 // brigade.json shape — intentionally loose at this stage so individual
 // subsystems can extend it without churning a central schema. Tightening
@@ -368,6 +370,26 @@ const SECRET_REF_PATTERN = /^\$\{([A-Z_][A-Z0-9_]*)\}$/;
 let lastParsedConfig: unknown = undefined;
 
 export function readConfigOrInit(): BrigadeConfig {
+  // Convex mode — serve from the boot-primed in-process cache. This is THE
+  // dispatch point for every config read in the codebase (the call sites
+  // stay untouched; sync callers like the per-turn loop keep working).
+  // The cache holds the raw `${VAR}`-refs-intact form; clone + resolve per
+  // call, mirroring the disk path's read-parse-resolve sequence below.
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    const raw = getCachedConfigRaw();
+    if (raw === undefined) {
+      throw new Error(
+        "config cache not primed — storage boot did not complete. " +
+          "This is a Brigade bug: bootRuntimeContext() must hydrate the config cache in convex mode.",
+      );
+    }
+    const parsed = structuredClone(raw);
+    lastParsedConfig = structuredClone(parsed);
+    resolveSecretsInPlace(parsed);
+    return parsed;
+  }
+
   const cfgPath = resolveConfigPath();
   if (!fs.existsSync(cfgPath)) {
     // Minimum viable shape — `agents` map is added so the onboard runner
@@ -404,6 +426,19 @@ export function readConfigOrInit(): BrigadeConfig {
 // observes (and writes back) the freshest state on disk.
 let writeChain: Promise<void> = Promise.resolve();
 
+// Convex-mode persistence chain. `writeConfigSafeInternal`'s convex branch
+// updates the in-process cache synchronously and appends the actual store
+// write here; async awaiters join it for durability.
+let convexConfigFlushChain: Promise<void> = Promise.resolve();
+
+/** Resolves when every config write enqueued so far has reached the
+ *  backend (convex mode) — shutdown paths await this so a sync
+ *  `writeConfigSafe` just before exit isn't lost. Filesystem mode resolves
+ *  immediately (sync writes are already durable). */
+export function awaitConfigFlush(): Promise<void> {
+  return convexConfigFlushChain;
+}
+
 export function writeConfigSafe(config: BrigadeConfig): void {
   writeConfigSafeInternal(config);
   // Refresh the queue head so any async awaiter that lands later
@@ -414,9 +449,14 @@ export function writeConfigSafe(config: BrigadeConfig): void {
 }
 
 export function writeConfigSafeAsync(config: BrigadeConfig): Promise<void> {
-  const next = writeChain.then(() => {
-    writeConfigSafeInternal(config);
-  });
+  const next = writeChain
+    .then(() => {
+      writeConfigSafeInternal(config);
+    })
+    // In convex mode the internal call only ENQUEUES the persist; join the
+    // flush chain so awaiters get end-to-end durability. Filesystem mode:
+    // resolved chain, no added latency.
+    .then(() => convexConfigFlushChain);
   writeChain = next.catch(() => {});
   return next;
 }
@@ -438,10 +478,47 @@ export function mutateConfigAtomic(
     resultRef = updated;
   });
   writeChain = next.catch(() => {});
-  return next.then(() => resultRef as BrigadeConfig);
+  return (
+    next
+      // Convex mode: the internal call only enqueues the persist — join the
+      // flush chain so the resolved promise means "the backend has it".
+      .then(() => awaitConfigFlush())
+      .then(() => resultRef as BrigadeConfig)
+  );
 }
 
 function writeConfigSafeInternal(config: BrigadeConfig): void {
+  // Convex mode — the brigadeConfig row is the destination, never disk.
+  // Same `${VAR}` restoration as the disk path (resolved secrets must not
+  // land in the row either), then: (1) prime the in-process cache so the
+  // very next readConfigOrInit sees this write, (2) enqueue the Convex
+  // persist on a serial flush chain. `writeConfigSafe` stays synchronous
+  // for its callers; awaiters that need durability use
+  // `writeConfigSafeAsync` / `mutateConfigAtomic`, which join the chain.
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    const restoredForStore = restoreEnvVarRefsRecursive(
+      config,
+      lastParsedConfig,
+      process.env,
+    ) as BrigadeConfig;
+    primeConfigCache(restoredForStore);
+    lastParsedConfig = structuredClone(restoredForStore);
+    const store = rctx.store;
+    convexConfigFlushChain = convexConfigFlushChain
+      .then(() => store.config.write(restoredForStore))
+      .then(() => {})
+      .catch((err) => {
+        // The cache already serves the new value in-process; surface the
+        // persistence failure loudly so the operator knows the backend
+        // didn't take the write. Subsequent writes retry the chain.
+        console.error(
+          `brigade: config write to convex failed — ${(err as Error).message}`,
+        );
+      });
+    return;
+  }
+
   const cfgPath = resolveConfigPath();
   ensureDir(path.dirname(cfgPath));
 
