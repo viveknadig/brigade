@@ -4,9 +4,10 @@
 // `agents/channels/access-control/store.ts` + `agents/channels/whatsapp/*`.
 // Implements `ChannelStore`.
 //
-// WhatsApp Baileys multi-file auth dir intentionally stays local in BOTH
-// modes (see `project_brigade_phase_2_user_flow` carve-outs) — Baileys
-// expects a real directory with creds.json + signal keys. `openWhatsApp-
+// WhatsApp Baileys auth: FILESYSTEM mode uses the multi-file auth dir
+// (real directory with creds.json + signal keys). CONVEX mode does NOT —
+// auth rides the whatsappAuthCreds/whatsappAuthKeys tables via
+// useConvexAuthState (the old both-modes carve-out is retired). `openWhatsApp-
 // AuthDir` returns a handle carrying the resolved path so callers
 // (the Baileys adapter) can keep using its FS-native multi-file auth API.
 //
@@ -123,6 +124,41 @@ export class LocalChannelStore implements ChannelStore {
 		}>;
 	}): Promise<void> {
 		// Filesystem mode persists via the access-control module itself.
+	}
+
+	// ---------------------------------------------------------------------
+	// Baileys auth — filesystem mode uses useMultiFileAuthState against the
+	// auth dir; these store methods only exist for the convex adapter.
+	// ---------------------------------------------------------------------
+
+	async loadWhatsAppAuth(_accountId: string): Promise<{
+		creds: string | null;
+		keys: Array<{ keyType: string; keyId: string; valueJson: string }>;
+	}> {
+		throw new NotImplementedYet(
+			"channels.loadWhatsAppAuth (filesystem mode uses useMultiFileAuthState)",
+		);
+	}
+
+	async writeWhatsAppCreds(_accountId: string, _credsJson: string): Promise<void> {
+		throw new NotImplementedYet(
+			"channels.writeWhatsAppCreds (filesystem mode uses useMultiFileAuthState)",
+		);
+	}
+
+	async writeWhatsAppKeys(
+		_accountId: string,
+		_entries: Array<{ keyType: string; keyId: string; valueJson: string | null }>,
+	): Promise<void> {
+		throw new NotImplementedYet(
+			"channels.writeWhatsAppKeys (filesystem mode uses useMultiFileAuthState)",
+		);
+	}
+
+	async clearWhatsAppAuth(_accountId: string): Promise<void> {
+		throw new NotImplementedYet(
+			"channels.clearWhatsAppAuth (filesystem mode uses useMultiFileAuthState)",
+		);
 	}
 
 	// ---------------------------------------------------------------------

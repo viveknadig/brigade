@@ -473,6 +473,21 @@ export interface ChannelStore {
 	}): Promise<void>;
 
 	openWhatsAppAuthDir(args: { accountId: string }): Promise<WhatsAppAuthHandle>;
+
+	/** Convex-mode Baileys auth surface. Values are BufferJSON strings —
+	 *  the adapter seals/opens them; the useConvexAuthState module owns the
+	 *  Baileys types. `valueJson: null` deletes the key. Local mode never
+	 *  calls these (useMultiFileAuthState owns the dir). */
+	loadWhatsAppAuth(accountId: string): Promise<{
+		creds: string | null;
+		keys: Array<{ keyType: string; keyId: string; valueJson: string }>;
+	}>;
+	writeWhatsAppCreds(accountId: string, credsJson: string): Promise<void>;
+	writeWhatsAppKeys(
+		accountId: string,
+		entries: Array<{ keyType: string; keyId: string; valueJson: string | null }>,
+	): Promise<void>;
+	clearWhatsAppAuth(accountId: string): Promise<void>;
 	readLidReverseMapping(args: { accountId: string; lidDigits: string }): Promise<string | null>;
 
 	putInboundMedia(args: {

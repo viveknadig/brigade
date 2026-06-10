@@ -24,7 +24,9 @@
 //   • mode.sentinel itself
 //   • gateway.lock + gateway.pid + gateway.heartbeat (per-process)
 //   • OS daemon unit files
-//   • WhatsApp Baileys auth dir
+//   • WhatsApp Baileys auth dir (filesystem mode only — convex mode
+//     stores auth in whatsappAuthCreds/whatsappAuthKeys; a mode switch
+//     re-pairs the device rather than migrating signal keys)
 //   • .dreams/* metadata
 //
 // After successful migrate, the sentinel is flipped to the new mode. The

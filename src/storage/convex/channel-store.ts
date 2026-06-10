@@ -243,6 +243,107 @@ export class ConvexChannelStore implements ChannelStore {
 		};
 	}
 
+	// ---------------------------------------------------------------------
+	// Baileys auth (whatsappAuthCreds + whatsappAuthKeys)
+	// ---------------------------------------------------------------------
+
+	/** ~900 KB is comfortably under the mutation arg cap with sealing
+	 *  overhead; bigger values (LTHashState) spill to File Storage. */
+	private static readonly AUTH_INLINE_CAP = 900 * 1024;
+
+	async loadWhatsAppAuth(accountId: string): Promise<{
+		creds: string | null;
+		keys: Array<{ keyType: string; keyId: string; valueJson: string }>;
+	}> {
+		const result = (await this.deps.client.query(api.whatsappAuth.loadAll, {
+			ownerId: this.deps.ownerId,
+			accountId,
+		})) as {
+			creds: ArrayBuffer | null;
+			keys: Array<{
+				keyType: string;
+				keyId: string;
+				payload?: ArrayBuffer;
+				url?: string | null;
+			}>;
+		};
+		const keys: Array<{ keyType: string; keyId: string; valueJson: string }> = [];
+		for (const k of result.keys) {
+			if (k.payload !== undefined) {
+				keys.push({ keyType: k.keyType, keyId: k.keyId, valueJson: bytesToString(k.payload) });
+				continue;
+			}
+			if (k.url) {
+				// File Storage spill — fetch + unseal.
+				const res = await fetch(k.url);
+				if (!res.ok) continue;
+				const sealed = await res.arrayBuffer();
+				keys.push({ keyType: k.keyType, keyId: k.keyId, valueJson: bytesToString(sealed) });
+			}
+		}
+		return {
+			creds: result.creds ? bytesToString(result.creds) : null,
+			keys,
+		};
+	}
+
+	async writeWhatsAppCreds(accountId: string, credsJson: string): Promise<void> {
+		await this.deps.client.mutation(api.whatsappAuth.writeCreds, {
+			ownerId: this.deps.ownerId,
+			accountId,
+			payload: stringToBytes(credsJson),
+		});
+	}
+
+	async writeWhatsAppKeys(
+		accountId: string,
+		entries: Array<{ keyType: string; keyId: string; valueJson: string | null }>,
+	): Promise<void> {
+		if (entries.length === 0) return;
+		const prepared: Array<{
+			keyType: string;
+			keyId: string;
+			payload?: ArrayBuffer;
+			storageId?: string;
+		}> = [];
+		for (const entry of entries) {
+			if (entry.valueJson === null) {
+				prepared.push({ keyType: entry.keyType, keyId: entry.keyId });
+				continue;
+			}
+			const sealed = stringToBytes(entry.valueJson);
+			if (sealed.byteLength <= ConvexChannelStore.AUTH_INLINE_CAP) {
+				prepared.push({ keyType: entry.keyType, keyId: entry.keyId, payload: sealed });
+				continue;
+			}
+			// Oversized (LTHashState) — File Storage spill via upload URL.
+			const uploadUrl = (await this.deps.client.mutation(
+				api.channels.generateMediaUploadUrl,
+				{},
+			)) as string;
+			const res = await fetch(uploadUrl, {
+				method: "POST",
+				headers: { "Content-Type": "application/octet-stream" },
+				body: sealed,
+			});
+			if (!res.ok) throw new Error(`auth key upload failed: HTTP ${res.status}`);
+			const { storageId } = (await res.json()) as { storageId: string };
+			prepared.push({ keyType: entry.keyType, keyId: entry.keyId, storageId });
+		}
+		await this.deps.client.mutation(api.whatsappAuth.writeKeys, {
+			ownerId: this.deps.ownerId,
+			accountId,
+			entries: prepared as never,
+		});
+	}
+
+	async clearWhatsAppAuth(accountId: string): Promise<void> {
+		await this.deps.client.mutation(api.whatsappAuth.clearAccount, {
+			ownerId: this.deps.ownerId,
+			accountId,
+		});
+	}
+
 	async eraseAccount(channelId: string, accountId: string): Promise<void> {
 		await this.deps.client.mutation(api.channels.eraseAccount, {
 			ownerId: this.deps.ownerId,

@@ -481,6 +481,33 @@ export default defineSchema({
     updatedAt: v.number(),
   }).index("by_owner_agent_kind", ["ownerId", "agentId", "kind"]),
 
+  // WhatsApp Baileys auth — replaces the ~900-file multi-file auth dir in
+  // convex mode. creds.json rides as ONE sealed BufferJSON blob (small,
+  // atomic updates); every signal key (pre-key / session / sender-key /
+  // app-state-sync-key / …) is a row keyed (keyType, keyId). Oversized
+  // values (LTHashState app-state-sync-version grows with contacts and can
+  // exceed the mutation arg cap) spill to Convex File Storage via
+  // `storageId`. keyType is a plain string — Baileys adds types across
+  // versions and a locked union would reject them.
+  whatsappAuthCreds: defineTable({
+    ownerId: v.string(),
+    accountId: v.string(),
+    payload: v.bytes(),
+    updatedAt: v.number(),
+  }).index("by_owner_account", ["ownerId", "accountId"]),
+
+  whatsappAuthKeys: defineTable({
+    ownerId: v.string(),
+    accountId: v.string(),
+    keyType: v.string(),
+    keyId: v.string(),
+    payload: v.optional(v.bytes()),
+    storageId: v.optional(v.id("_storage")),
+    updatedAt: v.number(),
+  })
+    .index("by_owner_account_type_id", ["ownerId", "accountId", "keyType", "keyId"])
+    .index("by_owner_account", ["ownerId", "accountId"]),
+
   // ===========================================================================
   // 10. EXEC APPROVALS  (REPORT 8)
   // ===========================================================================

@@ -24,8 +24,10 @@ import { join as joinPath } from "node:path";
 
 import type { ConnectionState, WAMessage, WASocket } from "@whiskeysockets/baileys";
 
+import { tryGetRuntimeContext } from "../../../storage/runtime-context.js";
 import { createDedupeCache } from "../dedupe.js";
 import { chunkText } from "./chunk.js";
+import { useConvexAuthState } from "./convex-auth-state.js";
 import { markdownToWhatsApp } from "./format.js";
 import { extractMentions, extractReplyContext } from "./inbound-extras.js";
 import { downloadInboundMedia } from "./media.js";
@@ -77,8 +79,12 @@ export interface WaInboundText {
 }
 
 export interface ConnectWhatsAppArgs {
-	/** Directory holding the multi-file auth state (creds + signal keys). */
+	/** Directory holding the multi-file auth state (creds + signal keys).
+	 *  Filesystem mode only — convex mode ignores it (auth rides the
+	 *  whatsappAuthCreds/whatsappAuthKeys tables). */
 	authDir: string;
+	/** Account namespace for the convex auth tables. Defaults to "default". */
+	accountId?: string;
 	/** Baileys log level — quiet unless the operator asked for verbose. */
 	verbose?: boolean;
 	/** Called with the QR string whenever WhatsApp wants the device linked. */
@@ -593,7 +599,29 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 		child: () => baileysLogger,
 	};
 
-	const { state, saveCreds } = await useMultiFileAuthState(args.authDir);
+	// Auth state — mode dispatch. Filesystem: Baileys' own multi-file dir
+	// (~900 small files under the channel state dir). Convex: the
+	// whatsappAuthCreds/whatsappAuthKeys tables via useConvexAuthState — no
+	// auth files on disk; key material is sealed before it leaves the
+	// process; pre-hydrated in one query so Signal-path key reads never pay
+	// a network round-trip.
+	const rctxForAuth = tryGetRuntimeContext();
+	let state: Awaited<ReturnType<typeof useMultiFileAuthState>>["state"];
+	let saveCreds: () => Promise<void>;
+	if (rctxForAuth?.mode === "convex") {
+		const accountId = args.accountId ?? "default";
+		const convexAuth = await useConvexAuthState(rctxForAuth.store, accountId, {
+			initAuthCreds: baileys.initAuthCreds as never,
+			BufferJSON: baileys.BufferJSON as never,
+			proto: baileys.proto as never,
+		});
+		state = convexAuth.state as never;
+		saveCreds = convexAuth.saveCreds;
+	} else {
+		const multiFile = await useMultiFileAuthState(args.authDir);
+		state = multiFile.state;
+		saveCreds = multiFile.saveCreds;
+	}
 	const { version } = await fetchLatestBaileysVersion();
 
 	let sock: WASocket | null = null;
