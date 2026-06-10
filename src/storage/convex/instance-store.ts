@@ -11,6 +11,7 @@ import type { ConvexHttpClient } from "convex/browser";
 import { api } from "../../../convex/_generated/api.js";
 import { acquireSessionWriteLock } from "../../sessions/session-write-lock.js";
 import * as path from "node:path";
+import { resolveOsCacheDir } from "../../config/paths.js";
 
 import type {
 	GatewayLockHandle,
@@ -78,7 +79,7 @@ export class ConvexInstanceStore implements InstanceStore {
 	}): Promise<GatewayLockHandle> {
 		// Lock stays local. The session-write-lock helper uses fs.open("wx")
 		// which is the safest atomic exclusive-create primitive available.
-		const lockFile = path.join(this.deps.stateDir, "gateway.lock");
+		const lockFile = path.join(resolveOsCacheDir(), "gateway.lock");
 		const handle = await acquireSessionWriteLock({
 			sessionFile: lockFile,
 			...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}),

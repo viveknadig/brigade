@@ -25,6 +25,7 @@ import * as path from "node:path";
 import { WebSocket } from "ws";
 
 import { BRIGADE_DIR } from "./config.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import type { SessionStateSnapshot } from "../protocol.js";
 
 export const GATEWAY_PID_PATH = path.join(BRIGADE_DIR, "gateway.pid");
@@ -71,6 +72,20 @@ export async function writeHeartbeatFile(): Promise<void> {
     pid: process.pid,
     uptimeMs: Math.round(process.uptime() * 1000),
   };
+
+  // Convex mode — the heartbeat is a gatewayCoord row, never a file.
+  // (The supervisor + doctor read it back through the same store.)
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    try {
+      await rctx.store.instance.writeHeartbeat(payload);
+    } catch {
+      // Heartbeat write failures degrade to "stale heartbeat" on the
+      // supervisor side — same posture as a failed file write.
+    }
+    return;
+  }
+
   await fsAsync.mkdir(path.dirname(GATEWAY_HEARTBEAT_PATH), { recursive: true });
   const tmp = `${GATEWAY_HEARTBEAT_PATH}.tmp`;
   await fsAsync.writeFile(tmp, JSON.stringify(payload), "utf8");
@@ -243,6 +258,17 @@ export async function probeGateway(opts: GatewayProbeOptions = {}): Promise<Gate
  * is created by `loadBrigadeConfig` on first read).
  */
 export async function writePidFile(): Promise<void> {
+  // Convex mode — the pid is a gatewayCoord row, never a file.
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    try {
+      await rctx.store.instance.writePid(process.pid);
+    } catch {
+      // Degrades to "no pid visible" — same posture as a failed file write.
+    }
+    return;
+  }
+
   await fsAsync.mkdir(path.dirname(GATEWAY_PID_PATH), { recursive: true });
   await fsAsync.writeFile(GATEWAY_PID_PATH, String(process.pid), "utf8");
 }

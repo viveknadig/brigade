@@ -281,9 +281,9 @@ export async function runGatewayStopCommand(opts: { timeout?: number; json?: boo
 			// Ignore; the file may have vanished concurrently.
 		}
 		try {
-			const { GATEWAY_LOCK_PATH } = await import("../../core/gateway-lock.js");
+			const { resolveGatewayLockPath } = await import("../../core/gateway-lock.js");
 			const fsAsync = await import("node:fs/promises");
-			await fsAsync.unlink(GATEWAY_LOCK_PATH);
+			await fsAsync.unlink(resolveGatewayLockPath());
 		} catch {
 			/* best-effort */
 		}
@@ -341,9 +341,9 @@ export async function runGatewayStopCommand(opts: { timeout?: number; json?: boo
 				/* best-effort */
 			}
 			try {
-				const { GATEWAY_LOCK_PATH } = await import("../../core/gateway-lock.js");
+				const { resolveGatewayLockPath } = await import("../../core/gateway-lock.js");
 				const fsAsync = await import("node:fs/promises");
-				await fsAsync.unlink(GATEWAY_LOCK_PATH);
+				await fsAsync.unlink(resolveGatewayLockPath());
 			} catch {
 				/* best-effort — file may already be gone if the gateway cleaned up */
 			}
