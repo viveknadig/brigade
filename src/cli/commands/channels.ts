@@ -23,6 +23,8 @@ import { addAllowFrom, readAllowFrom, removeAllowFrom } from "../../agents/chann
 import { DEFAULT_AGENT_ID, resolveAgentWorkspaceDir, resolveChannelStateDir } from "../../config/paths.js";
 import { loadConfig, saveConfig } from "../../core/config.js";
 import { isProcessAlive, readPid } from "../../core/gateway-probe.js";
+import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
+import { WHATSAPP_DEFAULT_ACCOUNT_ID } from "../../agents/channels/whatsapp/account-config.js";
 
 /* ─────────────────────────── helpers ─────────────────────────── */
 
@@ -296,19 +298,36 @@ export async function runChannelsLink(
 		}
 		return 1;
 	}
-	if (args.force && existingLinkInfo) {
-		// Operator opted into a fresh link. Wipe the state dir before starting
-		// so the adapter's `useMultiFileAuthState` opens on a clean slate.
-		// Failure to wipe is non-fatal — the link will still try, and may
-		// happen to work; surface the warning so it isn't silent.
-		const dir = resolveChannelStateDir(adapter.id);
-		try {
-			if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
-			process.stdout.write(`(forced: cleared previous ${adapter.label} state before linking)\n`);
-		} catch (err) {
-			process.stderr.write(
-				`(warning: --force could not clear previous state: ${err instanceof Error ? err.message : String(err)})\n`,
-			);
+	if (args.force) {
+		// Operator opted into a fresh link — clear prior auth so the adapter
+		// opens on a clean slate. Failure to clear is non-fatal (the link still
+		// tries); surface a warning so it isn't silent.
+		const rctx = tryGetRuntimeContext();
+		if (rctx?.mode === "convex") {
+			// No state dir in convex mode — creds + keys live in the
+			// whatsappAuthCreds/Keys tables. The disk-based existingLinkInfo
+			// probe can't see them, so clear unconditionally on --force
+			// (clearing an absent account is a harmless no-op).
+			if (adapter.id === "whatsapp") {
+				try {
+					await rctx.store.channels.clearWhatsAppAuth(WHATSAPP_DEFAULT_ACCOUNT_ID);
+					process.stdout.write(`(forced: cleared previous ${adapter.label} auth before linking)\n`);
+				} catch (err) {
+					process.stderr.write(
+						`(warning: --force could not clear previous auth: ${err instanceof Error ? err.message : String(err)})\n`,
+					);
+				}
+			}
+		} else if (existingLinkInfo) {
+			const dir = resolveChannelStateDir(adapter.id);
+			try {
+				if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+				process.stdout.write(`(forced: cleared previous ${adapter.label} state before linking)\n`);
+			} catch (err) {
+				process.stderr.write(
+					`(warning: --force could not clear previous state: ${err instanceof Error ? err.message : String(err)})\n`,
+				);
+			}
 		}
 	}
 
@@ -512,6 +531,14 @@ export async function runChannelsUnlink(
 	}
 
 	try {
+		// Convex mode — credentials live in the whatsappAuthCreds/Keys tables,
+		// not on disk, so the dir wipe below is a no-op; clear the backend rows
+		// explicitly. The dir wipe still runs (harmless when absent) so a
+		// mixed-history install with leftover files is also cleaned.
+		const rctx = tryGetRuntimeContext();
+		if (rctx?.mode === "convex" && id === "whatsapp") {
+			await rctx.store.channels.clearWhatsAppAuth(WHATSAPP_DEFAULT_ACCOUNT_ID);
+		}
 		if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);

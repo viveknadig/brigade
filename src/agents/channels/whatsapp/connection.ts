@@ -246,12 +246,20 @@ interface LidLookup {
  * async because the runtime lookup is async. Returns null when the file is
  * absent, unreadable, or carries a null/empty value.
  */
-function readLidReverseMappingSync(authDir: string | null | undefined, lidDigits: string): string | null {
+function readLidReverseMappingSync(
+	authDir: string | null | undefined,
+	lidDigits: string,
+	accountId: string = "default",
+): string | null {
 	if (!lidDigits) return null;
 	// Convex mode — the lid-mapping keys live in the keystore; the
 	// auth-state module mirrors reverse entries for exactly this sync read.
+	// The mirror is keyed by accountId, so the lookup MUST use the same
+	// accountId the auth-state was loaded with (not a hardcoded "default",
+	// which silently misses for any non-default WhatsApp account → inbound
+	// LID-form senders get dropped).
 	if (tryGetRuntimeContext()?.mode === "convex") {
-		return lookupLidReverseSync("default", lidDigits);
+		return lookupLidReverseSync(accountId, lidDigits);
 	}
 	if (!authDir) return null;
 	// Best-effort filesystem read — gated by a quick exists check so the
@@ -296,6 +304,7 @@ export async function resolveJidToE164(
 	sock: WASocket | null,
 	jid: string | null | undefined,
 	authDir?: string,
+	accountId?: string,
 ): Promise<string | null> {
 	if (!jid) return null;
 	const direct = jid.match(WA_PHONE_JID_RE);
@@ -307,7 +316,7 @@ export async function resolveJidToE164(
 	// these the moment it sees a LID's phone translation, so right after a
 	// fresh link they're available even while the in-memory `lidMapping` is
 	// still warming up.
-	const fromDisk = readLidReverseMappingSync(authDir, lidDigits);
+	const fromDisk = readLidReverseMappingSync(authDir, lidDigits, accountId);
 	if (fromDisk) return fromDisk;
 	// Then: runtime lookup. Some Baileys builds expose
 	// `signalRepository.lidMapping`; older / partially-initialized sockets
@@ -352,13 +361,14 @@ export async function resolveSenderIdentity(
 	sock: WASocket | null,
 	jid: string | null | undefined,
 	authDir?: string,
+	accountId?: string,
 ): Promise<{ id: string; e164?: string; lid?: string } | null> {
 	if (!jid) return null;
 	// Capture the LID alias whenever the sender came in via one — even when it
 	// DID map to a phone number — so the access-control gate can match on either
 	// the number or the LID (mirrors the reference codebase's identity overlap).
 	const lid = WA_LID_JID_RE.test(jid) ? (normalizeDeviceScopedJid(jid) ?? undefined) : undefined;
-	const e164 = await resolveJidToE164(sock, jid, authDir);
+	const e164 = await resolveJidToE164(sock, jid, authDir, accountId);
 	if (e164) return { id: e164, e164, ...(lid ? { lid } : {}) };
 	const normalized = normalizeDeviceScopedJid(jid) ?? jid;
 	if (!normalized) return null;
@@ -612,17 +622,26 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 	// process; pre-hydrated in one query so Signal-path key reads never pay
 	// a network round-trip.
 	const rctxForAuth = tryGetRuntimeContext();
+	// One accountId for the whole connection: the auth-state load, the
+	// LID-reverse mirror lookups, and (convex) the close() flush all key off
+	// it. Hardcoding "default" downstream silently breaks any non-default
+	// WhatsApp account.
+	const connectionAccountId = args.accountId ?? "default";
 	let state: Awaited<ReturnType<typeof useMultiFileAuthState>>["state"];
 	let saveCreds: () => Promise<void>;
+	// Convex-mode: the auth-state queues key writes write-behind. Capture its
+	// flush so close() can drain it — otherwise a fresh pair's keys can be
+	// lost when the link command exits right after a successful connect.
+	let convexAuthFlush: (() => Promise<void>) | undefined;
 	if (rctxForAuth?.mode === "convex") {
-		const accountId = args.accountId ?? "default";
-		const convexAuth = await useConvexAuthState(rctxForAuth.store, accountId, {
+		const convexAuth = await useConvexAuthState(rctxForAuth.store, connectionAccountId, {
 			initAuthCreds: baileys.initAuthCreds as never,
 			BufferJSON: baileys.BufferJSON as never,
 			proto: baileys.proto as never,
 		});
 		state = convexAuth.state as never;
 		saveCreds = convexAuth.saveCreds;
+		convexAuthFlush = convexAuth.flush;
 	} else {
 		const multiFile = await useMultiFileAuthState(args.authDir);
 		state = multiFile.state;
@@ -1236,7 +1255,7 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 							// chat than to spam a contact with a pairing card).
 							if (!isGroup) {
 								const selfPhone = canonicalWhatsAppId(sock?.user?.id);
-								const chatPhone = await resolveJidToE164(sock, jid, args.authDir);
+								const chatPhone = await resolveJidToE164(sock, jid, args.authDir, connectionAccountId);
 								const isSelfChat = !!(selfPhone && chatPhone && selfPhone === chatPhone);
 								if (!isSelfChat) {
 									args.log("dropped operator outbound DM (fromMe, not self-chat)", {
@@ -1283,7 +1302,7 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 						const rawParticipant = m.key.participant?.trim();
 						const senderJid =
 							isGroup && rawParticipant && rawParticipant.length > 0 ? rawParticipant : jid;
-						const senderIdentity = await resolveSenderIdentity(sock, senderJid, args.authDir);
+						const senderIdentity = await resolveSenderIdentity(sock, senderJid, args.authDir, connectionAccountId);
 						if (!senderIdentity) {
 							args.log("inbound dropped — empty/unusable sender jid", {
 								jid,
@@ -1297,9 +1316,11 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 						// pulled here so the manager can gate group activation cleanly and
 						// the LLM gets the "user replied to X" context for free. Async
 						// because LID mentions need the same resolver above.
-						const mentions = normalized ? await extractMentions(normalized, sock, args.authDir) : [];
+						const mentions = normalized
+							? await extractMentions(normalized, sock, args.authDir, connectionAccountId)
+							: [];
 						const replyTo = normalized
-							? await extractReplyContext(normalized, sock, args.authDir)
+							? await extractReplyContext(normalized, sock, args.authDir, connectionAccountId)
 							: undefined;
 						// Baileys' `messageTimestamp` is in seconds (Long or number).
 						// Normalize to epoch ms; the manager uses this to decide
@@ -1628,6 +1649,11 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 			sock = null;
 			// Let a final creds write flush so the link survives a restart.
 			await pendingCredsSave.catch(() => {});
+			// Convex mode: drain the auth-state's write-behind key queue so a
+			// just-completed pair (or any keys written right before close) lands
+			// in the backend. Without this, a `brigade channels link` that exits
+			// immediately after connect can lose the freshly-negotiated keys.
+			if (convexAuthFlush) await convexAuthFlush().catch(() => {});
 		},
 	};
 }
