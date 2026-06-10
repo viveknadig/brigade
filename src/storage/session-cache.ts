@@ -46,11 +46,21 @@ export function writeThroughSessionCache(
 	for (const [key, entry] of Object.entries(next.sessions)) {
 		const old = prev.sessions[key];
 		if (old && JSON.stringify(old) === JSON.stringify(entry)) continue;
-		if (old?.subagent !== undefined && entry.subagent === undefined) {
-			// Roll/replace that DROPS subagent metadata. The upsert mutation
-			// merges (write-once subagent, never clears), so realising this
-			// transition needs delete + reinsert — same as the adapter's own
-			// freshness-roll path.
+		// The upsert mutation MERGES — it adds/changes fields the caller
+		// supplies but never CLEARS one (omitted args keep their stored value;
+		// subagent is write-once). So any transition that DROPS a field the old
+		// entry had (a freshness roll that resets provider/model/auth/thinking/
+		// extra/subagent) can't be realised by a merge — it needs delete +
+		// reinsert. Widened from the subagent-only check, which silently
+		// retained stale model/auth state across a roll.
+		const oldRec = old as Record<string, unknown> | undefined;
+		const newRec = entry as unknown as Record<string, unknown>;
+		const clearsAField =
+			oldRec !== undefined &&
+			Object.keys(oldRec).some(
+				(k) => oldRec[k] !== undefined && newRec[k] === undefined,
+			);
+		if (clearsAField) {
 			ops.push(() => store.sessions.deleteEntry(agentId, key));
 		}
 		const frozen = structuredClone(entry) as Partial<SessionEntry>;

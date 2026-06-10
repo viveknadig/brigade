@@ -90,7 +90,12 @@ export const writeKeys = mutation({
 				.first();
 			const isDelete = entry.payload === undefined && entry.storageId === undefined;
 			if (isDelete) {
-				if (existing) await ctx.db.delete(existing._id);
+				if (existing) {
+					// Reap the spilled File Storage blob first — deleting only the
+					// row would orphan the object (storage isn't ref-counted).
+					if (existing.storageId) await ctx.storage.delete(existing.storageId);
+					await ctx.db.delete(existing._id);
+				}
 				continue;
 			}
 			const row = {
@@ -103,6 +108,12 @@ export const writeKeys = mutation({
 				updatedAt: Date.now(),
 			};
 			if (existing) {
+				// If the prior value spilled to File Storage and the new value
+				// doesn't reuse the same object, delete the old blob to avoid an
+				// orphan (overwrite with inline payload, or a fresh spill).
+				if (existing.storageId && existing.storageId !== entry.storageId) {
+					await ctx.storage.delete(existing.storageId);
+				}
 				await ctx.db.replace(existing._id, row);
 			} else {
 				await ctx.db.insert("whatsappAuthKeys", row);
@@ -129,7 +140,12 @@ export const clearAccount = mutation({
 				q.eq("ownerId", args.ownerId).eq("accountId", args.accountId),
 			)
 			.collect();
-		for (const row of keyRows) await ctx.db.delete(row._id);
+		for (const row of keyRows) {
+			// Reap any spilled File Storage blob before dropping the row so an
+			// unlink/logout leaves nothing behind in storage.
+			if (row.storageId) await ctx.storage.delete(row.storageId);
+			await ctx.db.delete(row._id);
+		}
 		return { removedKeys: keyRows.length };
 	},
 });

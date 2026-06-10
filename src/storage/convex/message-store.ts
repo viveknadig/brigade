@@ -13,6 +13,7 @@ import type {
 } from "../store.js";
 
 import { open as openSealed, sealJson } from "../encryption.js";
+import { BRIGADE_BOOTSTRAP_DELIVERED_CUSTOM_TYPE } from "../../sessions/bootstrap-marker.js";
 
 interface Deps { client: ConvexHttpClient }
 
@@ -90,15 +91,30 @@ export class ConvexMessageStore implements MessageStore {
 		sessionId: string,
 		opts?: { limit?: number; tailBytes?: number },
 	): Promise<PiTranscriptRecord[]> {
-		const rows = (await this.deps.client.query(api.messages.readTranscript, {
-			agentId,
-			sessionId,
-			...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
-		})) as Array<{ payload: ArrayBuffer }>;
+		// Page by seq cursor until we've satisfied `want` or the transcript is
+		// exhausted. A single `take(limit)` truncates a session longer than the
+		// per-query read cap; migrate asks for "all" (a huge limit) and MUST get
+		// every record so the copy is faithful.
+		const want = opts?.limit && opts.limit > 0 ? opts.limit : 1000;
+		const PAGE = 4000;
 		const out: PiTranscriptRecord[] = [];
-		for (const row of rows) {
-			const parsed = bytesToJson<PiTranscriptRecord>(row.payload);
-			if (parsed) out.push(parsed);
+		let afterSeq: number | undefined;
+		while (out.length < want) {
+			const pageSize = Math.min(PAGE, want - out.length);
+			const rows = (await this.deps.client.query(api.messages.readTranscript, {
+				agentId,
+				sessionId,
+				limit: pageSize,
+				...(afterSeq !== undefined ? { afterSeq } : {}),
+			})) as Array<{ payload: ArrayBuffer; seq: number }>;
+			if (rows.length === 0) break;
+			for (const row of rows) {
+				const parsed = bytesToJson<PiTranscriptRecord>(row.payload);
+				if (parsed) out.push(parsed);
+			}
+			afterSeq = rows[rows.length - 1]!.seq;
+			// A short page means the index range is drained — stop.
+			if (rows.length < pageSize) break;
 		}
 		return out;
 	}
@@ -109,14 +125,14 @@ export class ConvexMessageStore implements MessageStore {
 			sessionId,
 		})) as Array<{ type: string; customType?: string }>;
 		return rows.some(
-			(r) => r.type === "custom" && r.customType === "brigade.bootstrap-delivered",
+			(r) => r.type === "custom" && r.customType === BRIGADE_BOOTSTRAP_DELIVERED_CUSTOM_TYPE,
 		);
 	}
 
 	async markBootstrapDelivered(agentId: string, sessionId: string): Promise<void> {
 		await this.appendRecord(agentId, sessionId, {
 			type: "custom",
-			customType: "brigade.bootstrap-delivered",
+			customType: BRIGADE_BOOTSTRAP_DELIVERED_CUSTOM_TYPE,
 			data: { timestamp: new Date().toISOString() },
 		} as unknown as PiTranscriptRecord);
 	}

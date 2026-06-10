@@ -120,13 +120,22 @@ export const readTranscript = query({
 		agentId: v.string(),
 		sessionId: v.string(),
 		limit: v.optional(v.number()),
+		// Cursor for pagination: return only records with seq > afterSeq. The
+		// client loops with the last page's max seq so a transcript larger than
+		// Convex's per-query read cap (~16k docs / 8MB) is read across calls
+		// instead of silently truncating at `take(limit)`.
+		afterSeq: v.optional(v.number()),
 	},
 	handler: async (ctx, args) => {
-		const limit = args.limit && args.limit > 0 ? args.limit : 1000;
+		// Cap a single page well under Convex's per-query document limit.
+		const limit = args.limit && args.limit > 0 ? Math.min(args.limit, 4000) : 1000;
+		const after = args.afterSeq;
 		const rows = await ctx.db
 			.query("sessionTranscriptRecords")
 			.withIndex("by_session_seq", (q) =>
-				q.eq("agentId", args.agentId).eq("sessionId", args.sessionId),
+				after !== undefined
+					? q.eq("agentId", args.agentId).eq("sessionId", args.sessionId).gt("seq", after)
+					: q.eq("agentId", args.agentId).eq("sessionId", args.sessionId),
 			)
 			.order("asc")
 			.take(limit);

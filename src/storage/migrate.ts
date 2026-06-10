@@ -141,6 +141,20 @@ export async function runStoreMigrate(opts: MigrateOptions): Promise<MigrateRepo
 				for (const p of profiles) {
 					await target.auth.upsertProfile("main", p as never);
 				}
+				// Also carry the whole-file blobs VERBATIM — auth-state.json
+				// (failover order + lastGood + usageStats) and profile-state.json
+				// (cooldown windows + failure counts) and models.json. Without
+				// these a mode switch loses the operator's failover ordering and
+				// resets every cooldown — profiles alone aren't the full picture.
+				for (const kind of ["auth-state", "profile-state", "models"] as const) {
+					try {
+						const blob = await source.auth.readAuthFileBlob("main", kind);
+						if (blob) await target.auth.writeAuthFileBlob("main", kind, blob);
+					} catch {
+						// One missing/unreadable blob doesn't fail the domain — the
+						// profiles (the load-bearing part) already copied.
+					}
+				}
 			}
 			return { copied: profiles.length, verified: !verifySha ? false : profiles.length === (await target.auth.listProfiles("main")).length };
 		}),
@@ -162,17 +176,25 @@ export async function runStoreMigrate(opts: MigrateOptions): Promise<MigrateRepo
 	// --- memory facts + cursors + consolidate state ----------------------
 	domains.push(
 		await safeDomain("memory", opts.onProgress, async () => {
-			const facts = await source.memory.listFacts({ lifecycle: "active" });
+			// Use the RAW surface, not listFacts/writeFact:
+			//   • listAllFactRecordsRaw copies EVERY lifecycle (active + archived
+			//     + decayed), not just active — a mode switch must not silently
+			//     drop the operator's archived history.
+			//   • upsertFactRecordRaw preserves the record's id + timestamps +
+			//     lifecycle and is keyed by id, so re-running is idempotent
+			//     (writeFact mints a fresh id → duplicates on every re-run).
+			const records = await source.memory.listAllFactRecordsRaw("main");
 			if (!opts.dryRun) {
-				for (const fact of facts) {
-					await target.memory.writeFact(fact as never);
+				for (const record of records) {
+					await target.memory.upsertFactRecordRaw("main", record);
 				}
 				const consolidateAt = await source.memory.getConsolidateLastRunAt();
 				if (consolidateAt !== undefined) {
 					await target.memory.markConsolidateRunAt(consolidateAt);
 				}
 			}
-			return { copied: facts.length, verified: !verifySha ? false : facts.length <= (await target.memory.countActiveFacts()) };
+			const targetCount = (await target.memory.listAllFactRecordsRaw("main")).length;
+			return { copied: records.length, verified: !verifySha ? false : targetCount >= records.length };
 		}),
 	);
 
@@ -186,6 +208,34 @@ export async function runStoreMigrate(opts: MigrateOptions): Promise<MigrateRepo
 				}
 			}
 			return { copied: entries.length, verified: !verifySha ? false : entries.length === (await target.sessions.listEntries("main")).length };
+		}),
+	);
+
+	// --- transcripts (per-session Pi JSONL → sessionTranscriptRecords) ---
+	// The header always claimed transcripts were migrated; they weren't. Walk
+	// every session entry and copy its full transcript. replaceTranscript is a
+	// wholesale transactional swap, so re-running is idempotent (the target
+	// session ends up byte-identical, no duplicated rows).
+	domains.push(
+		await safeDomain("transcripts", opts.onProgress, async () => {
+			const entries = await source.sessions.listEntries("main");
+			let copied = 0;
+			for (const { entry } of entries) {
+				const sessionId = (entry as { sessionId?: string }).sessionId;
+				if (!sessionId) continue;
+				// A high limit (well above Pi's per-session row counts) so the
+				// whole transcript comes back in one read; the convex reader
+				// paginates internally to honour it.
+				const records = await source.messages.readTranscript("main", sessionId, {
+					limit: 1_000_000,
+				});
+				if (records.length === 0) continue;
+				if (!opts.dryRun) {
+					await target.messages.replaceTranscript("main", sessionId, records);
+				}
+				copied += records.length;
+			}
+			return { copied, verified: false };
 		}),
 	);
 

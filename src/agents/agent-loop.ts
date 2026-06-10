@@ -1024,9 +1024,19 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   //      recovery emit the first-turn nudge again when needed, while
   //      the workspace has long since completed setup.
   const phaseBefore = await evaluateBootstrapPhase(workspaceDir);
-  const sessionAlreadyHasBootstrap = await hasDeliveredBootstrapToSession(
-    resolved.transcriptPath,
-  );
+  // Per-session bootstrap-delivery marker. Convex mode has no JSONL on disk,
+  // so the file-scan returns false every turn (→ wasteful re-delivery); read
+  // the marker from the convex transcript records instead. The marker is
+  // WRITTEN via markBootstrapDeliveredToSession (appendCustomEntry → the
+  // convex-backed SessionManager persists it), so both sides agree on the
+  // canonical customType.
+  const rctxForBootstrap = tryGetRuntimeContext();
+  const sessionAlreadyHasBootstrap =
+    rctxForBootstrap?.mode === "convex"
+      ? await rctxForBootstrap.store.messages
+          .hasBootstrapDelivered(agentId, resolved.sessionId)
+          .catch(() => false)
+      : await hasDeliveredBootstrapToSession(resolved.transcriptPath);
   // `senderIsOwner` defaults to true — TUI, bash, and direct-RPC callers are
   // always the operator. Channel adapters set this to `false` when the
   // approved peer is NOT the operator's own linked-channel id, so a friend's

@@ -31,7 +31,6 @@ import {
 } from "../../agents/memory/records.js";
 import { FileMemoryStore } from "../../agents/memory/storage.js";
 import { getCursor } from "../../agents/memory/extract.js";
-import { markConsolidationRun } from "../../agents/memory/consolidate.js";
 import { resolveAgentWorkspaceDir, DEFAULT_AGENT_ID } from "../../config/paths.js";
 
 import { watchFile } from "./file-watcher.js";
@@ -175,7 +174,25 @@ export class LocalMemoryStore implements MemoryStore {
 	}
 
 	async markConsolidateRunAt(at: number): Promise<void> {
-		markConsolidationRun(activeWorkspaceDir(), at);
+		// Disk-direct, NOT via markConsolidationRun — that helper branches on
+		// the global runtime context and would write to convex when this store
+		// is a migrate TARGET while the operator is still in convex mode. The
+		// LocalMemoryStore impl must always stamp the local file (mirrors the
+		// inline read in getConsolidateLastRunAt).
+		const file = path.join(
+			activeWorkspaceDir(),
+			"memory",
+			".dreams",
+			"consolidate-state.json",
+		);
+		try {
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+			fs.writeFileSync(tmp, JSON.stringify({ lastRunAt: at }), "utf8");
+			fs.renameSync(tmp, file);
+		} catch {
+			/* best-effort — a missed stamp just reruns consolidation sooner */
+		}
 	}
 
 	async decay(_now?: number): Promise<{ archived: number; pruned: number }> {
@@ -211,17 +228,69 @@ export class LocalMemoryStore implements MemoryStore {
 		});
 	}
 
+	// Raw per-record surface — DISK-DIRECT on purpose. FactStore.readAll /
+	// writeAll branch on the global runtime context (convex cache vs disk),
+	// which is wrong when this store is a MIGRATE TARGET while the operator is
+	// still in convex mode (target=local must land on disk, not the cache).
+	// These three always touch the local JSONL, matching the LocalMemoryStore
+	// contract. In plain filesystem mode this is identical to FactStore.readAll.
+
+	private factsFilePath(workspaceId: string): string {
+		return path.join(resolveAgentWorkspaceDir(workspaceId), "memory", "facts.jsonl");
+	}
+
+	private readFactsFromDisk(workspaceId: string): MemoryRecord[] {
+		let raw: string;
+		try {
+			raw = fs.readFileSync(this.factsFilePath(workspaceId), "utf8");
+		} catch {
+			return [];
+		}
+		const out: MemoryRecord[] = [];
+		for (const line of raw.split("\n")) {
+			const trimmed = line.trim();
+			if (!trimmed) continue;
+			try {
+				const rec = JSON.parse(trimmed) as { memoryId?: unknown; content?: unknown };
+				if (typeof rec.memoryId === "string" && typeof rec.content === "string") {
+					out.push(rec as unknown as MemoryRecord);
+				}
+			} catch {
+				// Skip a corrupt line rather than failing the whole read.
+			}
+		}
+		return out;
+	}
+
+	private writeFactsToDisk(workspaceId: string, records: MemoryRecord[]): void {
+		const file = this.factsFilePath(workspaceId);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		const body =
+			records.map((r) => JSON.stringify(r)).join("\n") + (records.length > 0 ? "\n" : "");
+		const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+		fs.writeFileSync(tmp, body, "utf8");
+		fs.renameSync(tmp, file);
+	}
+
 	async listAllFactRecordsRaw(workspaceId: string): Promise<MemoryRecord[]> {
-		return new FactStore(resolveAgentWorkspaceDir(workspaceId)).readAll() as unknown as MemoryRecord[];
+		return this.readFactsFromDisk(workspaceId);
 	}
 
-	async upsertFactRecordRaw(_workspaceId: string, _record: MemoryRecord): Promise<void> {
-		// Filesystem mode persists via FactStore.writeAll directly — the raw
-		// per-record surface only exists for the convex dispatch + migrate.
-		throw new NotImplementedYet("memory.upsertFactRecordRaw (filesystem persists via FactStore)");
+	async upsertFactRecordRaw(workspaceId: string, record: MemoryRecord): Promise<void> {
+		// Upsert by memoryId — idempotent so a re-run of `store migrate`
+		// reconciles rather than duplicating.
+		const id = (record as { memoryId?: string }).memoryId;
+		if (!id) return;
+		const all = this.readFactsFromDisk(workspaceId);
+		const idx = all.findIndex((r) => (r as { memoryId?: string }).memoryId === id);
+		if (idx >= 0) all[idx] = record;
+		else all.push(record);
+		this.writeFactsToDisk(workspaceId, all);
 	}
 
-	async deleteFactRecordRaw(_workspaceId: string, _memoryId: string): Promise<void> {
-		throw new NotImplementedYet("memory.deleteFactRecordRaw (filesystem persists via FactStore)");
+	async deleteFactRecordRaw(workspaceId: string, memoryId: string): Promise<void> {
+		const all = this.readFactsFromDisk(workspaceId);
+		const next = all.filter((r) => (r as { memoryId?: string }).memoryId !== memoryId);
+		if (next.length !== all.length) this.writeFactsToDisk(workspaceId, next);
 	}
 }
