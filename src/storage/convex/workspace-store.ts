@@ -91,6 +91,13 @@ export class ConvexWorkspaceStore implements WorkspaceStore {
 		return { rev: "" as never, writtenAt: Date.now(), created: result.created };
 	}
 
+	async deletePersona(agentId: string, name: PersonaName): Promise<boolean> {
+		return (await this.deps.client.mutation(api.workspace.deletePersona, {
+			agentId,
+			name,
+		})) as boolean;
+	}
+
 	async readState(agentId: string): Promise<WorkspaceState> {
 		const row = (await this.deps.client.query(api.workspace.getState, { agentId })) as {
 			version?: number;

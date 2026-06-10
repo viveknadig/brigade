@@ -133,6 +133,18 @@ export class LocalWorkspaceStore implements WorkspaceStore {
 		};
 	}
 
+	async deletePersona(agentId: string, name: PersonaName): Promise<boolean> {
+		const workspaceDir = resolveAgentWorkspaceDir(agentId);
+		const filePath = path.join(workspaceDir, name);
+		try {
+			await fsAsync.unlink(filePath);
+			return true;
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+			throw err;
+		}
+	}
+
 	async readState(agentId: string): Promise<WorkspaceState> {
 		const workspaceDir = resolveAgentWorkspaceDir(agentId);
 		const state = await readWorkspaceState(workspaceDir);

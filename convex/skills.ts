@@ -12,8 +12,32 @@ const Source = v.union(
 );
 
 export const list = query({
-	args: { ownerId: v.string() },
+	args: {
+		ownerId: v.string(),
+		// Optional scoping: workspace skills are per-agent, so the mirror sync
+		// must fetch only THIS agent's workspace skills — without it every
+		// agent's skills bleed into every workspace on boot.
+		source: v.optional(Source),
+		agentId: v.optional(v.union(v.string(), v.null())),
+	},
 	handler: async (ctx, args) => {
+		if (args.source !== undefined && args.agentId !== undefined) {
+			const agentId = args.agentId;
+			const source = args.source;
+			return ctx.db
+				.query("skills")
+				.withIndex("by_owner_scope_name", (q) =>
+					q.eq("ownerId", args.ownerId).eq("source", source).eq("agentId", agentId),
+				)
+				.collect();
+		}
+		if (args.source !== undefined) {
+			const source = args.source;
+			return ctx.db
+				.query("skills")
+				.withIndex("by_owner_source", (q) => q.eq("ownerId", args.ownerId).eq("source", source))
+				.collect();
+		}
 		return ctx.db
 			.query("skills")
 			.withIndex("by_owner_source", (q) => q.eq("ownerId", args.ownerId))

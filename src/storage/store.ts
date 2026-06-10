@@ -173,6 +173,10 @@ export interface WorkspaceStore {
 		content: string,
 		opts?: { createOnly?: boolean },
 	): Promise<WriteResult & { created: boolean }>;
+	/** Remove a persona row from the mirror. Returns true if a row existed.
+	 *  Used to propagate a consumed BOOTSTRAP.md deletion so restore-on-missing
+	 *  doesn't resurrect it on the next boot. */
+	deletePersona(agentId: string, name: PersonaName): Promise<boolean>;
 	readState(agentId: string): Promise<WorkspaceState>;
 	markBootstrapSeeded(agentId: string): Promise<void>;
 	markSetupCompleted(agentId: string): Promise<void>;
@@ -592,6 +596,11 @@ export interface SkillStore {
 		personalDir?: string;
 		projectDir?: string;
 		extraPaths?: string[];
+		/** Convex-mode scoping: restrict to one agent's skills of one source
+		 *  (e.g. the per-agent workspace skills the mirror sync owns). Ignored
+		 *  by the filesystem store, which scopes implicitly via `workspaceDir`. */
+		agentId?: string;
+		source?: "bundled" | "config" | "managed" | "personal" | "project" | "workspace";
 	}): Promise<{ records: SkillRecord[]; diagnostics: unknown[] }>;
 	read(ref: string): Promise<SkillBody | undefined>;
 	write(args: {

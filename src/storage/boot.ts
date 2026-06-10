@@ -348,10 +348,32 @@ async function syncWorkspaceMirrors(
 				const byName = new Map(rows.map((r) => [r.name, r] as const));
 				if (!dirExists && rows.length === 0) return; // never materialised
 
+				// Read lifecycle state up-front: BOOTSTRAP.md is CONSUMED (deleted
+				// from disk) once first-run setup completes. Without this guard the
+				// restore-on-missing branch below would resurrect the first-run
+				// script on every boot — and the delete-propagation cleans the
+				// stale convex row so a fresh machine never restores it either.
+				const diskState = dirExists
+					? await readWorkspaceState(workspaceDir)
+					: { version: 1 };
+				const convexState = await store.workspace.readState(agentId);
+				const bootstrapConsumed = Boolean(
+					(diskState as { setupCompletedAt?: string }).setupCompletedAt ||
+						convexState.setupCompletedAt,
+				);
+
 				for (const name of PERSONA_NAMES) {
 					const filePath = path.join(workspaceDir, name);
 					const onDisk = existsSync(filePath);
 					const inConvex = byName.get(name);
+					// Consumed BOOTSTRAP.md: never restore it, and reap the stale
+					// mirror row so restore-on-missing can't bring it back later.
+					if (name === "BOOTSTRAP.md" && bootstrapConsumed) {
+						if (inConvex && !onDisk) {
+							await store.workspace.deletePersona(agentId, name);
+						}
+						continue;
+					}
 					if (onDisk) {
 						const content = await fsp.readFile(filePath, "utf8");
 						if (!inConvex || inConvex.content !== content) {
@@ -365,8 +387,15 @@ async function syncWorkspaceMirrors(
 
 				// Skills — same two-way rule, one row per workspace/skills/<name>/SKILL.md.
 				try {
+					const { skillContentFromParts } = await import("./convex/skill-store.js");
 					const skillsDir = path.join(workspaceDir, "skills");
-					const convexSkills = await store.skills.list({ workspaceDir });
+					// Scope to THIS agent's WORKSPACE skills only — without the
+					// scope every agent's skills would bleed into every workspace.
+					const convexSkills = await store.skills.list({
+						workspaceDir,
+						agentId,
+						source: "workspace",
+					});
 					const convexByName = new Map(
 						(convexSkills.records as Array<{ name?: string; frontmatter?: string; body?: string }>)
 							.filter((r) => typeof r.name === "string")
@@ -381,8 +410,10 @@ async function syncWorkspaceMirrors(
 							diskNames.add(entry.name);
 							const content = await fsp.readFile(skillFile, "utf8");
 							const inConvex = convexByName.get(entry.name);
+							// Reconstruct with `---` fences so the compare matches the
+							// on-disk shape (no fences → churn + malformed restores).
 							const convexContent = inConvex
-								? `${inConvex.frontmatter ?? ""}${inConvex.body ?? ""}`
+								? skillContentFromParts(inConvex.frontmatter, inConvex.body)
 								: undefined;
 							if (!inConvex || convexContent !== content) {
 								await store.skills.write({
@@ -400,7 +431,7 @@ async function syncWorkspaceMirrors(
 						await fsp.mkdir(path.dirname(skillFile), { recursive: true });
 						await fsp.writeFile(
 							skillFile,
-							`${record.frontmatter ?? ""}${record.body ?? ""}`,
+							skillContentFromParts(record.frontmatter, record.body),
 							"utf8",
 						);
 					}
@@ -409,11 +440,8 @@ async function syncWorkspaceMirrors(
 					// disk; a fresh machine simply re-installs skills.
 				}
 
-				// Lifecycle marker — same two-way rule.
-				const diskState = dirExists
-					? await readWorkspaceState(workspaceDir)
-					: { version: 1 };
-				const convexState = await store.workspace.readState(agentId);
+				// Lifecycle marker — same two-way rule. (diskState + convexState
+				// were read up-front for the BOOTSTRAP consumed-guard.)
 				if (diskState.bootstrapSeededAt && !convexState.bootstrapSeededAt) {
 					await store.workspace.markBootstrapSeeded(agentId);
 				}

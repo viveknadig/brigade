@@ -9,12 +9,32 @@ import type { SkillBody, SkillRecord, SkillStatusReport, SkillStore } from "../s
 
 interface Deps { client: ConvexHttpClient; ownerId: string }
 
+/** Rebuild a full SKILL.md from the split frontmatter + body columns. The
+ *  `write` split stores the YAML WITHOUT its `---` fences; reconstruction must
+ *  re-add them or the restored file is no longer valid frontmatter and skill
+ *  discovery silently ignores it. */
+export function skillContentFromParts(frontmatter: string | undefined, body: string | undefined): string {
+	const fm = frontmatter ?? "";
+	const b = body ?? "";
+	if (fm.trim().length === 0) return b;
+	return `---\n${fm}\n---\n${b}`;
+}
+
 export class ConvexSkillStore implements SkillStore {
 	constructor(private readonly deps: Deps) {}
 
-	async list(): Promise<{ records: SkillRecord[]; diagnostics: unknown[] }> {
+	async list(args?: {
+		agentId?: string;
+		source?: "bundled" | "config" | "managed" | "personal" | "project" | "workspace";
+	}): Promise<{ records: SkillRecord[]; diagnostics: unknown[] }> {
 		const rows = (await this.deps.client.query(api.skills.list, {
 			ownerId: this.deps.ownerId,
+			...(args?.source !== undefined ? { source: args.source } : {}),
+			// `agentId` is part of the scope key — pass it (incl. an explicit
+			// agent id) only alongside a source so the scoped index applies.
+			...(args?.source !== undefined && args?.agentId !== undefined
+				? { agentId: args.agentId }
+				: {}),
 		})) as Array<Record<string, unknown>>;
 		return { records: rows as unknown as SkillRecord[], diagnostics: [] };
 	}
@@ -26,7 +46,11 @@ export class ConvexSkillStore implements SkillStore {
 			name: ref,
 		})) as Record<string, unknown> | null;
 		if (!row) return undefined;
-		return { body: row.body as string, ...(row as object) } as unknown as SkillBody;
+		// Surface a reconstructed full-content `content` (fences restored)
+		// alongside the raw columns so callers that round-trip the file get
+		// valid frontmatter.
+		const content = skillContentFromParts(row.frontmatter as string, row.body as string);
+		return { body: row.body as string, content, ...(row as object) } as unknown as SkillBody;
 	}
 
 	async write(args: {

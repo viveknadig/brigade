@@ -251,8 +251,18 @@ export async function runStoreMigrate(opts: MigrateOptions): Promise<MigrateRepo
 			const { records } = await source.skills.list({ workspaceDir: opts.stateDir });
 			if (!opts.dryRun) {
 				for (const r of records as Array<Record<string, unknown>>) {
-					const body = await source.skills.read((r.name as string) ?? "");
-					const content = (body as { body?: string })?.body ?? "";
+					// Read ref differs by store: filesystem keys on the SKILL.md path
+					// (`filePath`), convex on the name. Pass filePath when present.
+					const ref = (r.filePath as string) ?? (r.name as string) ?? "";
+					const body = await source.skills.read(ref);
+					// Prefer the fence-reconstructed full content (convex `read`
+					// surfaces it as `content`); the filesystem `read` returns the
+					// whole SKILL.md in `body`. Either gives the target a complete
+					// file so its split preserves the frontmatter.
+					const content =
+						(body as { content?: string; body?: string })?.content ??
+						(body as { body?: string })?.body ??
+						"";
 					await target.skills.write({
 						scope: "managed",
 						name: r.name as string,

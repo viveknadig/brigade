@@ -50,6 +50,19 @@ export const writePersona = mutation({
 	},
 });
 
+export const deletePersona = mutation({
+	args: { agentId: v.string(), name: PersonaName },
+	handler: async (ctx, args) => {
+		const existing = await ctx.db
+			.query("personaFiles")
+			.withIndex("by_agent_name", (q) => q.eq("agentId", args.agentId).eq("name", args.name))
+			.first();
+		if (!existing) return false;
+		await ctx.db.delete(existing._id);
+		return true;
+	},
+});
+
 export const getState = query({
 	args: { agentId: v.string() },
 	handler: async (ctx, args) => {

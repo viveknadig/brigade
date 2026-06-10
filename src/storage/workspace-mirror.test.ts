@@ -34,6 +34,7 @@ class FakeWorkspaceApi {
 			updatedAt: Date.now(),
 		}));
 	}
+	deletes: Array<{ agentId: string; name: PersonaName }> = [];
 	async writePersona(agentId: string, name: PersonaName, content: string): Promise<{ created: boolean }> {
 		const byName = this.rows.get(agentId) ?? new Map<PersonaName, string>();
 		const created = !byName.has(name);
@@ -41,6 +42,11 @@ class FakeWorkspaceApi {
 		this.rows.set(agentId, byName);
 		this.pushes.push({ agentId, name });
 		return { created };
+	}
+	async deletePersona(agentId: string, name: PersonaName): Promise<boolean> {
+		const had = this.rows.get(agentId)?.delete(name) ?? false;
+		this.deletes.push({ agentId, name });
+		return had;
 	}
 	async readState(agentId: string): Promise<{ version: number; bootstrapSeededAt?: string; setupCompletedAt?: string }> {
 		return { version: 1, ...(this.states.get(agentId) ?? {}) };
@@ -177,6 +183,38 @@ describe("workspace mirror sync (convex mode boot)", () => {
 
 		assert.equal(existsSync(path.join(stateDir, "agents", "researcher", "workspace")), false);
 		assert.equal(fake.pushes.length, 0);
+	});
+
+	it("consumed BOOTSTRAP.md is NOT restored and its mirror row is reaped", async () => {
+		// First-run completed (setupCompletedAt set) and BOOTSTRAP.md was
+		// deleted from disk — but a stale row still sits in convex. The sync
+		// must NOT resurrect it on disk and must delete the stale row.
+		const wsDir = path.join(stateDir, "workspace");
+		mkdirSync(wsDir, { recursive: true });
+		writeFileSync(path.join(wsDir, "SOUL.md"), "soul", "utf8");
+		fake.rows.set(
+			"main",
+			new Map([
+				["SOUL.md" as PersonaName, "soul"],
+				["BOOTSTRAP.md" as PersonaName, "# First run\nWho am I?"],
+			]),
+		);
+		fake.states.set("main", { setupCompletedAt: "2026-06-10T00:00:00.000Z" });
+
+		const cfg = { agents: {} };
+		const store = makeStubStore(fake, cfg);
+		const { setRuntimeContext } = await import("./runtime-context.js");
+		setRuntimeContext(
+			Object.freeze({ mode: "convex" as const, store, clock: Date.now, stateDir }),
+		);
+		const boot = await import("./boot.js");
+		await (boot as unknown as { __syncWorkspaceMirrorsForTests: (s: BrigadeStore, c: Record<string, unknown>) => Promise<void> }).__syncWorkspaceMirrorsForTests(store, cfg);
+
+		// Not resurrected on disk.
+		assert.equal(existsSync(path.join(wsDir, "BOOTSTRAP.md")), false);
+		// Stale convex row reaped.
+		assert.equal(fake.rows.get("main")?.has("BOOTSTRAP.md" as PersonaName), false);
+		assert.ok(fake.deletes.some((d) => d.name === ("BOOTSTRAP.md" as PersonaName)));
 	});
 
 	it("unchanged disk content does not re-push", async () => {
