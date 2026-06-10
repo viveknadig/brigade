@@ -32,7 +32,7 @@ import chalk from "chalk";
 import { createConsoleStream, type LogLevel } from "../../core/console-stream.js";
 import { getLastLoggedError, getTodayLogPath } from "../../core/event-logger.js";
 import { isGatewayLockError } from "../../core/gateway-lock.js";
-import { isProcessAlive, probeGateway, readPidFile, GATEWAY_PID_PATH } from "../../core/gateway-probe.js";
+import { isProcessAlive, probeGateway, readPid, GATEWAY_PID_PATH } from "../../core/gateway-probe.js";
 import { formatPortListener, inspectPortListeners } from "../../core/port-inspect.js";
 import { EXIT_CONFIG_ERROR, EXIT_FAILURE } from "../../protocol.js";
 import { startServer } from "../../core/server.js";
@@ -118,7 +118,7 @@ export function registerGatewayCommand(program: import("commander").Command): vo
 export async function runGatewayStatusCommand(opts: { host?: string; port?: number; json?: boolean }): Promise<number> {
 	const port = opts.port ?? 7777;
 	const probe = await probeGateway({ host: opts.host, port: opts.port });
-	const pid = readPidFile();
+	const pid = await readPid();
 	const logPath = getTodayLogPath();
 	// Inspect the port even when the probe says reachable — surfaces a
 	// stale process when a different PID is bound (port hijack /
@@ -263,9 +263,9 @@ async function sendShutdownRpc(args: { host?: string; port?: number; timeoutMs: 
 
 export async function runGatewayStopCommand(opts: { timeout?: number; json?: boolean; host?: string; port?: number }): Promise<number> {
 	const timeoutMs = opts.timeout ?? STOP_DEFAULT_TIMEOUT_MS;
-	const pid = readPidFile();
+	const pid = await readPid();
 	if (!pid) {
-		const msg = `no PID file at ${GATEWAY_PID_PATH} — gateway is probably not running`;
+		const msg = `no running gateway recorded (checked ${GATEWAY_PID_PATH}) — gateway is probably not running`;
 		if (opts.json) process.stdout.write(`${JSON.stringify({ ok: true, reason: msg })}\n`);
 		else process.stdout.write(`${chalk.dim(msg)}\n`);
 		return 0;

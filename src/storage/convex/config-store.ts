@@ -61,6 +61,7 @@ function rowToConfig(row: Record<string, unknown> | null): {
 		"auth",
 		"plugins",
 		"skills",
+		"channels",
 		"bindings",
 		"org",
 		"wizard",
@@ -69,6 +70,14 @@ function rowToConfig(row: Record<string, unknown> | null): {
 	]) {
 		const v = (row as Record<string, unknown>)[key];
 		if (v !== undefined) out[key] = v;
+	}
+	// Restore any unknown top-level keys parked in `extra` (disk-path
+	// round-trip parity — io.ts preserves unknown sections).
+	const extra = (row as { extra?: Record<string, unknown> }).extra;
+	if (extra && typeof extra === "object") {
+		for (const [k, v] of Object.entries(extra)) {
+			if (out[k] === undefined) out[k] = v;
+		}
 	}
 	const sha = (row as { contentSha256?: string }).contentSha256;
 	return {
@@ -93,6 +102,19 @@ export class ConvexConfigStore implements ConfigStore {
 	): Promise<WriteResult> {
 		const sha = shaOf(cfg);
 		const bytes = Buffer.byteLength(JSON.stringify(cfg), "utf8");
+		// Collect any top-level keys NOT given a named column into `extra`, so
+		// the disk path's unknown-key round-trip is preserved byte-for-shape.
+		const NAMED = new Set([
+			"agents", "gateway", "session", "tools", "auth", "plugins", "skills",
+			"channels", "bindings", "org", "wizard", "meta", "defaults", "version",
+		]);
+		const extra: Record<string, unknown> = {};
+		let hasExtra = false;
+		for (const [k, v] of Object.entries(cfg as Record<string, unknown>)) {
+			if (NAMED.has(k) || v === undefined) continue;
+			extra[k] = v;
+			hasExtra = true;
+		}
 		try {
 			await this.deps.client.mutation(api.config.write, {
 				instanceId: this.deps.instanceId,
@@ -103,11 +125,13 @@ export class ConvexConfigStore implements ConfigStore {
 				auth:     (cfg as { auth?: unknown }).auth ?? undefined,
 				plugins:  (cfg as { plugins?: unknown }).plugins ?? undefined,
 				skills:   (cfg as { skills?: unknown }).skills ?? undefined,
+				channels: (cfg as { channels?: unknown }).channels ?? undefined,
 				bindings: (cfg as { bindings?: unknown }).bindings ?? undefined,
 				org:      (cfg as { org?: unknown }).org ?? undefined,
 				wizard:   (cfg as { wizard?: unknown }).wizard ?? undefined,
 				meta:     (cfg as { meta?: unknown }).meta ?? undefined,
 				defaults: (cfg as { defaults?: unknown }).defaults ?? undefined,
+				...(hasExtra ? { extra } : {}),
 				contentSha256: sha,
 				bytes,
 				...(opts?.expectedRev !== undefined

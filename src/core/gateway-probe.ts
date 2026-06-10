@@ -136,6 +136,18 @@ export function readHeartbeatFile(pathOverride?: string): GatewayHeartbeat | und
 
 /** Delete the heartbeat file. Called on graceful shutdown. */
 export async function clearHeartbeatFile(): Promise<void> {
+  // Convex mode — clear the gatewayCoord row's heartbeat columns so the next
+  // status/supervise probe doesn't see a stale beat from a stopped gateway.
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    try {
+      await rctx.store.instance.clearHeartbeat();
+    } catch {
+      // Best-effort; a stale heartbeat ages out of the freshness window.
+    }
+    return;
+  }
+
   try {
     await fsAsync.unlink(GATEWAY_HEARTBEAT_PATH);
   } catch (err) {
@@ -295,6 +307,18 @@ export async function writePidFile(): Promise<void> {
  * missing file.
  */
 export async function clearPidFile(): Promise<void> {
+  // Convex mode — clear the gatewayCoord row's pid so the next
+  // `brigade gateway status` doesn't report a dead PID as running.
+  const rctx = tryGetRuntimeContext();
+  if (rctx?.mode === "convex") {
+    try {
+      await rctx.store.instance.clearPid();
+    } catch {
+      // Best-effort; a stale pid is reconciled by the next liveness probe.
+    }
+    return;
+  }
+
   try {
     await fsAsync.unlink(GATEWAY_PID_PATH);
   } catch (err) {

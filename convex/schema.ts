@@ -34,11 +34,15 @@ export default defineSchema({
     auth:     v.optional(v.any()),
     plugins:  v.optional(v.any()),
     skills:   v.optional(v.any()),
+    channels: v.optional(v.any()),
     bindings: v.optional(v.any()),
     org:      v.optional(v.any()),
     wizard:   v.optional(v.any()),
     meta:     v.optional(v.any()),
     defaults: v.optional(v.any()),
+    // Catch-all for any top-level key not named above — preserves the disk
+    // path's unknown-key round-trip guarantee (io.ts orderTopLevelKeys).
+    extra:    v.optional(v.any()),
     encryptedGatewayAuthToken:    v.optional(Enc()),
     encryptedGatewayAuthPassword: v.optional(Enc()),
     contentSha256: v.string(),

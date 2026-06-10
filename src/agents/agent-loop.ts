@@ -124,6 +124,8 @@ import {
 } from "../auth/profile-cooldown.js";
 import { PROVIDERS } from "../providers/catalog.js";
 import { orderProfilesForSelection } from "../auth/profile-cooldown.js";
+import { readProfiles } from "../auth/profiles.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import {
   wrapStreamFnWithIdleTimeout,
   wrapStreamFnWithStopReasonRecovery,
@@ -342,11 +344,15 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   // longer interleave their snapshots — each waits for the previous
   // mark to land on disk before reading.
   let cooldownState = await loadProfileStateLocked(agentId);
-  const authBuild = buildAuthStorage(authProfilesPath, {
-    cooldownState,
-    provider: args.provider,
-    modelId: args.modelId,
-  });
+  const authBuild = buildAuthStorage(
+    authProfilesPath,
+    {
+      cooldownState,
+      provider: args.provider,
+      modelId: args.modelId,
+    },
+    agentId,
+  );
   const authStorage = authBuild.storage;
   const selectedProfileId = authBuild.selectedProfileId;
   const modelRegistry = buildModelRegistry(authStorage, modelsFile);
@@ -1841,10 +1847,12 @@ interface AuthStorageBuildResult {
 function buildAuthStorage(
   authProfilesPath: string,
   cooldownFilter?: AuthStorageCooldownFilter,
+  agentId?: string,
 ): AuthStorageBuildResult {
   const { credentials, selectedProfileId } = readAuthProfilesAsCredentialMap(
     authProfilesPath,
     cooldownFilter,
+    agentId,
   );
   const Storage = AuthStorage as unknown as {
     inMemory?: (data?: unknown) => unknown;
@@ -1898,16 +1906,34 @@ interface ReadCredentialsResult {
 export function readAuthProfilesAsCredentialMap(
   authProfilesPath: string,
   cooldownFilter?: AuthStorageCooldownFilter,
+  agentId?: string,
 ): ReadCredentialsResult {
   const out: Record<string, unknown> = {};
   let selectedProfileId: string | undefined;
   let parsed: {
     profiles?: Record<
       string,
-      { provider?: string; type?: string; key?: string; keyRef?: string; alias?: string }
+      {
+        provider?: string;
+        type?: string;
+        key?: string;
+        keyRef?: string | { source?: string; provider?: string; id?: string };
+        alias?: string;
+      }
     >;
   } = {};
-  if (fs.existsSync(authProfilesPath)) {
+  // Convex mode — no auth-profiles.json on disk; the secrets live as sealed
+  // columns mirrored into the in-process cache at boot. Route through the
+  // mode-aware `readProfiles` choke point so the credential map is populated
+  // identically to filesystem mode. Requires the agentId (the path can't be
+  // reverse-mapped reliably); falls back to the fs read when it's absent.
+  if (agentId && tryGetRuntimeContext()?.mode === "convex") {
+    try {
+      parsed = readProfiles(agentId) as unknown as typeof parsed;
+    } catch {
+      parsed = {};
+    }
+  } else if (fs.existsSync(authProfilesPath)) {
     try {
       parsed = JSON.parse(fs.readFileSync(authProfilesPath, "utf8"));
     } catch {
@@ -1924,8 +1950,11 @@ export function readAuthProfilesAsCredentialMap(
   >();
   for (const [profileId, profile] of Object.entries(parsed.profiles ?? {})) {
     if (!profile?.provider || profile.type !== "api_key") continue;
-    const literal = profile.key ?? profile.keyRef ?? "";
-    const resolvedKey = expandEnvRef(literal, profile.provider);
+    const resolvedKey = resolveCredentialSecret(
+      profile.key,
+      profile.keyRef,
+      profile.provider,
+    );
     if (!resolvedKey) continue;
     const list = byProvider.get(profile.provider) ?? [];
     list.push({ profileId, provider: profile.provider, resolvedKey });
@@ -1969,6 +1998,24 @@ export function readAuthProfilesAsCredentialMap(
   }
 
   return { credentials: out, selectedProfileId };
+}
+
+// Resolve a profile's api-key secret across both persisted shapes:
+//   • literal `key`                       → returned verbatim
+//   • string `keyRef` (legacy `${VAR}`)   → env-expanded
+//   • object `keyRef` (BrigadeSecretRef)  → env-source resolved by `id`
+// File/exec backends need an async resolver and are out of scope for this
+// synchronous credential-map build (they surface "no key" → env fallback).
+function resolveCredentialSecret(
+  key: string | undefined,
+  keyRef: string | { source?: string; provider?: string; id?: string } | undefined,
+  provider: string,
+): string {
+  if (key && key.length > 0) return key;
+  if (!keyRef) return "";
+  if (typeof keyRef === "string") return expandEnvRef(keyRef, provider);
+  if (keyRef.source === "env" && keyRef.id) return process.env[keyRef.id] ?? "";
+  return "";
 }
 
 const ENV_REF_PATTERN = /^\$\{([A-Z_][A-Z0-9_]*)\}$/;

@@ -62,19 +62,47 @@ export const insertJob = mutation({
 		createdByChannelId: v.optional(v.string()),
 		createdByConversationId: v.optional(v.string()),
 		createdByAccountId: v.optional(v.string()),
+		// Honour client timestamps so a filesystem→convex migration preserves
+		// the original create/update times; default to now for fresh jobs.
+		createdAtMs: v.optional(v.number()),
+		updatedAtMs: v.optional(v.number()),
+		// Run-time state — carried through on migration so failure counts +
+		// last-fire bookkeeping survive the move.
+		stateNextRunAtMs: v.optional(v.number()),
+		stateLastRunAtMs: v.optional(v.number()),
+		stateRunningAtMs: v.optional(v.number()),
+		stateLastStatus: v.optional(v.string()),
+		stateLastError: v.optional(v.string()),
+		stateScheduleErrorCount: v.optional(v.number()),
+		stateConsecutiveErrorCount: v.optional(v.number()),
+		stateLastFailureAlertAtMs: v.optional(v.number()),
+		stateLastDelivered: v.optional(v.boolean()),
+		stateLastDeliveryStatus: v.optional(v.string()),
+		stateLastDeliveryError: v.optional(v.string()),
 	},
 	handler: async (ctx, args) => {
 		const now = Date.now();
+		const { createdAtMs, updatedAtMs, ...rest } = args;
 		await ctx.db.insert("cronJobs", {
-			...args,
-			createdAtMs: now,
-			updatedAtMs: now,
+			...rest,
+			createdAtMs: createdAtMs ?? now,
+			updatedAtMs: updatedAtMs ?? now,
 		});
 	},
 });
 
 export const patchJob = mutation({
-	args: { ownerUserId: v.string(), jobId: v.string(), patch: v.any() },
+	args: {
+		ownerUserId: v.string(),
+		jobId: v.string(),
+		patch: v.any(),
+		// Column names to DELETE. Convex's arg serialiser strips
+		// `undefined`-valued object fields before they reach the handler, so a
+		// column can't be cleared from the client by patching it to undefined.
+		// We re-introduce the undefined HERE (server-side) where `db.patch`
+		// honours it as a field deletion.
+		unset: v.optional(v.array(v.string())),
+	},
 	handler: async (ctx, args) => {
 		const existing = await ctx.db
 			.query("cronJobs")
@@ -83,10 +111,14 @@ export const patchJob = mutation({
 			)
 			.first();
 		if (!existing) throw new Error(`cron: job ${args.jobId} not found`);
-		await ctx.db.patch(existing._id, {
+		const patchObj: Record<string, unknown> = {
 			...(args.patch as Record<string, unknown>),
 			updatedAtMs: Date.now(),
-		});
+		};
+		if (args.unset) {
+			for (const col of args.unset) patchObj[col] = undefined;
+		}
+		await ctx.db.patch(existing._id, patchObj);
 		return await ctx.db.get(existing._id);
 	},
 });
