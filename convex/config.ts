@@ -80,10 +80,89 @@ export const write = mutation({
 			updatedAtMs: Date.now(),
 		};
 		if (existing) {
+			// Snapshot the PRIOR config into the backup ring before overwriting —
+			// the convex equivalent of io.ts rotateBackups' .bak chain. Only on a
+			// real content change (skip no-op rewrites so the ring isn't flooded
+			// with identical snapshots). Ring of BACKUP_COUNT, slot 0 = newest.
+			if (existing.contentSha256 !== args.contentSha256) {
+				await captureBackup(ctx, args.instanceId, existing);
+			}
 			await ctx.db.replace(existing._id, payload);
 			return { rev: args.contentSha256, updated: true };
 		}
 		await ctx.db.insert("brigadeConfig", payload);
 		return { rev: args.contentSha256, updated: false };
+	},
+});
+
+// Keep the same depth as the filesystem .bak rotation (io.ts BACKUP_COUNT).
+const BACKUP_COUNT = 5;
+
+/** Rebuild the brigade.json shape from a stored brigadeConfig row (inverse of
+ *  the `write` payload): named domain columns that are set + the `extra`
+ *  catch-all (which also carries the legacy top-level `version`). */
+function reconstructConfig(row: Record<string, unknown>): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	for (const k of [
+		"agents", "gateway", "session", "tools", "auth", "plugins", "skills",
+		"channels", "bindings", "org", "wizard", "meta", "defaults",
+	]) {
+		if (row[k] !== undefined) out[k] = row[k];
+	}
+	const extra = row.extra as Record<string, unknown> | undefined;
+	if (extra && typeof extra === "object") {
+		for (const [k, v2] of Object.entries(extra)) if (out[k] === undefined) out[k] = v2;
+	}
+	return out;
+}
+
+/** Insert a backup at slot 0, shifting existing slots up and dropping anything
+ *  beyond BACKUP_COUNT-1 — a ring identical in depth to the disk .bak chain. */
+async function captureBackup(
+	ctx: { db: any },
+	instanceId: string,
+	priorRow: Record<string, unknown>,
+): Promise<void> {
+	const existing = await ctx.db
+		.query("brigadeConfigBackups")
+		.withIndex("by_instance_slot", (q: any) => q.eq("instanceId", instanceId))
+		.collect();
+	for (const b of existing) {
+		if (b.slot >= BACKUP_COUNT - 1) await ctx.db.delete(b._id);
+		else await ctx.db.patch(b._id, { slot: b.slot + 1 });
+	}
+	await ctx.db.insert("brigadeConfigBackups", {
+		instanceId,
+		slot: 0,
+		contentSha256: (priorRow.contentSha256 as string) ?? "",
+		payload: JSON.stringify(reconstructConfig(priorRow)),
+		bytes: (priorRow.bytes as number) ?? 0,
+		capturedAtMs: Date.now(),
+	});
+}
+
+export const listBackups = query({
+	args: { instanceId: v.string() },
+	handler: async (ctx, args) => {
+		const rows = await ctx.db
+			.query("brigadeConfigBackups")
+			.withIndex("by_instance_slot", (q) => q.eq("instanceId", args.instanceId))
+			.collect();
+		return rows
+			.sort((a, b) => a.slot - b.slot)
+			.map((r) => ({ slot: r.slot, sha256: r.contentSha256, mtimeMs: r.capturedAtMs, bytes: r.bytes }));
+	},
+});
+
+export const getBackup = query({
+	args: { instanceId: v.string(), slot: v.number() },
+	handler: async (ctx, args) => {
+		const row = await ctx.db
+			.query("brigadeConfigBackups")
+			.withIndex("by_instance_slot", (q) =>
+				q.eq("instanceId", args.instanceId).eq("slot", args.slot),
+			)
+			.first();
+		return row ? { payload: row.payload, sha256: row.contentSha256 } : null;
 	},
 });

@@ -205,15 +205,31 @@ export class ConvexConfigStore implements ConfigStore {
 	async listBackups(): Promise<
 		Array<{ slot: number; sha256: string; mtimeMs: number; bytes: number }>
 	> {
-		// brigadeConfigBackups table exists in the schema but isn't populated
-		// until a separate "snapshot" call is wired. Return empty for now;
-		// the doctor + restore flow will surface this when needed.
-		return [];
+		// Populated by the `write` mutation's backup ring (the convex twin of
+		// io.ts rotateBackups). Slot 0 = newest.
+		return (await this.deps.client.query(api.config.listBackups, {
+			instanceId: this.deps.instanceId,
+		})) as Array<{ slot: number; sha256: string; mtimeMs: number; bytes: number }>;
 	}
 
-	async restoreBackup(_slot: number): Promise<BrigadeConfig> {
-		throw new Error(
-			"ConvexConfigStore.restoreBackup not wired yet — restore via the dashboard or re-run `brigade onboard`.",
-		);
+	async restoreBackup(slot: number): Promise<BrigadeConfig> {
+		// Convex gives us a real restore (unlike the filesystem stub, which
+		// requires hand-copying a .bak): read the snapshot payload and return
+		// the parsed config. The caller decides whether to write it back as the
+		// new current (a subsequent write() snapshots the pre-restore state too).
+		const row = (await this.deps.client.query(api.config.getBackup, {
+			instanceId: this.deps.instanceId,
+			slot,
+		})) as { payload: string; sha256: string } | null;
+		if (!row) {
+			throw new Error(`ConvexConfigStore.restoreBackup: no backup at slot ${slot}`);
+		}
+		try {
+			return JSON.parse(row.payload) as BrigadeConfig;
+		} catch (err) {
+			throw new Error(
+				`ConvexConfigStore.restoreBackup: backup at slot ${slot} is unparseable — ${(err as Error).message}`,
+			);
+		}
 	}
 }
