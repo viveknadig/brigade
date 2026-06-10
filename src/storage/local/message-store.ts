@@ -149,6 +149,37 @@ export class LocalMessageStore implements MessageStore {
 		sm.appendCustomEntry(customType, data);
 	}
 
+	async appendRecordsBatch(
+		agentId: string,
+		sessionId: string,
+		records: PiTranscriptRecord[],
+	): Promise<void> {
+		// Filesystem mode never uses the batch path — Pi's SessionManager owns
+		// the JSONL and appends inline. Realise as raw line appends for the
+		// migrate engine's benefit only.
+		const transcriptPath = resolveSessionTranscriptPath(agentId, sessionId);
+		const lines = records.map((r) => `${JSON.stringify(r)}\n`).join("");
+		const { appendFileSync, mkdirSync } = await import("node:fs");
+		const { dirname } = await import("node:path");
+		mkdirSync(dirname(transcriptPath), { recursive: true });
+		appendFileSync(transcriptPath, lines, "utf8");
+	}
+
+	async replaceTranscript(
+		agentId: string,
+		sessionId: string,
+		records: PiTranscriptRecord[],
+	): Promise<void> {
+		const transcriptPath = resolveSessionTranscriptPath(agentId, sessionId);
+		const body = records.map((r) => `${JSON.stringify(r)}\n`).join("");
+		const { mkdirSync, renameSync, writeFileSync } = await import("node:fs");
+		const { dirname } = await import("node:path");
+		mkdirSync(dirname(transcriptPath), { recursive: true });
+		const tmp = `${transcriptPath}.tmp-${process.pid}-${Date.now().toString(36)}`;
+		writeFileSync(tmp, body, "utf8");
+		renameSync(tmp, transcriptPath);
+	}
+
 	async readTranscript(
 		agentId: string,
 		sessionId: string,

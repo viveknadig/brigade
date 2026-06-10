@@ -89,6 +89,7 @@ import { runCronIsolatedAgentJob } from "../cron/isolated-agent/run.js";
 import { createCronServiceState } from "../cron/service/state.js";
 import { start as cronStart, stop as cronStop } from "../cron/service/ops.js";
 import { bootRuntimeContext, enableConfigLiveRefresh } from "../storage/boot.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import {
 	DEFAULT_AGENT_ID,
@@ -264,10 +265,10 @@ function isLocalhostBind(host: string): boolean {
  * the caller's `limit`. Defensive fallbacks on every error path so a
  * corrupt or missing file never crashes the gateway.
  */
-function readSessionTranscriptMessages(params: {
+async function readSessionTranscriptMessages(params: {
 	sessionKey: string;
 	limit?: number;
-}): ReadonlyArray<unknown> {
+}): Promise<ReadonlyArray<unknown>> {
 	const sessionKey = (params.sessionKey ?? "").trim();
 	if (!sessionKey) return [];
 	const parsed = parseAgentSessionKey(sessionKey);
@@ -281,6 +282,28 @@ function readSessionTranscriptMessages(params: {
 	}
 	const sessionId = entry?.sessionId;
 	if (!sessionId) return [];
+
+	// Convex mode — project the transcript rows instead of the JSONL file.
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode === "convex") {
+		try {
+			const records = await rctx.store.messages.readTranscript(agentId, sessionId);
+			const messages: unknown[] = [];
+			for (const record of records) {
+				const r = record as { type?: string; message?: unknown };
+				if (r?.type === "message" && r.message !== undefined) messages.push(r.message);
+			}
+			const limit =
+				typeof params.limit === "number" && params.limit > 0 ? params.limit : undefined;
+			if (limit !== undefined && messages.length > limit) {
+				return messages.slice(messages.length - limit);
+			}
+			return messages;
+		} catch {
+			return [];
+		}
+	}
+
 	let transcriptPath: string;
 	try {
 		transcriptPath = resolveSessionTranscriptPath(agentId, sessionId);
@@ -4438,6 +4461,14 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			try {
 				const { awaitProfileStateFlush } = await import("../auth/profile-cooldown.js");
 				await awaitProfileStateFlush();
+			} catch {
+				/* best-effort */
+			}
+			try {
+				const { awaitTranscriptFlush } = await import(
+					"../sessions/session-manager-factory.js"
+				);
+				await awaitTranscriptFlush();
 			} catch {
 				/* best-effort */
 			}

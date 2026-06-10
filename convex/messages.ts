@@ -34,6 +34,87 @@ export const appendRecord = mutation({
 	},
 });
 
+/** Ordered batch append — the convex-mode SessionManager write-behind queue
+ *  flushes whole batches in one transaction so a mid-batch crash can't leave
+ *  a torn parent-id chain. */
+export const appendRecordsBatch = mutation({
+	args: {
+		agentId: v.string(),
+		sessionId: v.string(),
+		records: v.array(
+			v.object({
+				type: v.string(),
+				customType: v.optional(v.string()),
+				payload: v.bytes(),
+			}),
+		),
+	},
+	handler: async (ctx, args) => {
+		const tail = await ctx.db
+			.query("sessionTranscriptRecords")
+			.withIndex("by_session_seq", (q) =>
+				q.eq("agentId", args.agentId).eq("sessionId", args.sessionId),
+			)
+			.order("desc")
+			.first();
+		let seq = (tail?.seq ?? 0) + 1;
+		const now = Date.now();
+		for (const r of args.records) {
+			await ctx.db.insert("sessionTranscriptRecords", {
+				agentId: args.agentId,
+				sessionId: args.sessionId,
+				seq,
+				type: r.type,
+				...(r.customType !== undefined ? { customType: r.customType } : {}),
+				payload: r.payload,
+				createdAt: now,
+			});
+			seq += 1;
+		}
+		return { lastSeq: seq - 1 };
+	},
+});
+
+/** Wholesale transcript replace — realises Pi's `_rewriteFile` (v1→v3
+ *  migration, branch extraction) as one transaction. */
+export const replaceTranscript = mutation({
+	args: {
+		agentId: v.string(),
+		sessionId: v.string(),
+		records: v.array(
+			v.object({
+				type: v.string(),
+				customType: v.optional(v.string()),
+				payload: v.bytes(),
+			}),
+		),
+	},
+	handler: async (ctx, args) => {
+		const existing = await ctx.db
+			.query("sessionTranscriptRecords")
+			.withIndex("by_session_seq", (q) =>
+				q.eq("agentId", args.agentId).eq("sessionId", args.sessionId),
+			)
+			.collect();
+		for (const r of existing) await ctx.db.delete(r._id);
+		const now = Date.now();
+		let seq = 1;
+		for (const r of args.records) {
+			await ctx.db.insert("sessionTranscriptRecords", {
+				agentId: args.agentId,
+				sessionId: args.sessionId,
+				seq,
+				type: r.type,
+				...(r.customType !== undefined ? { customType: r.customType } : {}),
+				payload: r.payload,
+				createdAt: now,
+			});
+			seq += 1;
+		}
+		return { count: args.records.length };
+	},
+});
+
 export const readTranscript = query({
 	args: {
 		agentId: v.string(),

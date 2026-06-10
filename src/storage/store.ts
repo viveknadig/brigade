@@ -303,6 +303,20 @@ export type SystemEvent = Record<string, unknown>;
 
 export interface MessageStore {
 	appendRecord(agentId: string, sessionId: string, record: PiTranscriptRecord): Promise<void>;
+	/** Ordered batch — one transaction, no torn parent-id chains. Powers the
+	 *  convex-mode SessionManager write-behind flush. */
+	appendRecordsBatch(
+		agentId: string,
+		sessionId: string,
+		records: PiTranscriptRecord[],
+	): Promise<void>;
+	/** Wholesale replace — realises Pi's `_rewriteFile` (migration, branch
+	 *  extraction) transactionally. */
+	replaceTranscript(
+		agentId: string,
+		sessionId: string,
+		records: PiTranscriptRecord[],
+	): Promise<void>;
 	readTranscript(
 		agentId: string,
 		sessionId: string,

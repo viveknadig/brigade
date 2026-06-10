@@ -347,8 +347,11 @@ export function makeIsolatedLlm(
 	args: MakeExtractionLlmArgs,
 ): (input: string) => Promise<string> {
 	return async (input: string): Promise<string> => {
-		const tmpTranscript = path.join(args.agentDir, "sessions", `.subagent-${randomUUID()}.jsonl`);
-		const sessionManager = SessionManager.open(tmpTranscript);
+		// Throwaway transcript — deleted right after the call in the old shape,
+		// so writing it to disk at all was pure waste. `inMemory()` skips ALL
+		// persistence (both modes); convex mode additionally needs this so the
+		// isolated sweep writes nothing under ~/.brigade.
+		const sessionManager = SessionManager.inMemory(args.workspaceDir);
 		try {
 			const { session } = await createAgentSession({
 				cwd: args.workspaceDir,
@@ -389,11 +392,8 @@ export function makeIsolatedLlm(
 			}
 			return lastAssistantText(session as AgentSession);
 		} finally {
-			try {
-				fs.rmSync(tmpTranscript, { force: true });
-			} catch {
-				/* best-effort cleanup */
-			}
+			// inMemory() session — nothing to clean up; entries die with the
+			// manager reference.
 		}
 	};
 }

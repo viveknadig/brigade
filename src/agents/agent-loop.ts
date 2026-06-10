@@ -40,6 +40,10 @@ import {
   defaultSessionKey,
   resolveOrCreateSession,
 } from "../sessions/session-store.js";
+import {
+  awaitTranscriptFlush,
+  openSessionManagerForAgent,
+} from "../sessions/session-manager-factory.js";
 import { readConfigOrInit, type BrigadeConfig } from "../config/io.js";
 import { discoverEligibleSkills } from "./skills/index.js";
 import { BUNDLED_MODULES } from "./extensions/index.js";
@@ -435,6 +439,18 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
       model,
     });
   } finally {
+    // Convex mode: drain the transcript write-behind queue before the lock
+    // releases — the next turn's readTranscript must see this turn's rows.
+    // Filesystem mode resolves immediately (Pi appended inline). Bounded so
+    // a wedged backend can't hold the session lock hostage.
+    try {
+      await Promise.race([
+        awaitTranscriptFlush(),
+        new Promise<void>((resolve) => setTimeout(resolve, 5_000).unref?.()),
+      ]);
+    } catch {
+      /* flush failures already logged by the factory */
+    }
     await sessionLock.release();
   }
 
@@ -462,9 +478,16 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   let cooldownState = p.cooldownState;
   const selectedProfileId = p.selectedProfileId;
 
-  // SessionManager.open creates the JSONL on first write; passing the
-  // canonical transcript path keeps Pi and brigade aligned on filenames.
-  const sessionManager = SessionManager.open(resolved.transcriptPath);
+  // Filesystem mode: SessionManager.open creates the JSONL on first write;
+  // passing the canonical transcript path keeps Pi and brigade aligned on
+  // filenames. Convex mode: an inMemory() manager pre-seeded from the
+  // sessionTranscriptRecords table whose appends flush to Convex — the
+  // factory owns that dispatch (src/sessions/session-manager-factory.ts).
+  const sessionManager = await openSessionManagerForAgent({
+    agentId,
+    sessionId: resolved.sessionId,
+    transcriptPath: resolved.transcriptPath,
+  });
 
   // Anthropic models are the only family today that enforce a hard
   // cache_control breakpoint cap (Anthropic accepts ≤4). Run the sweep

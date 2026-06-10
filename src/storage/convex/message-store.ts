@@ -46,6 +46,45 @@ export class ConvexMessageStore implements MessageStore {
 		});
 	}
 
+	async appendRecordsBatch(
+		agentId: string,
+		sessionId: string,
+		records: PiTranscriptRecord[],
+	): Promise<void> {
+		if (records.length === 0) return;
+		await this.deps.client.mutation(api.messages.appendRecordsBatch, {
+			agentId,
+			sessionId,
+			records: records.map((record) => {
+				const customType = (record as { customType?: unknown }).customType;
+				return {
+					type: record.type,
+					...(typeof customType === "string" ? { customType } : {}),
+					payload: jsonToBytes(record),
+				};
+			}),
+		});
+	}
+
+	async replaceTranscript(
+		agentId: string,
+		sessionId: string,
+		records: PiTranscriptRecord[],
+	): Promise<void> {
+		await this.deps.client.mutation(api.messages.replaceTranscript, {
+			agentId,
+			sessionId,
+			records: records.map((record) => {
+				const customType = (record as { customType?: unknown }).customType;
+				return {
+					type: record.type,
+					...(typeof customType === "string" ? { customType } : {}),
+					payload: jsonToBytes(record),
+				};
+			}),
+		});
+	}
+
 	async readTranscript(
 		agentId: string,
 		sessionId: string,
