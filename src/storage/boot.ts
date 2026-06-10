@@ -39,6 +39,11 @@ export async function bootRuntimeContext(): Promise<RuntimeContext> {
 		_inflight = (async () => {
 			const ctx = await createRuntimeContext();
 			if (ctx.mode === "convex") {
+				// Enforcement that ~/.brigade stays file-free (modulo the
+				// allowlist): preventive fs patches + a detective watcher.
+				// BRIGADE_STRICT_MODE=off|warn|enforce (default warn).
+				const { installStrictGuard } = await import("./strict-guard.js");
+				installStrictGuard(ctx.stateDir);
 				const { value } = await ctx.store.config.read();
 				// First-boot parity with the disk path: an absent row reads as
 				// `{}`; the disk path's absent-file shape is `{ agents: {} }`.
