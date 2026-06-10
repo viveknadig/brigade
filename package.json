@@ -117,7 +117,8 @@
     "store:mode:set": "node scripts/run-brigade.mjs store mode set",
     "convex:install": "node scripts/install-convex.mjs",
     "convex:dev": "node scripts/install-convex.mjs && node scripts/convex-dev.mjs",
-    "convex:codegen": "convex codegen --admin-key \"$(node -e \"process.stdout.write(require('node:fs').readFileSync('.convex-data/admin-key.txt', 'utf8').trim())\")\" --url http://127.0.0.1:3210"
+    "convex:codegen": "convex codegen --admin-key \"$(node -e \"process.stdout.write(require('node:fs').readFileSync('.convex-data/admin-key.txt', 'utf8').trim())\")\" --url http://127.0.0.1:3210",
+    "smoke:strict-zero": "tsx scripts/strict-zero-smoke.mjs"
   },
   "engines": {
     "node": ">=22.12"

@@ -59,6 +59,14 @@ live sealed in Convex; the old on-disk auth dir is not migrated by design.
 
 ## Verifying strict-zero
 
+Automated end-to-end check (run while the backend is up, after onboard):
+
+```powershell
+npm run smoke:strict-zero
+# PASS = every domain round-trips through Convex AND ~/.brigade stayed clean
+```
+
+
 The guard is on by default in convex mode (`BRIGADE_STRICT_MODE=warn`):
 every write targeting `~/.brigade/` outside the allowlist (sentinel +
 workspace) is logged loudly with a stack. Flip to hard enforcement once a
