@@ -55,6 +55,7 @@ export async function bootRuntimeContext(): Promise<RuntimeContext> {
 					hydrateFactsCaches(ctx.store, cfg as Record<string, unknown>),
 					hydrateAuthCaches(ctx.store, cfg as Record<string, unknown>),
 					materialiseModelsCatalog(ctx.store),
+					syncWorkspaceMirrors(ctx.store, cfg as Record<string, unknown>),
 				]);
 			}
 			setRuntimeContext(ctx);
@@ -277,6 +278,113 @@ async function materialiseModelsCatalog(store: BrigadeStore): Promise<void> {
 			`brigade: models catalog materialisation failed — ${(err as Error).message}`,
 		);
 	}
+}
+
+/** Convex mode boot — two-way workspace mirror sync.
+ *
+ *  The workspace DIRECTORY stays fully local in both modes (operator
+ *  decision 2026-06-10): it is the agent's CWD, the git repo lives there,
+ *  and Pi tools read/write it natively. Convex's personaFiles +
+ *  workspaceState tables are the MIRROR:
+ *
+ *    • disk file present → push to Convex when content differs (the disk
+ *      copy is the working copy — disk wins while it exists)
+ *    • disk file missing but a Convex row exists → materialise to disk
+ *      (fresh machine, or the operator deleted ~/.brigade — customised
+ *      personas come back; only git history is lost, by design)
+ *
+ *  Runs BEFORE onboarding's bootstrapWorkspace can seed templates, so the
+ *  `wx` create-only flag preserves restored customisations over templates.
+ *  Agents that never had their own workspace (they share the top-level
+ *  one) have neither disk dirs nor Convex rows — both directions no-op. */
+async function syncWorkspaceMirrors(
+	store: BrigadeStore,
+	cfg: Record<string, unknown>,
+): Promise<void> {
+	const fsp = await import("node:fs/promises");
+	const { existsSync } = await import("node:fs");
+	const path = await import("node:path");
+	const { resolveAgentWorkspaceDir } = await import("../config/paths.js");
+	const { readWorkspaceState, markBootstrapSeeded, markSetupCompleted } = await import(
+		"../workspace/state.js"
+	);
+
+	const PERSONA_NAMES = [
+		"AGENTS.md",
+		"SOUL.md",
+		"IDENTITY.md",
+		"USER.md",
+		"TOOLS.md",
+		"BOOTSTRAP.md",
+		"MEMORY.md",
+		"HEARTBEAT.md",
+	] as const;
+
+	const agents = cfg.agents as Record<string, unknown> | undefined;
+	const ids = new Set<string>(["main"]);
+	if (agents && typeof agents === "object") {
+		for (const key of Object.keys(agents)) {
+			if (key === "defaults" || !key.trim()) continue;
+			ids.add(key.trim());
+		}
+	}
+
+	await Promise.all(
+		Array.from(ids, async (agentId) => {
+			try {
+				const workspaceDir = resolveAgentWorkspaceDir(agentId);
+				const dirExists = existsSync(workspaceDir);
+				const rows = await store.workspace.listPersona(agentId);
+				const byName = new Map(rows.map((r) => [r.name, r] as const));
+				if (!dirExists && rows.length === 0) return; // never materialised
+
+				for (const name of PERSONA_NAMES) {
+					const filePath = path.join(workspaceDir, name);
+					const onDisk = existsSync(filePath);
+					const inConvex = byName.get(name);
+					if (onDisk) {
+						const content = await fsp.readFile(filePath, "utf8");
+						if (!inConvex || inConvex.content !== content) {
+							await store.workspace.writePersona(agentId, name, content);
+						}
+					} else if (inConvex) {
+						await fsp.mkdir(workspaceDir, { recursive: true });
+						await fsp.writeFile(filePath, inConvex.content, "utf8");
+					}
+				}
+
+				// Lifecycle marker — same two-way rule.
+				const diskState = dirExists
+					? await readWorkspaceState(workspaceDir)
+					: { version: 1 };
+				const convexState = await store.workspace.readState(agentId);
+				if (diskState.bootstrapSeededAt && !convexState.bootstrapSeededAt) {
+					await store.workspace.markBootstrapSeeded(agentId);
+				}
+				if (diskState.setupCompletedAt && !convexState.setupCompletedAt) {
+					await store.workspace.markSetupCompleted(agentId);
+				}
+				if (!diskState.bootstrapSeededAt && convexState.bootstrapSeededAt) {
+					await markBootstrapSeeded(workspaceDir);
+				}
+				if (!diskState.setupCompletedAt && convexState.setupCompletedAt) {
+					await markSetupCompleted(workspaceDir);
+				}
+			} catch (err) {
+				console.error(
+					`brigade: workspace mirror sync failed for agent ${agentId} — ${(err as Error).message}`,
+				);
+			}
+		}),
+	);
+}
+
+/** Test-only — exercise the workspace mirror sync against a stub store. */
+export async function __syncWorkspaceMirrorsForTests(
+	store: BrigadeStore,
+	cfg: Record<string, unknown>,
+): Promise<void> {
+	await syncWorkspaceMirrors(store, cfg);
 }
 
 let _configLiveUnsub: (() => void) | undefined;
