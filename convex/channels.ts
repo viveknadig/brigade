@@ -354,6 +354,61 @@ export const revokePairing = mutation({
 	},
 });
 
+// ============================================================================
+// Media blobs (channelMediaBlob + Convex File Storage)
+// ============================================================================
+
+export const generateMediaUploadUrl = mutation({
+	args: {},
+	handler: async (ctx) => {
+		return await ctx.storage.generateUploadUrl();
+	},
+});
+
+export const recordMediaBlob = mutation({
+	args: {
+		ownerId: v.string(),
+		channelId: v.string(),
+		accountId: v.string(),
+		messageId: v.string(),
+		index: v.number(),
+		mimeType: v.string(),
+		fileName: v.optional(v.string()),
+		storageId: v.id("_storage"),
+		bytes: v.number(),
+	},
+	handler: async (ctx, args) => {
+		await ctx.db.insert("channelMediaBlob", { ...args, createdAt: Date.now() });
+		return { ok: true };
+	},
+});
+
+export const getMediaBlobUrl = query({
+	args: {
+		ownerId: v.string(),
+		channelId: v.string(),
+		accountId: v.string(),
+		messageId: v.string(),
+		index: v.number(),
+	},
+	handler: async (ctx, args) => {
+		const row = await ctx.db
+			.query("channelMediaBlob")
+			.withIndex("by_owner_channel_account_msg", (q) =>
+				q
+					.eq("ownerId", args.ownerId)
+					.eq("channelId", args.channelId)
+					.eq("accountId", args.accountId)
+					.eq("messageId", args.messageId),
+			)
+			.collect();
+		const match = row.find((r) => r.index === args.index);
+		if (!match) return null;
+		const url = await ctx.storage.getUrl(match.storageId);
+		return url ? { url, mimeType: match.mimeType, bytes: match.bytes } : null;
+	},
+});
+
 export const writeAuthFile = mutation({
 	args: {
 		ownerId: v.string(),

@@ -12,7 +12,7 @@ import type {
 
 interface Deps { client: ConvexHttpClient; ownerId: string; stateDir: string }
 
-import { open as openSealed, sealString } from "../encryption.js";
+import { open as openSealed, seal as sealBytes, sealString } from "../encryption.js";
 
 function stringToBytes(s: string): ArrayBuffer {
 	return sealString(s);
@@ -208,10 +208,37 @@ export class ConvexChannelStore implements ChannelStore {
 		mimeType: string;
 		bytes: Buffer;
 	}): Promise<{ ref: string; size: number }> {
-		// Convex File Storage flow is a follow-up. Until then return a
-		// stub locator carrying the message id so callers can move on.
+		// Convex File Storage upload flow: short-lived upload URL → HTTP POST
+		// the (sealed) bytes → record the channelMediaBlob row pointing at
+		// the storage id. Bytes are sealed with the operator key before they
+		// leave the process (passthrough when no key is set — same posture as
+		// every other sealed column).
+		const sealed = sealBytes(args.bytes);
+		const uploadUrl = (await this.deps.client.mutation(
+			api.channels.generateMediaUploadUrl,
+			{},
+		)) as string;
+		const res = await fetch(uploadUrl, {
+			method: "POST",
+			headers: { "Content-Type": "application/octet-stream" },
+			body: sealed,
+		});
+		if (!res.ok) {
+			throw new Error(`media upload failed: HTTP ${res.status}`);
+		}
+		const { storageId } = (await res.json()) as { storageId: string };
+		await this.deps.client.mutation(api.channels.recordMediaBlob, {
+			ownerId: this.deps.ownerId,
+			channelId: args.channelId,
+			accountId: (args.accountId ?? "default") || "default",
+			messageId: args.messageId,
+			index: args.index,
+			mimeType: args.mimeType,
+			storageId: storageId as never,
+			bytes: args.bytes.byteLength,
+		});
 		return {
-			ref: `convex-pending:${args.messageId}:${args.index}`,
+			ref: `convex-file:${args.messageId}:${args.index}`,
 			size: args.bytes.byteLength,
 		};
 	}

@@ -15,8 +15,53 @@ import path from "node:path";
 
 import type { WAMessage } from "@whiskeysockets/baileys";
 
-import { resolveChannelStateDir } from "../../../config/paths.js";
+import { resolveChannelStateDir, resolveOsCacheDir } from "../../../config/paths.js";
+import { tryGetRuntimeContext } from "../../../storage/runtime-context.js";
 import type { InboundMediaAttachment } from "../../extensions/types.js";
+
+/* ───────────────────── convex-mode background mirror ─────────────────────
+ * Latency posture (operator decision 2026-06-10): the LOCAL file is the
+ * hot path — Baileys streams from disk with zero added latency, downstream
+ * consumers (send_media, the agent's read tool) get a real path
+ * immediately. The Convex copy is a fire-and-forget background upload for
+ * durability/cross-machine history; a failed mirror logs and never blocks
+ * or fails the message flow. */
+
+let mediaMirrorChain: Promise<void> = Promise.resolve();
+
+function enqueueMediaMirror(args: {
+	messageId: string;
+	index: number;
+	mimeType: string;
+	bytes: Buffer;
+	log: (msg: string, meta?: Record<string, unknown>) => void;
+}): void {
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode !== "convex") return;
+	const store = rctx.store;
+	mediaMirrorChain = mediaMirrorChain
+		.then(() =>
+			store.channels.putInboundMedia({
+				channelId: CHANNEL_ID,
+				messageId: args.messageId,
+				index: args.index,
+				mimeType: args.mimeType,
+				bytes: args.bytes,
+			}),
+		)
+		.then(() => {})
+		.catch((err) => {
+			args.log("media mirror to convex failed (local copy unaffected)", {
+				messageId: args.messageId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		});
+}
+
+/** Drained by the gateway on shutdown. */
+export function awaitMediaMirrorFlush(): Promise<void> {
+	return mediaMirrorChain;
+}
 
 const CHANNEL_ID = "whatsapp";
 /** Cap a single attachment at 50 MB — past this it's almost certainly noise. */
@@ -133,11 +178,25 @@ export async function downloadInboundMedia(args: DownloadInboundMediaArgs): Prom
 				});
 				continue;
 			}
-			const dir = path.join(resolveChannelStateDir(CHANNEL_ID), "media", dayBucket());
+			// Local cache is the hot path in BOTH modes; in convex mode it
+			// relocates to the OS cache dir (never ~/.brigade) and the same
+			// bytes mirror to Convex in the background.
+			const baseDir =
+				tryGetRuntimeContext()?.mode === "convex"
+					? path.join(resolveOsCacheDir(), "channels", CHANNEL_ID)
+					: resolveChannelStateDir(CHANNEL_ID);
+			const dir = path.join(baseDir, "media", dayBucket());
 			mkdirSync(dir, { recursive: true });
 			const suffix = MEDIA_FIELDS.length > 1 ? `-${index}` : "";
 			const filePath = path.join(dir, `${args.msgId}${suffix}.${extFromMime(mime)}`);
 			writeFileSync(filePath, bytes, { mode: 0o600 });
+			enqueueMediaMirror({
+				messageId: args.msgId,
+				index,
+				mimeType: mime,
+				bytes,
+				log: args.log,
+			});
 			out.push({
 				kind: spec.kind,
 				path: filePath,
