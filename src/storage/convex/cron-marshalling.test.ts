@@ -65,7 +65,7 @@ describe("cron marshalling — schedule round-trip", () => {
 
 	it("omits absent optional schedule fields (no tz/stagger keys leak back)", () => {
 		const job = baseJob({ schedule: { kind: "cron", expr: "* * * * *" } });
-		const back = roundTrip(job).schedule as Record<string, unknown>;
+		const back = roundTrip(job).schedule as unknown as Record<string, unknown>;
 		assert.equal("tz" in back, false);
 		assert.equal("staggerMs" in back, false);
 	});

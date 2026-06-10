@@ -2,6 +2,25 @@ import { Command } from "commander";
 
 import { formatVersion } from "../../version.js";
 
+// ─────────────────────────── exit drain ───────────────────────────
+// Every command action terminates with `await exitAfterFlush(code)` instead
+// of a bare `process.exit(code)`. In convex mode the storage adapters batch
+// mutations onto write-behind chains; a short-lived CLI command that mutates
+// then exits immediately would terminate the process before the enqueued
+// write reached the backend (a silent lost write — `brigade exec allow`,
+// `brigade config set`, `brigade channels allow`, …). Draining first closes
+// that window. Filesystem mode + read-only commands drain already-settled
+// chains, so this is free there.
+async function exitAfterFlush(code: number): Promise<never> {
+  try {
+    const { flushAllPendingWrites } = await import("../../storage/flush.js");
+    await flushAllPendingWrites();
+  } catch {
+    // Never let a drain failure block process termination.
+  }
+  process.exit(code);
+}
+
 // ─────────────────────────── storage boot hook ───────────────────────────
 // One preAction hook initialises the RuntimeContext (mode sentinel → store →
 // `store.init()`) before ANY command action runs. Subsystems then reach
@@ -133,7 +152,7 @@ export function buildProgram(): Command {
         noEnvDetect: opts.envDetect === false,
         secretInputMode: mode,
       });
-      process.exit(code);
+      await exitAfterFlush(code);
     });
 
   program
@@ -159,9 +178,9 @@ export function buildProgram(): Command {
       const { runChatCommand } = await import("../commands/chat.js");
       await runChatCommand({ noEnvDetect: opts.envDetect === false, host: opts.host, port: opts.port });
       // Hold the action handler open — `runChatCommand` resolves once the
-      // editor is wired; without this pin, entry.ts's `process.exit(0)`
+      // editor is wired; without this pin, the entry-point exit hook
       // would kill the chat before the user could type. The chat itself
-      // exits via process.exit() on /exit / Ctrl+D / two-Ctrl+C.
+      // terminates on /exit / Ctrl+D / two-Ctrl+C.
       await new Promise<void>(() => {});
     });
 
@@ -216,7 +235,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { host?: string; port?: number; json?: boolean }) => {
       const { runGatewayStatusCommand } = await import("../commands/gateway.js");
-      process.exit(await runGatewayStatusCommand(opts));
+      await exitAfterFlush(await runGatewayStatusCommand(opts));
     });
 
   gw.command("stop")
@@ -225,7 +244,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { timeout?: number; json?: boolean }) => {
       const { runGatewayStopCommand } = await import("../commands/gateway.js");
-      process.exit(await runGatewayStopCommand(opts));
+      await exitAfterFlush(await runGatewayStopCommand(opts));
     });
 
   // OS-service installer: macOS launchd / Linux systemd-user / Windows Task
@@ -236,7 +255,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runGatewayInstall } = await import("../commands/gateway-install.js");
-      process.exit(await runGatewayInstall({ json: opts.json }));
+      await exitAfterFlush(await runGatewayInstall({ json: opts.json }));
     });
 
   gw.command("uninstall")
@@ -244,7 +263,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runGatewayUninstall } = await import("../commands/gateway-install.js");
-      process.exit(await runGatewayUninstall({ json: opts.json }));
+      await exitAfterFlush(await runGatewayUninstall({ json: opts.json }));
     });
 
   gw.command("restart")
@@ -252,7 +271,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runGatewayRestart } = await import("../commands/gateway-install.js");
-      process.exit(await runGatewayRestart({ json: opts.json }));
+      await exitAfterFlush(await runGatewayRestart({ json: opts.json }));
     });
 
   // Out-of-process watchdog. Reads the gateway's heartbeat file every N
@@ -296,7 +315,7 @@ export function buildProgram(): Command {
         json?: boolean;
       }) => {
         const { runGatewaySupervise } = await import("../commands/gateway-supervise.js");
-        process.exit(
+        await exitAfterFlush(
           await runGatewaySupervise({
             intervalMs: opts.interval,
             maxStaleMs: opts.maxStale,
@@ -363,7 +382,7 @@ export function buildProgram(): Command {
     .option("--strict", "exit non-zero on warnings (CI mode)", false)
     .action(async (opts: { host?: string; port?: number; json?: boolean; strict?: boolean }) => {
       const { runDoctorCommand } = await import("../commands/doctor.js");
-      process.exit(
+      await exitAfterFlush(
         await runDoctorCommand({ host: opts.host, port: opts.port, json: opts.json, strict: opts.strict }),
       );
     });
@@ -381,7 +400,7 @@ export function buildProgram(): Command {
     .option("--no-redact", "show raw values including secrets (use carefully)", false)
     .action(async (opts: { json?: boolean; redact?: boolean }) => {
       const { runConfigList } = await import("../commands/config-cmd.js");
-      process.exit(await runConfigList({ json: opts.json, noRedact: opts.redact === false }));
+      await exitAfterFlush(await runConfigList({ json: opts.json, noRedact: opts.redact === false }));
     });
 
   cfg
@@ -396,7 +415,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of bare-string output", false)
     .action(async (rawPath: string, opts: { json?: boolean }) => {
       const { runConfigGet } = await import("../commands/config-cmd.js");
-      process.exit(await runConfigGet(rawPath, { json: opts.json }));
+      await exitAfterFlush(await runConfigGet(rawPath, { json: opts.json }));
     });
 
   cfg
@@ -414,7 +433,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON status instead of human text", false)
     .action(async (rawPath: string, rawValue: string, opts: { strictJson?: boolean; dryRun?: boolean; json?: boolean }) => {
       const { runConfigSet } = await import("../commands/config-cmd.js");
-      process.exit(
+      await exitAfterFlush(
         await runConfigSet(rawPath, rawValue, {
           strictJson: opts.strictJson,
           dryRun: opts.dryRun,
@@ -432,7 +451,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON status instead of human text", false)
     .action(async (rawPath: string, opts: { json?: boolean }) => {
       const { runConfigUnset } = await import("../commands/config-cmd.js");
-      process.exit(await runConfigUnset(rawPath, { json: opts.json }));
+      await exitAfterFlush(await runConfigUnset(rawPath, { json: opts.json }));
     });
 
   cfg
@@ -441,7 +460,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of bare-path output", false)
     .action(async (opts: { json?: boolean }) => {
       const { runConfigFile } = await import("../commands/config-cmd.js");
-      process.exit(await runConfigFile({ json: opts.json }));
+      await exitAfterFlush(await runConfigFile({ json: opts.json }));
     });
 
   cfg
@@ -449,7 +468,7 @@ export function buildProgram(): Command {
     .description("Print the Brigade config TypeBox schema as JSON")
     .action(async () => {
       const { runConfigSchema } = await import("../commands/config-cmd.js");
-      process.exit(await runConfigSchema());
+      await exitAfterFlush(await runConfigSchema());
     });
 
   cfg
@@ -458,7 +477,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runConfigValidate } = await import("../commands/config-cmd.js");
-      process.exit(await runConfigValidate({ json: opts.json }));
+      await exitAfterFlush(await runConfigValidate({ json: opts.json }));
     });
 
   /* ───────────────────────────── channels ───────────────────────────── */
@@ -476,7 +495,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runChannelsList } = await import("../commands/channels.js");
-      process.exit(await runChannelsList({ json: opts.json }));
+      await exitAfterFlush(await runChannelsList({ json: opts.json }));
     });
 
   channels
@@ -486,7 +505,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; json?: boolean }) => {
       const { runChannelsStatus } = await import("../commands/channels.js");
-      process.exit(await runChannelsStatus({ channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runChannelsStatus({ channel: opts.channel }, { json: opts.json }));
     });
 
   channels
@@ -503,7 +522,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; timeout?: number; force?: boolean; json?: boolean }) => {
       const { runChannelsLink } = await import("../commands/channels.js");
-      process.exit(
+      await exitAfterFlush(
         await runChannelsLink(
           { channel: opts.channel, timeoutMs: opts.timeout, force: opts.force },
           { json: opts.json },
@@ -522,7 +541,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; yes?: boolean; json?: boolean }) => {
       const { runChannelsUnlink } = await import("../commands/channels.js");
-      process.exit(await runChannelsUnlink({ channel: opts.channel, yes: opts.yes }, { json: opts.json }));
+      await exitAfterFlush(await runChannelsUnlink({ channel: opts.channel, yes: opts.yes }, { json: opts.json }));
     });
 
   channels
@@ -532,7 +551,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; json?: boolean }) => {
       const { runChannelsEnable } = await import("../commands/channels.js");
-      process.exit(await runChannelsEnable({ channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runChannelsEnable({ channel: opts.channel }, { json: opts.json }));
     });
 
   channels
@@ -542,7 +561,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; json?: boolean }) => {
       const { runChannelsDisable } = await import("../commands/channels.js");
-      process.exit(await runChannelsDisable({ channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runChannelsDisable({ channel: opts.channel }, { json: opts.json }));
     });
 
   // `channels allow <list|add|remove>` — manage the per-channel allow-from list.
@@ -558,7 +577,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; json?: boolean }) => {
       const { runChannelsAllowList } = await import("../commands/channels.js");
-      process.exit(await runChannelsAllowList({ channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runChannelsAllowList({ channel: opts.channel }, { json: opts.json }));
     });
 
   channelsAllow
@@ -568,7 +587,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (id: string, opts: { channel?: string; json?: boolean }) => {
       const { runChannelsAllowAdd } = await import("../commands/channels.js");
-      process.exit(await runChannelsAllowAdd({ id, channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runChannelsAllowAdd({ id, channel: opts.channel }, { json: opts.json }));
     });
 
   channelsAllow
@@ -578,7 +597,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (id: string, opts: { channel?: string; json?: boolean }) => {
       const { runChannelsAllowRemove } = await import("../commands/channels.js");
-      process.exit(await runChannelsAllowRemove({ id, channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runChannelsAllowRemove({ id, channel: opts.channel }, { json: opts.json }));
     });
 
   // `channels add` — credential-prompt wizard for token-based channels
@@ -604,7 +623,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; nonInteractive?: boolean; json?: boolean }) => {
       const { runChannelsAdd } = await import("../commands/channels.js");
-      process.exit(
+      await exitAfterFlush(
         await runChannelsAdd(
           { channel: opts.channel, nonInteractive: opts.nonInteractive },
           { json: opts.json },
@@ -625,7 +644,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { agent?: string; json?: boolean }) => {
       const { runSessionsList } = await import("../commands/sessions.js");
-      process.exit(await runSessionsList({ agent: opts.agent }, { json: opts.json }));
+      await exitAfterFlush(await runSessionsList({ agent: opts.agent }, { json: opts.json }));
     });
 
   sessions
@@ -637,7 +656,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { agent?: string; olderThan: string; dryRun?: boolean; json?: boolean }) => {
       const { runSessionsCleanup } = await import("../commands/sessions.js");
-      process.exit(
+      await exitAfterFlush(
         await runSessionsCleanup(
           { agent: opts.agent, olderThan: opts.olderThan, dryRun: opts.dryRun },
           { json: opts.json },
@@ -653,7 +672,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runSkillsList } = await import("../commands/skills.js");
-      process.exit(await runSkillsList({ json: opts.json }));
+      await exitAfterFlush(await runSkillsList({ json: opts.json }));
     });
   skills
     .command("info <name>")
@@ -661,7 +680,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (name: string, opts: { json?: boolean }) => {
       const { runSkillsInfo } = await import("../commands/skills.js");
-      process.exit(await runSkillsInfo({ name }, { json: opts.json }));
+      await exitAfterFlush(await runSkillsInfo({ name }, { json: opts.json }));
     });
 
   /* ───────────────────────────── logs ───────────────────────────── */
@@ -673,7 +692,7 @@ export function buildProgram(): Command {
     .option("--json", "emit raw JSON lines instead of one-line formatted output", false)
     .action(async (opts: { follow?: boolean; limit?: number; json?: boolean }) => {
       const { runLogsCommand } = await import("../commands/logs.js");
-      process.exit(await runLogsCommand({ follow: opts.follow, limit: opts.limit }, { json: opts.json }));
+      await exitAfterFlush(await runLogsCommand({ follow: opts.follow, limit: opts.limit }, { json: opts.json }));
     });
 
   /* ───────────────────────────── secrets ───────────────────────────── */
@@ -687,7 +706,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { strict?: boolean; json?: boolean }) => {
       const { runSecretsAudit } = await import("../commands/secrets-audit.js");
-      process.exit(await runSecretsAudit({ strict: opts.strict }, { json: opts.json }));
+      await exitAfterFlush(await runSecretsAudit({ strict: opts.strict }, { json: opts.json }));
     });
 
   /* ───────────────────────────── pairing ───────────────────────────── */
@@ -706,7 +725,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { channel?: string; json?: boolean }) => {
       const { runPairingList } = await import("../commands/pairing.js");
-      process.exit(await runPairingList({ channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runPairingList({ channel: opts.channel }, { json: opts.json }));
     });
 
   pairing
@@ -716,7 +735,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (code: string, opts: { channel?: string; json?: boolean }) => {
       const { runPairingApprove } = await import("../commands/pairing.js");
-      process.exit(await runPairingApprove({ code, channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runPairingApprove({ code, channel: opts.channel }, { json: opts.json }));
     });
 
   pairing
@@ -726,7 +745,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (code: string, opts: { channel?: string; json?: boolean }) => {
       const { runPairingRevoke } = await import("../commands/pairing.js");
-      process.exit(await runPairingRevoke({ code, channel: opts.channel }, { json: opts.json }));
+      await exitAfterFlush(await runPairingRevoke({ code, channel: opts.channel }, { json: opts.json }));
     });
 
   /* ───────────────────────────── backup ───────────────────────────── */
@@ -745,7 +764,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { output?: string; force?: boolean; json?: boolean }) => {
       const { runBackupCreate } = await import("../commands/backup.js");
-      process.exit(await runBackupCreate({ output: opts.output, force: opts.force }, { json: opts.json }));
+      await exitAfterFlush(await runBackupCreate({ output: opts.output, force: opts.force }, { json: opts.json }));
     });
 
   backup
@@ -754,7 +773,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (archive: string, opts: { json?: boolean }) => {
       const { runBackupVerify } = await import("../commands/backup.js");
-      process.exit(await runBackupVerify({ archive }, { json: opts.json }));
+      await exitAfterFlush(await runBackupVerify({ archive }, { json: opts.json }));
     });
 
   backup
@@ -765,7 +784,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (archive: string, opts: { target?: string; force?: boolean; json?: boolean }) => {
       const { runBackupRestore } = await import("../commands/backup.js");
-      process.exit(
+      await exitAfterFlush(
         await runBackupRestore({ archive, target: opts.target, force: opts.force }, { json: opts.json }),
       );
     });
@@ -786,7 +805,7 @@ export function buildProgram(): Command {
     .option("--agent <id>", "agent id whose allowlist to inspect", "main")
     .action(async (opts: { json?: boolean; agent?: string }) => {
       const { runExecList } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecList({ json: opts.json, agentId: opts.agent }));
+      await exitAfterFlush(await runExecList({ json: opts.json, agentId: opts.agent }));
     });
 
   exec
@@ -800,7 +819,7 @@ export function buildProgram(): Command {
     .option("--agent <id>", "agent id whose allowlist to mutate", "main")
     .action(async (parts: string[], opts: { json?: boolean; agent?: string }) => {
       const { runExecAllow } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecAllow(parts.join(" "), { json: opts.json, agentId: opts.agent }));
+      await exitAfterFlush(await runExecAllow(parts.join(" "), { json: opts.json, agentId: opts.agent }));
     });
 
   exec
@@ -815,7 +834,7 @@ export function buildProgram(): Command {
     .option("--agent <id>", "agent id whose allowlist to mutate", "main")
     .action(async (regex: string, opts: { json?: boolean; agent?: string }) => {
       const { runExecAllowPattern } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecAllowPattern(regex, { json: opts.json, agentId: opts.agent }));
+      await exitAfterFlush(await runExecAllowPattern(regex, { json: opts.json, agentId: opts.agent }));
     });
 
   exec
@@ -828,7 +847,7 @@ export function buildProgram(): Command {
     .option("--agent <id>", "agent id whose allowlist to mutate", "main")
     .action(async (parts: string[], opts: { json?: boolean; agent?: string }) => {
       const { runExecRemove } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecRemove(parts.join(" "), { json: opts.json, agentId: opts.agent }));
+      await exitAfterFlush(await runExecRemove(parts.join(" "), { json: opts.json, agentId: opts.agent }));
     });
 
   exec
@@ -841,7 +860,7 @@ export function buildProgram(): Command {
     .option("--agent <id>", "agent id whose allowlist to consult", "main")
     .action(async (parts: string[], opts: { json?: boolean; agent?: string }) => {
       const { runExecDenyTest } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecDenyTest(parts.join(" "), { json: opts.json, agentId: opts.agent }));
+      await exitAfterFlush(await runExecDenyTest(parts.join(" "), { json: opts.json, agentId: opts.agent }));
     });
 
   exec
@@ -851,7 +870,7 @@ export function buildProgram(): Command {
     .option("--agent <id>", "agent id whose allowlist path to print", "main")
     .action(async (opts: { json?: boolean; agent?: string }) => {
       const { runExecFile } = await import("../commands/exec-cmd.js");
-      process.exit(await runExecFile({ json: opts.json, agentId: opts.agent }));
+      await exitAfterFlush(await runExecFile({ json: opts.json, agentId: opts.agent }));
     });
 
   // ──────────────── cron ────────────────
@@ -867,7 +886,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runCronStatus } = await import("../commands/cron.js");
-      process.exit(await runCronStatus({ json: opts.json }));
+      await exitAfterFlush(await runCronStatus({ json: opts.json }));
     });
 
   cron
@@ -879,7 +898,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { all?: boolean; query?: string; limit?: number; json?: boolean }) => {
       const { runCronList } = await import("../commands/cron.js");
-      process.exit(
+      await exitAfterFlush(
         await runCronList({
           ...(opts.all !== undefined ? { all: opts.all } : {}),
           ...(opts.query !== undefined ? { query: opts.query } : {}),
@@ -919,9 +938,10 @@ export function buildProgram(): Command {
       const job = buildCronJobCreateFromCliOpts(opts);
       if (typeof job === "string") {
         process.stderr.write(`cron add: ${job}\n`);
-        process.exit(1);
+        await exitAfterFlush(1);
+        return; // unreachable at runtime; restores `job` narrowing for tsc
       }
-      process.exit(
+      await exitAfterFlush(
         await runCronAdd({
           job,
           ...(opts.json !== undefined ? { json: opts.json } : {}),
@@ -944,11 +964,11 @@ export function buildProgram(): Command {
       if (opts.description !== undefined) patch.description = opts.description;
       if (opts.enable && opts.disable) {
         process.stderr.write("cron edit: --enable and --disable are mutually exclusive\n");
-        process.exit(1);
+        await exitAfterFlush(1);
       }
       if (opts.enable) patch.enabled = true;
       if (opts.disable) patch.enabled = false;
-      process.exit(
+      await exitAfterFlush(
         await runCronEdit({
           jobId,
           patch,
@@ -965,7 +985,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (jobId: string, opts: { json?: boolean }) => {
       const { runCronRemove } = await import("../commands/cron.js");
-      process.exit(
+      await exitAfterFlush(
         await runCronRemove({ jobId, ...(opts.json !== undefined ? { json: opts.json } : {}) }),
       );
     });
@@ -976,7 +996,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (jobId: string, opts: { json?: boolean }) => {
       const { runCronEnable } = await import("../commands/cron.js");
-      process.exit(
+      await exitAfterFlush(
         await runCronEnable({ jobId, ...(opts.json !== undefined ? { json: opts.json } : {}) }),
       );
     });
@@ -987,7 +1007,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (jobId: string, opts: { json?: boolean }) => {
       const { runCronDisable } = await import("../commands/cron.js");
-      process.exit(
+      await exitAfterFlush(
         await runCronDisable({ jobId, ...(opts.json !== undefined ? { json: opts.json } : {}) }),
       );
     });
@@ -999,7 +1019,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (jobId: string, opts: { due?: boolean; json?: boolean }) => {
       const { runCronRunCmd } = await import("../commands/cron.js");
-      process.exit(
+      await exitAfterFlush(
         await runCronRunCmd({
           jobId,
           mode: opts.due ? "due" : "force",
@@ -1015,7 +1035,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (jobId: string, opts: { limit?: number; json?: boolean }) => {
       const { runCronRuns } = await import("../commands/cron.js");
-      process.exit(
+      await exitAfterFlush(
         await runCronRuns({
           jobId,
           ...(opts.limit !== undefined ? { limit: opts.limit } : {}),
@@ -1040,7 +1060,7 @@ export function buildProgram(): Command {
     .description("Manage isolated agents (workspace + auth + routing)")
     .action(async () => {
       const { runAgentsList } = await import("../commands/agents-cmd.js");
-      process.exit(await runAgentsList({}));
+      await exitAfterFlush(await runAgentsList({}));
     });
 
   agents
@@ -1050,7 +1070,7 @@ export function buildProgram(): Command {
     .option("--bindings", "include routing bindings per agent", false)
     .action(async (opts: { json?: boolean; bindings?: boolean }) => {
       const { runAgentsList } = await import("../commands/agents-cmd.js");
-      process.exit(await runAgentsList({ json: opts.json, bindings: opts.bindings }));
+      await exitAfterFlush(await runAgentsList({ json: opts.json, bindings: opts.bindings }));
     });
 
   agents
@@ -1060,7 +1080,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { agent?: string; json?: boolean }) => {
       const { runAgentsBindings } = await import("../commands/agents-cmd.js");
-      process.exit(
+      await exitAfterFlush(
         await runAgentsBindings({
           ...(opts.agent !== undefined ? { agent: opts.agent } : {}),
           ...(opts.json !== undefined ? { json: opts.json } : {}),
@@ -1081,7 +1101,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { agent: string; bind: string[]; json?: boolean }) => {
       const { runAgentsBind } = await import("../commands/agents-cmd.js");
-      process.exit(
+      await exitAfterFlush(
         await runAgentsBind({
           agent: opts.agent,
           bind: opts.bind,
@@ -1104,7 +1124,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { agent: string; bind: string[]; all?: boolean; json?: boolean }) => {
       const { runAgentsUnbind } = await import("../commands/agents-cmd.js");
-      process.exit(
+      await exitAfterFlush(
         await runAgentsUnbind({
           agent: opts.agent,
           bind: opts.bind,
@@ -1146,7 +1166,7 @@ export function buildProgram(): Command {
         },
       ) => {
         const { runAgentsAdd } = await import("../commands/agents-cmd.js");
-        process.exit(
+        await exitAfterFlush(
           await runAgentsAdd({
             ...(name !== undefined ? { name } : {}),
             ...(opts.workspace !== undefined ? { workspace: opts.workspace } : {}),
@@ -1186,7 +1206,7 @@ export function buildProgram(): Command {
         json?: boolean;
       }) => {
         const { runAgentsSetIdentity } = await import("../commands/agents-cmd.js");
-        process.exit(
+        await exitAfterFlush(
           await runAgentsSetIdentity({
             agent: opts.agent,
             ...(opts.workspace !== undefined ? { workspace: opts.workspace } : {}),
@@ -1209,7 +1229,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (id: string, opts: { force?: boolean; json?: boolean }) => {
       const { runAgentsDelete } = await import("../commands/agents-cmd.js");
-      process.exit(
+      await exitAfterFlush(
         await runAgentsDelete({
           id,
           ...(opts.force !== undefined ? { force: opts.force } : {}),
@@ -1242,7 +1262,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { template: string; skipEditor?: boolean; json?: boolean }) => {
       const { runOrgInit } = await import("../commands/org-cmd.js");
-      process.exit(
+      await exitAfterFlush(
         await runOrgInit({
           template: opts.template,
           ...(opts.skipEditor !== undefined ? { skipEditor: opts.skipEditor } : {}),
@@ -1257,7 +1277,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runOrgShow } = await import("../commands/org-cmd.js");
-      process.exit(await runOrgShow({ ...(opts.json !== undefined ? { json: opts.json } : {}) }));
+      await exitAfterFlush(await runOrgShow({ ...(opts.json !== undefined ? { json: opts.json } : {}) }));
     });
 
   org
@@ -1268,7 +1288,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (from: string, to: string, opts: { json?: boolean }) => {
       const { runOrgExplain } = await import("../commands/org-cmd.js");
-      process.exit(
+      await exitAfterFlush(
         await runOrgExplain({ from, to, ...(opts.json !== undefined ? { json: opts.json } : {}) }),
       );
     });
@@ -1279,7 +1299,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runOrgDoctor } = await import("../commands/org-cmd.js");
-      process.exit(await runOrgDoctor({ ...(opts.json !== undefined ? { json: opts.json } : {}) }));
+      await exitAfterFlush(await runOrgDoctor({ ...(opts.json !== undefined ? { json: opts.json } : {}) }));
     });
 
   /* ─────────────────────────────── store ─────────────────────────────── */
@@ -1300,7 +1320,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runStoreModeShow } = await import("../commands/store-cmd.js");
-      process.exit(await runStoreModeShow({ ...(opts.json !== undefined ? { json: opts.json } : {}) }));
+      await exitAfterFlush(await runStoreModeShow({ ...(opts.json !== undefined ? { json: opts.json } : {}) }));
     });
 
   storeMode
@@ -1315,7 +1335,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (mode: string, opts: { convexUrl?: string; json?: boolean }) => {
       const { runStoreModeSet } = await import("../commands/store-cmd.js");
-      process.exit(
+      await exitAfterFlush(
         await runStoreModeSet({
           mode,
           ...(opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {}),
@@ -1340,7 +1360,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runEncryptStatus } = await import("../commands/encrypt-cmd.js");
-      process.exit(await runEncryptStatus(opts));
+      await exitAfterFlush(await runEncryptStatus(opts));
     });
 
   encrypt
@@ -1349,7 +1369,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runEncryptInit } = await import("../commands/encrypt-cmd.js");
-      process.exit(await runEncryptInit(opts));
+      await exitAfterFlush(await runEncryptInit(opts));
     });
 
   encrypt
@@ -1358,7 +1378,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human text", false)
     .action(async (opts: { json?: boolean }) => {
       const { runEncryptTest } = await import("../commands/encrypt-cmd.js");
-      process.exit(await runEncryptTest(opts));
+      await exitAfterFlush(await runEncryptTest(opts));
     });
 
   store
@@ -1377,7 +1397,7 @@ export function buildProgram(): Command {
     .option("--json", "emit JSON instead of human-readable text", false)
     .action(async (opts: { to: string; convexUrl?: string; dryRun?: boolean; skipVerify?: boolean; json?: boolean }) => {
       const { runStoreMigrateCmd } = await import("../commands/store-cmd.js");
-      process.exit(
+      await exitAfterFlush(
         await runStoreMigrateCmd({
           to: opts.to,
           ...(opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {}),

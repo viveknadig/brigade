@@ -451,6 +451,15 @@ export async function runChannelsLink(
 			for (const line of swallowedLogs) process.stderr.write(`${line}\n`);
 		}
 	}
+	// Drain write-behind chains (account config entry + channel access) before
+	// the one-shot exit so a successful link in convex mode isn't lost. The
+	// WhatsApp auth creds ride the adapter's own flush, awaited in its stop().
+	try {
+		const { flushAllPendingWrites } = await import("../../storage/flush.js");
+		await flushAllPendingWrites();
+	} catch {
+		/* best-effort — never block exit on a drain failure */
+	}
 	// Baileys keeps internal keepalive timers + unsettled promise chains alive
 	// after `adapter.stop()`; without an explicit exit, Node sees a pending
 	// top-level await on the entry shim and emits an "unsettled top-level
