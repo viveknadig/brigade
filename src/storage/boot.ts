@@ -67,6 +67,13 @@ export async function bootRuntimeContext(): Promise<RuntimeContext> {
 					materialiseModelsCatalog(ctx.store),
 					syncWorkspaceMirrors(ctx.store, cfg as Record<string, unknown>),
 				]);
+				// The boot reconcile above is point-in-time; the live mirror
+				// watches each agent's workspace for persona edits mid-session
+				// and pushes them as they happen, so a `rm -rf ~/.brigade`
+				// no longer loses everything written since the last boot.
+				// Lifecycle stamps + manage_skill writes ride the same chain.
+				const { startWorkspaceLiveMirror } = await import("./workspace-live-mirror.js");
+				startWorkspaceLiveMirror(ctx.store, cfg as Record<string, unknown>);
 			}
 			setRuntimeContext(ctx);
 			return ctx;

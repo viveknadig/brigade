@@ -4500,6 +4500,18 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			} catch {
 				/* best-effort */
 			}
+			try {
+				// Drain the live workspace mirror (forces a final persona sweep so
+				// an edit inside the watcher debounce window isn't lost), then
+				// close the watchers.
+				const { awaitWorkspaceMirrorFlush, disposeWorkspaceLiveMirror } = await import(
+					"../storage/workspace-live-mirror.js"
+				);
+				await awaitWorkspaceMirrorFlush();
+				disposeWorkspaceLiveMirror();
+			} catch {
+				/* best-effort */
+			}
 			// Dispose the agent-events bridge + every registered handler +
 			// the in-process gateway caller. Order: bridge → handlers →
 			// caller so a late `callGateway()` after shutdown gets a clean

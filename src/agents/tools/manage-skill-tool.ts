@@ -46,6 +46,8 @@ import {
 	resolveSkillsDir,
 } from "../../config/paths.js";
 import { listAgentEntries } from "../../cli/commands/agents-config.js";
+import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
+import { enqueueWorkspaceMirrorOp } from "../../storage/workspace-live-mirror.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { jsonResult } from "./common.js";
 import type { BrigadeTool } from "./types.js";
@@ -218,6 +220,7 @@ export function makeManageSkillTool(
 					body: (args.body ?? "").trim(),
 				});
 				fs.writeFileSync(skillFile, content, "utf8");
+				mirrorSkillWrite(scope, resolvedAgentId, safeName, content);
 				return jsonResult({
 					action: "create",
 					name: safeName,
@@ -246,6 +249,7 @@ export function makeManageSkillTool(
 				} satisfies ManageSkillResult) as AgentToolResult<ManageSkillResult>;
 			}
 			fs.rmSync(skillDir, { recursive: true, force: true });
+			mirrorSkillRemove(scope, resolvedAgentId, safeName);
 			return jsonResult({
 				action: "delete",
 				name: safeName,
@@ -259,6 +263,49 @@ export function makeManageSkillTool(
 			} satisfies ManageSkillResult) as AgentToolResult<ManageSkillResult>;
 		},
 	};
+}
+
+// Convex mode: the on-disk write above is what discovery reads (workspace
+// stays local-authoritative), but the skills TABLE used to learn about this
+// skill only at the next gateway boot via the mirror reconcile — a wipe in
+// between lost the skill entirely. Dual-write the table on the live-mirror
+// flush chain immediately. Tool scope "agent" maps to the table's
+// "workspace" source; "managed" maps to "managed". Best-effort: a failed
+// table write logs via the chain and the boot reconcile self-heals.
+function mirrorSkillWrite(
+	scope: "agent" | "managed",
+	agentId: string | undefined,
+	name: string,
+	content: string,
+): void {
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode !== "convex") return;
+	const store = rctx.store;
+	enqueueWorkspaceMirrorOp(() =>
+		store.skills.write({
+			scope: scope === "agent" ? "workspace" : "managed",
+			...(agentId !== undefined ? { agentId } : {}),
+			name,
+			content,
+		}),
+	);
+}
+
+function mirrorSkillRemove(
+	scope: "agent" | "managed",
+	agentId: string | undefined,
+	name: string,
+): void {
+	const rctx = tryGetRuntimeContext();
+	if (rctx?.mode !== "convex") return;
+	const store = rctx.store;
+	enqueueWorkspaceMirrorOp(() =>
+		store.skills.remove({
+			scope: scope === "agent" ? "workspace" : "managed",
+			...(agentId !== undefined ? { agentId } : {}),
+			name,
+		}),
+	);
 }
 
 /**

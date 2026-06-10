@@ -112,4 +112,10 @@ export async function flushAllPendingWrites(): Promise<void> {
 	} catch {
 		/* best-effort */
 	}
+	try {
+		const { awaitWorkspaceMirrorFlush } = await import("./workspace-live-mirror.js");
+		await awaitWorkspaceMirrorFlush();
+	} catch {
+		/* best-effort */
+	}
 }
