@@ -120,13 +120,23 @@ export class ConvexMessageStore implements MessageStore {
 	}
 
 	async hasBootstrapDelivered(agentId: string, sessionId: string): Promise<boolean> {
-		const rows = (await this.deps.client.query(api.messages.readTranscript, {
+		// Mirror the disk walk (hasDeliveredBootstrapToSession): scan
+		// newest-first and honour compaction-invalidation — a `compaction`
+		// record newer than the marker means the bootstrap context was likely
+		// compacted out, so the next turn must re-deliver. Walking the
+		// newest-first tail, the FIRST marker-or-compaction encountered decides:
+		// marker → delivered (still valid); compaction → invalidated.
+		const rows = (await this.deps.client.query(api.messages.readMarkerTail, {
 			agentId,
 			sessionId,
 		})) as Array<{ type: string; customType?: string }>;
-		return rows.some(
-			(r) => r.type === "custom" && r.customType === BRIGADE_BOOTSTRAP_DELIVERED_CUSTOM_TYPE,
-		);
+		for (const r of rows) {
+			if (r.type === "compaction") return false;
+			if (r.type === "custom" && r.customType === BRIGADE_BOOTSTRAP_DELIVERED_CUSTOM_TYPE) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	async markBootstrapDelivered(agentId: string, sessionId: string): Promise<void> {

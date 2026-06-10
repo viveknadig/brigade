@@ -53,11 +53,16 @@ export const readSessionEventTail = query({
 	handler: async (ctx, args) => {
 		const day = args.day ?? new Date().toISOString().slice(0, 10);
 		const limit = args.limit && args.limit > 0 ? args.limit : 200;
-		return ctx.db
+		// Take the most-recent `limit` (desc) but RETURN them chronological
+		// (oldest-first) to match the disk reader (event-logger.readSession-
+		// EventTail walks the file tail in append order). A consumer replaying
+		// the tail (e.g. convex→filesystem migrate) would otherwise reverse it.
+		const rows = await ctx.db
 			.query("sessionEvents")
 			.withIndex("by_owner_day", (q) => q.eq("ownerId", args.ownerId).eq("day", day))
 			.order("desc")
 			.take(limit);
+		return rows.reverse();
 	},
 });
 

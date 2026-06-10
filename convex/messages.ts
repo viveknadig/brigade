@@ -143,6 +143,25 @@ export const readTranscript = query({
 	},
 });
 
+/** Newest-first tail of (type, customType) only — for the bootstrap-delivery
+ *  check, which must honour compaction-invalidation (a compaction newer than
+ *  the marker means the bootstrap context was compacted out → re-deliver).
+ *  Returns just the two fields the walk needs, not the sealed payloads. */
+export const readMarkerTail = query({
+	args: { agentId: v.string(), sessionId: v.string(), limit: v.optional(v.number()) },
+	handler: async (ctx, args) => {
+		const limit = args.limit && args.limit > 0 ? Math.min(args.limit, 1000) : 500;
+		const rows = await ctx.db
+			.query("sessionTranscriptRecords")
+			.withIndex("by_session_seq", (q) =>
+				q.eq("agentId", args.agentId).eq("sessionId", args.sessionId),
+			)
+			.order("desc")
+			.take(limit);
+		return rows.map((r) => ({ type: r.type, customType: r.customType }));
+	},
+});
+
 export const deleteTranscript = mutation({
 	args: { agentId: v.string(), sessionId: v.string() },
 	handler: async (ctx, args) => {

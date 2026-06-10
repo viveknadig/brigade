@@ -104,9 +104,13 @@ export class ConvexConfigStore implements ConfigStore {
 		const bytes = Buffer.byteLength(JSON.stringify(cfg), "utf8");
 		// Collect any top-level keys NOT given a named column into `extra`, so
 		// the disk path's unknown-key round-trip is preserved byte-for-shape.
+		// NOTE: `version` is deliberately NOT named — there's no `version`
+		// column (the row carries its own `schemaVersion`), so the legacy
+		// back-compat `BrigadeConfig.version` field rides the `extra` catch-all
+		// and round-trips instead of being silently dropped.
 		const NAMED = new Set([
 			"agents", "gateway", "session", "tools", "auth", "plugins", "skills",
-			"channels", "bindings", "org", "wizard", "meta", "defaults", "version",
+			"channels", "bindings", "org", "wizard", "meta", "defaults",
 		]);
 		const extra: Record<string, unknown> = {};
 		let hasExtra = false;
