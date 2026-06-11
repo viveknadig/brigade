@@ -57,7 +57,7 @@ import {
 import { resolveSystemPromptOverride } from "../system-prompt/override.js";
 import { resolveRuntimeParams } from "../system-prompt/runtime-params.js";
 import { applyPersonaOverrideToSession } from "../system-prompt/pi-injection.js";
-import { deriveOrgGraph } from "./org/derive-graph.js";
+import { deriveOrgDisplayGraph, deriveOrgGraph } from "./org/derive-graph.js";
 import { renderSubAgentAnchor } from "../system-prompt/org/sub-agent-anchor.js";
 import { bootstrapWorkspace } from "../workspace/bootstrap.js";
 import {
@@ -1111,9 +1111,16 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
         reason: string;
         remediation?: string;
       }> = [];
+      // Linked self-account per adapter (sync, cheap — reads the cached
+      // connection id). The assembler surfaces it in `## Messaging` so the
+      // model knows the operator's own number instead of asking for it.
+      const linked: Array<{ channelId: string; selfId: string }> = [];
       for (const id of manager.started) {
         const adapter = manager.adapter(id);
-        if (!adapter || typeof adapter.health !== "function") continue;
+        if (!adapter) continue;
+        const selfId = typeof adapter.selfId === "function" ? adapter.selfId() : undefined;
+        if (selfId) linked.push({ channelId: id, selfId });
+        if (typeof adapter.health !== "function") continue;
         const status = adapter.health();
         if (!status.ok) {
           degraded.push({
@@ -1125,6 +1132,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       }
       return {
         started: manager.started,
+        ...(linked.length > 0 ? { linked } : {}),
         ...(degraded.length > 0 ? { degraded } : {}),
         ...(route
           ? {
@@ -1226,17 +1234,15 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // The user message is scrubbed of the Anthropic refusal-trigger magic
   // string before Pi sees it; otherwise a paste-through of that literal
   // would coerce Claude into refusing the next turn.
-  // Drain any pending system events queued for THIS session (today: cron's
-  // announce text when its delivery had no channel target, fallback path
-  // in `cron/service/timer.ts:maybeDeliverAnnounce`). Each pending event
-  // becomes a `<system_event>` block prepended to the user's text so the
-  // model sees the cron's reminder fired BEFORE it answers the new
-  // message. Without this the model would be answering the operator's
-  // next "did the cron fire?" question blind. Cron's gateway wiring
-  // dual-writes: a `system-event` WS frame for live TUI visibility AND
-  // the per-session queue this drain consumes — see `src/core/server.ts`
-  // `enqueueSystemEvent` for the writer + `src/agents/pending-system-events.ts`
-  // for the queue itself.
+  // Drain any pending system events queued for THIS session. Cron's
+  // fire-time announces now land in the SESSION INBOX (drained below as
+  // `inboxBlock`) so the heartbeat runner can consume them for synthetic
+  // turns; this legacy pending queue still carries cron DELIVERY-FAILURE
+  // notices ("couldn't deliver via whatsapp — …", see the announce
+  // dispatcher in `src/core/server.ts`). Each pending event becomes a
+  // `<system_event>` block prepended to the user's text so the model sees
+  // the failure BEFORE it answers the new message instead of bullshitting
+  // "should be landing any moment now".
   const pendingEvents = drainPendingSystemEvents(resolved.sessionKey);
   const pendingPrefix = formatPendingEventsPrefix(pendingEvents);
   // SessionInbox drain (Step 12). A2A messages (`sessions_send`), sub-agent
@@ -1266,7 +1272,7 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
         const hints = renderReceiverHints(inspected.events);
         if (hints) orgBlocks.push(hints);
         // Top-of-org escalation inbox summary (only when caller is topOrder).
-        const orgGraph = deriveOrgGraph(turnConfig as never);
+        const orgGraph = deriveOrgDisplayGraph(turnConfig as never);
         if (orgGraph) {
           const { renderEscalationInbox } = await import(
             "../system-prompt/org/escalation-inbox.js"
@@ -1736,6 +1742,10 @@ async function buildPersonaPrompt(args: {
    */
   channels?: {
     started: readonly string[];
+    linked?: ReadonlyArray<{
+      channelId: string;
+      selfId: string;
+    }>;
     degraded?: ReadonlyArray<{
       channelId: string;
       reason: string;
@@ -1787,7 +1797,7 @@ async function buildPersonaPrompt(args: {
   // block emits ZERO bytes. Sub-agent runs get a one-line anchor merged
   // into `ephemeralSuffix` instead of the full block. Existing callers
   // see no behavioural change when `cfg.org` is absent.
-  const orgGraph = config.org ? deriveOrgGraph(config) : undefined;
+  const orgGraph = config.org ? deriveOrgDisplayGraph(config) : undefined;
 
   // Sub-agent anchor: when this turn IS a sub-agent run AND we have an
   // org graph, append a one-line "Spawned by <id>, inheriting <dept>"

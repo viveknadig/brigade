@@ -33,6 +33,10 @@
 // sensitive columns; lands as a follow-up).
 
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+import { resolveEncryptionKeyFilePath } from "../config/paths.js";
 
 const MAGIC = 0x42;
 const VERSION = 0x01;
@@ -57,21 +61,56 @@ function parseHexKey(name: string, raw: string | undefined): Buffer | undefined 
 
 let cachedPrimary: Buffer | undefined;
 let cachedOld: Buffer | undefined;
-let cacheStamp = 0;
+let cachedSource: "env" | "file" | "none" = "none";
+let cacheStamp = "";
+// File-key cache: `undefined` = not checked yet; `null` = checked, absent.
+// seal/open run on every convex write, so the key file is read once per
+// process (and re-primed by saveEncryptionKeyToFile / the test reset) —
+// never per call. Mid-process file changes go through env rotation instead.
+let cachedFileKey: Buffer | null | undefined;
+
+function readKeyFileOnce(): Buffer | undefined {
+	if (cachedFileKey !== undefined) return cachedFileKey ?? undefined;
+	try {
+		const raw = fs.readFileSync(resolveEncryptionKeyFilePath(), "utf8").trim();
+		cachedFileKey = parseHexKey("encryption key file", raw) ?? null;
+	} catch {
+		cachedFileKey = null;
+	}
+	return cachedFileKey ?? undefined;
+}
 
 function getKeys(): { primary?: Buffer; old?: Buffer } {
-	// Re-resolve keys when env vars might have changed (cheap; env reads are
-	// fast). Tests + the rotate CLI need this so they don't have to restart
-	// the process.
-	const stamp = (process.env[KEY_ENV_PRIMARY] ?? "") + "|" + (process.env[KEY_ENV_OLD] ?? "");
-	const stampHash = stamp.length * 31 + (stamp.length > 0 ? stamp.charCodeAt(0) : 0);
-	if (stampHash !== cacheStamp) {
+	// Re-resolve when the env-side inputs might have changed (cheap; env reads
+	// are fast). Tests + the rotate CLI need this so they don't have to
+	// restart the process. The key FILE rides its own once-per-process cache.
+	const stamp =
+		(process.env[KEY_ENV_PRIMARY] ?? "") +
+		"|" +
+		(process.env[KEY_ENV_OLD] ?? "") +
+		"|" +
+		(process.env.BRIGADE_ENCRYPTION_KEY_FILE ?? "");
+	if (stamp !== cacheStamp) {
 		cachedPrimary = parseHexKey(KEY_ENV_PRIMARY, process.env[KEY_ENV_PRIMARY]);
 		cachedOld = parseHexKey(KEY_ENV_OLD, process.env[KEY_ENV_OLD]);
-		cacheStamp = stampHash;
+		// A changed key-file override invalidates the file cache too.
+		cachedFileKey = undefined;
+		cachedSource = cachedPrimary !== undefined ? "env" : "none";
+		cacheStamp = stamp;
+	}
+	let primary = cachedPrimary;
+	if (primary === undefined) {
+		// Env var always wins; the auto-generated key file is the fallback so
+		// onboarding can persist a key without asking the operator to manage
+		// shell profiles. See resolveEncryptionKeyFilePath for why the file
+		// lives OUTSIDE ~/.brigade.
+		primary = readKeyFileOnce();
+		cachedSource = primary !== undefined ? "file" : "none";
+	} else {
+		cachedSource = "env";
 	}
 	return {
-		...(cachedPrimary !== undefined ? { primary: cachedPrimary } : {}),
+		...(primary !== undefined ? { primary } : {}),
 		...(cachedOld !== undefined ? { old: cachedOld } : {}),
 	};
 }
@@ -79,6 +118,86 @@ function getKeys(): { primary?: Buffer; old?: Buffer } {
 /** Is at-rest encryption configured? */
 export function isEncryptionEnabled(): boolean {
 	return getKeys().primary !== undefined;
+}
+
+/** Where the active key came from: the env var, the key file, or nowhere. */
+export function encryptionKeySource(): "env" | "file" | "none" {
+	getKeys();
+	return cachedSource;
+}
+
+/**
+ * Persist a key to the key file (0600). REFUSES to overwrite an existing
+ * key file — overwriting would orphan every row sealed with the old key.
+ * Pass `backupExisting: true` to rename the current file to
+ * `encryption.key.bak-<stamp>` first (start-fresh flow) — the old key is
+ * never destroyed, only set aside.
+ */
+export function saveEncryptionKeyToFile(
+	hex: string,
+	opts: { backupExisting?: boolean } = {},
+): { path: string; backedUpTo?: string } {
+	const parsed = parseHexKey("encryption key", hex);
+	if (!parsed) throw new Error("saveEncryptionKeyToFile: key must be 64 hex chars");
+	const filePath = resolveEncryptionKeyFilePath();
+	let backedUpTo: string | undefined;
+	if (fs.existsSync(filePath)) {
+		if (!opts.backupExisting) {
+			throw new Error(
+				`an encryption key already exists — refusing to overwrite it. ` +
+					`(Overwriting would make data sealed with the current key unreadable.)`,
+			);
+		}
+		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+		backedUpTo = `${filePath}.bak-${stamp}`;
+		fs.renameSync(filePath, backedUpTo);
+	}
+	fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	fs.writeFileSync(filePath, `${hex.trim()}\n`, { encoding: "utf8", mode: 0o600 });
+	if (process.platform !== "win32") {
+		try {
+			fs.chmodSync(filePath, 0o600);
+		} catch {
+			/* FAT32 etc. */
+		}
+	}
+	// Prime the in-process cache so the key is live immediately.
+	cachedFileKey = parsed;
+	return { path: filePath, ...(backedUpTo !== undefined ? { backedUpTo } : {}) };
+}
+
+/**
+ * Set the key file aside as `encryption.key.bak-<stamp>` (factory reset:
+ * the data the key sealed is gone, so the next onboard mints a fresh key).
+ * The old key is NEVER deleted — an old backup of the erased data may still
+ * need it. No-op when no key file exists.
+ */
+export function retireEncryptionKeyFile(): { backedUpTo?: string } {
+	const filePath = resolveEncryptionKeyFilePath();
+	if (!fs.existsSync(filePath)) return {};
+	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+	const backedUpTo = `${filePath}.bak-${stamp}`;
+	fs.renameSync(filePath, backedUpTo);
+	cachedFileKey = undefined; // re-read (now absent) on next getKeys
+	return { backedUpTo };
+}
+
+/** True when a key file exists at the resolved path. */
+export function encryptionKeyFileExists(): boolean {
+	try {
+		return fs.existsSync(resolveEncryptionKeyFilePath());
+	} catch {
+		return false;
+	}
+}
+
+/** Test-only: drop the in-process key caches so env/file changes re-read. */
+export function __resetEncryptionKeyCacheForTests(): void {
+	cachedPrimary = undefined;
+	cachedOld = undefined;
+	cachedFileKey = undefined;
+	cachedSource = "none";
+	cacheStamp = "";
 }
 
 /** Encrypt arbitrary bytes. When no key is configured, returns the bytes
@@ -220,6 +339,8 @@ export interface EncryptionStatus {
 	enabled: boolean;
 	hasOldKey: boolean;
 	algorithm: "aes-256-gcm" | null;
+	/** Where the active key came from — environment variable or the key file. */
+	source: "env" | "file" | "none";
 	primaryKeyFingerprint?: string;
 	error?: string;
 }
@@ -227,8 +348,9 @@ export interface EncryptionStatus {
 /** Self-check: confirms the key is parseable AND a round-trip works. */
 export function encryptionStatus(): EncryptionStatus {
 	const keys = getKeys();
+	const source = encryptionKeySource();
 	if (!keys.primary) {
-		return { enabled: false, hasOldKey: keys.old !== undefined, algorithm: null };
+		return { enabled: false, hasOldKey: keys.old !== undefined, algorithm: null, source };
 	}
 	try {
 		const sample = "brigade-encryption-self-check";
@@ -239,6 +361,7 @@ export function encryptionStatus(): EncryptionStatus {
 				enabled: true,
 				hasOldKey: keys.old !== undefined,
 				algorithm: "aes-256-gcm",
+				source,
 				error: "round-trip mismatch",
 			};
 		}
@@ -250,6 +373,7 @@ export function encryptionStatus(): EncryptionStatus {
 			enabled: true,
 			hasOldKey: keys.old !== undefined,
 			algorithm: "aes-256-gcm",
+			source,
 			primaryKeyFingerprint: fp,
 		};
 	} catch (err) {
@@ -257,6 +381,7 @@ export function encryptionStatus(): EncryptionStatus {
 			enabled: true,
 			hasOldKey: keys.old !== undefined,
 			algorithm: "aes-256-gcm",
+			source,
 			error: err instanceof Error ? err.message : String(err),
 		};
 	}

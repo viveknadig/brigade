@@ -4,8 +4,8 @@ export declare const getEntry: import("convex/server").RegisteredQuery<"public",
 }, Promise<{
     _id: import("convex/values").GenericId<"sessions">;
     _creationTime: number;
-    provider?: string | undefined;
     modelId?: string | undefined;
+    provider?: string | undefined;
     authProfile?: string | undefined;
     thinkingLevel?: string | undefined;
     subagent?: {
@@ -30,8 +30,8 @@ export declare const listEntries: import("convex/server").RegisteredQuery<"publi
 }, Promise<{
     _id: import("convex/values").GenericId<"sessions">;
     _creationTime: number;
-    provider?: string | undefined;
     modelId?: string | undefined;
+    provider?: string | undefined;
     authProfile?: string | undefined;
     thinkingLevel?: string | undefined;
     subagent?: {
@@ -51,8 +51,8 @@ export declare const listEntries: import("convex/server").RegisteredQuery<"publi
     lastUsedAt: number;
 }[]>>;
 export declare const upsertEntry: import("convex/server").RegisteredMutation<"public", {
-    provider?: string | undefined;
     modelId?: string | undefined;
+    provider?: string | undefined;
     createdAt?: number | undefined;
     lastUsedAt?: number | undefined;
     authProfile?: string | undefined;
@@ -73,8 +73,8 @@ export declare const upsertEntry: import("convex/server").RegisteredMutation<"pu
 }, Promise<{
     _id: import("convex/values").GenericId<"sessions">;
     _creationTime: number;
-    provider?: string | undefined;
     modelId?: string | undefined;
+    provider?: string | undefined;
     authProfile?: string | undefined;
     thinkingLevel?: string | undefined;
     subagent?: {

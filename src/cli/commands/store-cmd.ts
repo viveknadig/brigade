@@ -10,12 +10,27 @@
 // where Brigade will read/write on next boot. `brigade store migrate` (a
 // later PR) handles the data copy.
 
+import * as fs from "node:fs";
+import readline from "node:readline/promises";
+
 import chalk from "chalk";
 import type { Command } from "commander";
 
 import { resolveStateDir } from "../../config/paths.js";
+import { isProcessAlive, readPid } from "../../core/gateway-probe.js";
+import {
+	encryptionKeySource,
+	generateMasterKeyHex,
+	retireEncryptionKeyFile,
+	saveEncryptionKeyToFile,
+} from "../../storage/encryption.js";
+import {
+	inspectConvexInstance,
+	resetConvexInstance,
+	type ConvexInstanceSummary,
+} from "../../storage/instance-admin.js";
 import { runStoreMigrate } from "../../storage/migrate.js";
-import { readSentinel, sentinelExists, writeSentinelNow } from "../../storage/sentinel.js";
+import { deleteSentinel, readSentinel, sentinelExists, writeSentinelNow } from "../../storage/sentinel.js";
 import type { StorageMode } from "../../storage/runtime-context.js";
 
 export interface StoreModeShowOptions {
@@ -120,6 +135,16 @@ export async function runStoreModeSet(opts: StoreModeSetOptions): Promise<number
 		}
 	}
 
+	// Convex mode is encrypted by default: make sure a key is active BEFORE
+	// the first sealed write. Env var wins; else the key file; else generate
+	// + persist + print ONCE (recovery-code framing). Mirrors the onboarding
+	// wizard's key step so the power-user path gets the same posture.
+	let generatedKeyHex: string | undefined;
+	if (mode === "convex" && encryptionKeySource() === "none") {
+		generatedKeyHex = generateMasterKeyHex();
+		saveEncryptionKeyToFile(generatedKeyHex);
+	}
+
 	const existed = sentinelExists();
 	const sentinel = writeSentinelNow(mode as StorageMode, {
 		...(opts.convexUrl ? { convexUrl: opts.convexUrl.trim() } : {}),
@@ -127,7 +152,26 @@ export async function runStoreModeSet(opts: StoreModeSetOptions): Promise<number
 
 	if (opts.json) {
 		process.stdout.write(
-			`${JSON.stringify({ ok: true, mode: sentinel.mode, previouslyPinned: existed, sentinel }, null, 2)}\n`,
+			`${JSON.stringify(
+				{
+					ok: true,
+					mode: sentinel.mode,
+					previouslyPinned: existed,
+					sentinel,
+					...(mode === "convex"
+						? {
+								encryption: {
+									source: encryptionKeySource(),
+									...(generatedKeyHex !== undefined
+										? { generated: true, key: generatedKeyHex }
+										: { generated: false }),
+								},
+							}
+						: {}),
+				},
+				null,
+				2,
+			)}\n`,
 		);
 		return 0;
 	}
@@ -135,6 +179,17 @@ export async function runStoreModeSet(opts: StoreModeSetOptions): Promise<number
 	process.stdout.write(`${chalk.green("✓")} storage mode pinned to ${chalk.bold(sentinel.mode)}\n`);
 	if (sentinel.mode === "convex") {
 		process.stdout.write(chalk.dim(`  Convex URL:  ${sentinel.convexUrl}\n`));
+	}
+	if (generatedKeyHex !== undefined) {
+		process.stdout.write(`\n${chalk.green("✓")} Created an encryption key for your data:\n\n`);
+		process.stdout.write(`  ${chalk.bold(generatedKeyHex)}\n\n`);
+		process.stdout.write(
+			chalk.dim(
+				"  Save this key in your password manager. It's also stored safely on this\n" +
+					"  computer so Brigade starts automatically — but if this computer is ever\n" +
+					"  lost, this key is the ONLY way to read your data.\n",
+			),
+		);
 	}
 	if (!existed) {
 		process.stdout.write(
@@ -144,6 +199,141 @@ export async function runStoreModeSet(opts: StoreModeSetOptions): Promise<number
 			chalk.dim(`    brigade store migrate --to ${sentinel.mode}  (not yet shipped — Phase 2 PR17)\n`),
 		);
 	}
+	return 0;
+}
+
+// ---------------------------------------------------------------------------
+// brigade store reset — factory reset of the convex instance
+// ---------------------------------------------------------------------------
+
+export interface StoreResetOptions {
+	convexUrl?: string;
+	yes?: boolean;
+	purgeLocal?: boolean;
+	json?: boolean;
+}
+
+function describeResetSummary(s: ConvexInstanceSummary): string {
+	const n = (v: number): string => (v >= 1000 ? "1000+" : String(v));
+	const parts = [
+		`${n(s.counts.memories)} memories`,
+		`${n(s.counts.sessions)} sessions`,
+		`${n(s.counts.cronJobs)} scheduled jobs`,
+		`${n(s.counts.personas)} persona files`,
+	];
+	if (s.whatsappLinked) parts.push("a linked WhatsApp");
+	return parts.join(" · ");
+}
+
+/**
+ * The honest "start over" for convex mode. Wiping `~/.brigade` is RESTORE
+ * (the backend brings everything back) — erasing the backend is what a
+ * fresh start actually means. Erases every row (+ stored files), removes
+ * the mode pin, and sets the encryption key file aside (never deleted) so
+ * the next onboard mints a fresh one.
+ */
+export async function runStoreReset(opts: StoreResetOptions = {}): Promise<number> {
+	const fail = (msg: string): number => {
+		if (opts.json) process.stdout.write(`${JSON.stringify({ ok: false, error: msg }, null, 2)}\n`);
+		else process.stderr.write(chalk.red(`brigade store reset: ${msg}\n`));
+		return 1;
+	};
+
+	// The gateway holds caches + write-behind chains — erasing under it
+	// would race. Same gate the link/unlink commands use.
+	const pid = await readPid();
+	if (pid && isProcessAlive(pid)) {
+		return fail("the gateway is running — stop it first with `brigade gateway stop`");
+	}
+
+	const sentinel = readSentinel();
+	const url =
+		opts.convexUrl?.trim() || sentinel?.convexUrl || process.env.BRIGADE_CONVEX_URL?.trim();
+	if (!url) {
+		return fail("no Convex deployment known — pass --convex-url <http(s)://...>");
+	}
+
+	let summary: ConvexInstanceSummary;
+	try {
+		summary = await inspectConvexInstance(url);
+	} catch (err) {
+		return fail(`couldn't reach the Convex backend at ${url} — ${(err as Error).message}`);
+	}
+
+	if (!opts.yes) {
+		if (!process.stdin.isTTY) {
+			return fail("refusing to erase without --yes in a non-interactive shell");
+		}
+		process.stderr.write(
+			`${chalk.red("This permanently erases the Brigade stored in this backend:")}\n` +
+				`  ${describeResetSummary(summary)}\n` +
+				`${chalk.dim("There is no undo.")}\n`,
+		);
+		const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+		try {
+			const answer = (await rl.question(`Type ${chalk.bold("erase")} to continue: `)).trim().toLowerCase();
+			if (answer !== "erase") {
+				process.stderr.write("Cancelled.\n");
+				return 1;
+			}
+		} finally {
+			rl.close();
+		}
+	}
+
+	const { deletedTotal } = await resetConvexInstance(url, {
+		onProgress: (table, deleted) => {
+			if (!opts.json) process.stderr.write(chalk.dim(`  cleared ${table} (${deleted})\n`));
+		},
+	});
+
+	// Local teardown: drop the mode pin; set the key file aside (the data it
+	// sealed is gone — next onboard mints a fresh key; the old file is kept
+	// as a .bak in case an old backup of the erased data still needs it).
+	deleteSentinel();
+	const retired = retireEncryptionKeyFile();
+
+	let purgedLocal = false;
+	if (opts.purgeLocal) {
+		try {
+			fs.rmSync(resolveStateDir(), { recursive: true, force: true });
+			purgedLocal = true;
+		} catch (err) {
+			return fail(`backend erased, but couldn't remove the local folder — ${(err as Error).message}`);
+		}
+	}
+
+	if (opts.json) {
+		process.stdout.write(
+			`${JSON.stringify(
+				{
+					ok: true,
+					deletedRecords: deletedTotal,
+					sentinelRemoved: true,
+					...(retired.backedUpTo !== undefined ? { keySetAsideAt: retired.backedUpTo } : {}),
+					purgedLocal,
+				},
+				null,
+				2,
+			)}\n`,
+		);
+		return 0;
+	}
+
+	process.stdout.write(`${chalk.green("✓")} Erased ${deletedTotal} records from the backend.\n`);
+	if (retired.backedUpTo) {
+		process.stdout.write(
+			chalk.dim(`  Your old encryption key was set aside (not deleted): ${retired.backedUpTo}\n`),
+		);
+	}
+	if (purgedLocal) {
+		process.stdout.write(chalk.dim("  Local Brigade folder removed.\n"));
+	} else {
+		process.stdout.write(
+			chalk.dim("  Local files were left in place — delete the Brigade folder yourself or re-run with --purge-local.\n"),
+		);
+	}
+	process.stdout.write(`\nRun ${chalk.bold("brigade onboard")} to start fresh.\n`);
 	return 0;
 }
 
@@ -248,6 +438,28 @@ export function registerStoreCommand(program: Command): void {
 				await runStoreModeSet({
 					mode: modeArg,
 					...(opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {}),
+					...(opts.json !== undefined ? { json: opts.json } : {}),
+				}),
+			);
+		});
+
+	store
+		.command("reset")
+		.description(
+			"Factory-reset the convex backend: permanently erase every stored record,\n" +
+				"remove the mode pin, and set the encryption key aside so the next onboard\n" +
+				"starts truly fresh. (Wiping ~/.brigade alone RESTORES — this erases.)",
+		)
+		.option("--convex-url <url>", "deployment URL (defaults to the pinned sentinel URL)")
+		.option("--yes", "skip the interactive confirmation", false)
+		.option("--purge-local", "also delete the local Brigade folder", false)
+		.option("--json", "emit JSON instead of human-readable text", false)
+		.action(async (opts: { convexUrl?: string; yes?: boolean; purgeLocal?: boolean; json?: boolean }) => {
+			process.exit(
+				await runStoreReset({
+					...(opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {}),
+					...(opts.yes !== undefined ? { yes: opts.yes } : {}),
+					...(opts.purgeLocal !== undefined ? { purgeLocal: opts.purgeLocal } : {}),
 					...(opts.json !== undefined ? { json: opts.json } : {}),
 				}),
 			);

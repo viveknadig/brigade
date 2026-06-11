@@ -321,14 +321,28 @@ export function checkSessionToolAccess(params: {
 	const targetAgentId = resolveAgentIdFromSessionKey(targetSessionKey);
 	const crossAgent = targetAgentId !== requesterAgentId;
 	if (crossAgent) {
+		// Self-documenting refusals: each carries the EXACT operator remedy.
+		// Production 2026-06-11 — without this the model guessed wrong causes
+		// ("hot-reload issue") instead of naming the real knob. The remedy is
+		// addressed to the OPERATOR by design: enabling cross-agent reach is
+		// a security decision the agent must surface, not silently apply.
 		if (visibility !== "all") {
-			return forbidden(action, "cross-agent visibility not enabled");
+			return forbidden(
+				action,
+				'cross-agent visibility not enabled. Operator remedy: in brigade.json set session.sessionTools.visibility: "all" (config is re-read next turn — no restart). Tell the operator; do not edit security config unasked.',
+			);
 		}
 		if (!a2aPolicy.enabled) {
-			return forbidden(action, "agent-to-agent disabled");
+			return forbidden(
+				action,
+				"agent-to-agent messaging disabled. Operator remedy: in brigade.json set session.agentToAgent.enabled: true (with an allow list, e.g. [{from: \"*\", to: \"*\"}]). Tell the operator; do not edit security config unasked.",
+			);
 		}
 		if (!a2aPolicy.isAllowed(requesterAgentId, targetAgentId)) {
-			return forbidden(action, `agent ${targetAgentId} not in allowlist`);
+			return forbidden(
+				action,
+				`agent ${targetAgentId} not reachable from ${requesterAgentId} under the current policy. With an org configured, edges follow the org graph (escalate up, assign down, same-department lateral, top↔all; cross-department lateral is closed) — route via the shared manager, or the operator can set org.a2a.mode: "explicit" / adjust session.agentToAgent.allow.`,
+			);
 		}
 		return { allowed: true };
 	}

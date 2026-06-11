@@ -10,8 +10,8 @@ export declare const generateUploadUrl: import("convex/server").RegisteredMutati
 export declare const recordUpload: import("convex/server").RegisteredMutation<"public", {
     contentType?: string | undefined;
     sha256: string;
-    ownerId: string;
     size: number;
+    ownerId: string;
     storageId: import("convex/values").GenericId<"_storage">;
 }, Promise<{
     existed: boolean;
@@ -22,8 +22,8 @@ export declare const getMeta: import("convex/server").RegisteredQuery<"public", 
     _id: import("convex/values").GenericId<"brigadeBlobs">;
     _creationTime: number;
     sha256: string;
-    ownerId: string;
     size: number;
+    ownerId: string;
     storageId: import("convex/values").GenericId<"_storage">;
     mime: string;
     refcount: number;

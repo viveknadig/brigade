@@ -688,7 +688,15 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	// State snapshots from the gateway — every mutation pushes one.
 	client.on("state", (snap) => {
 		lastSnapshot = snap;
-		isAgentRunning = snap.isAgentRunning;
+		// `snap.isAgentRunning` is AGENT-wide — it goes true when ANY session
+		// of this agent has a turn running (a WhatsApp chat, spawned
+		// sub-agents, a cron run). Taking it as-is flipped THIS lane into
+		// steer mode while our own session was idle, so typed messages
+		// bounced with "nothing to steer" and were lost. Only the CLEARING
+		// direction is safe from the snapshot (it reconciles a missed
+		// agent_end after a disconnect); the lane's own agent_start /
+		// agent_end events own the upward direction.
+		if (!snap.isAgentRunning) isAgentRunning = false;
 		// Seed the connection-bound agent from the first snapshot the
 		// gateway pushes. The operator can override via `/agent <id>` —
 		// once set explicitly, snapshot updates no longer reset the binding.
@@ -1103,7 +1111,9 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 			(snap) => {
 				if (!snap) return;
 				lastSnapshot = snap;
-				isAgentRunning = snap.isAgentRunning;
+				// Same one-way rule as the `state` handler: the agent-wide flag
+				// may only CLEAR our lane's busy state, never set it.
+				if (!snap.isAgentRunning) isAgentRunning = false;
 				// If the gateway says no turn is in flight, then any tool
 				// indicators we still hold are stale (their `tool_execution_end`
 				// landed while we were disconnected). Mark each one as
@@ -1599,6 +1609,23 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 				);
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
+				if (msg.includes("nothing to steer")) {
+					// Stale busy flag — our lane has no live turn (it ended a beat
+					// ago, or the busy signal came from another session before the
+					// one-way snapshot rule existed). The operator's message must
+					// never be lost: clear the flag and send it as a normal prompt.
+					isAgentRunning = false;
+					insertBeforeEditor(
+						new Markdown(`${brand.user("you")}  ${trimmed}`, 1, 0, markdownTheme),
+					);
+					try {
+						await client.request("prompt", withBinding({ text: trimmed }), { timeoutMs: 0 });
+					} catch (err2) {
+						const msg2 = err2 instanceof Error ? err2.message : String(err2);
+						insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg2)}`, 0, 0));
+					}
+					return;
+				}
 				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0));
 			}
 			return;

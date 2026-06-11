@@ -1,14 +1,16 @@
 export declare const list: import("convex/server").RegisteredQuery<"public", {
+    agentId?: string | null | undefined;
+    source?: "bundled" | "config" | "managed" | "personal" | "project" | "workspace" | undefined;
     ownerId: string;
 }, Promise<{
     _id: import("convex/values").GenericId<"skills">;
     _creationTime: number;
-    ownerId: string;
-    name: string;
-    source: "workspace" | "managed" | "bundled" | "project" | "config" | "personal";
-    description: string;
     agentId: string | null;
+    name: string;
+    source: "bundled" | "config" | "managed" | "personal" | "project" | "workspace";
+    description: string;
     createdAt: number;
+    ownerId: string;
     updatedAt: number;
     frontmatter: string;
     body: string;
@@ -22,17 +24,17 @@ export declare const list: import("convex/server").RegisteredQuery<"public", {
     disableModelInvocation: boolean;
 }[]>>;
 export declare const get: import("convex/server").RegisteredQuery<"public", {
-    ownerId: string;
     name: string;
+    ownerId: string;
 }, Promise<{
     _id: import("convex/values").GenericId<"skills">;
     _creationTime: number;
-    ownerId: string;
-    name: string;
-    source: "workspace" | "managed" | "bundled" | "project" | "config" | "personal";
-    description: string;
     agentId: string | null;
+    name: string;
+    source: "bundled" | "config" | "managed" | "personal" | "project" | "workspace";
+    description: string;
     createdAt: number;
+    ownerId: string;
     updatedAt: number;
     frontmatter: string;
     body: string;
@@ -46,11 +48,11 @@ export declare const get: import("convex/server").RegisteredQuery<"public", {
     disableModelInvocation: boolean;
 } | null>>;
 export declare const upsert: import("convex/server").RegisteredMutation<"public", {
-    ownerId: string;
-    name: string;
-    source: "workspace" | "managed" | "bundled" | "project" | "config" | "personal";
-    description: string;
     agentId: string | null;
+    name: string;
+    source: "bundled" | "config" | "managed" | "personal" | "project" | "workspace";
+    description: string;
+    ownerId: string;
     frontmatter: string;
     body: string;
     eligibility: {
@@ -65,7 +67,7 @@ export declare const upsert: import("convex/server").RegisteredMutation<"public"
     created: boolean;
 }>>;
 export declare const remove: import("convex/server").RegisteredMutation<"public", {
-    ownerId: string;
     name: string;
+    ownerId: string;
 }, Promise<boolean>>;
 //# sourceMappingURL=skills.d.ts.map

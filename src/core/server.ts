@@ -109,6 +109,7 @@ import {
 } from "../agents/session-registry.js";
 import crypto from "node:crypto";
 import { enqueuePendingSystemEvent } from "../agents/pending-system-events.js";
+import { enqueueSystemEvent as enqueueSessionInboxEvent } from "../agents/session-inbox.js";
 // Multi-routing wiring (Step 1-27 lift): in-process gateway-call dispatcher,
 // per-method handlers (sessions.*, health), agent-events bridge, heartbeat
 // runner + wake flag, lane drain helpers. All exported but never called
@@ -649,7 +650,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						| undefined;
 			  }
 			| undefined,
-	): Promise<{ added: string[]; removed: string[] }> {
+	): Promise<{ added: string[]; removed: string[]; updated: string[] }> {
 		const map = cfgAgents ?? {};
 		const defaultsEntry = map.defaults;
 		const defaultsProvider =
@@ -661,6 +662,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				: undefined;
 		const seenIds = new Set<string>([agentId]);
 		const added: string[] = [];
+		const updated: string[] = [];
 		// H4: honour a persisted `thinking` on the boot agent entry even when
 		// re-seeding (config hot-reload edits the level for the boot agent).
 		const bootPersisted = readPersistedThinking(map[agentId]);
@@ -673,13 +675,63 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		for (const [id, entry] of Object.entries(map)) {
 			if (id === "defaults" || !entry || typeof entry !== "object") continue;
 			seenIds.add(id);
-			if (perAgentRuntime.has(id)) continue; // already seeded
 			const aProvider =
 				(typeof entry.provider === "string" ? entry.provider : undefined) ?? defaultsProvider;
 			const aModelId =
 				(typeof entry.model === "object" && entry.model && typeof entry.model.primary === "string"
 					? entry.model.primary
 					: undefined) ?? defaultsModelId;
+			if (perAgentRuntime.has(id)) {
+				// BOOT AGENT EXCEPTION (audit P0 F5/F6, 2026-06-11): the boot
+				// agent's model is owned by the in-process set-model path
+				// (perAgentRuntime.set + persistDefaultModel → agents.defaults),
+				// NOT by its `agents.<id>` entry. Re-deriving it here from a
+				// stale per-agent pin REVERTED a just-applied set-model ~500ms
+				// later (config write → this watcher). HEAD skipped every
+				// already-seeded agent; preserve that for the boot agent exactly
+				// (its thinking hot-reload is handled separately above at the
+				// bootPersistedThinking block). Only NON-boot agents get the
+				// model hot-reload this branch was added for.
+				if (id === agentId) continue;
+				// Hot-reload model/provider edits for EXISTING non-boot agents.
+				// Previously this skipped outright, so changing an agent's model
+				// in brigade.json silently required a full gateway restart while
+				// every surface claimed "applies next turn". Rebuild the runtime
+				// only when the configured pair actually changed; the operator's
+				// in-session thinking choice survives the swap.
+				const current = perAgentRuntime.get(id);
+				if (
+					current &&
+					aProvider &&
+					aModelId &&
+					(current.provider !== aProvider || current.modelId !== aModelId)
+				) {
+					const rebuilt =
+						modelRegistry.find(aProvider, aModelId) ??
+						((await resolveModelNeverMiss({
+							modelRegistry,
+							provider: aProvider,
+							modelId: aModelId,
+							modelsFile,
+							authStorage: getAuthStorageForAgent(id),
+						})) as Model<string> | undefined);
+					if (rebuilt) {
+						perAgentRuntime.set(id, {
+							provider: aProvider,
+							modelId: aModelId,
+							model: rebuilt,
+							thinkingLevel:
+								readPersistedThinking(entry) ?? current.thinkingLevel,
+						});
+						updated.push(id);
+					} else {
+						bootLog(
+							`hot-reload: agent "${id}" model ${aProvider}/${aModelId} could not be resolved — keeping ${current.provider}/${current.modelId}`,
+						);
+					}
+				}
+				continue;
+			}
 			if (!aProvider || !aModelId) {
 				bootLog(
 					`skipping agent "${id}" — no provider/model resolved (per-agent entry has none and cfg.agents.defaults is incomplete)`,
@@ -721,7 +773,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			perAgentRuntime.delete(existingId);
 			removed.push(existingId);
 		}
-		return { added, removed };
+		return { added, removed, updated };
 	}
 
 	await seedAgentsFromConfig(
@@ -781,6 +833,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						);
 						for (const id of result.added) bootLog(`hot-reload: seeded agent "${id}"`);
 						for (const id of result.removed) bootLog(`hot-reload: evicted agent "${id}"`);
+						for (const id of result.updated) bootLog(`hot-reload: updated agent "${id}" model`);
 					} catch (err) {
 						bootLog(
 							`hot-reload failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -1360,22 +1413,30 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					agentId: cronTargetAgentId,
 					sessionId: cronTargetSessionKey,
 				});
-				// TRACK 2 — model awareness. ALSO queue the text per-session so
-				// the NEXT agent turn for that session picks it up via
-				// `drainPendingSystemEvents` and prepends a `<system_event>`
-				// block to the user message. Without this the model would be
-				// answering the operator's next "did the cron fire?" question
-				// blind and might bullshit "any moment now" while the actual
-				// fire happened minutes ago. The operator's main session is
-				// the default target — a cron without a channel target is
-				// announcing into "wherever the operator is", which on a
-				// TUI / connect-mode setup is the main session.
+				// TRACK 2 — model awareness. Queue the text in the SESSION INBOX
+				// (`agents/session-inbox.ts`) — the queue the heartbeat runner
+				// peeks/consumes. The cron timer follows its enqueue with a
+				// `requestHeartbeatNow` wake; the runner inspects this inbox and
+				// dispatches a synthetic turn that receives the event text as its
+				// message, so the agent ACTS on the reminder at fire time (e.g.
+				// sends the WhatsApp message) instead of the text sleeping until
+				// the operator happens to type. This used to write to
+				// `pending-system-events.ts` (Track 2's original cron-only queue)
+				// — a queue the runner never reads — so every wake was skipped
+				// "no-pending-events" and main-target reminders only ever
+				// piggybacked on the operator's next message. Real turns drain
+				// the session inbox at turn start too (`drainFormattedSessionEvents`
+				// in agent-loop.ts), so the catch-up path this write used to serve
+				// is preserved.
 				const targetSessionKey = args.sessionKey ?? defaultSessionKey(args.agentId ?? agentId);
-				enqueuePendingSystemEvent(targetSessionKey, {
-					text: args.text,
-					queuedAtMs: at,
-					...(args.jobId !== undefined ? { jobId: args.jobId } : {}),
-					...(args.jobName !== undefined ? { jobName: args.jobName } : {}),
+				const attribution =
+					args.jobName && !args.text.startsWith("[cron ")
+						? `[cron "${args.jobName}"] ${args.text}`
+						: args.text;
+				enqueueSessionInboxEvent(attribution, {
+					sessionKey: targetSessionKey,
+					...(args.jobId !== undefined ? { contextKey: `cron:${args.jobId}` } : {}),
+					trusted: true,
 				});
 			},
 			/**
@@ -3723,6 +3784,24 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			});
 		} catch {
 			// Heartbeat turns are best-effort; failures already log via the runner.
+			// Audit P2 (F3, 2026-06-11): the runner CONSUMED these events before
+			// firing this hook, so a dispatch throw (e.g. shutdown drain) would
+			// silently drop a real cron/system event. Re-enqueue the consumed
+			// payload events so the next turn/wake still surfaces them. Interval
+			// ticks carry no payload ("Heartbeat tick.") — nothing to restore.
+			// No tight loop: this hook only fires on a wake tick, not in a spin.
+			for (const ev of params.consumedEvents) {
+				if (!ev?.text) continue;
+				try {
+					enqueueSessionInboxEvent(ev.text, {
+						sessionKey: params.sessionKey,
+						...(ev.contextKey ? { contextKey: ev.contextKey } : {}),
+						trusted: ev.trusted !== false,
+					});
+				} catch {
+					/* best-effort restore */
+				}
+			}
 		}
 	});
 

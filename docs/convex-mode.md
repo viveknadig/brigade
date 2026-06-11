@@ -35,27 +35,39 @@ brigade gateway stop
 # 2. (You said you don't need current data) wipe the old state
 Remove-Item -Recurse -Force ~/.brigade
 
-# 3. Generate your encryption key — credentials are AES-256-GCM sealed
-#    with this BEFORE they leave the process; Convex never sees plaintext
-node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
-$env:BRIGADE_ENCRYPTION_KEY = "<the 64-char hex from above>"
-# Persist it for future shells (System Properties → Environment Variables,
-# or your daemon unit). Losing this key = losing access to sealed secrets.
-
-# 4. Start the self-hosted Convex backend
+# 3. Start the self-hosted Convex backend
 npm run convex:dev     # boots the local backend + pushes convex/ functions
 
-# 5. Point Brigade at it + onboard
+# 4. Point Brigade at it + onboard
 $env:BRIGADE_CONVEX_URL = "http://127.0.0.1:3210"
-brigade store mode set convex
+brigade store mode set convex   # auto-creates your encryption key (see below)
 brigade onboard        # provider + key (key lands SEALED in authProfiles)
 
-# 6. Run
+# 5. Run
 brigade gateway run    # or just: brigade
 ```
 
+**Encryption key — automatic.** Credentials are AES-256-GCM sealed BEFORE
+they leave the process; Convex never sees plaintext. On your first convex
+setup (`store mode set convex` or the onboard wizard's convex choice) Brigade
+generates a key, prints it ONCE (save it in your password manager), and
+stores it at the OS config location — `%LOCALAPPDATA%\Brigade\encryption.key`
+on Windows, `~/Library/Application Support/brigade/` on macOS,
+`~/.config/brigade/` on Linux — deliberately OUTSIDE `~/.brigade` so the
+wipe-and-restore flow can't destroy it. Resolution order:
+`BRIGADE_ENCRYPTION_KEY` env var (always wins) → key file → off.
+Check with `brigade encrypt status` (shows the active source).
+
+**Restore vs fresh.** Wiping `~/.brigade` is RESTORE — the next boot brings
+everything back from Convex (the onboard wizard also detects an existing
+Brigade in the backend and asks "Restore / Start fresh"). A true fresh start
+is `brigade store reset` — it permanently erases every backend record,
+removes the mode pin, and sets the old key file aside as a `.bak` (never
+deleted) so the next onboard mints a new key.
+
 WhatsApp: re-link once (`brigade channels link whatsapp`) — signal keys now
 live sealed in Convex; the old on-disk auth dir is not migrated by design.
+After that, even a full `~/.brigade` wipe reconnects WITHOUT a new QR scan.
 
 ## Verifying strict-zero
 

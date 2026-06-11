@@ -211,6 +211,39 @@ export function resolveOsCacheDir(): string {
   return path.join(xdg || path.join(os.homedir(), ".cache"), "brigade");
 }
 
+/**
+ * OS-conventional CONFIG dir (NOT cache — cache dirs are "safe to delete" by
+ * platform convention and cleanup tools honour that; config dirs are durable).
+ * Windows %LOCALAPPDATA%\Brigade, macOS ~/Library/Application Support/brigade,
+ * Linux $XDG_CONFIG_HOME|~/.config/brigade.
+ */
+export function resolveOsConfigDir(): string {
+  if (process.platform === "win32") {
+    const base = process.env.LOCALAPPDATA?.trim() || path.join(os.homedir(), "AppData", "Local");
+    return path.join(base, "Brigade");
+  }
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support", "brigade");
+  }
+  const xdg = process.env.XDG_CONFIG_HOME?.trim();
+  return path.join(xdg || path.join(os.homedir(), ".config"), "brigade");
+}
+
+/**
+ * Where the auto-generated at-rest encryption key lives. DELIBERATELY outside
+ * `~/.brigade`: the key decrypts the Convex data, and `rm -rf ~/.brigade` is
+ * the operation convex mode is designed to survive — a key stored inside the
+ * wiped dir would turn every wipe into permanent data loss (the n8n lockout
+ * failure mode). Also deliberately NOT in the cache dir (cleanup tools may
+ * reap caches). `BRIGADE_ENCRYPTION_KEY_FILE` overrides for tests / exotic
+ * setups; the `BRIGADE_ENCRYPTION_KEY` env var always beats the file.
+ */
+export function resolveEncryptionKeyFilePath(): string {
+  const override = process.env.BRIGADE_ENCRYPTION_KEY_FILE?.trim();
+  if (override) return path.resolve(override);
+  return path.join(resolveOsConfigDir(), "encryption.key");
+}
+
 // Per-channel state root, e.g. `~/.brigade/channels/whatsapp`. Channels keep
 // their own auth/creds here so `rm -rf ~/.brigade` wipes them with everything
 // else and a single channel can be reset by deleting just its subdir.

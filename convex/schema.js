@@ -31,11 +31,15 @@ export default defineSchema({
         auth: v.optional(v.any()),
         plugins: v.optional(v.any()),
         skills: v.optional(v.any()),
+        channels: v.optional(v.any()),
         bindings: v.optional(v.any()),
         org: v.optional(v.any()),
         wizard: v.optional(v.any()),
         meta: v.optional(v.any()),
         defaults: v.optional(v.any()),
+        // Catch-all for any top-level key not named above — preserves the disk
+        // path's unknown-key round-trip guarantee (io.ts orderTopLevelKeys).
+        extra: v.optional(v.any()),
         encryptedGatewayAuthToken: v.optional(Enc()),
         encryptedGatewayAuthPassword: v.optional(Enc()),
         contentSha256: v.string(),
@@ -225,6 +229,10 @@ export default defineSchema({
         aborted: v.optional(v.boolean()),
         willRetry: v.optional(v.boolean()),
         messageCount: v.optional(v.number()),
+        // auto_retry_end carries these — kept so a failed-then-recovered turn is
+        // fully reconstructable from the convex log (disk parity).
+        success: v.optional(v.boolean()),
+        finalError: v.optional(v.string()),
     })
         .index("by_owner_day", ["ownerId", "day"])
         .index("by_owner_session", ["ownerId", "sessionKey", "ts"])
@@ -403,6 +411,55 @@ export default defineSchema({
         .index("by_owner_agent_provider", ["ownerId", "agentId", "provider"])
         .index("by_owner_agent_profileId", ["ownerId", "agentId", "profileId"])
         .index("by_cooldown_until", ["ownerId", "agentId", "cooldownUntil"]),
+    // Whole-file auth state blobs — auth-state.json / profile-state.json
+    // round-trip VERBATIM as sealed payloads. Blob-per-file (not per-row
+    // flattening) is deliberate: the failover `order` field is a per-provider
+    // ARRAY (`{provider: [profileId…]}`) that a per-row `explicitOrder` rank
+    // cannot represent without semantic drift, and `lastGood` reconstruction
+    // from per-row flags proved fragile (two winners on a race). The
+    // per-row `profileState` table above stays for queryable cooldown views;
+    // the blob is the source of truth the runtime round-trips.
+    authFiles: defineTable({
+        ownerId: v.string(),
+        agentId: v.string(),
+        // "models" is the per-USER models.json (custom provider catalog —
+        // Ollama etc.); stored under agentId "main" since the file is global.
+        kind: v.union(v.literal("auth-state"), v.literal("profile-state"), v.literal("models")),
+        payload: v.bytes(),
+        updatedAt: v.number(),
+    }).index("by_owner_agent_kind", ["ownerId", "agentId", "kind"]),
+    // WhatsApp Baileys auth — replaces the ~900-file multi-file auth dir in
+    // convex mode. creds.json rides as ONE sealed BufferJSON blob (small,
+    // atomic updates); every signal key (pre-key / session / sender-key /
+    // app-state-sync-key / …) is a row keyed (keyType, keyId). Oversized
+    // values (LTHashState app-state-sync-version grows with contacts and can
+    // exceed the mutation arg cap) spill to Convex File Storage via
+    // `storageId`. keyType is a plain string — Baileys adds types across
+    // versions and a locked union would reject them.
+    // Small system-level key/value facts (encryption-key fingerprint, schema
+    // markers). Generic so future singletons don't need their own tables.
+    systemMeta: defineTable({
+        key: v.string(),
+        value: v.string(),
+        updatedAt: v.number(),
+    }).index("by_key", ["key"]),
+    whatsappAuthCreds: defineTable({
+        ownerId: v.string(),
+        accountId: v.string(),
+        payload: v.bytes(),
+        updatedAt: v.number(),
+    }).index("by_owner_account", ["ownerId", "accountId"]),
+    whatsappAuthKeys: defineTable({
+        ownerId: v.string(),
+        accountId: v.string(),
+        keyType: v.string(),
+        keyId: v.string(),
+        payload: v.optional(v.bytes()),
+        storageId: v.optional(v.id("_storage")),
+        updatedAt: v.number(),
+    })
+        .index("by_owner_account_type_id", ["ownerId", "accountId", "keyType", "keyId"])
+        .index("by_owner_account", ["ownerId", "accountId"]),
     // ===========================================================================
     // 10. EXEC APPROVALS  (REPORT 8)
     // ===========================================================================

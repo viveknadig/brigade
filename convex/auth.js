@@ -109,6 +109,40 @@ export const loadState = query({
             .collect();
     },
 });
+// ============================================================================
+// authFiles (whole-file state blobs — auth-state.json / profile-state.json)
+// ============================================================================
+const AuthFileKind = v.union(v.literal("auth-state"), v.literal("profile-state"), v.literal("models"));
+export const readAuthFile = query({
+    args: { ownerId: v.string(), agentId: v.string(), kind: AuthFileKind },
+    handler: async (ctx, args) => {
+        return ctx.db
+            .query("authFiles")
+            .withIndex("by_owner_agent_kind", (q) => q.eq("ownerId", args.ownerId).eq("agentId", args.agentId).eq("kind", args.kind))
+            .first();
+    },
+});
+export const writeAuthFile = mutation({
+    args: {
+        ownerId: v.string(),
+        agentId: v.string(),
+        kind: AuthFileKind,
+        payload: v.bytes(),
+    },
+    handler: async (ctx, args) => {
+        const existing = await ctx.db
+            .query("authFiles")
+            .withIndex("by_owner_agent_kind", (q) => q.eq("ownerId", args.ownerId).eq("agentId", args.agentId).eq("kind", args.kind))
+            .first();
+        const row = { ...args, updatedAt: Date.now() };
+        if (existing) {
+            await ctx.db.replace(existing._id, row);
+            return { updated: true };
+        }
+        await ctx.db.insert("authFiles", row);
+        return { updated: false };
+    },
+});
 export const upsertState = mutation({
     args: {
         ownerId: v.string(),

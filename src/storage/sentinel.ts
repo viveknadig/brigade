@@ -11,7 +11,7 @@
 // File location: `<stateDir>/mode.sentinel` (default `~/.brigade/mode.sentinel`)
 // File format: pretty JSON, < 1 KiB
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { resolveStateDir } from "../config/paths.js";
@@ -104,4 +104,13 @@ export function writeSentinelNow(
 
 export function sentinelExists(opts: SentinelOptions = {}): boolean {
 	return existsSync(resolveSentinelPath(opts.stateDir));
+}
+
+/** Remove the mode pin (factory reset / `store reset`). Missing file is fine. */
+export function deleteSentinel(opts: SentinelOptions = {}): void {
+	try {
+		rmSync(resolveSentinelPath(opts.stateDir), { force: true });
+	} catch {
+		// Best-effort — a stuck sentinel surfaces on the next mode show.
+	}
 }

@@ -1,8 +1,14 @@
 import { strict as assert } from "node:assert";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterEach, describe, it } from "node:test";
 
 import { __cronMarshalling } from "./cron-store.js";
 import type { CronJob } from "../../cron/types.js";
+
+// Hermetic: a real operator key file (auto-created by convex onboarding)
+// must not leak into the "no key" cases — point the file lookup nowhere.
+process.env.BRIGADE_ENCRYPTION_KEY_FILE = path.join(tmpdir(), "brigade-no-such-key-file");
 
 // Round-trip coverage for the cronJobs flatten/rebuild marshalling. This is
 // the seam that broke "zero jobs survive a restart in convex mode": insertJob

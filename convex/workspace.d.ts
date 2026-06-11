@@ -3,29 +3,33 @@ export declare const listPersona: import("convex/server").RegisteredQuery<"publi
 }, Promise<{
     _id: import("convex/values").GenericId<"personaFiles">;
     _creationTime: number;
-    name: "AGENTS.md" | "SOUL.md" | "IDENTITY.md" | "USER.md" | "TOOLS.md" | "BOOTSTRAP.md" | "MEMORY.md" | "HEARTBEAT.md";
     agentId: string;
+    name: "AGENTS.md" | "SOUL.md" | "IDENTITY.md" | "USER.md" | "TOOLS.md" | "BOOTSTRAP.md" | "MEMORY.md" | "HEARTBEAT.md";
     content: ArrayBuffer;
     updatedAt: number;
 }[]>>;
 export declare const getPersona: import("convex/server").RegisteredQuery<"public", {
-    name: "AGENTS.md" | "SOUL.md" | "IDENTITY.md" | "USER.md" | "TOOLS.md" | "BOOTSTRAP.md" | "MEMORY.md" | "HEARTBEAT.md";
     agentId: string;
+    name: "AGENTS.md" | "SOUL.md" | "IDENTITY.md" | "USER.md" | "TOOLS.md" | "BOOTSTRAP.md" | "MEMORY.md" | "HEARTBEAT.md";
 }, Promise<{
     _id: import("convex/values").GenericId<"personaFiles">;
     _creationTime: number;
-    name: "AGENTS.md" | "SOUL.md" | "IDENTITY.md" | "USER.md" | "TOOLS.md" | "BOOTSTRAP.md" | "MEMORY.md" | "HEARTBEAT.md";
     agentId: string;
+    name: "AGENTS.md" | "SOUL.md" | "IDENTITY.md" | "USER.md" | "TOOLS.md" | "BOOTSTRAP.md" | "MEMORY.md" | "HEARTBEAT.md";
     content: ArrayBuffer;
     updatedAt: number;
 } | null>>;
 export declare const writePersona: import("convex/server").RegisteredMutation<"public", {
-    name: "AGENTS.md" | "SOUL.md" | "IDENTITY.md" | "USER.md" | "TOOLS.md" | "BOOTSTRAP.md" | "MEMORY.md" | "HEARTBEAT.md";
     agentId: string;
+    name: "AGENTS.md" | "SOUL.md" | "IDENTITY.md" | "USER.md" | "TOOLS.md" | "BOOTSTRAP.md" | "MEMORY.md" | "HEARTBEAT.md";
     content: ArrayBuffer;
 }, Promise<{
     created: boolean;
 }>>;
+export declare const deletePersona: import("convex/server").RegisteredMutation<"public", {
+    agentId: string;
+    name: "AGENTS.md" | "SOUL.md" | "IDENTITY.md" | "USER.md" | "TOOLS.md" | "BOOTSTRAP.md" | "MEMORY.md" | "HEARTBEAT.md";
+}, Promise<boolean>>;
 export declare const getState: import("convex/server").RegisteredQuery<"public", {
     agentId: string;
 }, Promise<{

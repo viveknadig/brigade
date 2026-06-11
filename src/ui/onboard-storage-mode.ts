@@ -11,11 +11,25 @@
 // The caller (src/ui/onboarding.ts) writes the sentinel after the rest of the
 // wizard completes.
 
+import { createHash } from "node:crypto";
+
 import { CancellableLoader, Input, type SelectItem, SelectList, Text, type TUI } from "@mariozechner/pi-tui";
 
 import { renderBrandHeader } from "./brand.js";
 import { brand, selectListTheme } from "./theme.js";
 import type { StorageMode } from "../storage/runtime-context.js";
+import {
+	encryptionKeySource,
+	encryptionStatus,
+	generateMasterKeyHex,
+	saveEncryptionKeyToFile,
+} from "../storage/encryption.js";
+import {
+	classifyInstanceState,
+	inspectConvexInstance,
+	resetConvexInstance,
+	type ConvexInstanceSummary,
+} from "../storage/instance-admin.js";
 
 export interface StorageModeResult {
 	mode: StorageMode;
@@ -215,6 +229,30 @@ async function pickConvexBackend(tui: TUI): Promise<string> {
 		);
 		tui.requestRender();
 		await delay(500);
+
+		// Step 0d — at-rest encryption key. Auto-generate + persist on first
+		// convex onboard so the customer never manages an env var; show the
+		// key ONCE with recovery-code framing. Esc rewinds to the backend
+		// picker.
+		try {
+			await ensureEncryptionKeyStep(tui);
+		} catch (err) {
+			if ((err as Error).message === "back") continue;
+			throw err;
+		}
+
+		// Step 0e — does this backend already hold a Brigade? Offer
+		// restore-or-fresh (and handle the wrong-key case) BEFORE the rest of
+		// the wizard runs, so "start fresh" is an explicit choice instead of
+		// an accident of which files survived.
+		try {
+			const decision = await detectExistingInstanceStep(tui, url);
+			if (decision === "back") continue;
+		} catch (err) {
+			if ((err as Error).message === "back") continue;
+			throw err;
+		}
+
 		return url;
 	}
 }
@@ -246,6 +284,334 @@ async function probeConvexBackend(url: string): Promise<ProbeResult> {
 				: "";
 		return { ok: false, reason: `Couldn't reach ${cleaned}: ${msg}${localHint}` };
 	}
+}
+
+/* ──────────────── Step 0d — encryption key ──────────────── */
+
+/**
+ * Make sure an at-rest encryption key is active before any convex write:
+ *   • env var set        → use it (power users / CI own their key)
+ *   • key file exists    → use it silently (returning customer)
+ *   • neither            → generate, persist to the key file (OUTSIDE
+ *                          ~/.brigade — survives a state wipe), and show it
+ *                          ONCE so the customer can save a recovery copy.
+ * Throws "back" when the user Escs.
+ */
+async function ensureEncryptionKeyStep(tui: TUI): Promise<void> {
+	const source = encryptionKeySource();
+	if (source === "env") {
+		renderScreen(tui, "Step 0 of 5 · Encryption");
+		tui.addChild(
+			new Text(`  ${brand.amber("✓")} Encryption key found in your environment — using it.`, 0, 0),
+		);
+		tui.requestRender();
+		await delay(600);
+		return;
+	}
+	if (source === "file") {
+		renderScreen(tui, "Step 0 of 5 · Encryption");
+		tui.addChild(
+			new Text(`  ${brand.amber("✓")} Encryption key found on this computer — using it.`, 0, 0),
+		);
+		tui.requestRender();
+		await delay(600);
+		return;
+	}
+
+	// No key anywhere — generate + persist + show once.
+	const hex = generateMasterKeyHex();
+	saveEncryptionKeyToFile(hex);
+	await showRecoveryKeyScreen(tui, hex, "Your data will be encrypted before it leaves this computer.");
+}
+
+/** Full-screen "save this key" moment. Resolves when the user confirms;
+ *  throws "back" on Esc. */
+async function showRecoveryKeyScreen(tui: TUI, hex: string, intro: string): Promise<void> {
+	renderScreen(tui, "Step 0 of 5 · Your encryption key");
+	tui.addChild(new Text(`  ${brand.dim(intro)}`, 0, 0));
+	tui.addChild(new Text("", 0, 0));
+	tui.addChild(new Text(`  ${brand.white(hex)}`, 0, 0));
+	tui.addChild(new Text("", 0, 0));
+	tui.addChild(
+		new Text(
+			`  ${brand.dim("Save this key in your password manager. It's also stored safely on this")}`,
+			0,
+			0,
+		),
+	);
+	tui.addChild(
+		new Text(
+			`  ${brand.dim("computer so Brigade starts automatically — but if this computer is ever")}`,
+			0,
+			0,
+		),
+	);
+	tui.addChild(
+		new Text(`  ${brand.dim("lost, this key is the ONLY way to read your data.")}`, 0, 0),
+	);
+	tui.addChild(new Text("", 0, 0));
+
+	const items: SelectItem[] = [
+		{ value: "saved", label: "Continue", description: "I've saved my key somewhere safe" },
+	];
+	const list = new SelectList(items, items.length, selectListTheme, {
+		minPrimaryColumnWidth: 10,
+		maxPrimaryColumnWidth: 12,
+	});
+	tui.addChild(list);
+	tui.setFocus(list);
+	tui.requestRender();
+	await new Promise<void>((resolve, reject) => {
+		list.onSelect = () => resolve();
+		list.onCancel = () => reject(new Error("back"));
+	});
+}
+
+/* ──────────── Step 0e — existing-instance detection ──────────── */
+
+/**
+ * Look at what the backend already holds and route:
+ *   fresh        → proceed silently
+ *   restorable   → "Restore it / Start fresh?" (fresh = explicit erase)
+ *   key-mismatch → explain + offer the saved-key entry or erase
+ * Returns "proceed" or "back". Detection failures NEVER block onboarding —
+ * the backend was probed reachable a moment ago, so a summary error degrades
+ * to proceeding (boot will surface real problems loudly).
+ */
+async function detectExistingInstanceStep(tui: TUI, url: string): Promise<"proceed" | "back"> {
+	let summary: ConvexInstanceSummary;
+	try {
+		summary = await inspectConvexInstance(url);
+	} catch {
+		return "proceed";
+	}
+	const fp = encryptionStatus().primaryKeyFingerprint;
+	const state = classifyInstanceState(summary, fp);
+	if (state === "fresh") return "proceed";
+
+	if (state === "restorable") {
+		renderScreen(tui, "Step 0 of 5 · Found an existing Brigade");
+		tui.addChild(new Text(`  ${brand.dim(describeSummary(summary))}`, 0, 0));
+		tui.addChild(new Text("", 0, 0));
+		const items: SelectItem[] = [
+			{
+				value: "restore",
+				label: "Restore",
+				description: "Pick up exactly where it left off (memories, sessions, channels)",
+			},
+			{
+				value: "fresh",
+				label: "Start fresh",
+				description: "Permanently erase it and begin new — cannot be undone",
+			},
+		];
+		const list = new SelectList(items, items.length, selectListTheme, {
+			minPrimaryColumnWidth: 12,
+			maxPrimaryColumnWidth: 14,
+		});
+		tui.addChild(list);
+		tui.setFocus(list);
+		tui.requestRender();
+		let choice: string;
+		try {
+			const chosen = await new Promise<SelectItem>((resolve, reject) => {
+				list.onSelect = (item) => resolve(item);
+				list.onCancel = () => reject(new Error("back"));
+			});
+			choice = String(chosen.value);
+		} catch {
+			return "back";
+		}
+		if (choice === "restore") return "proceed";
+		return (await confirmAndErase(tui, url, summary)) ? "proceed" : "back";
+	}
+
+	// key-mismatch — the backend's data was sealed with a different key.
+	renderScreen(tui, "Step 0 of 5 · This backend is locked with a different key");
+	tui.addChild(new Text(`  ${brand.dim(describeSummary(summary))}`, 0, 0));
+	tui.addChild(new Text("", 0, 0));
+	tui.addChild(
+		new Text(
+			`  ${brand.dim("The data here was encrypted with a different key than the one on this")}`,
+			0,
+			0,
+		),
+	);
+	tui.addChild(
+		new Text(`  ${brand.dim("computer. To restore it, enter the key you saved when it was created.")}`, 0, 0),
+	);
+	if (encryptionKeySource() === "env") {
+		tui.addChild(new Text("", 0, 0));
+		tui.addChild(
+			new Text(
+				`  ${brand.dim("(Your key currently comes from the BRIGADE_ENCRYPTION_KEY environment")}`,
+				0,
+				0,
+			),
+		);
+		tui.addChild(
+			new Text(`  ${brand.dim("variable — update that variable instead of entering a key here.)")}`, 0, 0),
+		);
+	}
+	tui.addChild(new Text("", 0, 0));
+
+	const canEnterKey = encryptionKeySource() !== "env";
+	const items: SelectItem[] = [
+		...(canEnterKey
+			? [
+					{
+						value: "enter-key",
+						label: "Enter key",
+						description: "Type the saved recovery key to unlock and restore",
+					},
+				]
+			: []),
+		{
+			value: "fresh",
+			label: "Start fresh",
+			description: "Permanently erase the locked data and begin new",
+		},
+	];
+	const list = new SelectList(items, items.length, selectListTheme, {
+		minPrimaryColumnWidth: 12,
+		maxPrimaryColumnWidth: 14,
+	});
+	tui.addChild(list);
+	tui.setFocus(list);
+	tui.requestRender();
+	let choice: string;
+	try {
+		const chosen = await new Promise<SelectItem>((resolve, reject) => {
+			list.onSelect = (item) => resolve(item);
+			list.onCancel = () => reject(new Error("back"));
+		});
+		choice = String(chosen.value);
+	} catch {
+		return "back";
+	}
+
+	if (choice === "enter-key") {
+		const ok = await promptForRecoveryKey(tui, summary.storedKeyFingerprint ?? "");
+		if (!ok) return "back";
+		return "proceed";
+	}
+	return (await confirmAndErase(tui, url, summary)) ? "proceed" : "back";
+}
+
+/** Ask for the saved recovery key; accept only when its fingerprint matches
+ *  what the backend was sealed with, then persist it as the active key file
+ *  (the wrong file key, if any, is set aside as a .bak — never destroyed). */
+async function promptForRecoveryKey(tui: TUI, expectedFingerprint: string): Promise<boolean> {
+	let lastError: string | null = null;
+	while (true) {
+		renderScreen(tui, "Step 0 of 5 · Enter your recovery key");
+		if (lastError) {
+			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
+			tui.addChild(new Text("", 0, 0));
+		}
+		tui.addChild(new Text(`  ${brand.dim("Paste the 64-character key you saved. Esc to go back.")}`, 0, 0));
+		tui.addChild(new Text("", 0, 0));
+		const input = new Input();
+		tui.addChild(input);
+		tui.setFocus(input);
+		tui.requestRender();
+		let raw: string;
+		try {
+			raw = await new Promise<string>((resolve, reject) => {
+				input.onSubmit = (value: string) => resolve(value.trim());
+				input.onEscape = () => reject(new Error("back"));
+			});
+		} catch {
+			return false;
+		}
+		if (!/^[0-9a-f]{64}$/i.test(raw)) {
+			lastError = "That doesn't look like a Brigade key (expected 64 hex characters).";
+			continue;
+		}
+		const fp = createHash("sha256").update(Buffer.from(raw, "hex")).digest("hex").slice(0, 8);
+		if (expectedFingerprint && fp !== expectedFingerprint) {
+			lastError = "That key doesn't match this backend's data. Check for typos and try again.";
+			continue;
+		}
+		saveEncryptionKeyToFile(raw, { backupExisting: true });
+		return true;
+	}
+}
+
+/** Double-confirm, then erase the backend instance with progress. After a
+ *  file-sourced key, a FRESH key is generated (old file kept as .bak). */
+async function confirmAndErase(
+	tui: TUI,
+	url: string,
+	summary: ConvexInstanceSummary,
+): Promise<boolean> {
+	renderScreen(tui, "Step 0 of 5 · Erase this Brigade?");
+	tui.addChild(new Text(`  ${brand.error("This permanently deletes:")} ${describeSummary(summary)}`, 0, 0));
+	tui.addChild(new Text(`  ${brand.dim("There is no undo.")}`, 0, 0));
+	tui.addChild(new Text("", 0, 0));
+	const items: SelectItem[] = [
+		{ value: "no", label: "Go back", description: "Keep the existing data" },
+		{ value: "yes", label: "Erase everything", description: "Delete it all and start new" },
+	];
+	const list = new SelectList(items, items.length, selectListTheme, {
+		minPrimaryColumnWidth: 16,
+		maxPrimaryColumnWidth: 18,
+	});
+	tui.addChild(list);
+	tui.setFocus(list);
+	tui.requestRender();
+	let choice: string;
+	try {
+		const chosen = await new Promise<SelectItem>((resolve, reject) => {
+			list.onSelect = (item) => resolve(item);
+			list.onCancel = () => reject(new Error("back"));
+		});
+		choice = String(chosen.value);
+	} catch {
+		return false;
+	}
+	if (choice !== "yes") return false;
+
+	renderScreen(tui, "Step 0 of 5 · Erasing…");
+	const loader = new CancellableLoader(
+		tui,
+		(s) => brand.amber(s),
+		(s) => brand.dim(s),
+		"Erasing the previous Brigade…",
+	);
+	tui.addChild(loader);
+	tui.requestRender();
+	let deletedTotal = 0;
+	try {
+		const result = await resetConvexInstance(url);
+		deletedTotal = result.deletedTotal;
+	} finally {
+		tui.removeChild(loader);
+	}
+	tui.addChild(new Text(`  ${brand.amber("✓")} Erased ${deletedTotal} records.`, 0, 0));
+	tui.requestRender();
+	await delay(400);
+
+	// Fresh start hygiene: when the key lives in the key file, mint a new one
+	// (the old key may exist in old backups of the erased data). The previous
+	// key file is renamed aside, never deleted.
+	if (encryptionKeySource() === "file") {
+		const hex = generateMasterKeyHex();
+		saveEncryptionKeyToFile(hex, { backupExisting: true });
+		await showRecoveryKeyScreen(tui, hex, "A new encryption key was created for your fresh start.");
+	}
+	return true;
+}
+
+function describeSummary(s: ConvexInstanceSummary): string {
+	const parts: string[] = [];
+	const n = (v: number): string => (v >= 1000 ? "1000+" : String(v));
+	parts.push(`${n(s.counts.memories)} memories`);
+	parts.push(`${n(s.counts.sessions)} sessions`);
+	parts.push(`${n(s.counts.cronJobs)} scheduled jobs`);
+	if (s.whatsappLinked) parts.push("WhatsApp linked");
+	const created = s.createdAtMs ? new Date(s.createdAtMs).toLocaleDateString() : undefined;
+	return `${parts.join(" · ")}${created ? ` · created ${created}` : ""}`;
 }
 
 /* ────────────────────────── helpers ────────────────────────── */

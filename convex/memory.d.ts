@@ -17,7 +17,7 @@ export declare const listFacts: import("convex/server").RegisteredQuery<"public"
     createdAt: number;
     content: ArrayBuffer;
     memoryId: string;
-    segment: "identity" | "preference" | "correction" | "relationship" | "project" | "knowledge" | "context";
+    segment: "project" | "identity" | "preference" | "correction" | "relationship" | "knowledge" | "context";
     tier: "short" | "long" | "permanent";
     importance: number;
     decayRate: number;
@@ -38,7 +38,7 @@ export declare const writeFact: import("convex/server").RegisteredMutation<"publ
     embedding?: number[] | undefined;
     content: ArrayBuffer;
     memoryId: string;
-    segment: "identity" | "preference" | "correction" | "relationship" | "project" | "knowledge" | "context";
+    segment: "project" | "identity" | "preference" | "correction" | "relationship" | "knowledge" | "context";
     tier: "short" | "long" | "permanent";
     importance: number;
     decayRate: number;
@@ -58,7 +58,7 @@ export declare const writeFact: import("convex/server").RegisteredMutation<"publ
     createdAt: number;
     content: ArrayBuffer;
     memoryId: string;
-    segment: "identity" | "preference" | "correction" | "relationship" | "project" | "knowledge" | "context";
+    segment: "project" | "identity" | "preference" | "correction" | "relationship" | "knowledge" | "context";
     tier: "short" | "long" | "permanent";
     importance: number;
     decayRate: number;
@@ -67,6 +67,63 @@ export declare const writeFact: import("convex/server").RegisteredMutation<"publ
     lifecycle: "active" | "archived" | "pruned";
     workspaceId: string;
 } | null>>;
+/** Every fact row for a workspace across all lifecycles — boot hydration of
+ *  the in-process facts cache. */
+export declare const listAllFacts: import("convex/server").RegisteredQuery<"public", {
+    workspaceId: string;
+}, Promise<{
+    _id: import("convex/values").GenericId<"memoryFacts">;
+    _creationTime: number;
+    metadata?: any;
+    sourceTurn?: string | undefined;
+    supersedes?: string[] | undefined;
+    createdByKind?: "owner" | "channel" | undefined;
+    createdByChannelId?: string | undefined;
+    createdByConversationId?: string | undefined;
+    createdBySessionKey?: string | undefined;
+    createdByAccountId?: string | undefined;
+    embedding?: number[] | undefined;
+    createdAt: number;
+    content: ArrayBuffer;
+    memoryId: string;
+    segment: "project" | "identity" | "preference" | "correction" | "relationship" | "knowledge" | "context";
+    tier: "short" | "long" | "permanent";
+    importance: number;
+    decayRate: number;
+    accessCount: number;
+    lastAccessedAt: number;
+    lifecycle: "active" | "archived" | "pruned";
+    workspaceId: string;
+}[]>>;
+/** Authoritative single-record upsert — every field caller-supplied
+ *  (accessCount, lifecycle, timestamps included). The FactStore dispatch
+ *  realises its whole-file diffs through this. */
+export declare const upsertFactRecord: import("convex/server").RegisteredMutation<"public", {
+    metadata?: any;
+    sourceTurn?: string | undefined;
+    supersedes?: string[] | undefined;
+    createdByKind?: "owner" | "channel" | undefined;
+    createdByChannelId?: string | undefined;
+    createdByConversationId?: string | undefined;
+    createdBySessionKey?: string | undefined;
+    createdByAccountId?: string | undefined;
+    embedding?: number[] | undefined;
+    createdAt: number;
+    content: ArrayBuffer;
+    memoryId: string;
+    segment: "project" | "identity" | "preference" | "correction" | "relationship" | "knowledge" | "context";
+    tier: "short" | "long" | "permanent";
+    importance: number;
+    decayRate: number;
+    accessCount: number;
+    lastAccessedAt: number;
+    lifecycle: "active" | "archived" | "pruned";
+    workspaceId: string;
+}, Promise<void>>;
+export declare const deleteFactRecord: import("convex/server").RegisteredMutation<"public", {
+    memoryId: string;
+    workspaceId: string;
+}, Promise<void>>;
 export declare const markAccessed: import("convex/server").RegisteredMutation<"public", {
     workspaceId: string;
     memoryIds: string[];
@@ -124,7 +181,7 @@ export declare const searchContent: import("convex/server").RegisteredQuery<"pub
     createdAt: number;
     content: ArrayBuffer;
     memoryId: string;
-    segment: "identity" | "preference" | "correction" | "relationship" | "project" | "knowledge" | "context";
+    segment: "project" | "identity" | "preference" | "correction" | "relationship" | "knowledge" | "context";
     tier: "short" | "long" | "permanent";
     importance: number;
     decayRate: number;
@@ -153,7 +210,7 @@ export declare const findSimilar: import("convex/server").RegisteredQuery<"publi
     createdAt: number;
     content: ArrayBuffer;
     memoryId: string;
-    segment: "identity" | "preference" | "correction" | "relationship" | "project" | "knowledge" | "context";
+    segment: "project" | "identity" | "preference" | "correction" | "relationship" | "knowledge" | "context";
     tier: "short" | "long" | "permanent";
     importance: number;
     decayRate: number;

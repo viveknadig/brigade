@@ -8,7 +8,7 @@ export declare const list: import("convex/server").RegisteredQuery<"public", {},
     enabled: boolean;
     createdBy: string;
     createdAt: number;
-    origin: "user" | "bundled";
+    origin: "bundled" | "user";
     updatedAt: number;
     moduleId: string;
     sourceLabel: string;
@@ -20,7 +20,7 @@ export declare const upsert: import("convex/server").RegisteredMutation<"public"
     bundleSha?: string | undefined;
     enabled: boolean;
     createdBy: string;
-    origin: "user" | "bundled";
+    origin: "bundled" | "user";
     moduleId: string;
     sourceLabel: string;
 }, Promise<void>>;

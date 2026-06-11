@@ -4,8 +4,8 @@ export declare const listJobs: import("convex/server").RegisteredQuery<"public",
 }, Promise<{
     _id: import("convex/values").GenericId<"cronJobs">;
     _creationTime: number;
-    description?: string | undefined;
     agentId?: string | undefined;
+    description?: string | undefined;
     sessionKey?: string | undefined;
     wakeMode?: string | undefined;
     delivery?: ArrayBuffer | undefined;
@@ -31,8 +31,8 @@ export declare const listJobs: import("convex/server").RegisteredQuery<"public",
     stateLastDelivered?: boolean | undefined;
     stateLastDeliveryStatus?: string | undefined;
     stateLastDeliveryError?: string | undefined;
-    enabled: boolean;
     name: string;
+    enabled: boolean;
     sessionTarget: string;
     payload: ArrayBuffer;
     jobId: string;
@@ -48,8 +48,8 @@ export declare const getJob: import("convex/server").RegisteredQuery<"public", {
 }, Promise<{
     _id: import("convex/values").GenericId<"cronJobs">;
     _creationTime: number;
-    description?: string | undefined;
     agentId?: string | undefined;
+    description?: string | undefined;
     sessionKey?: string | undefined;
     wakeMode?: string | undefined;
     delivery?: ArrayBuffer | undefined;
@@ -75,8 +75,8 @@ export declare const getJob: import("convex/server").RegisteredQuery<"public", {
     stateLastDelivered?: boolean | undefined;
     stateLastDeliveryStatus?: string | undefined;
     stateLastDeliveryError?: string | undefined;
-    enabled: boolean;
     name: string;
+    enabled: boolean;
     sessionTarget: string;
     payload: ArrayBuffer;
     jobId: string;
@@ -87,13 +87,14 @@ export declare const getJob: import("convex/server").RegisteredQuery<"public", {
     createdAtMs: number;
 } | null>>;
 export declare const insertJob: import("convex/server").RegisteredMutation<"public", {
-    description?: string | undefined;
     agentId?: string | undefined;
+    description?: string | undefined;
     sessionKey?: string | undefined;
     wakeMode?: string | undefined;
     delivery?: ArrayBuffer | undefined;
     failureAlert?: any;
     deleteAfterRun?: boolean | undefined;
+    updatedAtMs?: number | undefined;
     createdByChannelId?: string | undefined;
     createdByConversationId?: string | undefined;
     createdByAccountId?: string | undefined;
@@ -103,8 +104,20 @@ export declare const insertJob: import("convex/server").RegisteredMutation<"publ
     scheduleEveryMs?: number | undefined;
     scheduleAnchorMs?: number | undefined;
     scheduleAt?: number | undefined;
-    enabled: boolean;
+    createdAtMs?: number | undefined;
+    stateNextRunAtMs?: number | undefined;
+    stateLastRunAtMs?: number | undefined;
+    stateRunningAtMs?: number | undefined;
+    stateLastStatus?: string | undefined;
+    stateLastError?: string | undefined;
+    stateScheduleErrorCount?: number | undefined;
+    stateConsecutiveErrorCount?: number | undefined;
+    stateLastFailureAlertAtMs?: number | undefined;
+    stateLastDelivered?: boolean | undefined;
+    stateLastDeliveryStatus?: string | undefined;
+    stateLastDeliveryError?: string | undefined;
     name: string;
+    enabled: boolean;
     sessionTarget: string;
     payload: ArrayBuffer;
     jobId: string;
@@ -113,14 +126,15 @@ export declare const insertJob: import("convex/server").RegisteredMutation<"publ
     scheduleKind: "at" | "every" | "cron";
 }, Promise<void>>;
 export declare const patchJob: import("convex/server").RegisteredMutation<"public", {
+    unset?: string[] | undefined;
     jobId: string;
     ownerUserId: string;
     patch: any;
 }, Promise<{
     _id: import("convex/values").GenericId<"cronJobs">;
     _creationTime: number;
-    description?: string | undefined;
     agentId?: string | undefined;
+    description?: string | undefined;
     sessionKey?: string | undefined;
     wakeMode?: string | undefined;
     delivery?: ArrayBuffer | undefined;
@@ -146,8 +160,8 @@ export declare const patchJob: import("convex/server").RegisteredMutation<"publi
     stateLastDelivered?: boolean | undefined;
     stateLastDeliveryStatus?: string | undefined;
     stateLastDeliveryError?: string | undefined;
-    enabled: boolean;
     name: string;
+    enabled: boolean;
     sessionTarget: string;
     payload: ArrayBuffer;
     jobId: string;
@@ -169,10 +183,10 @@ export declare const markRunning: import("convex/server").RegisteredMutation<"pu
 export declare const appendRunLog: import("convex/server").RegisteredMutation<"public", {
     error?: string | undefined;
     provider?: string | undefined;
-    model?: string | undefined;
     delivered?: boolean | undefined;
     sessionKey?: string | undefined;
     nextRunAtMs?: number | undefined;
+    model?: string | undefined;
     sessionId?: string | undefined;
     runAtMs?: number | undefined;
     summary?: ArrayBuffer | undefined;
@@ -185,9 +199,9 @@ export declare const appendRunLog: import("convex/server").RegisteredMutation<"p
     usageCacheWrite?: number | undefined;
     usageTotalTokens?: number | undefined;
     usageCostUsd?: number | undefined;
-    ts: number;
     jobId: string;
     status: "error" | "ok" | "skipped";
+    ts: number;
     ownerUserId: string;
 }, Promise<void>>;
 export declare const listRunLog: import("convex/server").RegisteredQuery<"public", {
@@ -199,10 +213,10 @@ export declare const listRunLog: import("convex/server").RegisteredQuery<"public
     _creationTime: number;
     error?: string | undefined;
     provider?: string | undefined;
-    model?: string | undefined;
     delivered?: boolean | undefined;
     sessionKey?: string | undefined;
     nextRunAtMs?: number | undefined;
+    model?: string | undefined;
     sessionId?: string | undefined;
     runAtMs?: number | undefined;
     summary?: ArrayBuffer | undefined;
@@ -215,9 +229,9 @@ export declare const listRunLog: import("convex/server").RegisteredQuery<"public
     usageCacheWrite?: number | undefined;
     usageTotalTokens?: number | undefined;
     usageCostUsd?: number | undefined;
-    ts: number;
     jobId: string;
     status: "error" | "ok" | "skipped";
+    ts: number;
     ownerUserId: string;
 }[]>>;
 //# sourceMappingURL=cron.d.ts.map

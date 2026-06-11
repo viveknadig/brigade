@@ -39,8 +39,8 @@ export declare const get: import("convex/server").RegisteredQuery<"public", {
     attachmentsDir?: string | undefined;
     attachmentsRootDir?: string | undefined;
     retainAttachmentsOnKeep?: boolean | undefined;
-    ownerId: string;
     createdAt: number;
+    ownerId: string;
     cleanup: "delete" | "keep";
     runId: string;
     childSessionKey: string;
@@ -89,8 +89,8 @@ export declare const getByChildSessionKey: import("convex/server").RegisteredQue
     attachmentsDir?: string | undefined;
     attachmentsRootDir?: string | undefined;
     retainAttachmentsOnKeep?: boolean | undefined;
-    ownerId: string;
     createdAt: number;
+    ownerId: string;
     cleanup: "delete" | "keep";
     runId: string;
     childSessionKey: string;
@@ -139,8 +139,8 @@ export declare const listByRequester: import("convex/server").RegisteredQuery<"p
     attachmentsDir?: string | undefined;
     attachmentsRootDir?: string | undefined;
     retainAttachmentsOnKeep?: boolean | undefined;
-    ownerId: string;
     createdAt: number;
+    ownerId: string;
     cleanup: "delete" | "keep";
     runId: string;
     childSessionKey: string;
@@ -149,14 +149,14 @@ export declare const listByRequester: import("convex/server").RegisteredQuery<"p
     task: ArrayBuffer;
 }[]>>;
 export declare const put: import("convex/server").RegisteredMutation<"public", {
-    ownerId: string;
     record: any;
+    ownerId: string;
 }, Promise<void>>;
 export declare const markCompleted: import("convex/server").RegisteredMutation<"public", {
     error?: string | undefined;
     endedHookEmittedAt?: number | undefined;
-    ownerId: string;
     reason: string;
+    ownerId: string;
     runId: string;
     endedAt: number;
     outcome: any;
@@ -198,8 +198,8 @@ export declare const markCompleted: import("convex/server").RegisteredMutation<"
     attachmentsDir?: string | undefined;
     attachmentsRootDir?: string | undefined;
     retainAttachmentsOnKeep?: boolean | undefined;
-    ownerId: string;
     createdAt: number;
+    ownerId: string;
     cleanup: "delete" | "keep";
     runId: string;
     childSessionKey: string;

@@ -514,10 +514,16 @@ async function verifyEncryptionFingerprint(store: BrigadeStore): Promise<void> {
 			}
 		}
 		throw new Error(
-			`BRIGADE_ENCRYPTION_KEY does not match the key this deployment was sealed with ` +
-				`(stored fingerprint ${stored}, current ${status.primaryKeyFingerprint}). ` +
-				`Use the original key, or rotate properly by setting BRIGADE_ENCRYPTION_KEY_OLD ` +
-				`to the previous key alongside the new BRIGADE_ENCRYPTION_KEY.`,
+			`This backend holds Brigade data protected by a DIFFERENT encryption key.\n` +
+				`  Your options:\n` +
+				`    • Provide the original key — set BRIGADE_ENCRYPTION_KEY to the recovery\n` +
+				`      key you saved when this Brigade was created (or restore its key file).\n` +
+				`    • Rotating on purpose? Set BRIGADE_ENCRYPTION_KEY_OLD to the previous\n` +
+				`      key alongside the new BRIGADE_ENCRYPTION_KEY.\n` +
+				`    • Start over — \`brigade store reset\` permanently erases the backend\n` +
+				`      so you can onboard fresh.\n` +
+				`  (key fingerprints: stored ${stored}, current ${status.primaryKeyFingerprint}; ` +
+				`active key source: ${status.source})`,
 		);
 	} catch (err) {
 		// Re-throw only the deliberate mismatch error — a transient meta

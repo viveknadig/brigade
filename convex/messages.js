@@ -30,20 +30,117 @@ export const appendRecord = mutation({
         return { seq };
     },
 });
+/** Ordered batch append — the convex-mode SessionManager write-behind queue
+ *  flushes whole batches in one transaction so a mid-batch crash can't leave
+ *  a torn parent-id chain. */
+export const appendRecordsBatch = mutation({
+    args: {
+        agentId: v.string(),
+        sessionId: v.string(),
+        records: v.array(v.object({
+            type: v.string(),
+            customType: v.optional(v.string()),
+            payload: v.bytes(),
+        })),
+    },
+    handler: async (ctx, args) => {
+        const tail = await ctx.db
+            .query("sessionTranscriptRecords")
+            .withIndex("by_session_seq", (q) => q.eq("agentId", args.agentId).eq("sessionId", args.sessionId))
+            .order("desc")
+            .first();
+        let seq = (tail?.seq ?? 0) + 1;
+        const now = Date.now();
+        for (const r of args.records) {
+            await ctx.db.insert("sessionTranscriptRecords", {
+                agentId: args.agentId,
+                sessionId: args.sessionId,
+                seq,
+                type: r.type,
+                ...(r.customType !== undefined ? { customType: r.customType } : {}),
+                payload: r.payload,
+                createdAt: now,
+            });
+            seq += 1;
+        }
+        return { lastSeq: seq - 1 };
+    },
+});
+/** Wholesale transcript replace — realises Pi's `_rewriteFile` (v1→v3
+ *  migration, branch extraction) as one transaction. */
+export const replaceTranscript = mutation({
+    args: {
+        agentId: v.string(),
+        sessionId: v.string(),
+        records: v.array(v.object({
+            type: v.string(),
+            customType: v.optional(v.string()),
+            payload: v.bytes(),
+        })),
+    },
+    handler: async (ctx, args) => {
+        const existing = await ctx.db
+            .query("sessionTranscriptRecords")
+            .withIndex("by_session_seq", (q) => q.eq("agentId", args.agentId).eq("sessionId", args.sessionId))
+            .collect();
+        for (const r of existing)
+            await ctx.db.delete(r._id);
+        const now = Date.now();
+        let seq = 1;
+        for (const r of args.records) {
+            await ctx.db.insert("sessionTranscriptRecords", {
+                agentId: args.agentId,
+                sessionId: args.sessionId,
+                seq,
+                type: r.type,
+                ...(r.customType !== undefined ? { customType: r.customType } : {}),
+                payload: r.payload,
+                createdAt: now,
+            });
+            seq += 1;
+        }
+        return { count: args.records.length };
+    },
+});
 export const readTranscript = query({
     args: {
         agentId: v.string(),
         sessionId: v.string(),
         limit: v.optional(v.number()),
+        // Cursor for pagination: return only records with seq > afterSeq. The
+        // client loops with the last page's max seq so a transcript larger than
+        // Convex's per-query read cap (~16k docs / 8MB) is read across calls
+        // instead of silently truncating at `take(limit)`.
+        afterSeq: v.optional(v.number()),
     },
     handler: async (ctx, args) => {
-        const limit = args.limit && args.limit > 0 ? args.limit : 1000;
+        // Cap a single page well under Convex's per-query document limit.
+        const limit = args.limit && args.limit > 0 ? Math.min(args.limit, 4000) : 1000;
+        const after = args.afterSeq;
         const rows = await ctx.db
             .query("sessionTranscriptRecords")
-            .withIndex("by_session_seq", (q) => q.eq("agentId", args.agentId).eq("sessionId", args.sessionId))
+            .withIndex("by_session_seq", (q) => after !== undefined
+            ? q.eq("agentId", args.agentId).eq("sessionId", args.sessionId).gt("seq", after)
+            : q.eq("agentId", args.agentId).eq("sessionId", args.sessionId))
             .order("asc")
             .take(limit);
         return rows;
+    },
+});
+/** Newest-first tail of (type, customType) only — for the bootstrap-delivery
+ *  check, which must honour compaction-invalidation (a compaction newer than
+ *  the marker means the bootstrap context was compacted out → re-deliver).
+ *  Returns just the two fields the walk needs, not the sealed payloads. */
+export const readMarkerTail = query({
+    args: { agentId: v.string(), sessionId: v.string(), limit: v.optional(v.number()) },
+    handler: async (ctx, args) => {
+        const limit = args.limit && args.limit > 0 ? Math.min(args.limit, 1000) : 500;
+        const rows = await ctx.db
+            .query("sessionTranscriptRecords")
+            .withIndex("by_session_seq", (q) => q.eq("agentId", args.agentId).eq("sessionId", args.sessionId))
+            .order("desc")
+            .take(limit);
+        return rows.map((r) => ({ type: r.type, customType: r.customType }));
     },
 });
 export const deleteTranscript = mutation({
@@ -65,6 +162,10 @@ export const inboxEnqueue = mutation({
     args: {
         sessionKey: v.string(),
         text: v.bytes(),
+        // Client-supplied ts — areSystemEventsEqual (session-inbox.ts) does
+        // ts-equality during prefix matching, so we MUST preserve the
+        // producer's timestamp rather than stamping our own.
+        ts: v.optional(v.number()),
         contextKey: v.optional(v.string()),
         deliveryContext: v.optional(v.any()),
         trusted: v.boolean(),
@@ -80,7 +181,7 @@ export const inboxEnqueue = mutation({
             sessionKey: args.sessionKey,
             seq,
             text: args.text,
-            ts: Date.now(),
+            ts: args.ts ?? Date.now(),
             ...(args.contextKey !== undefined ? { contextKey: args.contextKey } : {}),
             ...(args.deliveryContext !== undefined ? { deliveryContext: args.deliveryContext } : {}),
             trusted: args.trusted,

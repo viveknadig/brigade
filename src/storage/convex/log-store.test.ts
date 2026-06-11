@@ -1,8 +1,14 @@
 import { strict as assert } from "node:assert";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterEach, describe, it } from "node:test";
 
 import { ConvexLogStore } from "./log-store.js";
 import { open, sealJson } from "../encryption.js";
+
+// Hermetic: a real operator key file (auto-created by convex onboarding)
+// must not leak into the "no key" cases — point the file lookup nowhere.
+process.env.BRIGADE_ENCRYPTION_KEY_FILE = path.join(tmpdir(), "brigade-no-such-key-file");
 
 // Batch-4 fix: ConvexLogStore.appendSessionEvent used to forward only
 // ts/day/ownerId/agentId/sessionKey/type — every event-specific field was

@@ -14,14 +14,16 @@ export declare const appendSessionEvent: import("convex/server").RegisteredMutat
     attempt?: number | undefined;
     maxAttempts?: number | undefined;
     delayMs?: number | undefined;
+    success?: boolean | undefined;
+    finalError?: string | undefined;
     willRetry?: boolean | undefined;
     messageCount?: number | undefined;
-    ts: string;
-    ownerId: string;
     type: string;
     agentId: string;
     sessionKey: string;
+    ts: string;
     day: string;
+    ownerId: string;
 }, Promise<void>>;
 export declare const readSessionEventTail: import("convex/server").RegisteredQuery<"public", {
     limit?: number | undefined;
@@ -45,14 +47,16 @@ export declare const readSessionEventTail: import("convex/server").RegisteredQue
     attempt?: number | undefined;
     maxAttempts?: number | undefined;
     delayMs?: number | undefined;
+    success?: boolean | undefined;
+    finalError?: string | undefined;
     willRetry?: boolean | undefined;
     messageCount?: number | undefined;
-    ts: string;
-    ownerId: string;
     type: string;
     agentId: string;
     sessionKey: string;
+    ts: string;
     day: string;
+    ownerId: string;
 }[]>>;
 export declare const findLastError: import("convex/server").RegisteredQuery<"public", {
     limit?: number | undefined;
@@ -75,23 +79,25 @@ export declare const findLastError: import("convex/server").RegisteredQuery<"pub
     attempt?: number | undefined;
     maxAttempts?: number | undefined;
     delayMs?: number | undefined;
+    success?: boolean | undefined;
+    finalError?: string | undefined;
     willRetry?: boolean | undefined;
     messageCount?: number | undefined;
-    ts: string;
-    ownerId: string;
     type: string;
     agentId: string;
     sessionKey: string;
+    ts: string;
     day: string;
+    ownerId: string;
 } | null>>;
 export declare const appendSubsystemRecord: import("convex/server").RegisteredMutation<"public", {
     fields?: any;
     message: string;
-    ownerId: string;
     time: string;
     level: "error" | "trace" | "debug" | "info" | "warn" | "fatal";
     subsystem: string;
     day: string;
+    ownerId: string;
 }, Promise<void>>;
 export declare const readSubsystemRecords: import("convex/server").RegisteredQuery<"public", {
     level?: "error" | "trace" | "debug" | "info" | "warn" | "fatal" | undefined;
@@ -104,11 +110,11 @@ export declare const readSubsystemRecords: import("convex/server").RegisteredQue
     _creationTime: number;
     fields?: any;
     message: string;
-    ownerId: string;
     time: string;
     level: string;
     subsystem: string;
     day: string;
+    ownerId: string;
 }[]>>;
 export declare const pruneSubsystemLogs: import("convex/server").RegisteredMutation<"public", {
     ownerId: string;
@@ -138,23 +144,23 @@ export declare const listConfigAudit: import("convex/server").RegisteredQuery<"p
 }, Promise<{
     _id: import("convex/values").GenericId<"brigadeConfigAudit">;
     _creationTime: number;
-    prevHash?: string | undefined;
     pid?: number | undefined;
+    prevHash?: string | undefined;
     sha256: string;
     ts: string;
     bytes: number;
+    instanceId: string;
     lineHash: string;
     seq: number;
-    instanceId: string;
 }[]>>;
 export declare const writeConfigHealth: import("convex/server").RegisteredMutation<"public", {
     sha256: string;
-    ts: string;
-    bytes: number;
-    configPath: string;
     mtimeMs: number;
+    ts: string;
     pid: number;
+    bytes: number;
     ownerId: string;
+    configPath: string;
 }, Promise<void>>;
 export declare const readConfigHealth: import("convex/server").RegisteredQuery<"public", {
     ownerId: string;
@@ -162,11 +168,11 @@ export declare const readConfigHealth: import("convex/server").RegisteredQuery<"
     _id: import("convex/values").GenericId<"configHealth">;
     _creationTime: number;
     sha256: string;
-    ts: string;
-    bytes: number;
-    configPath: string;
     mtimeMs: number;
+    ts: string;
     pid: number;
+    bytes: number;
     ownerId: string;
+    configPath: string;
 } | null>>;
 //# sourceMappingURL=logs.d.ts.map

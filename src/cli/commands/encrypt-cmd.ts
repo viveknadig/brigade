@@ -27,8 +27,9 @@ export async function runEncryptStatus(opts: { json?: boolean } = {}): Promise<n
 		process.stdout.write(`${chalk.dim("Brigade at-rest encryption:")} ${chalk.bold("OFF")}\n`);
 		process.stdout.write(
 			chalk.dim(
-				`  No BRIGADE_ENCRYPTION_KEY in env. Convex byte columns store plaintext.\n` +
-					`  Generate a key with: ${chalk.bold("brigade encrypt init")}\n`,
+				`  No key in the environment and no key file on this computer.\n` +
+					`  Onboarding in convex mode creates one automatically, or generate one\n` +
+					`  yourself with: ${chalk.bold("brigade encrypt init")}\n`,
 			),
 		);
 		return 0;
@@ -40,6 +41,11 @@ export async function runEncryptStatus(opts: { json?: boolean } = {}): Promise<n
 	process.stdout.write(`${chalk.green("✓")} Brigade at-rest encryption: ${chalk.bold("ON")}\n`);
 	process.stdout.write(chalk.dim(`  Algorithm:    ${status.algorithm}\n`));
 	process.stdout.write(chalk.dim(`  Fingerprint:  ${status.primaryKeyFingerprint}\n`));
+	process.stdout.write(
+		chalk.dim(
+			`  Key source:   ${status.source === "env" ? "environment variable" : "key file on this computer"}\n`,
+		),
+	);
 	if (status.hasOldKey) {
 		process.stdout.write(chalk.dim(`  Old key:      present (key rotation in progress)\n`));
 	}

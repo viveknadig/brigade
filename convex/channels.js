@@ -20,6 +20,69 @@ export const listAccess = query({
             .collect();
     },
 });
+/** Every access row for the owner — single-operator scale keeps this tiny.
+ *  Boot hydration uses it to fill the in-process access cache in one query
+ *  instead of guessing the channel/account layout from config. */
+export const listAllAccess = query({
+    args: { ownerId: v.string() },
+    handler: async (ctx, args) => {
+        return ctx.db
+            .query("channelAccess")
+            .withIndex("by_owner_channel_account_kind", (q) => q.eq("ownerId", args.ownerId))
+            .collect();
+    },
+});
+/** Replace the row set for one (channel, account, kind) in a single
+ *  transaction — the convex-mode realisation of the filesystem's
+ *  whole-file atomic write. Caller-supplied codes/timestamps are
+ *  authoritative so locally-generated pairing codes survive verbatim. */
+export const reconcileAccess = mutation({
+    args: {
+        ownerId: v.string(),
+        channelId: v.string(),
+        accountId: v.string(),
+        kind: AccessKind,
+        rows: v.array(v.object({
+            senderId: v.bytes(),
+            senderName: v.optional(v.string()),
+            code: v.optional(v.bytes()),
+            createdAt: v.number(),
+            lastSeenAt: v.number(),
+        })),
+    },
+    handler: async (ctx, args) => {
+        // Wholesale replace: delete the existing set, insert the wanted set —
+        // one transaction either way. Sealed senderId bytes carry a random
+        // nonce per seal, so byte-equality between an incoming row and a
+        // stored row is meaningless; matching for in-place patches would be
+        // wrong, and at single-operator scale (a handful of rows per list)
+        // replacement churn is irrelevant.
+        const existing = await ctx.db
+            .query("channelAccess")
+            .withIndex("by_owner_channel_account_kind", (q) => q
+            .eq("ownerId", args.ownerId)
+            .eq("channelId", args.channelId)
+            .eq("accountId", args.accountId)
+            .eq("kind", args.kind))
+            .collect();
+        for (const row of existing)
+            await ctx.db.delete(row._id);
+        for (const wanted of args.rows) {
+            await ctx.db.insert("channelAccess", {
+                ownerId: args.ownerId,
+                channelId: args.channelId,
+                accountId: args.accountId,
+                kind: args.kind,
+                senderId: wanted.senderId,
+                ...(wanted.senderName !== undefined ? { senderName: wanted.senderName } : {}),
+                ...(wanted.code !== undefined ? { code: wanted.code } : {}),
+                createdAt: wanted.createdAt,
+                lastSeenAt: wanted.lastSeenAt,
+            });
+        }
+        return { count: args.rows.length };
+    },
+});
 function bytesEqual(a, b) {
     if (a.byteLength !== b.byteLength)
         return false;
@@ -260,6 +323,56 @@ export const revokePairing = mutation({
             }
         }
         return false;
+    },
+});
+// ============================================================================
+// Media blobs (channelMediaBlob + Convex File Storage)
+// ============================================================================
+export const generateMediaUploadUrl = mutation({
+    args: {},
+    handler: async (ctx) => {
+        return await ctx.storage.generateUploadUrl();
+    },
+});
+export const recordMediaBlob = mutation({
+    args: {
+        ownerId: v.string(),
+        channelId: v.string(),
+        accountId: v.string(),
+        messageId: v.string(),
+        index: v.number(),
+        mimeType: v.string(),
+        fileName: v.optional(v.string()),
+        storageId: v.id("_storage"),
+        bytes: v.number(),
+    },
+    handler: async (ctx, args) => {
+        await ctx.db.insert("channelMediaBlob", { ...args, createdAt: Date.now() });
+        return { ok: true };
+    },
+});
+export const getMediaBlobUrl = query({
+    args: {
+        ownerId: v.string(),
+        channelId: v.string(),
+        accountId: v.string(),
+        messageId: v.string(),
+        index: v.number(),
+    },
+    handler: async (ctx, args) => {
+        const row = await ctx.db
+            .query("channelMediaBlob")
+            .withIndex("by_owner_channel_account_msg", (q) => q
+            .eq("ownerId", args.ownerId)
+            .eq("channelId", args.channelId)
+            .eq("accountId", args.accountId)
+            .eq("messageId", args.messageId))
+            .collect();
+        const match = row.find((r) => r.index === args.index);
+        if (!match)
+            return null;
+        const url = await ctx.storage.getUrl(match.storageId);
+        return url ? { url, mimeType: match.mimeType, bytes: match.bytes } : null;
     },
 });
 export const writeAuthFile = mutation({
