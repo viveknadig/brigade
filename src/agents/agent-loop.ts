@@ -57,7 +57,7 @@ import {
 import { resolveSystemPromptOverride } from "../system-prompt/override.js";
 import { resolveRuntimeParams } from "../system-prompt/runtime-params.js";
 import { applyPersonaOverrideToSession } from "../system-prompt/pi-injection.js";
-import { deriveOrgDisplayGraph, deriveOrgGraph } from "./org/derive-graph.js";
+import { deriveOrgDisplayGraph } from "./org/derive-graph.js";
 import { renderSubAgentAnchor } from "../system-prompt/org/sub-agent-anchor.js";
 import { bootstrapWorkspace } from "../workspace/bootstrap.js";
 import {
@@ -85,15 +85,11 @@ import {
   drainFormattedSessionEvents,
   inspectPendingSessionEvents,
 } from "./session-event-prompt.js";
-import {
-  createAgentToAgentPolicy,
-  type SessionToolsVisibility,
-} from "./tools/sessions/shared.js";
-// Stage C — derived A2A adapter. Only activated when cfg.org is present
-// and `cfg.org.a2a.mode === "derived"` (or "open"); legacy installs see
-// the identical createAgentToAgentPolicy code path that shipped pre-org.
-// `deriveOrgGraph` is already imported above (for Stage B prompt rendering).
-import { orgGraphAsA2APolicy } from "./org/a2a-adapter.js";
+// Per-turn session-tool access policy resolution. The flatten + org-graph-
+// vs-flat-allow logic lives in `resolve-access.ts` so `sessions_send` can
+// re-resolve it live (honouring a mid-run manage_access change) with the
+// exact same derivation this build uses.
+import { resolveSessionAccessPolicy } from "./tools/sessions/resolve-access.js";
 import { wrapStreamFnWithPayloadMutations } from "./payload-mutators.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
@@ -591,37 +587,12 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // four sessions tools fail-closed when the caller is not allowed to read /
   // send to the target session. Defaults stay backward-compatible:
   // visibility="self" (tool only sees the caller's own session) + A2A disabled.
-  const sessionToolsCfg = (turnConfig.session as { sessionTools?: { visibility?: SessionToolsVisibility } } | undefined)?.sessionTools;
-  const visibility: SessionToolsVisibility = sessionToolsCfg?.visibility ?? "self";
-  const a2aRaw = (turnConfig.session as { agentToAgent?: { enabled?: boolean; allow?: Array<{ from?: unknown; to?: unknown }> } } | undefined)?.agentToAgent;
-  // The shared policy factory takes a flat allow-list of agent ids;
-  // brigade.json stores `{from, to}` pairs. Flatten to the union of every
-  // id mentioned on either side — the matcher checks both sides anyway.
-  const a2aAllow: string[] = [];
-  if (Array.isArray(a2aRaw?.allow)) {
-    for (const pair of a2aRaw.allow) {
-      const from = typeof pair?.from === "string" ? pair.from.trim() : "";
-      const to = typeof pair?.to === "string" ? pair.to.trim() : "";
-      if (from) a2aAllow.push(from);
-      if (to) a2aAllow.push(to);
-    }
-  }
-  // Stage C additive-gate: when cfg.org is present AND mode === "derived"
-  // (or "open"), the derived a2a-adapter replaces the legacy
-  // flat-allowlist policy. ALL other branches (cfg.org absent / mode ===
-  // "explicit") keep the LEGACY createAgentToAgentPolicy code path
-  // unchanged so pre-org installs run bit-for-bit identical to today.
-  const orgCfg = (turnConfig as { org?: { a2a?: { mode?: string } } }).org;
-  let a2aPolicy = createAgentToAgentPolicy({
-    enabled: !!a2aRaw?.enabled,
-    allow: a2aAllow,
-  });
-  if (orgCfg && orgCfg.a2a?.mode !== "explicit") {
-    const graph = deriveOrgGraph(turnConfig as never);
-    if (graph) {
-      a2aPolicy = orgGraphAsA2APolicy(graph);
-    }
-  }
+  // Resolve the per-turn session-tool access policy. Extracted to
+  // `resolveSessionAccessPolicy` (2026-06-11) so the SAME derivation backs
+  // both this build AND the `sessions_send` live re-check that honours a
+  // mid-run `manage_access` change — identical flatten + org-graph-vs-flat
+  // logic in one place. Behaviour is bit-for-bit the legacy block.
+  const { visibility, a2aPolicy } = resolveSessionAccessPolicy(turnConfig);
 
   // Wave O0.5 (fix #3): populate spawnedKeys so visibility="tree" actually
   // permits the caller to reach its own sub-agents. The registry walk

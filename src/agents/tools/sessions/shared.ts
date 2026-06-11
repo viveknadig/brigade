@@ -329,19 +329,19 @@ export function checkSessionToolAccess(params: {
 		if (visibility !== "all") {
 			return forbidden(
 				action,
-				'cross-agent visibility not enabled. Operator remedy: in brigade.json set session.sessionTools.visibility: "all" (config is re-read next turn — no restart). Tell the operator; do not edit security config unasked.',
+				'cross-agent visibility not enabled (session.sessionTools.visibility is not "all"). When the operator asks you to enable cross-agent messaging, call manage_access set {visibility: "all"} then RETRY this sessions_send in the same turn — it re-checks against the new setting and goes through. The change is live in-memory; NEVER tell the operator to restart the gateway. Do NOT change it unasked.',
 			);
 		}
 		if (!a2aPolicy.enabled) {
 			return forbidden(
 				action,
-				"agent-to-agent messaging disabled. Operator remedy: in brigade.json set session.agentToAgent.enabled: true (with an allow list, e.g. [{from: \"*\", to: \"*\"}]). Tell the operator; do not edit security config unasked.",
+				"agent-to-agent messaging disabled (session.agentToAgent.enabled is false). When the operator asks, call manage_access set {a2aEnabled: true} (it seeds a wide-open allow list if none exists) then RETRY this sessions_send in the same turn. The change is live — NEVER suggest a gateway restart. Do NOT change it unasked.",
 			);
 		}
 		if (!a2aPolicy.isAllowed(requesterAgentId, targetAgentId)) {
 			return forbidden(
 				action,
-				`agent ${targetAgentId} not reachable from ${requesterAgentId} under the current policy. With an org configured, edges follow the org graph (escalate up, assign down, same-department lateral, top↔all; cross-department lateral is closed) — route via the shared manager, or the operator can set org.a2a.mode: "explicit" / adjust session.agentToAgent.allow.`,
+				`agent ${targetAgentId} not reachable from ${requesterAgentId} under the current policy. With an org configured, edges follow the org graph (escalate up, assign down, same-department lateral, top↔all; cross-department lateral is closed) — route via the shared manager. A non-org agent like main reaches org members only under explicit/open mode: when the operator asks, call manage_access set {a2aMode: "explicit"}. Do NOT change it unasked.`,
 			);
 		}
 		return { allowed: true };

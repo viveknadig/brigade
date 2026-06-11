@@ -17,7 +17,7 @@ const REQ = "agent:main:main";
 const TARGET = "agent:marketing-lead:main";
 
 describe("cross-agent refusals carry the exact operator remedy", () => {
-	it("visibility gate names session.sessionTools.visibility", () => {
+	it("visibility gate points at manage_access (visibility) + the unasked guardrail", () => {
 		const res = checkSessionToolAccess({
 			action: "send",
 			requesterSessionKey: REQ,
@@ -26,11 +26,11 @@ describe("cross-agent refusals carry the exact operator remedy", () => {
 			a2aPolicy: createAgentToAgentPolicy({ enabled: true, allow: [] }),
 		});
 		assert.equal(res.allowed, false);
-		assert.match(("error" in res ? res.error : ""), /session\.sessionTools\.visibility: "all"/);
-		assert.match(("error" in res ? res.error : ""), /do not edit security config unasked/);
+		assert.match(("error" in res ? res.error : ""), /manage_access set \{visibility: "all"\}/);
+		assert.match(("error" in res ? res.error : ""), /Do NOT change it unasked/);
 	});
 
-	it("A2A gate names session.agentToAgent.enabled", () => {
+	it("A2A gate points at manage_access (a2aEnabled)", () => {
 		const res = checkSessionToolAccess({
 			action: "send",
 			requesterSessionKey: REQ,
@@ -39,10 +39,10 @@ describe("cross-agent refusals carry the exact operator remedy", () => {
 			a2aPolicy: createAgentToAgentPolicy({ enabled: false, allow: [] }),
 		});
 		assert.equal(res.allowed, false);
-		assert.match(("error" in res ? res.error : ""), /session\.agentToAgent\.enabled: true/);
+		assert.match(("error" in res ? res.error : ""), /manage_access set \{a2aEnabled: true\}/);
 	});
 
-	it("policy gate explains org-graph edges and the explicit-mode escape hatch", () => {
+	it("policy gate explains org-graph edges + manage_access (a2aMode) escape hatch", () => {
 		const policy = createAgentToAgentPolicy({ enabled: true, allow: ["main"] });
 		const res = checkSessionToolAccess({
 			action: "send",
@@ -52,8 +52,8 @@ describe("cross-agent refusals carry the exact operator remedy", () => {
 			a2aPolicy: policy,
 		});
 		assert.equal(res.allowed, false);
-		assert.match(("error" in res ? res.error : ""), /org\.a2a\.mode: "explicit"/);
-		assert.match(("error" in res ? res.error : ""), /session\.agentToAgent\.allow/);
+		assert.match(("error" in res ? res.error : ""), /manage_access set \{a2aMode: "explicit"\}/);
+		assert.match(("error" in res ? res.error : ""), /cross-department lateral is closed/);
 	});
 
 	it("an allowed cross-agent send still passes untouched", () => {

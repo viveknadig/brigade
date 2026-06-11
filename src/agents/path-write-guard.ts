@@ -63,9 +63,10 @@ function buildProtectedRoots(): ProtectedRoot[] {
 	const stateDir = resolveStateDir();
 	const stateFileRedirect =
 		"Brigade state files must never be hand-edited — use the owning tool instead: " +
-		"manage_agent (agents), manage_provider (API keys + per-agent models), org (hierarchy + " +
-		"a2a mode), manage_skill (skills), cron (jobs). If no tool covers the change, tell the " +
-		"operator the exact edit to make — do not apply it yourself.";
+		"manage_agent (agents), manage_provider (API keys + per-agent models), manage_access " +
+		"(agent-to-agent visibility / enabled / org a2a mode), org (hierarchy), manage_skill " +
+		"(skills), cron (jobs). If no tool covers the change, tell the operator the exact edit " +
+		"to make — do not apply it yourself.";
 	return [
 		{
 			target: path.resolve(resolveConfigPath()),

@@ -36,6 +36,7 @@ import { makeCronTool } from "./cron-tool.js";
 import { makeManageAgentTool } from "./manage-agent-tool.js";
 import { makeFindTool } from "./find-tool.js";
 import { makeGenerateImageTool } from "./generate-image-tool.js";
+import { makeManageAccessTool } from "./manage-access-tool.js";
 import { makeManageProviderTool } from "./manage-provider-tool.js";
 import { makeManageSkillTool } from "./manage-skill-tool.js";
 // Consolidated `org` tool — only registered when cfg.org is present
@@ -247,6 +248,12 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		makeManageProviderTool(
 			opts.agentId !== undefined ? { requesterAgentId: opts.agentId } : {},
 		),
+		// manage_access — owner-only agent-to-agent access control. The
+		// sanctioned path the path-write / config-write guards point to for
+		// changing session.sessionTools.visibility / session.agentToAgent /
+		// org.a2a.mode, so "let main message marketing-lead" is one validated
+		// call instead of a guard-refused hand-edit.
+		makeManageAccessTool(),
 	];
 	// Consolidated org tool additive-gate: the single `org` tool is
 	// registered ONLY when cfg.org is present in the loaded config. When

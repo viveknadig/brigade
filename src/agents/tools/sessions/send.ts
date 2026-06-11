@@ -41,6 +41,7 @@ import {
 // Otherwise the legacy error message stays untouched.
 import { buildOrgDeniedMessage } from "../../org/structured-errors.js";
 import { deriveOrgGraph } from "../../org/derive-graph.js";
+import { resolveSessionAccessPolicy } from "./resolve-access.js";
 import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
 
 export interface SessionsSendToolArgs {
@@ -219,7 +220,7 @@ export function createSessionsSendTool(
 						error: "sessions_send forbidden: session access policy not configured",
 					});
 				}
-				const access = checkSessionToolAccess({
+				let access = checkSessionToolAccess({
 					action: "send",
 					requesterSessionKey: opts.agentSessionKey,
 					targetSessionKey: parsed.sessionKey,
@@ -227,6 +228,34 @@ export function createSessionsSendTool(
 					a2aPolicy: opts.a2aPolicy,
 					...(opts.spawnedKeys ? { spawnedKeys: opts.spawnedKeys } : {}),
 				});
+				// LIVE re-check (2026-06-11): the injected policy was frozen at
+				// run start. If the model just called `manage_access` to enable
+				// cross-agent messaging and is retrying THIS run, the frozen
+				// policy still says "denied". Re-resolve from CURRENT config and
+				// re-check before refusing — a mid-run enable then takes effect
+				// immediately (no gateway restart, which is what the model used
+				// to wrongly tell the operator). Deny-path only: the happy path
+				// keeps the injected policy untouched, and a re-check can only
+				// GRANT (after an enable), never widen a still-denying config.
+				if (!access.allowed && opts.agentSessionKey) {
+					try {
+						const freshCfg = (
+							require("../../../core/config.js") as { loadConfig: () => unknown }
+						).loadConfig();
+						const live = resolveSessionAccessPolicy(freshCfg);
+						const liveAccess = checkSessionToolAccess({
+							action: "send",
+							requesterSessionKey: opts.agentSessionKey,
+							targetSessionKey: parsed.sessionKey,
+							visibility: live.visibility,
+							a2aPolicy: live.a2aPolicy,
+							...(opts.spawnedKeys ? { spawnedKeys: opts.spawnedKeys } : {}),
+						});
+						if (liveAccess.allowed) access = liveAccess;
+					} catch {
+						/* keep the original denial on any resolve failure */
+					}
+				}
 				if (!access.allowed) {
 					// Stage C additive-gate: when cfg.org is present AND mode ===
 					// "derived", wrap the legacy denial message with the

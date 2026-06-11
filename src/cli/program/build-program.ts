@@ -170,13 +170,28 @@ export function buildProgram(): Command {
   program
     .command("tui", { isDefault: true })
     .description("Launch the Brigade chat TUI (auto-starts the gateway if needed)")
+    // Positional agent id — the npm-friendly spelling. `npm run tui <agent>`
+    // passes the bare word straight through (no `--` dance), and even
+    // `npm run tui --agent <agent>` works because npm strips its own
+    // `--agent` config flag and forwards just `<agent>` as this positional.
+    // The `--agent <id>` flag below is the equivalent for `brigade tui`.
+    .argument("[agent]", "agent id to bind at startup (positional alias for --agent)")
     // Same Commander `--no-X` pattern as `onboard` above — no third arg.
     .option("--no-env-detect", "ignore API keys from the shell environment")
     .option("-h, --host <host>", "gateway host to connect to / spawn on (default: 127.0.0.1)")
     .option("-p, --port <port>", "gateway port (default: 7777)", (v) => parseInt(v, 10))
-    .action(async (opts: { envDetect?: boolean; host?: string; port?: number }) => {
+    .option("--agent <id>", "bind the TUI to this agent at startup (skips the /agent step)")
+    .action(async (agentArg: string | undefined, opts: { envDetect?: boolean; host?: string; port?: number; agent?: string }) => {
       const { runChatCommand } = await import("../commands/chat.js");
-      await runChatCommand({ noEnvDetect: opts.envDetect === false, host: opts.host, port: opts.port });
+      // Flag wins over positional when both are given; otherwise the
+      // positional (npm path) supplies the binding.
+      const agentId = opts.agent ?? agentArg;
+      await runChatCommand({
+        noEnvDetect: opts.envDetect === false,
+        host: opts.host,
+        port: opts.port,
+        ...(agentId ? { agentId } : {}),
+      });
       // Hold the action handler open — `runChatCommand` resolves once the
       // editor is wired; without this pin, the entry-point exit hook
       // would kill the chat before the user could type. The chat itself
@@ -336,18 +351,24 @@ export function buildProgram(): Command {
       "Connect to a running Brigade gateway from a thin TUI client.\n" +
         "  Examples:\n" +
         "    brigade connect                          # default 127.0.0.1:7777\n" +
+        "    brigade connect marketing-lead           # open bound to that agent\n" +
+        "    brigade connect --agent marketing-lead   # same, flag form\n" +
         "    brigade connect --host 192.168.1.5 -p 7777\n" +
         "    brigade connect --timeout 120000",
     )
+    .argument("[agent]", "agent id to bind at startup (positional alias for --agent)")
     .option("-h, --host <host>", "gateway host (default: 127.0.0.1)")
     .option("-p, --port <port>", "gateway port", (v) => parseInt(v, 10))
     .option("--timeout <ms>", "request timeout in ms", (v) => parseInt(v, 10))
-    .action(async (opts: { host?: string; port?: number; timeout?: number }) => {
+    .option("--agent <id>", "bind the TUI to this agent at startup (skips the /agent step)")
+    .action(async (agentArg: string | undefined, opts: { host?: string; port?: number; timeout?: number; agent?: string }) => {
       const { runConnectCommand } = await import("../commands/connect.js");
+      const agentId = opts.agent ?? agentArg;
       await runConnectCommand({
         host: opts.host,
         port: opts.port,
         requestTimeoutMs: opts.timeout,
+        ...(agentId ? { agentId } : {}),
       });
       await new Promise<void>(() => {});
     });

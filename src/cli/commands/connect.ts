@@ -88,12 +88,41 @@ export interface ConnectCommandOptions {
 	port?: number;
 	/** Per-request timeout (ms). Default: 60_000 */
 	requestTimeoutMs?: number;
+	/**
+	 * Bind the TUI to this agent id at startup — equivalent to opening the
+	 * TUI and immediately running `/agent <id>`, but without the manual step.
+	 * Validated against the gateway's `agents.list` before the UI engages;
+	 * an unknown id exits with the available list (an unvalidated id would
+	 * silently fall back to the boot agent server-side, so the operator
+	 * would think they were talking to X while actually talking to main).
+	 */
+	agentId?: string;
 }
 
 export interface ConnectHandle {
 	/** Aborts the in-flight turn (true) or signals "no turn was running" (false). */
 	abort(): boolean;
 	close(): Promise<void>;
+}
+
+/**
+ * Should a `state` snapshot's `sessionKey` seed the connection-bound session?
+ *
+ * Yes when unbound (normal first-snapshot seed) or when the snapshot is for
+ * the SAME agent we're bound to. No when bound to a DIFFERENT agent than the
+ * snapshot — that's the `--agent X` cross-agent-session bug: the gateway's
+ * boot snapshot (agent `main`, session `agent:main:main`) must NOT seed the
+ * session for a connection bound to `marketing-lead`, or `withBinding` emits
+ * the incoherent pair `{agentId: marketing-lead, sessionKey: agent:main:main}`
+ * and the reply gets filtered to the wrong lane. Exported for regression
+ * testing of that exact decision.
+ */
+export function snapshotSessionSeedable(
+	boundAgentId: string | undefined,
+	snapAgentId: string | undefined,
+): boolean {
+	if (boundAgentId === undefined) return true;
+	return typeof snapAgentId === "string" && snapAgentId === boundAgentId;
 }
 
 /**
@@ -184,7 +213,34 @@ export async function runConnectCommand(opts: ConnectCommandOptions = {}): Promi
 		process.exit(1);
 	}
 
-	chatHandle = await wireConnectUi(tui, client);
+	// Startup `--agent <id>` binding. Validate against the gateway's live
+	// agent list BEFORE engaging the UI — an unknown id would otherwise fall
+	// back to the boot agent server-side (getAgentRuntime), silently routing
+	// the operator's turns to `main` while they believe they're talking to X.
+	// Mirrors the in-TUI `/agent` validation. agents.list failure is lenient
+	// (bind anyway; the in-TUI /agent can correct) so a transient RPC hiccup
+	// doesn't block launch.
+	let initialAgentId: string | undefined;
+	if (opts.agentId) {
+		try {
+			const known = (await client.request("agents.list")) as AgentSummary[];
+			if (!known.some((a) => a.id === opts.agentId)) {
+				tui.stop();
+				restoreTerminal();
+				const available = known.map((a) => a.id).join(", ") || "(none)";
+				console.error(chalk.red(`✗ Unknown agent "${opts.agentId}".`));
+				console.error(chalk.dim(`  Available: ${available}`));
+				console.error(chalk.dim(`  (run \`brigade agents list\` to see them all)`));
+				process.exit(1);
+			}
+			initialAgentId = opts.agentId;
+		} catch {
+			// Lenient: bind anyway; `/agent` inside the TUI re-validates.
+			initialAgentId = opts.agentId;
+		}
+	}
+
+	chatHandle = await wireConnectUi(tui, client, initialAgentId);
 	return chatHandle;
 }
 
@@ -193,7 +249,11 @@ export async function runConnectCommand(opts: ConnectCommandOptions = {}): Promi
  * tests can inject a pre-connected client without going through CLI flag
  * parsing or process.exit.
  */
-export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<ConnectHandle> {
+export async function wireConnectUi(
+	tui: TUI,
+	client: BrigadeClient,
+	initialAgentId?: string,
+): Promise<ConnectHandle> {
 	// Static (last-frame) wordmark — `brigade connect` is the chat surface
 	// just like `brigade chat`, so we want the same still rendering here. The
 	// looping clip is reserved for onboarding's one-time wow moment.
@@ -213,7 +273,11 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 	// working unchanged. The `/agent <id>` slash command rebinds the connection
 	// so subsequent prompt / abort / steer / set-model / set-thinking RPCs all
 	// target that agent without the operator having to repeat it every turn.
-	let boundAgentId: string | undefined = undefined;
+	// Seeded from `--agent <id>` when supplied (already validated against
+	// agents.list in runConnectCommand); otherwise filled from the first
+	// `state` snapshot. A pre-set value is preserved by the snapshot handler's
+	// `=== undefined` guard, so the startup binding sticks.
+	let boundAgentId: string | undefined = initialAgentId;
 	// Wave K — connection-bound session key. Lets the operator point this
 	// TUI at a per-peer session (e.g. a channel-routed turn under
 	// `agent:main:whatsapp:<jid>`) so abort / steer / compact / set-model
@@ -706,7 +770,25 @@ export async function wireConnectUi(tui: TUI, client: BrigadeClient): Promise<Co
 		// Wave K — seed the connection-bound session key from the first
 		// snapshot. Once set explicitly via `/session <key>`, snapshot
 		// updates no longer reset it (mirrors boundAgentId semantics).
-		if (boundSessionKey === undefined && typeof snap.sessionKey === "string" && snap.sessionKey.length > 0) {
+		//
+		// --agent guard (2026-06-11): do NOT inherit a session key from a
+		// snapshot whose agent differs from the one we're explicitly bound to.
+		// On `brigade connect --agent marketing-lead`, the gateway's first
+		// (boot) snapshot is for `main` with sessionKey `agent:main:main`.
+		// Seeding that here made `withBinding` send the incoherent pair
+		// {agentId: "marketing-lead", sessionKey: "agent:main:main"} — the
+		// turn routed to main's session and the off-lane / subscription filter
+		// dropped the reply (first message landed on main, "fixed" itself only
+		// once a marketing-lead snapshot arrived). Leaving boundSessionKey
+		// undefined lets the gateway resolve the bound agent's OWN default
+		// session from agentId alone. Once a snapshot for the bound agent
+		// arrives, the match passes and the real session key seeds normally.
+		if (
+			boundSessionKey === undefined &&
+			typeof snap.sessionKey === "string" &&
+			snap.sessionKey.length > 0 &&
+			snapshotSessionSeedable(boundAgentId, snap.agentId)
+		) {
 			boundSessionKey = snap.sessionKey;
 		}
 		// Wave N3 (bug #3) — fire the initial subscription as soon as we
