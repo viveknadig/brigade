@@ -5,6 +5,7 @@ import JSON5 from "json5";
 
 import {
   ensureDir,
+  peekConvexMode,
   resolveConfigAuditLogPath,
   resolveConfigHealthPath,
   resolveConfigPath,
@@ -542,6 +543,21 @@ function writeConfigSafeInternal(config: BrigadeConfig): void {
         );
       });
     return;
+  }
+
+  // Fail CLOSED: the sentinel/env says convex but no runtime context (and thus
+  // no store) is installed in this process — a context-less window such as a
+  // command that skipped storage boot or a BOOT_OPTIONAL command whose backend
+  // was unreachable. Falling through to the disk write would (a) leak
+  // brigade.json + .bak + config logs under ~/.brigade and (b) be silently
+  // ignored on the next convex boot (the brigadeConfig row is authoritative,
+  // not the file). Refuse loudly instead of writing somewhere that gets lost.
+  if (!rctx && peekConvexMode()) {
+    throw new Error(
+      "Cannot write Brigade config: storage is in convex mode but the backend " +
+        "isn't connected in this process. Run this after the gateway is up, or " +
+        "verify the deployment URL — config must go to the convex backend, not disk.",
+    );
   }
 
   const cfgPath = resolveConfigPath();

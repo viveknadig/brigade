@@ -29,6 +29,22 @@ function bytesToJson<T>(b: ArrayBuffer | null | undefined): T | undefined {
 	}
 }
 
+/** Concatenate sealed-byte slices of a chunked transcript record back into
+ *  the whole sealed blob (slicing then re-joining AES-GCM ciphertext is
+ *  lossless — the envelope is over the full payload). */
+function concatArrayBuffers(parts: ArrayBuffer[]): ArrayBuffer {
+	if (parts.length === 1) return parts[0]!;
+	let total = 0;
+	for (const p of parts) total += p.byteLength;
+	const joined = new Uint8Array(total);
+	let offset = 0;
+	for (const p of parts) {
+		joined.set(new Uint8Array(p), offset);
+		offset += p.byteLength;
+	}
+	return joined.buffer;
+}
+
 export class ConvexMessageStore implements MessageStore {
 	constructor(private readonly deps: Deps) {}
 
@@ -95,26 +111,55 @@ export class ConvexMessageStore implements MessageStore {
 		// exhausted. A single `take(limit)` truncates a session longer than the
 		// per-query read cap; migrate asks for "all" (a huge limit) and MUST get
 		// every record so the copy is faithful.
+		//
+		// Chunk reassembly: an oversized record was split across `chunkCount`
+		// consecutive rows on write (see convex/messages.ts). They arrive in
+		// seq order (= chunkIndex order) and contiguously (one atomic batch),
+		// so we collect `chunkCount` consecutive chunk rows, concatenate their
+		// sealed-byte slices into the whole blob, then decrypt once.
 		const want = opts?.limit && opts.limit > 0 ? opts.limit : 1000;
 		const PAGE = 4000;
 		const out: PiTranscriptRecord[] = [];
 		let afterSeq: number | undefined;
+		// A chunk group that may straddle a page boundary.
+		let pending: { count: number; parts: ArrayBuffer[] } | undefined;
 		while (out.length < want) {
-			const pageSize = Math.min(PAGE, want - out.length);
 			const rows = (await this.deps.client.query(api.messages.readTranscript, {
 				agentId,
 				sessionId,
-				limit: pageSize,
+				limit: PAGE,
 				...(afterSeq !== undefined ? { afterSeq } : {}),
-			})) as Array<{ payload: ArrayBuffer; seq: number }>;
+			})) as Array<{
+				payload: ArrayBuffer;
+				seq: number;
+				chunkIndex?: number;
+				chunkCount?: number;
+			}>;
 			if (rows.length === 0) break;
 			for (const row of rows) {
-				const parsed = bytesToJson<PiTranscriptRecord>(row.payload);
-				if (parsed) out.push(parsed);
+				afterSeq = row.seq;
+				const cc =
+					typeof row.chunkCount === "number" && row.chunkCount > 1 ? row.chunkCount : 1;
+				if (cc <= 1) {
+					// Normal single-row record. (Defensive: a stray pending here
+					// would mean a torn group — impossible with atomic writes —
+					// so drop it rather than corrupt the stream.)
+					pending = undefined;
+					const parsed = bytesToJson<PiTranscriptRecord>(row.payload);
+					if (parsed) out.push(parsed);
+					continue;
+				}
+				// Chunk row — collect by arrival order (== chunkIndex order).
+				if (!pending || pending.count !== cc) pending = { count: cc, parts: [] };
+				pending.parts.push(row.payload);
+				if (pending.parts.length >= pending.count) {
+					const parsed = bytesToJson<PiTranscriptRecord>(concatArrayBuffers(pending.parts));
+					if (parsed) out.push(parsed);
+					pending = undefined;
+				}
 			}
-			afterSeq = rows[rows.length - 1]!.seq;
 			// A short page means the index range is drained — stop.
-			if (rows.length < pageSize) break;
+			if (rows.length < PAGE) break;
 		}
 		return out;
 	}

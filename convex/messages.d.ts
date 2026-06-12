@@ -43,6 +43,8 @@ export declare const readTranscript: import("convex/server").RegisteredQuery<"pu
     _id: import("convex/values").GenericId<"sessionTranscriptRecords">;
     _creationTime: number;
     customType?: string | undefined;
+    chunkIndex?: number | undefined;
+    chunkCount?: number | undefined;
     type: string;
     agentId: string;
     payload: ArrayBuffer;

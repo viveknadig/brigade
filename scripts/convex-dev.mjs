@@ -124,6 +124,57 @@ backend.on("exit", (code) => {
 });
 
 // ---------------------------------------------------------------------------
+// 5b. Push the current convex/ functions once the backend answers.
+//
+// The runbook always promised "boots the local backend + pushes convex/
+// functions" — but nothing ever pushed, so the deployed bundle silently
+// drifted from the code: every function added after the last manual push
+// failed at runtime with "Could not find public function 'auth:readAuthFile'"
+// while the gateway limped along half-broken. Pushing here (and via the
+// standalone `npm run convex:push`) keeps backend and code in lockstep; the
+// boot-time bundle-version gate in src/storage/boot.ts is the backstop.
+// ---------------------------------------------------------------------------
+async function pushFunctionsWhenReady() {
+  const deadline = Date.now() + 60_000;
+  let up = false;
+  while (Date.now() < deadline && !shuttingDown) {
+    try {
+      const res = await fetch(`http://${BACKEND_HOST}:${BACKEND_PORT}/version`);
+      if (res.ok) {
+        up = true;
+        break;
+      }
+    } catch {
+      /* backend still starting */
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  if (!up || shuttingDown) {
+    if (!shuttingDown) {
+      console.error(
+        `\x1b[31m▌ Backend didn't answer within 60s — skipped the function push. Run \`npm run convex:push\` once it's up.\x1b[0m`,
+      );
+    }
+    return;
+  }
+  console.log(`\x1b[36m▌ Pushing convex/ functions…\x1b[0m`);
+  const push = spawn(process.execPath, [join(ROOT, "scripts", "convex-push.mjs")], {
+    stdio: "inherit",
+  });
+  push.on("exit", (code) => {
+    if (code === 0) {
+      console.log(`\x1b[32m▌ Functions up to date.\x1b[0m`);
+    } else {
+      console.error(
+        `\x1b[31m▌ Function push failed (code ${code}) — run \`npm run convex:push\` manually.\x1b[0m`,
+      );
+    }
+  });
+}
+// NOTE: invoked at the BOTTOM of this file — it reads `shuttingDown`, which
+// is declared in section 7 below; calling it here would hit the TDZ.
+
+// ---------------------------------------------------------------------------
 // 6. Spawn the static dashboard server on 127.0.0.1:6791
 // ---------------------------------------------------------------------------
 const MIME = {
@@ -168,6 +219,35 @@ const dashboardServer = createServer(async (req, res) => {
     const ext = extname(filePath).toLowerCase();
     const mime = MIME[ext] ?? "application/octet-stream";
     res.writeHead(200, { "content-type": mime, "cache-control": "no-store" });
+    // Zero-click login. The dashboard's logged-in flag is in-memory React
+    // state — sessionStorage alone never logs it in. The supported hook is
+    // a postMessage handshake: on load the app broadcasts
+    // "dashboard-credentials-request" to window.parent and auto-logs-in if
+    // anything replies with {type:"dashboard-credentials", adminKey,
+    // deploymentUrl, deploymentName}. The page is top-level here, so
+    // window.parent === window and our injected listener can be that
+    // responder. Localhost-only listener; same trust domain as the key
+    // file itself. Respects Log Out: the dashboard records it as
+    // sessionStorage adminKey = JSON '""' — we stay silent then so manual
+    // re-login still works (fresh tabs have no marker and auto-login).
+    if (ext === ".html") {
+      const creds =
+        `{type:"dashboard-credentials",adminKey:${JSON.stringify(adminKey)},` +
+        `deploymentUrl:${JSON.stringify(`http://${BACKEND_HOST}:${BACKEND_PORT}`)},` +
+        `deploymentName:${JSON.stringify(identity.instanceName)}}`;
+      const html = (await readFile(filePath, "utf8")).replace(
+        /<head>/i,
+        `<head><script>(function(){try{` +
+          `function loggedOut(){try{var k=sessionStorage.getItem("adminKey");` +
+          `return k!==null&&JSON.parse(k||"null")===""}catch(e){return false}}` +
+          `window.addEventListener("message",function(ev){` +
+          `if(ev&&ev.data&&ev.data.type==="dashboard-credentials-request"&&!loggedOut()){` +
+          `window.postMessage(${creds},"*");}});` +
+          `}catch(e){}})();</script>`,
+      );
+      res.end(html);
+      return;
+    }
     res.end(await readFile(filePath));
   } catch (err) {
     res.writeHead(500);
@@ -176,10 +256,36 @@ const dashboardServer = createServer(async (req, res) => {
 });
 
 dashboardServer.listen(DASHBOARD_PORT, BACKEND_HOST, () => {
-  console.log(`\x1b[36m▌   dashboard → http://${BACKEND_HOST}:${DASHBOARD_PORT}\x1b[0m`);
+  const dashboardUrl = `http://${BACKEND_HOST}:${DASHBOARD_PORT}`;
+  console.log(`\x1b[36m▌   dashboard → ${dashboardUrl}\x1b[0m`);
   console.log(`\x1b[33m▌ Add deployment in dashboard with:\x1b[0m`);
   console.log(`\x1b[33m▌   URL:        http://${BACKEND_HOST}:${BACKEND_PORT}\x1b[0m`);
   console.log(`\x1b[33m▌   Admin key:  (paste contents of .convex-data/admin-key.txt)\x1b[0m`);
+
+  // Convenience: open the dashboard in the default browser and put the
+  // admin key on the clipboard so "add deployment" is paste-and-go.
+  // Opt out (CI / headless / "stop opening tabs") with BRIGADE_NO_BROWSER=1.
+  if (process.env.BRIGADE_NO_BROWSER !== "1") {
+    try {
+      if (process.platform === "win32") {
+        // `start` needs the empty-title arg; clip reads the key from stdin.
+        spawn("cmd", ["/c", "start", "", dashboardUrl], { stdio: "ignore", detached: true }).unref();
+        const clip = spawn("clip", [], { stdio: ["pipe", "ignore", "ignore"] });
+        clip.stdin.end(adminKey);
+        console.log(`\x1b[32m▌   (dashboard opened · admin key copied to clipboard — just paste it)\x1b[0m`);
+      } else if (process.platform === "darwin") {
+        spawn("open", [dashboardUrl], { stdio: "ignore", detached: true }).unref();
+        const pb = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
+        pb.stdin.end(adminKey);
+        console.log(`\x1b[32m▌   (dashboard opened · admin key copied to clipboard — just paste it)\x1b[0m`);
+      } else {
+        spawn("xdg-open", [dashboardUrl], { stdio: "ignore", detached: true }).unref();
+        console.log(`\x1b[32m▌   (dashboard opened — admin key is in .convex-data/admin-key.txt)\x1b[0m`);
+      }
+    } catch {
+      /* best-effort — the printed instructions above always work */
+    }
+  }
   console.log(``);
 });
 
@@ -197,3 +303,8 @@ function shutdown(code = 0) {
 }
 process.on("SIGINT",  () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
+
+// Kick off the function push LAST — after `shuttingDown` above is
+// initialized (pushFunctionsWhenReady reads it; an earlier call site hit
+// the let-binding TDZ and crashed the whole orchestrator at startup).
+void pushFunctionsWhenReady();

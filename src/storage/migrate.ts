@@ -37,7 +37,7 @@ import { createHash } from "node:crypto";
 
 import { LocalBrigadeStore } from "./local/index.js";
 import { ConvexBrigadeStore } from "./convex/index.js";
-import { writeSentinelNow } from "./sentinel.js";
+import { readSentinel, writeSentinelNow } from "./sentinel.js";
 
 import type { BrigadeStore } from "./store.js";
 
@@ -83,6 +83,21 @@ function sha256OfJson(value: unknown): string {
 	return createHash("sha256").update(JSON.stringify(value ?? null)).digest("hex");
 }
 
+/** Every agent id in a config (always includes "main"); skips the `defaults`
+ *  pseudo-entry. Mirrors the boot-hydration enumeration so per-agent auth
+ *  migrates for the whole crew, not just the default agent. */
+function collectAgentIds(cfg: unknown): string[] {
+	const ids = new Set<string>(["main"]);
+	const agents = (cfg as { agents?: Record<string, unknown> } | undefined)?.agents;
+	if (agents && typeof agents === "object") {
+		for (const key of Object.keys(agents)) {
+			if (key === "defaults" || !key.trim()) continue;
+			ids.add(key.trim());
+		}
+	}
+	return Array.from(ids);
+}
+
 async function buildStores(opts: MigrateOptions): Promise<{ source: BrigadeStore; target: BrigadeStore }> {
 	const local: BrigadeStore = new LocalBrigadeStore({ stateDir: opts.stateDir });
 	const convex: BrigadeStore = new ConvexBrigadeStore({
@@ -116,7 +131,19 @@ async function safeDomain(
 
 export async function runStoreMigrate(opts: MigrateOptions): Promise<MigrateReport> {
 	const startedAt = Date.now();
-	const { source, target } = await buildStores(opts);
+	// Resolve the convex URL ONCE, from full precedence, so the store
+	// connection AND the sentinel flip below agree on one backend: explicit
+	// flag → the pinned sentinel (incl. a dormant URL a prior `--to filesystem`
+	// left behind) → env (resolved downstream). Previously buildStores and the
+	// flip resolved independently — a flag-less run connected only by a
+	// boot-cache accident yet wrote `{}` to the sentinel (→ "requires a
+	// convexUrl", silently swallowed), and `--to filesystem` erased the URL,
+	// bricking the round-trip.
+	const priorSentinel = readSentinel({ stateDir: opts.stateDir });
+	const resolvedConvexUrl = opts.convexUrl ?? priorSentinel?.convexUrl;
+	const { source, target } = await buildStores(
+		resolvedConvexUrl !== undefined ? { ...opts, convexUrl: resolvedConvexUrl } : opts,
+	);
 	const fromMode = opts.to === "convex" ? "filesystem" : "convex";
 	const domains: MigrateReport["domains"] = [];
 	const verifySha = !opts.skipVerify;
@@ -133,30 +160,53 @@ export async function runStoreMigrate(opts: MigrateOptions): Promise<MigrateRepo
 		}),
 	);
 
-	// --- auth profiles + state -------------------------------------------
+	// --- auth profiles + state (ALL agents, not just main) ---------------
 	domains.push(
 		await safeDomain("auth", opts.onProgress, async () => {
-			const profiles = await source.auth.listProfiles("main");
-			if (!opts.dryRun) {
-				for (const p of profiles) {
-					await target.auth.upsertProfile("main", p as never);
+			// Every agent has its OWN auth-profiles.json. Migrating only "main"
+			// left non-main agents' keys behind — unsealed on disk AND absent
+			// from convex, so after the flip their plaintext disk copy was both
+			// the leak AND the only copy. Enumerate from the source config (the
+			// config domain already copied it).
+			const { value: cfgVal } = await source.config.read();
+			const agentIds = collectAgentIds(cfgVal);
+			let copied = 0;
+			for (const agentId of agentIds) {
+				const profiles = await source.auth.listProfiles(agentId);
+				if (!opts.dryRun) {
+					for (const p of profiles) {
+						await target.auth.upsertProfile(agentId, p as never);
+					}
+					// Also carry the whole-file blobs VERBATIM — auth-state.json
+					// (failover order + lastGood + usageStats) and profile-state.json
+					// (cooldown windows + failure counts) and models.json. Without
+					// these a mode switch loses the operator's failover ordering and
+					// resets every cooldown — profiles alone aren't the full picture.
+					for (const kind of ["auth-state", "profile-state", "models"] as const) {
+						try {
+							const blob = await source.auth.readAuthFileBlob(agentId, kind);
+							if (blob) await target.auth.writeAuthFileBlob(agentId, kind, blob);
+						} catch {
+							// One missing/unreadable blob doesn't fail the domain — the
+							// profiles (the load-bearing part) already copied.
+						}
+					}
 				}
-				// Also carry the whole-file blobs VERBATIM — auth-state.json
-				// (failover order + lastGood + usageStats) and profile-state.json
-				// (cooldown windows + failure counts) and models.json. Without
-				// these a mode switch loses the operator's failover ordering and
-				// resets every cooldown — profiles alone aren't the full picture.
-				for (const kind of ["auth-state", "profile-state", "models"] as const) {
-					try {
-						const blob = await source.auth.readAuthFileBlob("main", kind);
-						if (blob) await target.auth.writeAuthFileBlob("main", kind, blob);
-					} catch {
-						// One missing/unreadable blob doesn't fail the domain — the
-						// profiles (the load-bearing part) already copied.
+				copied += profiles.length;
+			}
+			let verified = false;
+			if (verifySha && !opts.dryRun) {
+				verified = true;
+				for (const agentId of agentIds) {
+					const srcN = (await source.auth.listProfiles(agentId)).length;
+					const tgtN = (await target.auth.listProfiles(agentId)).length;
+					if (tgtN < srcN) {
+						verified = false;
+						break;
 					}
 				}
 			}
-			return { copied: profiles.length, verified: !verifySha ? false : profiles.length === (await target.auth.listProfiles("main")).length };
+			return { copied, verified };
 		}),
 	);
 
@@ -415,11 +465,24 @@ export async function runStoreMigrate(opts: MigrateOptions): Promise<MigrateRepo
 	let sentinelWritten = false;
 	if (!opts.dryRun) {
 		try {
-			writeSentinelNow(
-				opts.to,
-				opts.to === "convex" && opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {},
-				{ stateDir: opts.stateDir },
-			);
+			if (opts.to === "convex") {
+				// Pin the URL we actually connected to (flag → sentinel → env),
+				// not just the flag — else a flag-less run wrote `{}` here and
+				// writeSentinel threw "convex mode requires a convexUrl".
+				const { resolveConvexUrl } = await import("./convex/client.js");
+				const pin = resolveConvexUrl(
+					resolvedConvexUrl !== undefined ? { url: resolvedConvexUrl } : {},
+				);
+				writeSentinelNow("convex", { convexUrl: pin }, { stateDir: opts.stateDir });
+			} else {
+				// → filesystem: keep the prior convexUrl as a dormant field so a
+				// later `--to convex` round-trips without re-supplying the URL.
+				writeSentinelNow(
+					"filesystem",
+					priorSentinel?.convexUrl ? { convexUrl: priorSentinel.convexUrl } : {},
+					{ stateDir: opts.stateDir },
+				);
+			}
 			sentinelWritten = true;
 		} catch {
 			// Sentinel write failure is fatal-ish — the data was copied but

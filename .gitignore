@@ -49,3 +49,10 @@ test.txt
 
 # VSCode workspace files
 *.code-workspace
+
+# Compiled artifacts must never live next to the convex/ sources — the convex
+# CLI bundles every .ts AND .js it finds, so a stray tsc emit makes deploys
+# fail with "Two output files share the same path". (_generated/ is exempt —
+# its api.js/server.js are the CLI's own output.)
+convex/*.js
+convex/*.js.map

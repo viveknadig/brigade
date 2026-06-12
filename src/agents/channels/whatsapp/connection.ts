@@ -30,7 +30,7 @@ import { chunkText } from "./chunk.js";
 import { lookupLidReverseSync, useConvexAuthState } from "./convex-auth-state.js";
 import { markdownToWhatsApp } from "./format.js";
 import { extractMentions, extractReplyContext } from "./inbound-extras.js";
-import { downloadInboundMedia } from "./media.js";
+import { downloadInboundMedia, hasInboundMedia } from "./media.js";
 
 /** A normalized inbound WhatsApp message (text and/or media). */
 export interface WaInboundText {
@@ -74,6 +74,15 @@ export interface WaInboundText {
 	replyTo?: import("../../extensions/types.js").InboundReplyContext;
 	/** Media attachments saved to disk under ~/.brigade/channels/whatsapp/media. */
 	media?: import("../../extensions/types.js").InboundMediaAttachment[];
+	/**
+	 * DEFERRED media download. The socket layer no longer downloads media
+	 * eagerly — a stranger's group video used to be fetched from WhatsApp,
+	 * sealed, and archived into the backend BEFORE the access-control gate
+	 * dropped the message (storage bloat + privacy hole: anyone in any group
+	 * with the operator could fill the database). The pipeline invokes this
+	 * ONLY after the gate admits the sender.
+	 */
+	resolveMedia?: () => Promise<import("../../extensions/types.js").InboundMediaAttachment[]>;
 	/** Raw Baileys message (for adapters that need more). */
 	raw: WAMessage;
 }
@@ -1278,19 +1287,27 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 							| WAMessage["message"]
 							| undefined;
 						const text = extractText(m.message, normalizeMessageContent as (x: unknown) => unknown).trim();
-						// Download any attached media so the agent gets paths it can read.
-						const media =
-							normalized && msgId
-								? await downloadInboundMedia({
-										content: normalized,
-										msgId,
-										downloadMediaMessage: baileys.downloadMediaMessage as never,
-										rawMessage: m,
-										log: args.log,
-									})
-								: [];
+						// Media download is DEFERRED. Only a cheap envelope probe runs
+						// here; the actual download (bytes from WhatsApp + seal +
+						// backend archive) happens via `resolveMedia` AFTER the
+						// pipeline's access-control gate admits the sender. Eager
+						// download meant any stranger in any group could push videos
+						// into the operator's storage even though the message itself
+						// was dropped by policy.
+						const hasMedia = !!(normalized && msgId) && hasInboundMedia(normalized);
+						const resolveMedia =
+							hasMedia && normalized && msgId
+								? () =>
+										downloadInboundMedia({
+											content: normalized,
+											msgId,
+											downloadMediaMessage: baileys.downloadMediaMessage as never,
+											rawMessage: m,
+											log: args.log,
+										})
+								: undefined;
 						// Drop the message entirely only if there's no text AND no media.
-						if (!text && media.length === 0) return;
+						if (!text && !hasMedia) return;
 						// Sender resolution. For DMs the chat jid itself is the sender;
 						// for groups the per-message `participant` carries the speaker.
 						// We resolve to a STABLE identity that NEVER drops a usable
@@ -1345,7 +1362,7 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 							chatType: isGroup ? "group" : "direct",
 							mentions: mentions.length > 0 ? mentions : undefined,
 							replyTo,
-							media: media.length > 0 ? media : undefined,
+							...(resolveMedia ? { resolveMedia } : {}),
 							raw: m,
 						});
 					} catch (err) {

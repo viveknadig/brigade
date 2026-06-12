@@ -112,6 +112,34 @@ export function startWorkspaceLiveMirror(
 	}
 }
 
+/** Register an agent CREATED MID-SESSION (manage_agent add / org init) with
+ *  the live mirror: an immediate sweep pushes the just-seeded persona files
+ *  to Convex, and a watcher covers subsequent edits. Without this, a freshly
+ *  created agent's personas existed ONLY on disk until the next gateway boot
+ *  — the wipe-restore promise silently broke for new agents (found
+ *  2026-06-12: a 20-agent org's personas were absent from personaFiles while
+ *  their skills, which dual-write immediately, were present). No-op when the
+ *  mirror isn't running (filesystem mode / pre-boot — the boot reconcile
+ *  owns those cases). Idempotent per agent; calling it for an already-
+ *  watched agent just forces a sweep. */
+export function ensureAgentInWorkspaceLiveMirror(agentId: string): void {
+	if (!_started || !_store) return;
+	const id = agentId.trim();
+	if (!id) return;
+	const existing = _watched.find((w) => w.agentId === id);
+	if (existing) {
+		enqueueSweep(existing.agentId, existing.workspaceDir);
+		return;
+	}
+	const workspaceDir = resolveAgentWorkspaceDir(id);
+	const unsub = watchDirectory(workspaceDir, () => {
+		enqueueSweep(id, workspaceDir);
+	});
+	_watched.push({ agentId: id, workspaceDir, unsub });
+	// Initial push of the freshly seeded files.
+	enqueueSweep(id, workspaceDir);
+}
+
 function enqueueSweep(agentId: string, workspaceDir: string): void {
 	const store = _store;
 	if (!store) return;

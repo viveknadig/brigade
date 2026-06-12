@@ -22,6 +22,21 @@ export const ping = query({
 	},
 });
 
+// Brigade function-bundle version. The Node client (verifyConvexBundleVersion
+// in src/storage/boot.ts) requires remote >= its expected constant at every
+// convex boot, so a backend serving an older push fails the boot with ONE
+// clear "run npm run convex:push" error instead of per-domain "Could not
+// find public function" spam (auth/memory/channels hydration failures +
+// per-turn transcript-flush errors). BUMP THIS — and the twin
+// EXPECTED_CONVEX_BUNDLE_VERSION in src/storage/boot.ts — together whenever
+// convex/ functions or the schema change shape.
+export const BUNDLE_VERSION = 3;
+
+export const bundleVersion = query({
+	args: {},
+	handler: async () => BUNDLE_VERSION,
+});
+
 // ============================================================================
 // systemMeta — small singleton facts (encryption-key fingerprint, markers)
 // ============================================================================

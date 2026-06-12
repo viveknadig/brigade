@@ -339,25 +339,12 @@ export async function runChannelInboundPipeline(
 ): Promise<void> {
 	const { adapter, config: cfg, agentId, runTurn, commandMap, inflight, pendingDispatches } = ctx;
 	try {
-		// Media + reply-context note synthesis.
-		const mediaNote =
-			msg.media && msg.media.length > 0
-				? msg.media
-						.map((m) => {
-							const caption = m.caption ? `: "${m.caption}"` : "";
-							const name = m.fileName ? ` (${m.fileName})` : "";
-							return `[attached ${m.kind}${name}${caption} → ${m.path}]`;
-						})
-						.join("\n")
-				: "";
-		const replyNote = msg.replyTo?.body
-			? `> ${msg.replyTo.body.replace(/\n/g, " ").slice(0, 200)}\n`
-			: "";
-		const text = [replyNote + mediaNote, msg.text?.trim() ?? ""]
-			.filter(Boolean)
-			.join("\n")
-			.trim();
-		if (!text) return;
+		// Cheap empty-message fast-path. Media synthesis happens AFTER the
+		// access gate now (media may be a deferred download — see below), so
+		// this only needs presence checks: text, eager media, or a deferral.
+		if (!msg.text?.trim() && !(msg.media && msg.media.length > 0) && !msg.resolveMedia) {
+			return;
+		}
 
 		// Access-control gate.
 		const isGroup = msg.isGroup === true || msg.chatType === "group";
@@ -453,6 +440,46 @@ export async function runChannelInboundPipeline(
 				/* cosmetic */
 			}
 		}
+		// ── Sender ADMITTED — only now pay for media. ──────────────────────
+		// Deferred downloads (msg.resolveMedia) run here, after the access
+		// gate, so a blocked stranger's group video is never fetched from
+		// WhatsApp, never sealed, never archived to the backend. Before this
+		// reorder, media was downloaded at the socket layer and ~17 MB of
+		// strangers' group videos landed in storage within minutes even
+		// though every one of their messages was dropped by policy.
+		if (msg.resolveMedia && (!msg.media || msg.media.length === 0)) {
+			try {
+				msg.media = await msg.resolveMedia();
+			} catch (err) {
+				log.warn("deferred media download failed", {
+					channel: adapter.id,
+					sender: msg.from,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
+		// Media + reply-context note synthesis (moved from pre-gate — the
+		// gate never reads `text`, and synthesis must wait for the deferred
+		// media above).
+		const mediaNote =
+			msg.media && msg.media.length > 0
+				? msg.media
+						.map((m) => {
+							const caption = m.caption ? `: "${m.caption}"` : "";
+							const name = m.fileName ? ` (${m.fileName})` : "";
+							return `[attached ${m.kind}${name}${caption} → ${m.path}]`;
+						})
+						.join("\n")
+				: "";
+		const replyNote = msg.replyTo?.body
+			? `> ${msg.replyTo.body.replace(/\n/g, " ").slice(0, 200)}\n`
+			: "";
+		const text = [replyNote + mediaNote, msg.text?.trim() ?? ""]
+			.filter(Boolean)
+			.join("\n")
+			.trim();
+		// Media-only message whose deferred download failed → nothing usable.
+		if (!text) return;
 		// Approval-reply intercept (AFTER access gate, BEFORE abort triggers).
 		const approvalIntercept = tryConsumeChannelApprovalReply({
 			channelId: adapter.id,

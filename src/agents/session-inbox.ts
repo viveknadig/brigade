@@ -475,6 +475,48 @@ export function hasSystemEvents(sessionKey: string): boolean {
 }
 
 /**
+ * Remove the FIRST queued event matching `text` + `contextKey` exactly,
+ * wherever it sits in the queue. Returns true when one was removed.
+ *
+ * Exists for producers that enqueue an event BEFORE a dispatch that can
+ * fail (sessions_send enqueues the A2A attribution event, then dispatches
+ * the peer turn): on a failed dispatch the event must be withdrawn or it
+ * ghosts into the peer's NEXT unrelated turn ("A2A from X: …" acted on
+ * hours later). `consumeSystemEventEntries` can't do this — it only
+ * removes exact queue PREFIXES (its drain contract).
+ */
+export function removeMatchingSystemEvent(
+	sessionKey: string,
+	match: { text: string; contextKey?: string },
+): boolean {
+	const key = requireSessionKey(sessionKey);
+	hydrateFromDiskIfNeeded(key);
+	const entry = getSessionQueue(key);
+	if (!entry || entry.queue.length === 0) return false;
+	const idx = entry.queue.findIndex(
+		(e) =>
+			e.text === match.text &&
+			(match.contextKey === undefined || e.contextKey === match.contextKey),
+	);
+	if (idx < 0) return false;
+	entry.queue.splice(idx, 1);
+	if (entry.queue.length === 0) {
+		entry.lastText = null;
+		entry.lastContextKey = null;
+		queues.delete(key);
+		truncateInboxFile(key);
+	} else {
+		const newest = entry.queue[entry.queue.length - 1];
+		if (newest) {
+			entry.lastText = newest.text;
+			entry.lastContextKey = newest.contextKey ?? null;
+		}
+		rewriteInboxFile(key, entry.queue);
+	}
+	return true;
+}
+
+/**
  * Merge the delivery contexts of `events` into a single context. Later
  * events override earlier ones field-by-field. Used by the dispatcher to
  * pick a delivery target when multiple events fired for the same session.

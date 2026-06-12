@@ -31,6 +31,7 @@
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import { Type } from "typebox";
 
+import { resolveDefaultAgentId } from "../agent-scope.js";
 import { listAgentEntries } from "../../cli/commands/agents-config.js";
 import { loadConfig } from "../../core/config.js";
 import { orgGraphAsA2APolicy } from "../org/a2a-adapter.js";
@@ -132,7 +133,17 @@ export function makeAgentsListTool(
 			if (orgCfg && orgCfg.a2a?.mode !== "explicit") {
 				const graph = deriveOrgDisplayGraph(cfg as never);
 				if (graph) {
-					a2aPolicy = orgGraphAsA2APolicy(graph);
+					// Same orchestrator bypass as resolveSessionAccessPolicy —
+					// keep the canSend flags this tool REPORTS consistent with
+					// what sessions_send actually ENFORCES, or the model sees
+					// "canSend: true" rows it then can't message (or vice versa).
+					const restrict =
+						(orgCfg.a2a as { restrictDefaultAgent?: unknown } | undefined)
+							?.restrictDefaultAgent === true;
+					a2aPolicy = orgGraphAsA2APolicy(
+						graph,
+						restrict ? {} : { orchestratorId: resolveDefaultAgentId(cfg as never) },
+					);
 				}
 			}
 

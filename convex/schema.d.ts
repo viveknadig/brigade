@@ -269,6 +269,8 @@ declare const _default: import("convex/server").SchemaDefinition<{
     }, {}, {}>;
     sessionTranscriptRecords: import("convex/server").TableDefinition<import("convex/values").VObject<{
         customType?: string | undefined;
+        chunkIndex?: number | undefined;
+        chunkCount?: number | undefined;
         type: string;
         agentId: string;
         payload: ArrayBuffer;
@@ -282,8 +284,15 @@ declare const _default: import("convex/server").SchemaDefinition<{
         type: import("convex/values").VString<string, "required">;
         customType: import("convex/values").VString<string | undefined, "optional">;
         payload: import("convex/values").VBytes<ArrayBuffer, "required">;
+        /** 0-based position of this slice within a chunked record; unset (→ 0)
+         *  for a normal single-row record. */
+        chunkIndex: import("convex/values").VFloat64<number | undefined, "optional">;
+        /** Total slices for a chunked record (>1); unset (→ 1) when not chunked.
+         *  All `chunkCount` rows are written in ONE mutation (atomic), so a
+         *  group can never be torn across a crash. */
+        chunkCount: import("convex/values").VFloat64<number | undefined, "optional">;
         createdAt: import("convex/values").VFloat64<number, "required">;
-    }, "required", "type" | "agentId" | "payload" | "sessionId" | "createdAt" | "seq" | "customType">, {
+    }, "required", "type" | "agentId" | "payload" | "sessionId" | "createdAt" | "seq" | "customType" | "chunkIndex" | "chunkCount">, {
         by_session_seq: ["agentId", "sessionId", "seq", "_creationTime"];
         by_session_type: ["agentId", "sessionId", "type", "_creationTime"];
     }, {}, {}>;

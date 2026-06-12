@@ -110,9 +110,26 @@ export async function createRuntimeContext(opts: CreateRuntimeContextOpts = {}):
 	}
 
 	const mode = resolveMode(stateDir, opts.override, process.env);
+	// Thread the operator's chosen backend URL into the store. resolveMode
+	// consults the sentinel only for the MODE; the sentinel's `convexUrl`
+	// (written by onboard / `store migrate`) is where the operator pinned their
+	// deployment. Without passing it here, convex boot falls through to
+	// resolveConvexUrl's env-var lookup and throws "requires a deployment URL"
+	// unless BRIGADE_CONVEX_URL happens to be exported — even though the URL is
+	// sitting in the sentinel the whole time. Priority: explicit override →
+	// sentinel → (env, resolved downstream in resolveConvexUrl).
+	// Only honor the sentinel's URL when the sentinel ITSELF is convex — a
+	// dormant convexUrl on a FILESYSTEM sentinel (left by `migrate --to
+	// filesystem` for round-trip convenience) must not hijack a
+	// BRIGADE_FORCE_MODE=1 + BRIGADE_CONVEX_URL diagnostic run, where mode
+	// resolves convex from ENV and the operator's exported URL should win.
+	const sentinelForUrl = mode === "convex" ? readSentinel(stateDir) : undefined;
+	const convexUrl =
+		opts.override?.convexUrl ??
+		(sentinelForUrl?.mode === "convex" ? sentinelForUrl.convexUrl : undefined);
 	const store = await buildStoreForMode(mode, {
 		stateDir,
-		...(opts.override?.convexUrl !== undefined ? { convexUrl: opts.override.convexUrl } : {}),
+		...(convexUrl !== undefined ? { convexUrl } : {}),
 	});
 	await store.init();
 

@@ -168,6 +168,9 @@ export function createWhatsAppAdapter(opts: CreateWhatsAppAdapterOptions = {}): 
 						mentions: msg.mentions,
 						replyTo: msg.replyTo,
 						media: msg.media,
+						// Deferred media thunk rides through untouched — the pipeline
+						// resolves it only after the access gate admits the sender.
+						resolveMedia: msg.resolveMedia,
 						raw: msg.raw,
 					});
 				},

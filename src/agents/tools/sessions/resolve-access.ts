@@ -15,6 +15,7 @@
  * without any restart. This module is the single source of that derivation.
  */
 
+import { resolveDefaultAgentId } from "../../agent-scope.js";
 import { deriveOrgGraph } from "../../org/derive-graph.js";
 import { orgGraphAsA2APolicy } from "../../org/a2a-adapter.js";
 import {
@@ -62,7 +63,23 @@ export function resolveSessionAccessPolicy(cfg: unknown): ResolvedSessionAccess 
 	const orgCfg = c.org;
 	if (orgCfg && orgCfg.a2a?.mode !== "explicit") {
 		const graph = deriveOrgGraph(cfg as never);
-		if (graph) a2aPolicy = orgGraphAsA2APolicy(graph);
+		if (graph) {
+			// Orchestrator bypass: the operator's DEFAULT agent is the
+			// operator's own voice, not a chart member — in derived mode the
+			// graph used to hard-refuse it as a non-member, so "ask eng-lead
+			// if they're up for work" from main was forbidden out of the box
+			// and the model offered to flip the whole org to explicit mode.
+			// Pairs touching the default agent bypass the chart; everyone
+			// else stays graph-governed. Lockdown installs opt out with
+			// `org.a2a.restrictDefaultAgent: true`.
+			const restrict =
+				(orgCfg.a2a as { restrictDefaultAgent?: unknown } | undefined)
+					?.restrictDefaultAgent === true;
+			a2aPolicy = orgGraphAsA2APolicy(
+				graph,
+				restrict ? {} : { orchestratorId: resolveDefaultAgentId(cfg as never) },
+			);
+		}
 	}
 	return { visibility, a2aPolicy };
 }

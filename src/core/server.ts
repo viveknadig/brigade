@@ -89,6 +89,7 @@ import { runCronIsolatedAgentJob } from "../cron/isolated-agent/run.js";
 import { createCronServiceState } from "../cron/service/state.js";
 import { start as cronStart, stop as cronStop } from "../cron/service/ops.js";
 import { bootRuntimeContext, enableConfigLiveRefresh } from "../storage/boot.js";
+import { onConfigCachePrimed } from "../storage/config-cache.js";
 import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import {
@@ -803,45 +804,61 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		return fab;
 	};
 
-	// H1: hot-reload watcher. fs.watch on brigade.json + a 500ms debounce
-	// so we coalesce the editor's atomic-write burst (rename + write + close)
-	// into a single re-seed. Newly added agents become usable without
-	// restarting the gateway; removed agents are evicted from perAgentRuntime.
+	// H1: hot-reload. One debounced re-seed body, two triggers by mode:
+	//
+	//   • Filesystem — fs.watch on brigade.json (editor atomic-write bursts
+	//     coalesce via the 500ms debounce). Unchanged behaviour.
+	//   • Convex — there is no brigade.json; config changes land in the
+	//     in-process config cache (primed by io.ts on every local write AND by
+	//     the live subscription for cross-process writes). Subscribe to those
+	//     primes. Without this, a mid-session `manage_agent add` / org init
+	//     updated the CONFIG but never perAgentRuntime: 20 agents in config
+	//     while `agents on the gateway` listed only main and `/agent <id>` /
+	//     `brigade tui <id>` refused every new agent until a restart.
+	//
+	// Newly added agents become usable without restarting the gateway;
+	// removed agents are evicted from perAgentRuntime.
 	let configWatcher: ReturnType<typeof fsWatch> | undefined;
 	let configReloadTimer: ReturnType<typeof setTimeout> | undefined;
+	let configPrimeUnsub: (() => void) | undefined;
+	const scheduleAgentReseed = (): void => {
+		if (configReloadTimer) clearTimeout(configReloadTimer);
+		configReloadTimer = setTimeout(() => {
+			configReloadTimer = undefined;
+			void (async () => {
+				try {
+					const fresh = await loadConfig();
+					const result = await seedAgentsFromConfig(
+						(fresh as { agents?: Record<string, unknown> }).agents as
+							| {
+									[id: string]:
+										| {
+												provider?: string;
+												model?: { primary?: string };
+												thinking?: string;
+										  }
+										| undefined;
+							  }
+							| undefined,
+					);
+					for (const id of result.added) bootLog(`hot-reload: seeded agent "${id}"`);
+					for (const id of result.removed) bootLog(`hot-reload: evicted agent "${id}"`);
+					for (const id of result.updated) bootLog(`hot-reload: updated agent "${id}" model`);
+				} catch (err) {
+					bootLog(
+						`hot-reload failed: ${err instanceof Error ? err.message : String(err)}`,
+					);
+				}
+			})();
+		}, 500);
+	};
+	if (tryGetRuntimeContext()?.mode === "convex") {
+		configPrimeUnsub = onConfigCachePrimed(scheduleAgentReseed);
+		bootLog("config hot-reload: convex mode — following backend config changes (no disk watcher)");
+	} else
 	try {
 		const configPath = resolveConfigPath();
-		configWatcher = fsWatch(configPath, { persistent: false }, () => {
-			if (configReloadTimer) clearTimeout(configReloadTimer);
-			configReloadTimer = setTimeout(() => {
-				configReloadTimer = undefined;
-				void (async () => {
-					try {
-						const fresh = await loadConfig();
-						const result = await seedAgentsFromConfig(
-							(fresh as { agents?: Record<string, unknown> }).agents as
-								| {
-										[id: string]:
-											| {
-													provider?: string;
-													model?: { primary?: string };
-													thinking?: string;
-											  }
-											| undefined;
-								  }
-								| undefined,
-						);
-						for (const id of result.added) bootLog(`hot-reload: seeded agent "${id}"`);
-						for (const id of result.removed) bootLog(`hot-reload: evicted agent "${id}"`);
-						for (const id of result.updated) bootLog(`hot-reload: updated agent "${id}" model`);
-					} catch (err) {
-						bootLog(
-							`hot-reload failed: ${err instanceof Error ? err.message : String(err)}`,
-						);
-					}
-				})();
-			}, 500);
-		});
+		configWatcher = fsWatch(configPath, { persistent: false }, scheduleAgentReseed);
 		configWatcher.on("error", (err: Error) => {
 			bootLog(`config watcher error: ${err.message}`);
 		});
@@ -3181,6 +3198,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				idempotencyKey?: string;
 				thinking?: string;
 				timeout?: number;
+				/** Sync-style: await the run's settled outcome (ok/reply/error)
+				 *  instead of the fire-and-forget {ok, runId} ack. */
+				wait?: boolean;
 				deliver?: boolean;
 				channel?: string;
 				accountId?: string;
@@ -3270,6 +3290,33 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					},
 				},
 			);
+			// `wait: true` — sync-style: await the run's settled outcome and
+			// return it (ok/error/reply). sessions_send needs this to know
+			// when the PEER'S RUN actually finished: the in-process gateway
+			// caller resolves when this handler RETURNS, so without `wait`
+			// the caller's "held run promise" settled in ~1 tick and every
+			// settle-gated behaviour (final-reply reads, async late delivery)
+			// was dead code. Awaiting blocks only this handler invocation —
+			// each call is independently async — and a caller-side timeout or
+			// rejection does NOT abort the run (the dispatcher owns the run).
+			if (p.wait === true) {
+				const settled = await run.settled.catch(
+					(err): { ok: false; error: string } => ({
+						ok: false,
+						error: err instanceof Error ? err.message : String(err),
+					}),
+				);
+				return {
+					ok: settled.ok,
+					runId: run.runId,
+					...(settled.error ? { error: settled.error } : {}),
+					...("reply" in settled && typeof settled.reply === "string"
+						? { reply: settled.reply }
+						: {}),
+					...("aborted" in settled && settled.aborted ? { aborted: true } : {}),
+					...("timedOut" in settled && settled.timedOut ? { timedOut: true } : {}),
+				};
+			}
 			// Same fire-and-forget pattern as sessions.send - return runId now,
 			// let the lifecycle stream surface the settled outcome.
 			void run.settled.catch(() => undefined);
@@ -4475,6 +4522,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			try {
 				if (configReloadTimer) clearTimeout(configReloadTimer);
 				configWatcher?.close();
+				configPrimeUnsub?.();
 			} catch {
 				/* best-effort */
 			}

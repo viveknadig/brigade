@@ -1,6 +1,66 @@
 // convex/messages.ts — sessionTranscriptRecords + sessionInboxEvents
 import { v } from "convex/values";
-import { mutation, query } from "./_generated/server.js";
+import { mutation, query, type MutationCtx } from "./_generated/server.js";
+
+// Max sealed bytes per ROW. Convex caps a single DOCUMENT at 1 MiB; a record
+// whose sealed payload exceeds this is split across several consecutive rows
+// (chunkIndex / chunkCount) so no row approaches the cap. 768 KiB leaves
+// generous headroom for the row's other fields + index overhead AND stays
+// below Convex's ~1 MB "large document" WARN threshold. The reader
+// concatenates the slices in seq order before decrypting.
+const MAX_CHUNK_BYTES = 768 * 1024;
+
+/**
+ * Insert one logical transcript record as 1+ chunk rows starting at
+ * `startSeq`; returns the next free seq. A record at or under the per-row
+ * cap is a single row (chunk fields unset — byte-identical to the legacy
+ * shape). A larger record is sliced into `ceil(size / MAX_CHUNK_BYTES)`
+ * rows that share `chunkCount` and carry sequential `chunkIndex`. All slices
+ * of one record are inserted inside the SAME mutation, so the group is
+ * atomic — a crash can never leave it torn.
+ */
+async function insertRecordChunked(
+	ctx: MutationCtx,
+	agentId: string,
+	sessionId: string,
+	startSeq: number,
+	now: number,
+	rec: { type: string; customType?: string; payload: ArrayBuffer },
+): Promise<number> {
+	const bytes = rec.payload;
+	const total = bytes.byteLength;
+	const customType = rec.customType !== undefined ? { customType: rec.customType } : {};
+	if (total <= MAX_CHUNK_BYTES) {
+		await ctx.db.insert("sessionTranscriptRecords", {
+			agentId,
+			sessionId,
+			seq: startSeq,
+			type: rec.type,
+			...customType,
+			payload: bytes,
+			createdAt: now,
+		});
+		return startSeq + 1;
+	}
+	const chunkCount = Math.ceil(total / MAX_CHUNK_BYTES);
+	let seq = startSeq;
+	for (let i = 0; i < chunkCount; i += 1) {
+		const slice = bytes.slice(i * MAX_CHUNK_BYTES, Math.min((i + 1) * MAX_CHUNK_BYTES, total));
+		await ctx.db.insert("sessionTranscriptRecords", {
+			agentId,
+			sessionId,
+			seq,
+			type: rec.type,
+			...customType,
+			payload: slice,
+			chunkIndex: i,
+			chunkCount,
+			createdAt: now,
+		});
+		seq += 1;
+	}
+	return seq;
+}
 
 export const appendRecord = mutation({
 	args: {
@@ -20,17 +80,13 @@ export const appendRecord = mutation({
 			)
 			.order("desc")
 			.first();
-		const seq = (tail?.seq ?? 0) + 1;
-		await ctx.db.insert("sessionTranscriptRecords", {
-			agentId: args.agentId,
-			sessionId: args.sessionId,
-			seq,
+		const startSeq = (tail?.seq ?? 0) + 1;
+		await insertRecordChunked(ctx, args.agentId, args.sessionId, startSeq, Date.now(), {
 			type: args.type,
 			...(args.customType !== undefined ? { customType: args.customType } : {}),
 			payload: args.payload,
-			createdAt: Date.now(),
 		});
-		return { seq };
+		return { seq: startSeq };
 	},
 });
 
@@ -60,16 +116,7 @@ export const appendRecordsBatch = mutation({
 		let seq = (tail?.seq ?? 0) + 1;
 		const now = Date.now();
 		for (const r of args.records) {
-			await ctx.db.insert("sessionTranscriptRecords", {
-				agentId: args.agentId,
-				sessionId: args.sessionId,
-				seq,
-				type: r.type,
-				...(r.customType !== undefined ? { customType: r.customType } : {}),
-				payload: r.payload,
-				createdAt: now,
-			});
-			seq += 1;
+			seq = await insertRecordChunked(ctx, args.agentId, args.sessionId, seq, now, r);
 		}
 		return { lastSeq: seq - 1 };
 	},
@@ -100,16 +147,7 @@ export const replaceTranscript = mutation({
 		const now = Date.now();
 		let seq = 1;
 		for (const r of args.records) {
-			await ctx.db.insert("sessionTranscriptRecords", {
-				agentId: args.agentId,
-				sessionId: args.sessionId,
-				seq,
-				type: r.type,
-				...(r.customType !== undefined ? { customType: r.customType } : {}),
-				payload: r.payload,
-				createdAt: now,
-			});
-			seq += 1;
+			seq = await insertRecordChunked(ctx, args.agentId, args.sessionId, seq, now, r);
 		}
 		return { count: args.records.length };
 	},

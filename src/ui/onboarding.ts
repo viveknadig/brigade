@@ -97,6 +97,15 @@ export interface OnboardingOptions {
 	 * environment.
 	 */
 	secretInputMode?: "plaintext" | "ref";
+	/**
+	 * Storage mode the CALLER already picked (and for which it already
+	 * established the runtime context). When set, the wizard SKIPS its own
+	 * Step 0 storage picker. The `brigade onboard` command hoists Step 0 so it
+	 * can boot the convex context before any secret/config write — without
+	 * this, every wizard write would run context-less in filesystem mode and
+	 * land plaintext on disk even for a convex pick.
+	 */
+	storage?: StorageModeResult;
 }
 
 export async function runOnboarding(
@@ -123,13 +132,21 @@ export async function runOnboarding(
 	// Escs the convex sub-flow — we catch and default to filesystem so the
 	// rest of the wizard always sees a settled choice.
 	let storage: StorageModeResult;
-	try {
-		storage = await pickStorageMode(tui);
-	} catch (err) {
-		if ((err as Error).message === "storage-mode-revert-to-filesystem") {
-			storage = { mode: "filesystem" };
-		} else {
-			throw err; // "onboarding-cancelled" propagates to caller
+	if (opts.storage) {
+		// Caller already picked the mode AND booted the matching runtime context
+		// (the onboard command hoists Step 0 so convex writes seal into the
+		// backend). Don't re-run the picker or we'd prompt twice and risk a
+		// second, conflicting mode pick.
+		storage = opts.storage;
+	} else {
+		try {
+			storage = await pickStorageMode(tui);
+		} catch (err) {
+			if ((err as Error).message === "storage-mode-revert-to-filesystem") {
+				storage = { mode: "filesystem" };
+			} else {
+				throw err; // "onboarding-cancelled" propagates to caller
+			}
 		}
 	}
 

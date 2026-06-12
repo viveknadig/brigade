@@ -15,6 +15,7 @@
  */
 
 import * as fs from "node:fs/promises";
+import path from "node:path";
 
 import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 
@@ -194,6 +195,12 @@ export async function writeOllamaToModelsJson(
 		models: modelDefs,
 	};
 
+	// In convex mode resolveModelsPath routes to the OS cache dir, which may
+	// not exist yet on a fresh machine (boot only mkdirs it when a "models"
+	// blob already exists to materialise) — a bare write would ENOENT inside
+	// the wizard's retry loop, making Ollama unpickable. Filesystem mode:
+	// ~/.brigade always exists by this point, so this is a no-op.
+	await fs.mkdir(path.dirname(modelsJsonPath), { recursive: true });
 	await fs.writeFile(modelsJsonPath, JSON.stringify(existing, null, 2), "utf8");
 
 	// Convex mode — the file just written lives in the OS cache (resolveModelsPath

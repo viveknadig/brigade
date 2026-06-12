@@ -218,7 +218,23 @@ export default defineSchema({
     seq: v.number(),
     type: v.string(),
     customType: v.optional(v.string()),
+    // Sealed record payload. Convex caps a single DOCUMENT at 1 MiB, so a
+    // record whose sealed bytes exceed that (a turn carrying a huge tool
+    // result — scraped HTML, big research output) is SPLIT across several
+    // consecutive rows that share a `chunkCount` and differ by `chunkIndex`;
+    // `payload` then holds one slice of the sealed bytes. The reader
+    // concatenates the slices back into the whole sealed blob before
+    // decrypting. Normal records leave the chunk fields unset (one row, one
+    // payload). The text stays in the transcript table — no File-Storage
+    // spill — and no single row ever approaches the per-document limit.
     payload: Enc(),
+    /** 0-based position of this slice within a chunked record; unset (→ 0)
+     *  for a normal single-row record. */
+    chunkIndex: v.optional(v.number()),
+    /** Total slices for a chunked record (>1); unset (→ 1) when not chunked.
+     *  All `chunkCount` rows are written in ONE mutation (atomic), so a
+     *  group can never be torn across a crash. */
+    chunkCount: v.optional(v.number()),
     createdAt: v.number(),
   })
     .index("by_session_seq", ["agentId", "sessionId", "seq"])

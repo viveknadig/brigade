@@ -45,43 +45,73 @@ describe("resolveSessionAccessPolicy — derivation", () => {
 		assert.equal(canSend(cfg), true);
 	});
 
-	it("org derived mode blocks a non-member orchestrator (main not in graph)", () => {
-		const cfg = {
-			session: {
-				sessionTools: { visibility: "all" },
-				agentToAgent: { enabled: true, allow: [{ from: "*", to: "*" }] },
-			},
-			org: {
-				topOrder: "ceo-agent",
-				a2a: { mode: "derived" },
-				// main is NOT a member; marketing-lead reports to cmo-agent.
-			},
-			agents: {
-				"ceo-agent": { org: { department: "exec", reportsTo: null } },
-				"cmo-agent": { org: { department: "marketing", reportsTo: "ceo-agent" } },
-				"marketing-lead": { org: { department: "marketing", reportsTo: "cmo-agent" } },
-			},
-		};
-		assert.equal(canSend(cfg), false, "derived mode: main (non-member) cannot reach marketing-lead");
+	// CONTRACT CHANGE (2026-06-12, operator-demanded): the orchestrator —
+	// the operator's DEFAULT agent — now BYPASSES the org chart in derived
+	// mode. This file previously pinned "main (non-member) cannot reach
+	// marketing-lead", which meant the agent the operator actually talks to
+	// couldn't message its own crew out of the box ("ask eng-lead if they're
+	// up for work" → forbidden) and the model offered to flip the WHOLE org
+	// to explicit mode as a workaround. Member↔member traffic stays
+	// graph-governed; `org.a2a.restrictDefaultAgent: true` restores the old
+	// strict behaviour for lockdown installs.
+	const ORG_CFG = {
+		session: {
+			sessionTools: { visibility: "all" },
+			agentToAgent: { enabled: true, allow: [{ from: "*", to: "*" }] },
+		},
+		org: {
+			topOrder: "ceo-agent",
+			a2a: { mode: "derived" },
+			// main is NOT a member; marketing-lead reports to cmo-agent.
+		},
+		agents: {
+			main: {},
+			"ceo-agent": { org: { department: "exec", reportsTo: null } },
+			"cmo-agent": { org: { department: "marketing", reportsTo: "ceo-agent" } },
+			"marketing-lead": { org: { department: "marketing", reportsTo: "cmo-agent" } },
+			"eng-lead": { org: { department: "engineering", reportsTo: "ceo-agent" } },
+		},
+	};
+
+	it("derived mode: the DEFAULT agent (orchestrator) bypasses the chart", () => {
+		assert.equal(canSend(ORG_CFG), true, "main reaches marketing-lead out of the box");
+		// And the reverse — members can report back to the orchestrator.
+		const { visibility, a2aPolicy } = resolveSessionAccessPolicy(ORG_CFG);
+		assert.equal(visibility, "all");
+		assert.equal(a2aPolicy.isAllowed("marketing-lead", "main"), true);
 	});
 
-	it("THE FIX: flipping that same org to explicit mode → send now allowed", () => {
-		// Exactly the mid-run manage_access change: derived → explicit. Under
-		// explicit the org graph is bypassed and the flat allow matrix
-		// (everyone↔everyone) applies, so main reaches marketing-lead.
-		const base = {
-			session: {
-				sessionTools: { visibility: "all" },
-				agentToAgent: { enabled: true, allow: [{ from: "*", to: "*" }] },
-			},
-			agents: {
-				"ceo-agent": { org: { department: "exec", reportsTo: null } },
-				"marketing-lead": { org: { department: "marketing", reportsTo: "ceo-agent" } },
-			},
+	it("derived mode: member↔member traffic stays graph-governed (cross-dept lateral blocked)", () => {
+		const { a2aPolicy } = resolveSessionAccessPolicy(ORG_CFG);
+		assert.equal(
+			a2aPolicy.isAllowed("marketing-lead", "eng-lead"),
+			false,
+			"cross-department lateral between members is still chart-governed",
+		);
+	});
+
+	it("derived mode: a NON-default ad-hoc non-member is still blocked", () => {
+		const { a2aPolicy } = resolveSessionAccessPolicy(ORG_CFG);
+		assert.equal(
+			a2aPolicy.isAllowed("rogue-agent", "marketing-lead"),
+			false,
+			"the bypass is for the operator's default agent ONLY",
+		);
+	});
+
+	it("org.a2a.restrictDefaultAgent: true restores the strict members-only contract", () => {
+		const strict = {
+			...ORG_CFG,
+			org: { ...ORG_CFG.org, a2a: { mode: "derived", restrictDefaultAgent: true } },
 		};
-		const derived = { ...base, org: { topOrder: "ceo-agent", a2a: { mode: "derived" } } };
-		const explicit = { ...base, org: { topOrder: "ceo-agent", a2a: { mode: "explicit" } } };
-		assert.equal(canSend(derived), false, "before: derived blocks main");
-		assert.equal(canSend(explicit), true, "after manage_access set explicit: allowed");
+		assert.equal(canSend(strict), false, "lockdown opt-out: main blocked again");
+	});
+
+	it("explicit mode still bypasses the graph entirely (flat allow matrix)", () => {
+		const explicit = {
+			...ORG_CFG,
+			org: { topOrder: "ceo-agent", a2a: { mode: "explicit" } },
+		};
+		assert.equal(canSend(explicit), true, "manage_access set explicit keeps working");
 	});
 });

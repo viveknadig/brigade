@@ -197,6 +197,15 @@ export function assembleBrigadeToolset(opts: {
 		if (t.name === "generate_image") {
 			return wrapToolExecutionTimeout(ownerWrapped, 200_000);
 		}
+		// sessions_send WAITS for the peer's run up to its own
+		// `timeoutSeconds` (default 90s) + a 10s final-text flush poll — the
+		// blanket 60s watchdog killed every legitimate wait mid-flight
+		// (tool_end ✗ while the peer was still working; observed in
+		// production 2026-06-12, same class as the spawn-tool kill). Budget
+		// per call: the call's own wait window + flush + slack.
+		if (t.name === "sessions_send") {
+			return wrapToolExecutionTimeout(ownerWrapped, undefined, resolveSessionsSendTimeoutMs);
+		}
 		return wrapToolExecutionTimeout(ownerWrapped);
 	});
 	// Per-job toolsAllow filter (cron). When omitted, every tool flows
@@ -251,6 +260,25 @@ export function resolveSpawnToolTimeoutMs(toolArgs: unknown): number {
 		}
 	}
 	return (perChildSeconds ?? DEFAULT_SUBAGENT_TIMEOUT_SECONDS) * 1000 + 30_000;
+}
+
+/**
+ * Per-call watchdog budget for `sessions_send`. The tool's legitimate
+ * runtime = its own wait window (`timeoutSeconds`, default 90s — the
+ * settle race in send.ts) + the 10s final-text flush poll + slack for
+ * dispatch/history reads. Without this, the blanket 60s watchdog killed
+ * every wait longer than a minute while the peer kept working.
+ * Exported for tests.
+ */
+export function resolveSessionsSendTimeoutMs(toolArgs: unknown): number {
+	const bag = toolArgs as { timeoutSeconds?: unknown } | undefined;
+	const waitSeconds =
+		typeof bag?.timeoutSeconds === "number" &&
+		Number.isFinite(bag.timeoutSeconds) &&
+		bag.timeoutSeconds > 0
+			? bag.timeoutSeconds
+			: 90;
+	return waitSeconds * 1000 + 10_000 + 30_000;
 }
 
 /** Live correlation-id bag the guards read for `tool-blocked` bus events. */

@@ -404,6 +404,10 @@ export function describeSessionsHistoryTool(): string {
 export function describeSessionsSendTool(): string {
 	return [
 		"Delegate a question to another agent in the crew. The peer agent runs the message in ITS own session (its persona, skills, memory) and returns its reply to you — you can then relay to the user.",
+		"OUTCOMES — exactly two, read them carefully:",
+		'  status "ok": the peer\'s run FINISHED and `reply` is its complete, final answer. Relay it. If the reply is a bare acknowledgement with no deliverable, the peer violated its contract — send a follow-up demanding the deliverable.',
+		'  status "accepted": the peer is STILL WORKING past your wait window. Its finished reply will be DELIVERED to your session automatically — you will see "A2A reply from <peer>: …" on a later turn; relay it to the user THEN. Meanwhile tell the user the work is in progress. Do NOT fabricate results, do NOT poll sessions_history, do NOT promise a time.',
+		"For long tasks you can raise timeoutSeconds (default 90) to wait inline instead of taking the async path.",
 		"Two shorthand shapes:",
 		'  sessions_send({ agentId: "<peer-id>", message: "..." })  — auto-targets the peer\'s main session (the common case)',
 		'  sessions_send({ sessionKey: "agent:<peer-id>:main", message: "..." })  — when you need an explicit session',

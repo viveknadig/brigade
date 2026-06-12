@@ -49,7 +49,18 @@ function isAllowlisted(target: string): boolean {
 	if (parts[0] === "mode.sentinel") return true;
 	// Workspace stays local (incl. .git) — operator decision.
 	if (parts[0] === "workspace") return true;
-	if (parts[0] === "agents" && parts[2] === "workspace") return true;
+	if (parts[0] === "agents") {
+		// agents/<id>/workspace/** stays local (operator decision).
+		if (parts[2] === "workspace") return true;
+		// `agents` and `agents/<id>` are just the PARENT dirs of allowed
+		// workspaces — creating a new agent (org init mkdir -p's the tree)
+		// fires watcher events on the intermediates, which flooded the
+		// console with false violations during a 20-agent org creation.
+		// A REAL leak under agents/<id>/<anything-else> fires its own event
+		// with parts[2] !== "workspace" and still flags (e.g. a stray
+		// agents/<id>/agent/auth-profiles.json).
+		if (parts.length <= 2) return true;
+	}
 	// Agent-deletion trash is local recovery state (workspace is local), so
 	// its trash is too — covers agents/.brigade-trash/**, agents/<id>/
 	// .brigade-trash/**, and a custom in-state workspace's trash.
@@ -135,8 +146,32 @@ export function installStrictGuard(stateDir: string): void {
 		if (fs.existsSync(_stateDir)) {
 			_watcher = fs.watch(_stateDir, { recursive: true }, (_event, filename) => {
 				if (!filename) return;
-				const full = path.join(_stateDir as string, filename.toString());
+				const name = filename.toString();
+				// Windows quirk: when the WATCHED ROOT itself is removed (e.g.
+				// `store reset --purge-local` rm -rf's ~/.brigade), events can
+				// carry an absolute extended-length path (`\\?\C:\…`) instead of
+				// a relative name. Joining that onto the state dir produced
+				// nonsense like `…\.brigade\?\C:\…\.brigade` and a violation
+				// FLOOD for what is actually the sanctioned wipe. Treat absolute
+				// names as-is, never join them.
+				const full = path.isAbsolute(name) || name.startsWith("\\\\?\\")
+					? name.replace(/^\\\\\?\\/, "")
+					: path.join(_stateDir as string, name);
 				if (isAllowlisted(full)) return;
+				// Strict-zero forbids WRITES; deletions are the goal. fs.watch
+				// can't distinguish create/delete (both are "rename" events), so
+				// discriminate cheaply: a path that no longer exists was removed
+				// — not a violation. And once the state dir itself is gone, the
+				// watcher is moot — close it instead of spinning on events.
+				try {
+					if (!fs.existsSync(_stateDir as string)) {
+						stopStrictGuard();
+						return;
+					}
+					if (!fs.existsSync(full)) return;
+				} catch {
+					return; // unreadable mid-delete — never flag noise
+				}
 				recordViolation("fs.watch(detected)", full);
 			});
 			_watcher.unref?.();

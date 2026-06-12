@@ -137,6 +137,24 @@ const MEDIA_FIELDS: MediaDescriptor[] = [
 	},
 ];
 
+/**
+ * Cheap presence probe — does this normalized message carry any downloadable
+ * media envelope? Walks the same MEDIA_FIELDS table as the downloader but
+ * never touches the network. Lets the socket layer defer the actual download
+ * (bytes + seal + archive) until AFTER the access-control gate admits the
+ * sender — without losing the "drop messages with no text AND no media"
+ * fast-path.
+ */
+export function hasInboundMedia(content: WAMessage["message"]): boolean {
+	const c = (content ?? {}) as Record<string, unknown>;
+	for (const spec of MEDIA_FIELDS) {
+		const env = c[spec.field as string] as Record<string, unknown> | undefined;
+		if (!env) continue;
+		if (spec.mimeFromMessage?.(env)) return true;
+	}
+	return false;
+}
+
 export interface DownloadInboundMediaArgs {
 	/** The normalized message content (post `normalizeMessageContent`). */
 	content: WAMessage["message"];

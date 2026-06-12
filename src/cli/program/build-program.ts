@@ -1365,6 +1365,29 @@ export function buildProgram(): Command {
       );
     });
 
+  store
+    .command("reset")
+    .description(
+      "Factory-reset the convex backend: permanently erase every stored record,\n" +
+        "remove the mode pin, and set the encryption key aside so the next onboard\n" +
+        "starts truly fresh. (Wiping ~/.brigade alone RESTORES — this erases.)",
+    )
+    .option("--convex-url <url>", "deployment URL (defaults to the pinned sentinel URL)")
+    .option("--yes", "skip the interactive confirmation", false)
+    .option("--purge-local", "also delete the local Brigade folder", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { convexUrl?: string; yes?: boolean; purgeLocal?: boolean; json?: boolean }) => {
+      const { runStoreReset } = await import("../commands/store-cmd.js");
+      await exitAfterFlush(
+        await runStoreReset({
+          ...(opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {}),
+          ...(opts.yes !== undefined ? { yes: opts.yes } : {}),
+          ...(opts.purgeLocal !== undefined ? { purgeLocal: opts.purgeLocal } : {}),
+          ...(opts.json !== undefined ? { json: opts.json } : {}),
+        }),
+      );
+    });
+
   /* ───────────────────────────── encrypt ───────────────────────────── */
   // At-rest encryption for Convex byte columns. Operator-supplied master
   // key via `BRIGADE_ENCRYPTION_KEY` (hex). When unset, payloads pass

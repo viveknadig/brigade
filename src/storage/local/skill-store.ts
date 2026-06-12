@@ -22,7 +22,6 @@ import type { BrigadeConfig } from "../../config/io.js";
 import {
 	resolveAgentWorkspaceDir,
 	resolveBundledSkillsDir,
-	resolveManagedSkillsDir,
 } from "../../config/paths.js";
 
 import type {
@@ -35,8 +34,17 @@ import type {
 function resolveScopeRoot(
 	scope: "managed" | "workspace",
 	agentId: string | undefined,
+	stateDir: string,
 ): string {
-	if (scope === "managed") return resolveManagedSkillsDir();
+	// Managed root is pinned to THIS store's stateDir, NOT the mode-aware
+	// resolveManagedSkillsDir(): the Local store IS the filesystem backend by
+	// definition. During `store migrate --to filesystem` the process runs
+	// under a CONVEX context (the backend must be up to read the source), so
+	// the mode-aware resolver would route the target's managed-skill writes
+	// to the OS cache — invisible to filesystem discovery after the flip,
+	// with a false-green verify (list scans the same wrong dir). Identical
+	// path in plain filesystem mode.
+	if (scope === "managed") return path.join(stateDir, "skills");
 	// workspace scope — per-agent workspace
 	const id = agentId ?? "main";
 	return path.join(resolveAgentWorkspaceDir(id), "skills");
@@ -65,7 +73,9 @@ export class LocalSkillStore implements SkillStore {
 		const result = discoverSkills({
 			workspaceSkillsDir: path.join(args.workspaceDir, "skills"),
 			bundledSkillsDir: args.bundledDir ?? resolveBundledSkillsDir(),
-			managedSkillsDir: args.managedDir ?? resolveManagedSkillsDir(),
+			// Same stateDir pin as resolveScopeRoot — list/verify must scan the
+			// exact root write() lands in, regardless of the process's mode.
+			managedSkillsDir: args.managedDir ?? path.join(this._stateDir, "skills"),
 			personalSkillsDir:
 				args.personalDir ?? path.join(os.homedir(), ".agents", "skills"),
 			projectSkillsDir:
@@ -109,7 +119,7 @@ export class LocalSkillStore implements SkillStore {
 		content: string;
 	}): Promise<{ ref: string; created: boolean }> {
 		const safeName = sanitizeSkillName(args.name);
-		const root = resolveScopeRoot(args.scope, args.agentId);
+		const root = resolveScopeRoot(args.scope, args.agentId, this._stateDir);
 		const dir = path.join(root, safeName);
 		const file = path.join(dir, "SKILL.md");
 		const created = !fs.existsSync(file);
@@ -127,7 +137,7 @@ export class LocalSkillStore implements SkillStore {
 		name: string;
 	}): Promise<{ removed: boolean }> {
 		const safeName = sanitizeSkillName(args.name);
-		const root = resolveScopeRoot(args.scope, args.agentId);
+		const root = resolveScopeRoot(args.scope, args.agentId, this._stateDir);
 		const dir = path.join(root, safeName);
 		if (!fs.existsSync(dir)) return { removed: false };
 		await fsAsync.rm(dir, { recursive: true, force: true });

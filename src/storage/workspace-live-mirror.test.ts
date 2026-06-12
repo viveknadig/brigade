@@ -8,6 +8,7 @@ import {
 	__resetWorkspaceLiveMirrorForTests,
 	awaitWorkspaceMirrorFlush,
 	enqueueWorkspaceMirrorOp,
+	ensureAgentInWorkspaceLiveMirror,
 	startWorkspaceLiveMirror,
 } from "./workspace-live-mirror.js";
 import { markBootstrapSeeded, markSetupCompleted } from "../workspace/state.js";
@@ -88,6 +89,33 @@ describe("workspace live mirror (convex mode)", () => {
 		if (savedStateDir === undefined) delete process.env.BRIGADE_STATE_DIR;
 		else process.env.BRIGADE_STATE_DIR = savedStateDir;
 		rmSync(stateDir, { recursive: true, force: true });
+	});
+
+	it("an agent CREATED mid-session is mirrored immediately (ensureAgentInWorkspaceLiveMirror)", async () => {
+		// Production gap (2026-06-12): a 20-agent org created mid-session had
+		// all its persona files on disk but ZERO rows in personaFiles — the
+		// mirror's watch set was built at boot from the config, so new agents
+		// were invisible until the next gateway restart (a wipe in that window
+		// lost their personas). bootstrapWorkspace now registers the agent +
+		// pushes the seeded files right away.
+		startWorkspaceLiveMirror(fake as unknown as BrigadeStore, { agents: {} });
+
+		// Simulate org-init seeding a brand-new agent AFTER boot.
+		const newWs = path.join(stateDir, "agents", "growth-lead", "workspace");
+		mkdirSync(newWs, { recursive: true });
+		writeFileSync(path.join(newWs, "IDENTITY.md"), "# Growth Lead\nrole: growth", "utf8");
+		ensureAgentInWorkspaceLiveMirror("growth-lead");
+		await awaitWorkspaceMirrorFlush();
+
+		assert.deepEqual(fake.personaWrites, [
+			{ agentId: "growth-lead", name: "IDENTITY.md", content: "# Growth Lead\nrole: growth" },
+		]);
+
+		// Idempotent: re-registering neither duplicates the watcher nor re-pushes.
+		fake.personaWrites.length = 0;
+		ensureAgentInWorkspaceLiveMirror("growth-lead");
+		await awaitWorkspaceMirrorFlush();
+		assert.deepEqual(fake.personaWrites, [], "unchanged files are not re-pushed");
 	});
 
 	it("a mid-session persona edit reaches convex at the next drain (not next boot)", async () => {

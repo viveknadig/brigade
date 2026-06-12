@@ -23,6 +23,41 @@ export function resolveStateDir(): string {
   return path.join(os.homedir(), ".brigade");
 }
 
+/**
+ * True when Brigade is in convex mode — INCLUDING the pre-context windows
+ * (onboard before bootRuntimeContext, the BOOT_OPTIONAL repair commands when
+ * the backend is unreachable, and the boot window before setRuntimeContext is
+ * installed).
+ *
+ * The installed runtime context is authoritative and fast, so consult it
+ * first. Only when NO context exists do we peek the sticky sentinel/env
+ * directly — so callers fail CLOSED (resolve to the OS cache, never under
+ * ~/.brigade; refuse a disk write) instead of leaking state just because the
+ * context hadn't booted yet. Mirrors subsystem-logger's peekStorageMode, the
+ * proven fail-closed pattern. No caching: the no-context branch is rare (when
+ * a context exists we return immediately), and not caching avoids serving a
+ * stale mode across an onboard that flips the sentinel mid-process.
+ */
+export function peekConvexMode(): boolean {
+  const ctx = tryGetRuntimeContext();
+  if (ctx) return ctx.mode === "convex";
+  try {
+    const explicit = process.env.BRIGADE_MODE?.trim();
+    if (explicit === "convex") return true;
+    if (explicit === "filesystem") return false;
+    const sentinelPath = path.join(resolveStateDir(), "mode.sentinel");
+    if (fs.existsSync(sentinelPath)) {
+      const parsed = JSON.parse(fs.readFileSync(sentinelPath, "utf8")) as { mode?: string };
+      return parsed.mode === "convex";
+    }
+    if (process.env.BRIGADE_CONVEX_URL?.trim()) return true;
+  } catch {
+    // Unreadable/corrupt sentinel — boot will throw a proper error. Default to
+    // filesystem behaviour meanwhile (matches subsystem-logger's peek).
+  }
+  return false;
+}
+
 export function resolveConfigPath(): string {
   const override = process.env.BRIGADE_CONFIG_PATH?.trim();
   if (override && override.length > 0) return path.resolve(override);
@@ -63,7 +98,7 @@ export function resolveModelsPath(_agentId: string): string {
   // ~/.brigade). Boot materialises the catalog from its Convex blob there;
   // catalog writers push the blob back after every file write so the file
   // is a regenerable cache, never the source of truth.
-  if (tryGetRuntimeContext()?.mode === "convex") {
+  if (peekConvexMode()) {
     return path.join(resolveOsCacheDir(), "models.json");
   }
   return path.join(resolveStateDir(), "models.json");
@@ -83,7 +118,7 @@ export function resolveSessionTranscriptPath(agentId: string, sessionId: string)
   // + the write-behind factory own it), but Pi's getSessionFile() and the
   // advisory write-lock sidecar still need a real path — route it to the OS
   // cache dir, NEVER under ~/.brigade. Filesystem mode unchanged.
-  if (tryGetRuntimeContext()?.mode === "convex") {
+  if (peekConvexMode()) {
     return path.join(resolveOsCacheDir(), "sessions", agentId, `${sessionId}.jsonl`);
   }
   return path.join(resolveSessionsDir(agentId), `${sessionId}.jsonl`);
@@ -136,6 +171,17 @@ export function resolveSkillsDir(agentId: string, override?: string): string {
 // bundled-shipped skills (so a managed install shadows a stale bundled
 // copy) but BELOW the workspace dir (so user-authored skills always win).
 export function resolveManagedSkillsDir(): string {
+  // Convex mode: managed skills must NOT live under ~/.brigade. The skills
+  // table is the source of truth; the on-disk dir is a regenerable cache that
+  // persists in the OS cache location (survives `rm -rf ~/.brigade`). Pre-
+  // context callers peek the sentinel so an agent's manage_skill({scope:
+  // "managed"}) on a not-yet-booted process still resolves to the OS cache,
+  // never leaking under ~/.brigade — and never tripping the strict guard
+  // (which would THROW under BRIGADE_STRICT_MODE=enforce and break skill
+  // creation). Filesystem mode unchanged.
+  if (peekConvexMode()) {
+    return path.join(resolveOsCacheDir(), "skills");
+  }
   return path.join(resolveStateDir(), "skills");
 }
 
@@ -188,9 +234,12 @@ export function resolveCacheDir(): string {
   //   Windows %LOCALAPPDATA%\Brigade\cache, macOS ~/Library/Caches/brigade,
   //   Linux $XDG_CACHE_HOME|~/.cache/brigade.
   // Filesystem mode keeps today's ~/.brigade/cache path unchanged. Pre-boot
-  // callers (no runtime context yet) also get the filesystem path, which is
-  // correct — no context means convex mode isn't active.
-  if (tryGetRuntimeContext()?.mode === "convex") {
+  // callers (no runtime context yet) resolve via peekConvexMode's sentinel
+  // peek — "no context" does NOT mean convex is inactive (onboard, repair
+  // commands with the backend down, the pre-setRuntimeContext boot window),
+  // and the old context-only check leaked cache files under ~/.brigade in
+  // exactly those windows.
+  if (peekConvexMode()) {
     return resolveOsCacheDir();
   }
   return path.join(resolveStateDir(), "cache");

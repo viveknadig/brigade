@@ -35,6 +35,7 @@
 import { spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 
+import { resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import { resolveConfigPath } from "../../config/paths.js";
 import { loadConfig, saveConfig } from "../../core/config.js";
 import { deriveOrgDisplayGraph } from "../../agents/org/derive-graph.js";
@@ -362,7 +363,13 @@ export async function runOrgExplain(opts: OrgExplainOpts): Promise<number> {
     return 0;
   }
 
-  const policy = orgGraphAsA2APolicy(graph);
+  // Mirror the runtime's orchestrator bypass (resolve-access.ts) so
+  // `org explain main <member>` reports what sessions_send actually does.
+  const orgA2a = (cfg as { org?: { a2a?: { restrictDefaultAgent?: unknown } } }).org?.a2a;
+  const policy = orgGraphAsA2APolicy(
+    graph,
+    orgA2a?.restrictDefaultAgent === true ? {} : { orchestratorId: resolveDefaultAgentId(cfg) },
+  );
   const allowed = policy.isAllowed(opts.from, opts.to);
   if (allowed) {
     const edges = graph.edges.filter((e) => e.from === opts.from && e.to === opts.to);

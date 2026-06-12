@@ -88,12 +88,21 @@ function installConvexContext(configStore: FakeConfigStore, stateDir: string): v
 describe("config dispatcher (convex mode)", () => {
 	let stateDir: string;
 	let savedStateDir: string | undefined;
+	let savedMode: string | undefined;
+	let savedConvexUrl: string | undefined;
 	let fake: FakeConfigStore;
 
 	beforeEach(() => {
 		stateDir = mkdtempSync(path.join(tmpdir(), "brigade-cfg-dispatch-"));
 		savedStateDir = process.env.BRIGADE_STATE_DIR;
 		process.env.BRIGADE_STATE_DIR = stateDir;
+		// Hermeticity: a stray BRIGADE_MODE/BRIGADE_CONVEX_URL in the dev shell
+		// would make peekConvexMode see convex during the no-context phases and
+		// the config writer fail closed. Same isolation as boot.test.ts.
+		savedMode = process.env.BRIGADE_MODE;
+		savedConvexUrl = process.env.BRIGADE_CONVEX_URL;
+		delete process.env.BRIGADE_MODE;
+		delete process.env.BRIGADE_CONVEX_URL;
 		fake = new FakeConfigStore();
 	});
 
@@ -106,6 +115,10 @@ describe("config dispatcher (convex mode)", () => {
 		__resetConfigCacheForTests();
 		if (savedStateDir === undefined) delete process.env.BRIGADE_STATE_DIR;
 		else process.env.BRIGADE_STATE_DIR = savedStateDir;
+		if (savedMode === undefined) delete process.env.BRIGADE_MODE;
+		else process.env.BRIGADE_MODE = savedMode;
+		if (savedConvexUrl === undefined) delete process.env.BRIGADE_CONVEX_URL;
+		else process.env.BRIGADE_CONVEX_URL = savedConvexUrl;
 		rmSync(stateDir, { recursive: true, force: true });
 	});
 

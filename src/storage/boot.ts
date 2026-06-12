@@ -44,6 +44,11 @@ export async function bootRuntimeContext(): Promise<RuntimeContext> {
 				// BRIGADE_STRICT_MODE=off|warn|enforce (default warn).
 				const { installStrictGuard } = await import("./strict-guard.js");
 				installStrictGuard(ctx.stateDir);
+				// Stale-bundle gate FIRST: a backend serving an older function
+				// push must fail boot with one clear operator action, not limp
+				// through hydration with per-domain "Could not find public
+				// function" spam + broken transcript flushes every turn.
+				await verifyConvexBundleVersion();
 				// Wrong-key tripwire: the first encrypted boot stores the key's
 				// fingerprint; every later boot verifies it. A mismatched
 				// BRIGADE_ENCRYPTION_KEY would otherwise corrupt-on-write and
@@ -476,10 +481,70 @@ async function syncWorkspaceMirrors(
  *  cryptically mid-turn. Key ROTATION goes through
  *  BRIGADE_ENCRYPTION_KEY_OLD: when the stored fingerprint matches the OLD
  *  key, the stored value updates to the new key's fingerprint. */
+/** Twin of `BUNDLE_VERSION` in convex/health.ts — bump BOTH together
+ *  whenever convex/ functions or the schema change shape. */
+const EXPECTED_CONVEX_BUNDLE_VERSION = 3;
+
+function buildStaleBundleError(remote: string): Error {
+	return Object.assign(
+		new Error(
+			`The Convex backend is running an OLDER Brigade function bundle ` +
+				`(backend: ${remote}, this build needs: v${EXPECTED_CONVEX_BUNDLE_VERSION}).\n` +
+				`  Push the current functions, then retry:\n` +
+				`    npm run convex:push\n` +
+				`  (restarting \`npm run convex:dev\` also pushes automatically at startup)`,
+		),
+		{ brigadeStaleBundle: true as const },
+	);
+}
+
+/** Refuse to boot against a backend whose deployed function bundle is older
+ *  than this build expects. Nothing used to push functions automatically, so
+ *  the deployed bundle silently drifted from the code — every NEW function
+ *  then failed at runtime with "Could not find public function" while the
+ *  gateway limped along half-broken. One deterministic check → one clear fix.
+ *  Transient/network failures never block boot (the store's init()
+ *  healthcheck already proved the backend reachable). */
+async function verifyConvexBundleVersion(): Promise<void> {
+	let staleErr: Error | undefined;
+	try {
+		const { getConvexClient } = await import("./convex/client.js");
+		const { api } = await import("../../convex/_generated/api.js");
+		const client = getConvexClient({});
+		const remote = (await client.query(api.health.bundleVersion, {})) as number;
+		if (typeof remote === "number" && remote >= EXPECTED_CONVEX_BUNDLE_VERSION) return;
+		staleErr = buildStaleBundleError(`v${String(remote)}`);
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		// A reachable backend that doesn't know the function = pre-versioning
+		// (stale) bundle. Anything else is transient — don't block boot.
+		if (msg.includes("Could not find public function")) {
+			staleErr = buildStaleBundleError("pre-versioning push");
+		}
+	}
+	if (staleErr) throw staleErr;
+}
+
 async function verifyEncryptionFingerprint(store: BrigadeStore): Promise<void> {
 	const { encryptionStatus } = await import("./encryption.js");
 	const status = encryptionStatus();
-	if (!status.enabled || !status.primaryKeyFingerprint) return; // no key — nothing to pin
+	if (!status.enabled || !status.primaryKeyFingerprint) {
+		// Convex mode with NO active encryption key: seal() degrades to a
+		// plaintext pass-through, so provider keys + other secrets would be
+		// written UNSEALED to the backend. The happy path always has a key
+		// (onboard / `store mode set convex` mint one), so reaching here means
+		// the key file was deleted or BRIGADE_ENCRYPTION_KEY is unset. Warn
+		// LOUDLY so the operator restores the key before saving credentials. (A
+		// hard boot-refuse is the stronger guard but risks bricking a
+		// recoverable install — flagged as a follow-up.)
+		console.error(
+			"brigade: WARNING — convex mode is active but NO at-rest encryption key is " +
+				"loaded. Provider keys and other secrets will be stored UNSEALED in the backend. " +
+				"Set BRIGADE_ENCRYPTION_KEY to your recovery key (or restore the key file) before " +
+				"saving credentials.",
+		);
+		return; // no key — nothing to pin
+	}
 	try {
 		const { getConvexClient } = await import("./convex/client.js");
 		const { api } = await import("../../convex/_generated/api.js");
@@ -513,22 +578,32 @@ async function verifyEncryptionFingerprint(store: BrigadeStore): Promise<void> {
 				}
 			}
 		}
-		throw new Error(
-			`This backend holds Brigade data protected by a DIFFERENT encryption key.\n` +
-				`  Your options:\n` +
-				`    • Provide the original key — set BRIGADE_ENCRYPTION_KEY to the recovery\n` +
-				`      key you saved when this Brigade was created (or restore its key file).\n` +
-				`    • Rotating on purpose? Set BRIGADE_ENCRYPTION_KEY_OLD to the previous\n` +
-				`      key alongside the new BRIGADE_ENCRYPTION_KEY.\n` +
-				`    • Start over — \`brigade store reset\` permanently erases the backend\n` +
-				`      so you can onboard fresh.\n` +
-				`  (key fingerprints: stored ${stored}, current ${status.primaryKeyFingerprint}; ` +
-				`active key source: ${status.source})`,
+		// Tag the deliberate mismatch so the catch below re-throws it without
+		// substring-matching the human-facing message. The previous guard
+		// matched "BRIGADE_ENCRYPTION_KEY does not match" — a string this error
+		// never contains — so the tripwire was DEAD: a wrong key was swallowed
+		// and boot proceeded, the exact corrupt-on-write scenario it guards.
+		throw Object.assign(
+			new Error(
+				`This backend holds Brigade data protected by a DIFFERENT encryption key.\n` +
+					`  Your options:\n` +
+					`    • Provide the original key — set BRIGADE_ENCRYPTION_KEY to the recovery\n` +
+					`      key you saved when this Brigade was created (or restore its key file).\n` +
+					`    • Rotating on purpose? Set BRIGADE_ENCRYPTION_KEY_OLD to the previous\n` +
+					`      key alongside the new BRIGADE_ENCRYPTION_KEY.\n` +
+					`    • Start over — \`brigade store reset\` permanently erases the backend\n` +
+					`      so you can onboard fresh.\n` +
+					`  (key fingerprints: stored ${stored}, current ${status.primaryKeyFingerprint}; ` +
+					`active key source: ${status.source})`,
+			),
+			{ brigadeKeyMismatch: true as const },
 		);
 	} catch (err) {
-		// Re-throw only the deliberate mismatch error — a transient meta
-		// read failure must not block boot (the healthcheck already passed).
-		if ((err as Error).message?.includes("BRIGADE_ENCRYPTION_KEY does not match")) throw err;
+		// Re-throw only the deliberate key-mismatch error (tagged above) — a
+		// transient meta read failure must not block boot (the healthcheck
+		// already passed). Tag check, not substring match, so the message can
+		// change freely without silently disarming the tripwire again.
+		if ((err as { brigadeKeyMismatch?: boolean }).brigadeKeyMismatch) throw err;
 	}
 }
 
