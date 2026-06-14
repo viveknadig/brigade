@@ -57,15 +57,19 @@ export async function resetConvexInstance(
 	let deletedTotal = 0;
 	for (const table of tables) {
 		let deletedForTable = 0;
-		// Loop until a short page — each call deletes up to PAGE rows.
+		// Loop until the table reports `done`. A page can come back SHORT without
+		// being drained (the server caps each batch by bytes read, not just row
+		// count, so large-row tables clear a handful at a time) — so we trust the
+		// explicit `done` flag, never the batch size, and stop if a batch deletes
+		// nothing (defensive against an unexpected stall).
 		for (;;) {
-			const { deleted } = (await client.mutation(api.admin.resetPage, {
+			const { deleted, done } = (await client.mutation(api.admin.resetPage, {
 				table,
 				limit: PAGE,
-			})) as { deleted: number };
+			})) as { deleted: number; done?: boolean };
 			deletedForTable += deleted;
 			deletedTotal += deleted;
-			if (deleted < PAGE) break;
+			if (done || deleted === 0) break;
 			opts.onProgress?.(table, deletedForTable);
 		}
 		if (deletedForTable > 0) opts.onProgress?.(table, deletedForTable);

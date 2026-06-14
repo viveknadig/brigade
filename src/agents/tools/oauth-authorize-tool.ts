@@ -29,6 +29,7 @@
  */
 
 import * as crypto from "node:crypto";
+import { readFileSync } from "node:fs";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 
@@ -265,9 +266,30 @@ function startListener(flow: PendingFlow, requestedPort: number | undefined): Pr
 	});
 }
 
+// Brigade favicon — read ONCE from the bundled asset (src/assets →
+// dist/assets, copied by scripts/build-done.mjs) and inlined as a data URI so
+// the one-shot callback page renders the icon with no second HTTP request.
+// Resolved relative to this module so it works the same in dev (src/) and the
+// built/npm-installed tree (dist/). A missing asset renders without an icon —
+// never a crash.
+let faviconDataUri: string | null = null;
+function brigadeFaviconDataUri(): string {
+	if (faviconDataUri === null) {
+		try {
+			const bytes = readFileSync(new URL("../../assets/brigade-favicon.png", import.meta.url));
+			faviconDataUri = `data:image/png;base64,${bytes.toString("base64")}`;
+		} catch {
+			faviconDataUri = "";
+		}
+	}
+	return faviconDataUri;
+}
+
 function htmlPage(message: string): string {
 	const safe = message.replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c] ?? c);
-	return `<!doctype html><meta charset="utf-8"><title>Brigade</title><body style="font-family:system-ui;padding:3rem;color:#1a7f37"><h2>${safe}</h2></body>`;
+	const icon = brigadeFaviconDataUri();
+	const iconTag = icon ? `<link rel="icon" type="image/png" href="${icon}">` : "";
+	return `<!doctype html><meta charset="utf-8"><title>Brigade</title>${iconTag}<body style="font-family:system-ui;padding:3rem;color:#1a7f37"><h2>${safe}</h2></body>`;
 }
 
 /**

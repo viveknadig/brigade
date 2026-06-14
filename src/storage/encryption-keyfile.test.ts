@@ -194,7 +194,7 @@ describe("resetConvexInstance (paginated erase loop)", () => {
 				calls.push({ table, limit });
 				const take = Math.min(remaining[table] ?? 0, limit);
 				remaining[table] = (remaining[table] ?? 0) - take;
-				return { deleted: take };
+				return { deleted: take, done: (remaining[table] ?? 0) === 0 };
 			},
 		};
 		const { deletedTotal } = await resetConvexInstance("http://fake", {

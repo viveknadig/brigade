@@ -109,27 +109,69 @@ export const instanceSummary = query({
 	},
 });
 
-/** Delete up to `limit` rows from one table (reaping File-Storage spills
- *  first). Returns the number deleted — the client loops while it equals
- *  `limit`. */
+/** Rough byte size of a row, for read-budgeting only. The sealed ArrayBuffer
+ *  columns (transcript chunks, media, auth, blobs) dominate; everything else
+ *  is tiny. This drives WHEN we stop reading more pages — the actual read cost
+ *  is charged by Convex on each `.take()`. */
+function estimateRowBytes(row: Record<string, unknown>): number {
+	let n = 64; // per-row overhead
+	for (const value of Object.values(row)) {
+		if (value instanceof ArrayBuffer) n += value.byteLength;
+		else if (typeof value === "string") n += value.length;
+		else if (typeof value === "number" || typeof value === "boolean") n += 8;
+		else if (value && typeof value === "object") n += JSON.stringify(value).length;
+	}
+	return n;
+}
+
+/** Delete a bounded batch of rows from one table (reaping File-Storage spills
+ *  first). Returns `{ deleted, done }` where `done` is true ONLY when the table
+ *  is fully drained — the client loops while `!done`.
+ *
+ *  Convex caps a single function execution at 16 MiB of reads. A fixed row
+ *  count blows that on large-row tables (transcript chunks ~768 KiB, media /
+ *  auth / blobs near the 1 MiB doc limit) — 200 such rows is ~150 MiB and
+ *  crashes with "Too many bytes read". So we read in small inner `.take()`
+ *  batches (deleted rows drop out of the next `.take()`, so no cursor needed),
+ *  sum the bytes, and stop once another batch could approach the cap. Small-row
+ *  tables still clear ~MAX_ROWS per call; large-row tables clear a safe handful.
+ *  A byte-capped batch is "short" but NOT drained, so `done` — not the batch
+ *  size — is the loop signal. */
 export const resetPage = mutation({
 	args: { table: TableName, limit: v.optional(v.number()) },
 	handler: async (ctx, args) => {
-		const limit = args.limit && args.limit > 0 ? Math.min(args.limit, 500) : 200;
-		const rows = await ctx.db.query(args.table).take(limit);
-		for (const row of rows) {
-			if (STORAGE_SPILL_TABLES.has(args.table)) {
-				const storageId = (row as { storageId?: string }).storageId;
-				if (storageId) {
-					try {
-						await ctx.storage.delete(storageId as never);
-					} catch {
-						// Already gone — the row delete below still proceeds.
+		const MAX_ROWS = args.limit && args.limit > 0 ? Math.min(args.limit, 500) : 200;
+		const INNER = 8; // ≤ 8 MiB worst case (8 × 1 MiB doc cap)
+		const READ_CEILING = 6 * 1024 * 1024; // stop before the next batch; 6 + 8 < 16 MiB
+		let removed = 0;
+		let bytesRead = 0;
+		let drained = false;
+		while (removed < MAX_ROWS) {
+			const rows = await ctx.db.query(args.table).take(INNER);
+			for (const row of rows) {
+				bytesRead += estimateRowBytes(row as unknown as Record<string, unknown>);
+				if (STORAGE_SPILL_TABLES.has(args.table)) {
+					const storageId = (row as { storageId?: string }).storageId;
+					if (storageId) {
+						try {
+							await ctx.storage.delete(storageId as never);
+						} catch {
+							// Already gone — the row delete below still proceeds.
+						}
 					}
 				}
+				await ctx.db.delete(row._id);
+				removed += 1;
 			}
-			await ctx.db.delete(row._id);
+			// Fewer rows than asked (incl. zero) ⇒ the table is now empty.
+			if (rows.length < INNER) {
+				drained = true;
+				break;
+			}
+			// Next `.take(INNER)` could read up to ~8 MiB; stop while still well
+			// under the 16 MiB execution cap. Not drained — the client loops.
+			if (bytesRead >= READ_CEILING) break;
 		}
-		return { deleted: rows.length };
+		return { deleted: removed, done: drained };
 	},
 });
