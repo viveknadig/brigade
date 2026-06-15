@@ -70,8 +70,11 @@ interface ComposioAuthConfigItem {
 }
 interface ComposioLike {
 	toolkits: {
-		/** List the live toolkit catalog (NOT hardcoded — new apps appear automatically). */
-		get(query?: Record<string, unknown>): Promise<{ items?: ComposioToolkitItem[] } | ComposioToolkitItem[]>;
+		/** List the live toolkit catalog (NOT hardcoded — new apps appear automatically).
+		 *  Paginated: the response carries `nextCursor` when more pages remain. */
+		get(
+			query?: Record<string, unknown>,
+		): Promise<{ items?: ComposioToolkitItem[]; nextCursor?: string | null } | ComposioToolkitItem[]>;
 	};
 	authConfigs: {
 		list(query?: Record<string, unknown>): Promise<{ items?: ComposioAuthConfigItem[] }>;
@@ -187,6 +190,32 @@ export function projectToolkits(raw: unknown): Array<{ slug: string; name?: stri
 	return items
 		.filter((t): t is ComposioToolkitItem => !!t && typeof (t as ComposioToolkitItem).slug === "string")
 		.map((t) => ({ slug: t.slug, name: t.name, description: t.meta?.description, toolsCount: t.meta?.toolsCount }));
+}
+
+const TOOLKIT_PAGE_LIMIT = 500;
+const TOOLKIT_MAX_PAGES = 12; // safety bound (≈6,000 toolkits); flagged if hit, never silent.
+
+/** Page through the WHOLE toolkit catalog by following `nextCursor` — so the count
+ *  the crew reports is REAL, not "however many fit in one page". Returns the projected
+ *  toolkits + `truncated` (true only if we hit the page-safety bound with more pages
+ *  left, so the caller can say so honestly rather than pretend it's the full list). */
+async function fetchAllToolkits(
+	composio: ComposioLike,
+): Promise<{ toolkits: ReturnType<typeof projectToolkits>; truncated: boolean }> {
+	const out: ReturnType<typeof projectToolkits> = [];
+	let cursor: string | undefined;
+	for (let page = 0; page < TOOLKIT_MAX_PAGES; page++) {
+		const res = await composio.toolkits.get({
+			limit: TOOLKIT_PAGE_LIMIT,
+			sortBy: "usage",
+			...(cursor ? { cursor } : {}),
+		});
+		out.push(...projectToolkits(res));
+		const next = Array.isArray(res) ? undefined : (res?.nextCursor ?? undefined);
+		if (!next) return { toolkits: out, truncated: false };
+		cursor = next;
+	}
+	return { toolkits: out, truncated: true }; // hit the page bound with more remaining
 }
 
 /** Whether an error looks like Composio rejecting the API key (vs a network/other
@@ -437,11 +466,12 @@ export function makeComposioTool(opts?: {
 				const composio = await clientFactory(apiKey);
 				switch (args.action) {
 					case "apps": {
-						// Live catalog, most-used first; NOTHING hardcoded, so apps Composio
-						// adds later appear automatically. Filter client-side (toolkits.get
-						// has no free-text search param) and cap the projected output.
-						const raw = await composio.toolkits.get({ limit: 500, sortBy: "usage" });
-						let apps = projectToolkits(raw);
+						// Page through the WHOLE live catalog (don't assume one page is all of
+						// it) so the count is REAL. Nothing hardcoded → apps Composio adds later
+						// appear automatically. Filter client-side (toolkits.get has no free-text
+						// search param) and cap only the SHOWN rows, while reporting the true total.
+						const { toolkits: allApps, truncated } = await fetchAllToolkits(composio);
+						let apps = allApps;
 						const q = (args.query ?? "").trim().toLowerCase();
 						if (q) {
 							apps = apps.filter(
@@ -451,12 +481,16 @@ export function makeComposioTool(opts?: {
 									(a.description ?? "").toLowerCase().includes(q),
 							);
 						}
-						const capped = apps.slice(0, 30);
+						const SHOWN = 30;
+						const capped = apps.slice(0, SHOWN);
+						const total = `${apps.length}${truncated ? "+" : ""}`;
 						return ok(
 							capped.length > 0
-								? `${capped.length}${apps.length > capped.length ? ` of ${apps.length}` : ""} connectable app(s)${q ? ` matching "${q}"` : ""}. Pick a slug and call action:"connect".`
-								: `No connectable apps${q ? ` matching "${q}"` : ""} found — try a broader term, or call action:"connect" with the app's slug directly (Composio can connect apps even if they're not in this list).`,
-							{ data: { apps: capped } },
+								? `${total} connectable app(s)${q ? ` matching "${q}"` : " in Composio's catalog"}${
+										apps.length > capped.length ? ` — showing the first ${capped.length}` : ""
+									}. Pick a slug and call action:"connect", or action:"search" to find a specific tool in any app.`
+								: `No connectable apps${q ? ` matching "${q}"` : ""} found — try a broader term, or call action:"connect" with the app's slug directly (any Composio app connects, even if not listed here).`,
+							{ data: { apps: capped, total: apps.length, shown: capped.length, ...(truncated ? { truncated: true } : {}) } },
 						);
 					}
 					case "connect": {

@@ -158,6 +158,35 @@ describe("composio tool", () => {
 		assert.match(payload.message, /managed sign-in|own OAuth|dashboard/i);
 	});
 
+	it("apps pages through the WHOLE catalog (follows nextCursor) and reports the REAL total", async () => {
+		const agentId = "composio-paging-agent";
+		// Page 1 (no cursor) → 2 apps + nextCursor; page 2 (cursor) → 1 app + no cursor.
+		const client = fakeComposio({
+			toolkits: {
+				get: async (q?: { cursor?: string }) =>
+					q?.cursor
+						? { items: [{ slug: "appc", name: "App C", meta: {} }], nextCursor: null }
+						: {
+								items: [
+									{ slug: "appa", name: "App A", meta: {} },
+									{ slug: "appb", name: "App B", meta: {} },
+								],
+								nextCursor: "cur1",
+							},
+			},
+		});
+		const t = makeComposioTool({ agentId, clientFactory: async () => client });
+		await t.execute("k", { action: "set-key", key: "csk_ok" } as never);
+		const r = await t.execute("a", { action: "apps" } as never);
+		const payload = r.details as { ok: boolean; data: { apps: Array<{ slug: string }>; total: number } };
+		assert.equal(payload.ok, true);
+		assert.equal(payload.data.total, 3); // 2 (page 1) + 1 (page 2) — not a single page
+		assert.deepEqual(
+			payload.data.apps.map((a) => a.slug).sort(),
+			["appa", "appb", "appc"],
+		);
+	});
+
 	it("apps discovers the live catalog (no hardcoded list) and filters by query", async () => {
 		const agentId = "composio-apps-agent";
 		const catalog = {
