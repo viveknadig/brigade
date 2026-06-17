@@ -14,7 +14,6 @@ import * as fs from "node:fs";
 import readline from "node:readline/promises";
 
 import chalk from "chalk";
-import type { Command } from "commander";
 
 import { resolveStateDir } from "../../config/paths.js";
 import { isProcessAlive, readPid } from "../../core/gateway-probe.js";
@@ -29,6 +28,7 @@ import {
 	resetConvexInstance,
 	type ConvexInstanceSummary,
 } from "../../storage/instance-admin.js";
+import { wipeLocalBrigadeState } from "../../storage/factory-reset.js";
 import { runStoreMigrate } from "../../storage/migrate.js";
 import { deleteSentinel, readSentinel, sentinelExists, writeSentinelNow } from "../../storage/sentinel.js";
 import type { StorageMode } from "../../storage/runtime-context.js";
@@ -145,7 +145,18 @@ export async function runStoreModeSet(opts: StoreModeSetOptions): Promise<number
 		saveEncryptionKeyToFile(generatedKeyHex);
 	}
 
+	// `store mode set` is the command meant to (re-)pin the mode, so a corrupt
+	// prior sentinel must not abort it — treat an unreadable prior as unknown
+	// and let writeSentinelNow below heal the file (matches runStoreModeShow's
+	// tolerance). modeChanged then reads false, skipping the no-data-moved warn.
+	let priorSentinel: ReturnType<typeof readSentinel>;
+	try {
+		priorSentinel = readSentinel();
+	} catch {
+		priorSentinel = undefined;
+	}
 	const existed = sentinelExists();
+	const modeChanged = priorSentinel?.mode !== undefined && priorSentinel.mode !== mode;
 	const sentinel = writeSentinelNow(mode as StorageMode, {
 		...(opts.convexUrl ? { convexUrl: opts.convexUrl.trim() } : {}),
 	});
@@ -192,11 +203,33 @@ export async function runStoreModeSet(opts: StoreModeSetOptions): Promise<number
 		);
 	}
 	if (!existed) {
+		const urlHint = sentinel.mode === "convex" ? " --convex-url <url>" : "";
 		process.stdout.write(
-			chalk.dim(`  This is a fresh pin. To migrate existing data between modes use:\n`),
+			chalk.dim(`  Fresh pin — ${sentinel.mode} starts EMPTY. Flipping the mode does NOT move data.\n`),
 		);
 		process.stdout.write(
-			chalk.dim(`    brigade store migrate --to ${sentinel.mode}  (not yet shipped — Phase 2 PR17)\n`),
+			chalk.dim(`  To copy your existing data across (the source mode is left intact), run:\n`),
+		);
+		process.stdout.write(
+			chalk.dim(`    brigade store migrate --to ${sentinel.mode}${urlHint} --dry-run   # preview first\n`),
+		);
+		process.stdout.write(chalk.dim(`    brigade store migrate --to ${sentinel.mode}${urlHint}\n`));
+	} else if (modeChanged) {
+		// A re-flip moves NO data, and the previous mode's local files persist. On
+		// the next boot the disk-authoritative workspace reconcile ("disk wins")
+		// can push a STALE local persona/skill over the backend's correct copy.
+		// Warn loudly and point at the safe paths (this used to be silent).
+		const urlHint = sentinel.mode === "convex" ? " --convex-url <url>" : "";
+		process.stdout.write(
+			chalk.yellow(`  ⚠ Mode changed ${priorSentinel?.mode} → ${sentinel.mode}, but NO data was moved.\n`),
+		);
+		process.stdout.write(
+			chalk.dim(
+				`    ${sentinel.mode} uses whatever it already holds; a stale local workspace/skill can\n` +
+					`    overwrite the backend mirror on the next boot. To bring your data across:\n` +
+					`      brigade store migrate --to ${sentinel.mode}${urlHint}\n` +
+					`    Or for a clean ${sentinel.mode} start: brigade store reset${urlHint}  then  brigade onboard\n`,
+			),
 		);
 	}
 	return 0;
@@ -250,6 +283,65 @@ export async function runStoreReset(opts: StoreResetOptions = {}): Promise<numbe
 	const sentinel = readSentinel();
 	const url =
 		opts.convexUrl?.trim() || sentinel?.convexUrl || process.env.BRIGADE_CONVEX_URL?.trim();
+
+	// Filesystem mode (or never-onboarded) has NO backend to erase — the state IS
+	// the local ~/.brigade tree. A factory reset WIPES it (delete-outright) so the
+	// next onboard starts VIRGIN, identical to a first-ever onboard, then retires
+	// the encryption key. (Convex mode falls through to the backend-erase flow.)
+	if ((sentinel?.mode ?? "filesystem") !== "convex" && !url) {
+		if (!opts.yes) {
+			if (!process.stdin.isTTY) {
+				return fail("refusing to erase without --yes in a non-interactive shell");
+			}
+			process.stderr.write(
+				`${chalk.red("This permanently erases your LOCAL Brigade data")} (workspace, skills, sessions, memory).\n` +
+					`${chalk.dim("There is no undo.")}\n`,
+			);
+			const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+			try {
+				const answer = (await rl.question(`Type ${chalk.bold("erase")} to continue: `)).trim().toLowerCase();
+				if (answer !== "erase") {
+					process.stderr.write("Cancelled.\n");
+					return 1;
+				}
+			} finally {
+				rl.close();
+			}
+		}
+		// Retire the key BEFORE the wipe (it lives outside the state dir, so the
+		// wipe can't touch it — but order it first so a wipe failure can't strand a
+		// renamed key). The wipe also removes the sentinel (it's under the state dir).
+		const retired = retireEncryptionKeyFile();
+		try {
+			wipeLocalBrigadeState();
+		} catch (err) {
+			return fail(`couldn't remove the local Brigade folder — ${(err as Error).message}`);
+		}
+		if (opts.json) {
+			process.stdout.write(
+				`${JSON.stringify(
+					{
+						ok: true,
+						mode: "filesystem",
+						wipedLocal: true,
+						sentinelRemoved: true,
+						...(retired.backedUpTo !== undefined ? { keySetAsideAt: retired.backedUpTo } : {}),
+					},
+					null,
+					2,
+				)}\n`,
+			);
+			return 0;
+		}
+		process.stdout.write(`${chalk.green("✓")} Local Brigade data erased — your next onboard starts fresh.\n`);
+		if (retired.backedUpTo) {
+			process.stdout.write(
+				chalk.dim(`  Your old encryption key was set aside (not deleted): ${retired.backedUpTo}\n`),
+			);
+		}
+		return 0;
+	}
+
 	if (!url) {
 		return fail("no Convex deployment known — pass --convex-url <http(s)://...>");
 	}
@@ -347,6 +439,9 @@ export interface StoreMigrateOptions {
 	convexUrl?: string;
 	dryRun?: boolean;
 	skipVerify?: boolean;
+	/** Keep the local filesystem source after a `--to convex` migrate instead of
+	 *  wiping it (the default). Trades a clean footprint for an instant rollback. */
+	keepSource?: boolean;
 	json?: boolean;
 }
 
@@ -365,6 +460,7 @@ export async function runStoreMigrateCmd(opts: StoreMigrateOptions): Promise<num
 		...(opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {}),
 		...(opts.dryRun !== undefined ? { dryRun: opts.dryRun } : {}),
 		...(opts.skipVerify !== undefined ? { skipVerify: opts.skipVerify } : {}),
+		...(opts.keepSource ? { cleanSource: false } : {}),
 		onProgress: opts.json
 			? undefined
 			: (e) => {
@@ -402,101 +498,21 @@ export async function runStoreMigrateCmd(opts: StoreMigrateOptions): Promise<num
 			chalk.yellow(`  ⚠ sentinel write failed — flip manually with brigade store mode set ${report.to}\n`),
 		);
 	}
+	// Report the local-source cleanup so "where did my filesystem copy go?" is
+	// never a surprise — and so the rollback escape hatch is discoverable.
+	if (!report.dryRun && report.to === "convex") {
+		if (report.sourceCleaned) {
+			process.stdout.write(
+				chalk.dim(`  local filesystem copy cleared — Convex is now the only source (re-run with --keep-source to keep it)\n`),
+			);
+		} else if (skipped > 0) {
+			process.stdout.write(
+				chalk.yellow(`  local filesystem copy kept — a domain errored, so the source is preserved\n`),
+			);
+		} else if (opts.keepSource) {
+			process.stdout.write(chalk.dim(`  local filesystem copy kept (--keep-source) — delete it when you're confident\n`));
+		}
+	}
 	return 0;
 }
 
-// ---------------------------------------------------------------------------
-// Registrar
-// ---------------------------------------------------------------------------
-
-export function registerStoreCommand(program: Command): void {
-	const store = program
-		.command("store")
-		.description("Inspect or flip Brigade's storage backend (filesystem / convex)");
-
-	const mode = store.command("mode").description("Manage the storage-mode sentinel");
-
-	mode
-		.command("show")
-		.description("Print the active storage mode (and Convex URL if applicable)")
-		.option("--json", "emit JSON instead of human-readable text", false)
-		.action(async (opts: { json?: boolean }) => {
-			process.exit(await runStoreModeShow({ json: opts.json }));
-		});
-
-	mode
-		.command("set <mode>")
-		.description(
-			"Pin the storage mode for this machine.\n" +
-				"  Examples:\n" +
-				"    brigade store mode set filesystem\n" +
-				"    brigade store mode set convex --convex-url http://127.0.0.1:3210",
-		)
-		.option("--convex-url <url>", "deployment URL (required when <mode> is convex)")
-		.option("--json", "emit JSON instead of human-readable text", false)
-		.action(async (modeArg: string, opts: { convexUrl?: string; json?: boolean }) => {
-			process.exit(
-				await runStoreModeSet({
-					mode: modeArg,
-					...(opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {}),
-					...(opts.json !== undefined ? { json: opts.json } : {}),
-				}),
-			);
-		});
-
-	store
-		.command("reset")
-		.description(
-			"Factory-reset the convex backend: permanently erase every stored record,\n" +
-				"remove the mode pin, and set the encryption key aside so the next onboard\n" +
-				"starts truly fresh. (Wiping ~/.brigade alone RESTORES — this erases.)",
-		)
-		.option("--convex-url <url>", "deployment URL (defaults to the pinned sentinel URL)")
-		.option("--yes", "skip the interactive confirmation", false)
-		.option("--purge-local", "also delete the local Brigade folder", false)
-		.option("--json", "emit JSON instead of human-readable text", false)
-		.action(async (opts: { convexUrl?: string; yes?: boolean; purgeLocal?: boolean; json?: boolean }) => {
-			process.exit(
-				await runStoreReset({
-					...(opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {}),
-					...(opts.yes !== undefined ? { yes: opts.yes } : {}),
-					...(opts.purgeLocal !== undefined ? { purgeLocal: opts.purgeLocal } : {}),
-					...(opts.json !== undefined ? { json: opts.json } : {}),
-				}),
-			);
-		});
-
-	store
-		.command("migrate")
-		.description(
-			"Copy your Brigade data between storage backends.\n" +
-				"  Examples:\n" +
-				"    brigade store migrate --to convex --convex-url http://127.0.0.1:3210\n" +
-				"    brigade store migrate --to filesystem\n" +
-				"    brigade store migrate --to convex --dry-run\n",
-		)
-		.requiredOption("--to <mode>", "destination mode: filesystem | convex")
-		.option("--convex-url <url>", "deployment URL (used when migrating to/from convex)")
-		.option("--dry-run", "report what would be copied without writing", false)
-		.option("--skip-verify", "skip sha256 verification (faster, less safe)", false)
-		.option("--json", "emit JSON instead of human-readable text", false)
-		.action(
-			async (opts: {
-				to: string;
-				convexUrl?: string;
-				dryRun?: boolean;
-				skipVerify?: boolean;
-				json?: boolean;
-			}) => {
-				process.exit(
-					await runStoreMigrateCmd({
-						to: opts.to,
-						...(opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {}),
-						...(opts.dryRun !== undefined ? { dryRun: opts.dryRun } : {}),
-						...(opts.skipVerify !== undefined ? { skipVerify: opts.skipVerify } : {}),
-						...(opts.json !== undefined ? { json: opts.json } : {}),
-					}),
-				);
-			},
-		);
-}

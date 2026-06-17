@@ -2,8 +2,8 @@
  * Auto-recall — proactively surface relevant memories into the turn's context
  * BEFORE the model runs, so it doesn't have to remember to call recall_memory.
  *
- * Design (scalable): a synchronous LEXICAL search of the structured fact
- * store for the user's message, injecting the top-N facts as an
+ * Design (scalable): a hybrid (BM25 primary + vector recovery) recall of the
+ * structured fact store for the user's message, injecting the top-N facts as an
  * untrusted-context block. Zero extra model calls, sub-millisecond, and
  * recalled facts are reinforced (accessCount) for decay — so frequently-
  * useful facts stay alive. We deliberately avoid the per-turn cost of a
@@ -26,10 +26,38 @@
 import type { MemoryCapability } from "../extensions/types.js";
 import { wrapUntrustedDataBlock } from "../../system-prompt/sanitize.js";
 import { isDefaultMemoryCapability } from "./plugin-runtime.js";
-import { FactStore, type RecordOriginFilter } from "./records.js";
+import { FactStore, type MemoryRecordOrigin, type RecordOriginFilter } from "./records.js";
 
 /** Max facts to surface — keep the injection small + high-signal. */
 const MAX_AUTO_RECALL_FACTS = 5;
+
+/**
+ * Resolve the SAFE auto-recall origin for a turn, or `undefined` to SKIP
+ * auto-recall (fail CLOSED). Owner turns recall owner-scope; a channel-routed
+ * peer recalls their own session scope; a non-owner turn with NO channel route
+ * gets NOTHING — auto-recall must never fall back to owner-scope for an
+ * unidentified peer (that would surface the operator's private memory into a
+ * stranger's pre-model context). Callers MUST skip `buildAutoRecallBlock` when
+ * this returns `undefined` — do NOT pass undefined to it (that means whole-store).
+ */
+export function resolveAutoRecallOrigin(args: {
+	senderIsOwner: boolean;
+	channelApprovalRoute?: { channelId: string; conversationId: string; accountId?: string };
+	sessionKey: string;
+}): MemoryRecordOrigin | undefined {
+	if (args.senderIsOwner) return { kind: "owner" };
+	const route = args.channelApprovalRoute;
+	if (route) {
+		return {
+			kind: "channel",
+			channelId: route.channelId,
+			conversationId: route.conversationId,
+			sessionKey: args.sessionKey,
+			...(route.accountId !== undefined ? { accountId: route.accountId } : {}),
+		};
+	}
+	return undefined;
+}
 
 /**
  * Build the auto-recall context block for a user message, or `undefined` when
@@ -73,7 +101,7 @@ export function buildAutoRecallBlock(
 	// Legacy workspace-dir path — synchronous FactStore search. Preserved
 	// because some test surfaces still call it that way, and a synchronous
 	// return keeps the persona-assembler call site simple in those tests.
-	const hits = new FactStore(workspaceDirOrCapability).search(query, {
+	const hits = new FactStore(workspaceDirOrCapability).recall(query, {
 		limit: MAX_AUTO_RECALL_FACTS,
 		markAccessed: false,
 		...(opts.origin !== undefined ? { origin: opts.origin } : {}),
@@ -96,7 +124,7 @@ async function buildBlockFromCapability(
 	opts: { origin?: RecordOriginFilter } = {},
 ): Promise<string | undefined> {
 	if (isDefaultMemoryCapability(capability)) {
-		const hits = capability.factStore.search(query, {
+		const hits = capability.factStore.recall(query, {
 			limit: MAX_AUTO_RECALL_FACTS,
 			markAccessed: false,
 			...(opts.origin !== undefined ? { origin: opts.origin } : {}),
@@ -105,11 +133,17 @@ async function buildBlockFromCapability(
 		const facts = hits.map((f) => `- [${f.segment}] ${f.content}`).join("\n");
 		return renderBlock(facts);
 	}
-	// Plugin backends don't have the origin contract (yet). The SDK
-	// `search` method ignores it; plugins that want per-origin scoping
-	// can read the createdBy field from the `meta` write payload and
-	// honour it themselves.
-	const hits = await capability.search(query, { limit: MAX_AUTO_RECALL_FACTS });
+	// Plugin backends scope per-origin via the SDK `search` sessionKey (the
+	// documented isolation contract — the plugin owns honouring it). Thread the
+	// channel origin's sessionKey through so a peer turn can't pull another
+	// principal's facts via the plugin; an owner origin omits it (the owner sees
+	// all owner-scoped facts). Previously this dropped the scope entirely → unscoped
+	// global hits on a channel-routed turn (a cross-origin recall leak).
+	const channelKey = opts.origin?.kind === "channel" ? opts.origin.sessionKey : undefined;
+	const hits = await capability.search(query, {
+		limit: MAX_AUTO_RECALL_FACTS,
+		...(channelKey ? { sessionKey: channelKey } : {}),
+	});
 	if (hits.length === 0) return undefined;
 	// Plugin backend — we don't know segments, so surface source + content.
 	const facts = hits.map((h) => `- [${h.source}] ${h.content}`).join("\n");

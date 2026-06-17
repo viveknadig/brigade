@@ -1438,19 +1438,34 @@ export function buildProgram(): Command {
     .option("--convex-url <url>", "deployment URL")
     .option("--dry-run", "report what would be copied without writing", false)
     .option("--skip-verify", "skip sha256 verification (faster)", false)
+    .option(
+      "--keep-source",
+      "after --to convex, keep the local filesystem copy (default: wipe it once the copy is verified)",
+      false,
+    )
     .option("--json", "emit JSON instead of human-readable text", false)
-    .action(async (opts: { to: string; convexUrl?: string; dryRun?: boolean; skipVerify?: boolean; json?: boolean }) => {
-      const { runStoreMigrateCmd } = await import("../commands/store-cmd.js");
-      await exitAfterFlush(
-        await runStoreMigrateCmd({
-          to: opts.to,
-          ...(opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {}),
-          ...(opts.dryRun !== undefined ? { dryRun: opts.dryRun } : {}),
-          ...(opts.skipVerify !== undefined ? { skipVerify: opts.skipVerify } : {}),
-          ...(opts.json !== undefined ? { json: opts.json } : {}),
-        }),
-      );
-    });
+    .action(
+      async (opts: {
+        to: string;
+        convexUrl?: string;
+        dryRun?: boolean;
+        skipVerify?: boolean;
+        keepSource?: boolean;
+        json?: boolean;
+      }) => {
+        const { runStoreMigrateCmd } = await import("../commands/store-cmd.js");
+        await exitAfterFlush(
+          await runStoreMigrateCmd({
+            to: opts.to,
+            ...(opts.convexUrl !== undefined ? { convexUrl: opts.convexUrl } : {}),
+            ...(opts.dryRun !== undefined ? { dryRun: opts.dryRun } : {}),
+            ...(opts.skipVerify !== undefined ? { skipVerify: opts.skipVerify } : {}),
+            ...(opts.keepSource !== undefined ? { keepSource: opts.keepSource } : {}),
+            ...(opts.json !== undefined ? { json: opts.json } : {}),
+          }),
+        );
+      },
+    );
 
   return program;
 }

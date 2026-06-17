@@ -6,14 +6,27 @@ export declare const listFacts: import("convex/server").RegisteredQuery<"public"
     _id: import("convex/values").GenericId<"memoryFacts">;
     _creationTime: number;
     metadata?: any;
+    status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
+    sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
+    links?: {
+        kind: "supersedes" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        target: string;
+    }[] | undefined;
+    validFrom?: number | undefined;
+    validTo?: number | undefined;
+    confidence?: number | undefined;
+    sourcePointers?: string[] | undefined;
+    embedding?: number[] | undefined;
+    modality?: "text" | "image" | "video" | "audio" | "document" | undefined;
+    mediaPointer?: string | undefined;
+    subjectKey?: string | undefined;
     createdByKind?: "owner" | "channel" | undefined;
     createdByChannelId?: string | undefined;
     createdByConversationId?: string | undefined;
     createdBySessionKey?: string | undefined;
     createdByAccountId?: string | undefined;
-    embedding?: number[] | undefined;
     createdAt: number;
     content: ArrayBuffer;
     memoryId: string;
@@ -28,14 +41,27 @@ export declare const listFacts: import("convex/server").RegisteredQuery<"public"
 }[]>>;
 export declare const writeFact: import("convex/server").RegisteredMutation<"public", {
     metadata?: any;
+    status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
+    sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
+    links?: {
+        kind: "supersedes" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        target: string;
+    }[] | undefined;
+    validFrom?: number | undefined;
+    validTo?: number | undefined;
+    confidence?: number | undefined;
+    sourcePointers?: string[] | undefined;
+    embedding?: number[] | undefined;
+    modality?: "text" | "image" | "video" | "audio" | "document" | undefined;
+    mediaPointer?: string | undefined;
+    subjectKey?: string | undefined;
     createdByKind?: "owner" | "channel" | undefined;
     createdByChannelId?: string | undefined;
     createdByConversationId?: string | undefined;
     createdBySessionKey?: string | undefined;
     createdByAccountId?: string | undefined;
-    embedding?: number[] | undefined;
     content: ArrayBuffer;
     memoryId: string;
     segment: "project" | "identity" | "preference" | "correction" | "relationship" | "knowledge" | "context";
@@ -47,14 +73,27 @@ export declare const writeFact: import("convex/server").RegisteredMutation<"publ
     _id: import("convex/values").GenericId<"memoryFacts">;
     _creationTime: number;
     metadata?: any;
+    status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
+    sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
+    links?: {
+        kind: "supersedes" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        target: string;
+    }[] | undefined;
+    validFrom?: number | undefined;
+    validTo?: number | undefined;
+    confidence?: number | undefined;
+    sourcePointers?: string[] | undefined;
+    embedding?: number[] | undefined;
+    modality?: "text" | "image" | "video" | "audio" | "document" | undefined;
+    mediaPointer?: string | undefined;
+    subjectKey?: string | undefined;
     createdByKind?: "owner" | "channel" | undefined;
     createdByChannelId?: string | undefined;
     createdByConversationId?: string | undefined;
     createdBySessionKey?: string | undefined;
     createdByAccountId?: string | undefined;
-    embedding?: number[] | undefined;
     createdAt: number;
     content: ArrayBuffer;
     memoryId: string;
@@ -77,14 +116,27 @@ export declare const listAllFacts: import("convex/server").RegisteredQuery<"publ
     _id: import("convex/values").GenericId<"memoryFacts">;
     _creationTime: number;
     metadata?: any;
+    status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
+    sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
+    links?: {
+        kind: "supersedes" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        target: string;
+    }[] | undefined;
+    validFrom?: number | undefined;
+    validTo?: number | undefined;
+    confidence?: number | undefined;
+    sourcePointers?: string[] | undefined;
+    embedding?: number[] | undefined;
+    modality?: "text" | "image" | "video" | "audio" | "document" | undefined;
+    mediaPointer?: string | undefined;
+    subjectKey?: string | undefined;
     createdByKind?: "owner" | "channel" | undefined;
     createdByChannelId?: string | undefined;
     createdByConversationId?: string | undefined;
     createdBySessionKey?: string | undefined;
     createdByAccountId?: string | undefined;
-    embedding?: number[] | undefined;
     createdAt: number;
     content: ArrayBuffer;
     memoryId: string;
@@ -102,14 +154,27 @@ export declare const listAllFacts: import("convex/server").RegisteredQuery<"publ
  *  realises its whole-file diffs through this. */
 export declare const upsertFactRecord: import("convex/server").RegisteredMutation<"public", {
     metadata?: any;
+    status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
+    sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
+    links?: {
+        kind: "supersedes" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        target: string;
+    }[] | undefined;
+    validFrom?: number | undefined;
+    validTo?: number | undefined;
+    confidence?: number | undefined;
+    sourcePointers?: string[] | undefined;
+    embedding?: number[] | undefined;
+    modality?: "text" | "image" | "video" | "audio" | "document" | undefined;
+    mediaPointer?: string | undefined;
+    subjectKey?: string | undefined;
     createdByKind?: "owner" | "channel" | undefined;
     createdByChannelId?: string | undefined;
     createdByConversationId?: string | undefined;
     createdBySessionKey?: string | undefined;
     createdByAccountId?: string | undefined;
-    embedding?: number[] | undefined;
     createdAt: number;
     content: ArrayBuffer;
     memoryId: string;
@@ -169,6 +234,14 @@ export declare const markConsolidateRunAt: import("convex/server").RegisteredMut
     workspaceId: string;
     lastRunAt: number;
 }, Promise<void>>;
+export declare const vectorProbe: import("convex/server").RegisteredAction<"public", {
+    k?: number | undefined;
+    embedding: number[];
+    workspaceId: string;
+}, Promise<{
+    id: import("convex/values").GenericId<"memoryFacts">;
+    score: number;
+}[]>>;
 export declare const searchContent: import("convex/server").RegisteredQuery<"public", {
     limit?: number | undefined;
     query: string;
@@ -177,14 +250,27 @@ export declare const searchContent: import("convex/server").RegisteredQuery<"pub
     _id: import("convex/values").GenericId<"memoryFacts">;
     _creationTime: number;
     metadata?: any;
+    status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
+    sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
+    links?: {
+        kind: "supersedes" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        target: string;
+    }[] | undefined;
+    validFrom?: number | undefined;
+    validTo?: number | undefined;
+    confidence?: number | undefined;
+    sourcePointers?: string[] | undefined;
+    embedding?: number[] | undefined;
+    modality?: "text" | "image" | "video" | "audio" | "document" | undefined;
+    mediaPointer?: string | undefined;
+    subjectKey?: string | undefined;
     createdByKind?: "owner" | "channel" | undefined;
     createdByChannelId?: string | undefined;
     createdByConversationId?: string | undefined;
     createdBySessionKey?: string | undefined;
     createdByAccountId?: string | undefined;
-    embedding?: number[] | undefined;
     createdAt: number;
     content: ArrayBuffer;
     memoryId: string;
@@ -199,21 +285,34 @@ export declare const searchContent: import("convex/server").RegisteredQuery<"pub
 }[]>>;
 export declare const findSimilar: import("convex/server").RegisteredQuery<"public", {
     k?: number | undefined;
-    workspaceId: string;
     embedding: number[];
+    workspaceId: string;
 }, Promise<{
     score: number;
     _id: import("convex/values").GenericId<"memoryFacts">;
     _creationTime: number;
     metadata?: any;
+    status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
+    sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
+    links?: {
+        kind: "supersedes" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        target: string;
+    }[] | undefined;
+    validFrom?: number | undefined;
+    validTo?: number | undefined;
+    confidence?: number | undefined;
+    sourcePointers?: string[] | undefined;
+    embedding?: number[] | undefined;
+    modality?: "text" | "image" | "video" | "audio" | "document" | undefined;
+    mediaPointer?: string | undefined;
+    subjectKey?: string | undefined;
     createdByKind?: "owner" | "channel" | undefined;
     createdByChannelId?: string | undefined;
     createdByConversationId?: string | undefined;
     createdBySessionKey?: string | undefined;
     createdByAccountId?: string | undefined;
-    embedding?: number[] | undefined;
     createdAt: number;
     content: ArrayBuffer;
     memoryId: string;

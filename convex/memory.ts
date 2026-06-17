@@ -1,6 +1,6 @@
 // convex/memory.ts — memoryFacts + memoryExtractCursors + memoryConsolidateState
 import { v } from "convex/values";
-import { mutation, query } from "./_generated/server.js";
+import { action, mutation, query } from "./_generated/server.js";
 
 const Segment = v.union(
 	v.literal("identity"),
@@ -14,6 +14,39 @@ const Segment = v.union(
 const Tier = v.union(v.literal("short"), v.literal("long"), v.literal("permanent"));
 const Lifecycle = v.union(v.literal("active"), v.literal("archived"), v.literal("pruned"));
 const Origin = v.union(v.literal("owner"), v.literal("channel"));
+const SourceType = v.union(
+	v.literal("user_instruction"),
+	v.literal("owner_message"),
+	v.literal("channel_message"),
+	v.literal("tool_output"),
+	v.literal("retrieved_document"),
+	v.literal("compaction"),
+	v.literal("extraction"),
+	v.literal("dream"),
+);
+const LinkKind = v.union(
+	v.literal("supersedes"),
+	v.literal("corrects"),
+	v.literal("relates"),
+	v.literal("derived_from"),
+	v.literal("supports"),
+	v.literal("contradicts"),
+);
+const Link = v.object({ kind: LinkKind, target: v.string() });
+const Status = v.union(
+	v.literal("asserted"),
+	v.literal("provisional"),
+	v.literal("confirmed"),
+	v.literal("disputed"),
+	v.literal("retracted"),
+);
+const Modality = v.union(
+	v.literal("text"),
+	v.literal("audio"),
+	v.literal("image"),
+	v.literal("video"),
+	v.literal("document"),
+);
 
 export const listFacts = query({
 	args: {
@@ -23,7 +56,7 @@ export const listFacts = query({
 	},
 	handler: async (ctx, args) => {
 		const lifecycle = args.lifecycle ?? "active";
-		let q = ctx.db
+		const q = ctx.db
 			.query("memoryFacts")
 			.withIndex("by_workspace_lifecycle_createdAt", (q2) =>
 				q2.eq("workspaceId", args.workspaceId).eq("lifecycle", lifecycle),
@@ -50,6 +83,16 @@ export const writeFact = mutation({
 		createdByConversationId: v.optional(v.string()),
 		createdBySessionKey: v.optional(v.string()),
 		createdByAccountId: v.optional(v.string()),
+		sourceType: v.optional(SourceType),
+		links: v.optional(v.array(Link)),
+		validFrom: v.optional(v.number()),
+		validTo: v.optional(v.number()),
+		confidence: v.optional(v.number()),
+		status: v.optional(Status),
+		sourcePointers: v.optional(v.array(v.string())),
+		modality: v.optional(Modality),
+		mediaPointer: v.optional(v.string()),
+		subjectKey: v.optional(v.string()),
 		metadata: v.optional(v.any()),
 		embedding: v.optional(v.array(v.number())),
 	},
@@ -123,6 +166,16 @@ export const upsertFactRecord = mutation({
 		createdByConversationId: v.optional(v.string()),
 		createdBySessionKey: v.optional(v.string()),
 		createdByAccountId: v.optional(v.string()),
+		sourceType: v.optional(SourceType),
+		links: v.optional(v.array(Link)),
+		validFrom: v.optional(v.number()),
+		validTo: v.optional(v.number()),
+		confidence: v.optional(v.number()),
+		status: v.optional(Status),
+		sourcePointers: v.optional(v.array(v.string())),
+		modality: v.optional(Modality),
+		mediaPointer: v.optional(v.string()),
+		subjectKey: v.optional(v.string()),
 		metadata: v.optional(v.any()),
 		embedding: v.optional(v.array(v.number())),
 	},
@@ -175,6 +228,12 @@ export const markAccessed = mutation({
 	},
 });
 
+// ⚠️ DEAD / superseded by Tideline 0.6. This DISCRETE per-tier decay
+// (short→archived@7d / archived→pruned@30d / long→archived@90d) is NOT the
+// live decay path: the gateway sweep runs `runDecayGc` (continuous
+// `effectiveScore`, src/agents/memory/decay.ts) in BOTH modes, and nothing
+// calls `ConvexMemoryStore.decay`. Kept only to avoid redeploy churn; DELETE
+// on the next convex deploy. Calling it would re-diverge cognition from fs.
 export const decay = mutation({
 	args: {
 		workspaceId: v.string(),
@@ -317,6 +376,31 @@ export const markConsolidateRunAt = mutation({
 	},
 });
 
+// Probe: does this backend expose the native `ctx.vectorSearch` over the
+// `by_embedding` vectorIndex? (Older in-memory backends didn't — `findSimilar`
+// falls back to a manual cosine scan.) Returns the ANN hits' ids + scores.
+// ⚠️ LATENT / v2-only / origin-UNSAFE: this filters by workspaceId ONLY —
+// it does NOT apply the per-origin (createdBy*) recall filter the isolation
+// model requires, so it must NOT be wired into recall until it origin-filters
+// server-side (extend the `ctx.vectorSearch` filter to constrain the
+// createdBy* fields). Not on the recall path today.
+export const vectorProbe = action({
+	args: { workspaceId: v.string(), embedding: v.array(v.number()), k: v.optional(v.number()) },
+	handler: async (ctx, args) => {
+		const results = await ctx.vectorSearch("memoryFacts", "by_embedding", {
+			vector: args.embedding,
+			limit: args.k && args.k > 0 ? args.k : 5,
+			filter: (q) => q.eq("workspaceId", args.workspaceId),
+		});
+		return results.map((r) => ({ id: r._id, score: r._score }));
+	},
+});
+
+// ⚠️ LATENT / v2-only. This runs BM25 full-text matching over the sealed
+// `content` column, which stores CIPHERTEXT (v.bytes()), so it yields dead
+// results while content is sealed at rest. It must NOT be wired into recall —
+// live recall ranks BM25 in-app over decrypted content. Repurpose only if/when
+// content stops being sealed, or this is reworked to scan decrypted rows.
 export const searchContent = query({
 	args: { workspaceId: v.string(), query: v.string(), limit: v.optional(v.number()) },
 	handler: async (ctx, args) => {
@@ -334,7 +418,19 @@ export const searchContent = query({
 	},
 });
 
+// Bound on the manual candidate scan below — a single `.collect()` over every
+// active fact would hit the 16 MiB per-query read cap once memory grows (each row
+// carries a 256-float embedding + encrypted content), so we scan at most the
+// newest N. The cap-safe, index-served path is `vectorProbe` (an ACTION using the
+// native `ctx.vectorSearch`); this query is the in-memory-backend fallback.
+const VECTOR_SCAN_CAP = 2000;
+
 // PR19 — Vector recall against the `memoryFacts.embedding` vectorIndex.
+// ⚠️ LATENT / v2-only / origin-UNSAFE: this filters by workspaceId + lifecycle
+// ONLY — it does NOT apply the per-origin (createdBy*) recall filter the isolation
+// model requires, so it must NOT be wired into recall until it (or its native
+// `vectorProbe`/`ctx.vectorSearch` replacement) origin-filters server-side.
+// No live caller today (v1 recall runs BM25 in-app over the decrypted cache).
 // Convex query handlers can't issue HTTP calls (queries are deterministic),
 // so embedding generation happens at the CALLER (the adapter's `findSimilar`
 // passes pre-computed embeddings). This query just does the ANN search
@@ -352,12 +448,13 @@ export const findSimilar = query({
 			.withIndex("by_workspace_lifecycle_createdAt", (q) =>
 				q.eq("workspaceId", args.workspaceId).eq("lifecycle", "active" as const),
 			)
-			.collect();
-		// Compute cosine similarity client-side against the candidate set.
+			.order("desc") // NEWEST-first: the index is createdAt-ordered and Convex defaults to ascending, so without this .take() would scan the OLDEST N (matches listFacts + the cap comment above)
+			.take(VECTOR_SCAN_CAP);
+		// Compute cosine similarity client-side against the (capped) candidate set.
 		// (The schema declares a vectorIndex but Convex query helpers don't
 		// expose .vectorSearch on the in-memory backend yet; this fallback
-		// keeps the contract intact while emitting accurate scores. Future
-		// Convex API support lets us swap this to a direct vectorIndex query.)
+		// keeps the contract intact while emitting accurate scores. The native
+		// `vectorProbe` action is the index-served, cap-safe path.)
 		const queryVec = args.embedding;
 		const norm = (v: number[]) => Math.sqrt(v.reduce((s, x) => s + x * x, 0));
 		const queryNorm = norm(queryVec);

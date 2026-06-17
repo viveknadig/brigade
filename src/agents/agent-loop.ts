@@ -74,7 +74,7 @@ import { runWithRetry } from "./retry-policy.js";
 import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
 import { cleanProviderError } from "../core/model-caps.js";
 import { resolveModelNeverMiss } from "./model-resolution.js";
-import { buildAutoRecallBlock } from "./memory/auto-recall.js";
+import { buildAutoRecallBlock, resolveAutoRecallOrigin } from "./memory/auto-recall.js";
 import { resolveActiveMemoryCapability } from "./memory/plugin-runtime.js";
 import { buildBrigadeTransformContext } from "./payload-mutators.js";
 import {
@@ -1043,6 +1043,16 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     summary: resolveToolSummary(name) ?? "",
   }));
 
+  // Resolve the SAFE auto-recall origin for this turn ONCE — fail-closed
+  // `undefined` means SKIP auto-recall (no safe scope). Threads
+  // `effectiveSenderIsOwner` (the injection-downgraded owner flag, not the raw
+  // `senderIsOwner`) so a poisoned-inbox turn does not auto-recall owner memory.
+  const recallOrigin = resolveAutoRecallOrigin({
+    senderIsOwner: effectiveSenderIsOwner,
+    sessionKey: resolved.sessionKey,
+    ...(args.channelApprovalRoute ? { channelApprovalRoute: args.channelApprovalRoute } : {}),
+  });
+
   // Pin the assembled persona before the first turn. Done after
   // createAgentSession (which has already set up Pi's stock prompt) but
   // before prompt() so the model sees the brigade-flavoured persona on
@@ -1149,22 +1159,20 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // channelContext or sessionKey falls back to `undefined` — auto-recall
     // sees no records (consistent with the recall_memory tool's behaviour).
     ephemeralSuffix: mergeEphemeralSuffix(
-      promptCapabilities?.memory && !promptCapabilities.subagentMode && !promptCapabilities.cronMode
-        ? await buildAutoRecallBlock(memoryCapability, args.message, {
-            origin: senderIsOwner
-              ? { kind: "owner" }
-              : args.channelApprovalRoute
-                ? {
-                    kind: "channel",
-                    channelId: args.channelApprovalRoute.channelId,
-                    conversationId: args.channelApprovalRoute.conversationId,
-                    sessionKey: resolved.sessionKey,
-                    ...(args.channelApprovalRoute.accountId !== undefined
-                      ? { accountId: args.channelApprovalRoute.accountId }
-                      : {}),
-                  }
-                : { kind: "owner" },
-          })
+      promptCapabilities?.memory &&
+      !promptCapabilities.subagentMode &&
+      !promptCapabilities.cronMode &&
+      // Fail CLOSED: only auto-recall when there is a SAFE origin (owner turn, or
+      // a channel-routed peer). A non-owner turn with no channel route is skipped
+      // entirely — never the operator's facts. (Defends the isolation invariant
+      // at THIS sink, not via a caller-enforced precondition.)
+      //
+      // Use `effectiveSenderIsOwner` (NOT the raw `senderIsOwner`): an untrusted
+      // pending event downgrades this turn to non-owner, so a poisoned-inbox turn
+      // must NOT auto-recall owner-scope memory. Resolve the origin ONCE and reuse
+      // it for the block — a single source of truth for the recall scope.
+      recallOrigin
+        ? await buildAutoRecallBlock(memoryCapability, args.message, { origin: recallOrigin })
         : undefined,
       contextEngineAddition,
     ),

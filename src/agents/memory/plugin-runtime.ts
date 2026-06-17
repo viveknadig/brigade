@@ -9,6 +9,14 @@
  * they call `capability.search(query)` and `capability.recordFact(content)`
  * uniformly, and the slot resolver picks the active backend.
  *
+ * Note on origin scoping: the public `search()` is the minimal,
+ * origin-agnostic SDK contract — it's what plugin backends implement and what
+ * origin-unaware consumers fall back to. It is NOT the origin-aware path. For
+ * the DEFAULT backend the origin-aware path is `searchRich`, which accepts a
+ * `RecordOriginFilter` so fact recall stays scoped per owner/channel; callers
+ * that need isolation must route through `searchRich` (or the rich-aware
+ * recall tool), not the plain `search()`.
+ *
  * Selection: `extensions.slots.memory` in `brigade.json`. When unset, the
  * default backend wins. When pinned to a registered capability id, that
  * plugin owns memory for the turn (vector DB, knowledge graph, sqlite-fts,
@@ -101,7 +109,7 @@ export function createDefaultMemoryCapability(args: {
 		const factOpts: { limit?: number; origin?: RecordOriginFilter } = {};
 		if (limit !== undefined) factOpts.limit = limit;
 		if (origin !== undefined) factOpts.origin = origin;
-		const facts = factStore.search(query, factOpts);
+		const facts = factStore.recall(query, factOpts);
 		return { notes, facts };
 	};
 

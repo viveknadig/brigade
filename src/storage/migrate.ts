@@ -9,12 +9,15 @@
 //   • config            — brigade.json → brigadeConfig row
 //   • auth profiles     — auth-profiles.json → authProfiles rows
 //   • workspace personas— ~/.brigade/agents/<id>/workspace/*.md → personaFiles
-//   • memory facts      — memory/facts.jsonl → memoryFacts (+ cursors)
-//   • sessions index    — sessions.json → sessions table
-//   • messages          — per-session JSONL → sessionTranscriptRecords
+//   • memory facts      — facts.jsonl → memoryFacts (ALL agents + consolidate
+//                         state; per-session extract cursors are re-derivable,
+//                         not carried)
+//   • sessions index    — sessions.json → sessions table (ALL agents)
+//   • messages          — per-session JSONL → sessionTranscriptRecords (ALL agents)
 //   • logs              — today's tail only (full log isn't worth copying)
 //   • cron jobs + runs  — cron.json + per-job JSONL → cronJobs + cronRuns
-//   • channels (access) — allow-from + pairing → channelAccess
+//   • channels (access) — allow-from senders, direct + group (pairing requests
+//                         are transient, not carried) → channelAccess
 //   • exec approvals    — exec-approvals.json → execApprovals
 //   • skills            — managed dir → skills table
 //   • subagent runs     — in-memory map → subagentRuns (when present)
@@ -29,17 +32,21 @@
 //     re-pairs the device rather than migrating signal keys)
 //   • .dreams/* metadata
 //
-// After successful migrate, the sentinel is flipped to the new mode. The
-// data in the OLD mode is left intact (not deleted) — operators flip back
-// with `brigade store migrate --to filesystem` if needed.
+// After successful migrate, the sentinel is flipped to the new mode. For
+// `--to convex` the local filesystem source is then WIPED by default (its data
+// now lives in convex, which rebuilds the workspace on boot) — pass
+// `--keep-source` to retain it for an instant `--to filesystem` rollback. A
+// `--to filesystem` migrate always leaves the convex side intact.
 
 import { createHash } from "node:crypto";
 
+import { resolveAgentWorkspaceDir } from "../config/paths.js";
+import { wipeLocalBrigadeState } from "./factory-reset.js";
 import { LocalBrigadeStore } from "./local/index.js";
 import { ConvexBrigadeStore } from "./convex/index.js";
 import { readSentinel, writeSentinelNow } from "./sentinel.js";
 
-import type { BrigadeStore } from "./store.js";
+import type { BrigadeStore, SkillRecord } from "./store.js";
 
 export interface MigrateOptions {
 	/** Target mode. Source mode is the opposite. */
@@ -52,6 +59,16 @@ export interface MigrateOptions {
 	dryRun?: boolean;
 	/** When true, skip the sha256 verification pass (faster, less safe). */
 	skipVerify?: boolean;
+	/**
+	 * After a verified `--to convex` migrate, wipe the local filesystem source
+	 * (its data now lives in convex, and convex mode rebuilds the workspace on
+	 * boot via restore-on-missing) so no stale state — most importantly the
+	 * plaintext filesystem auth — lingers after the flip. Default `true`; pass
+	 * `false` (CLI `--keep-source`) to keep the source for an instant rollback.
+	 * Never wipes on `--to filesystem` (filesystem mode needs the local copy),
+	 * on `--dry-run`, or if any domain errored (the copy would be incomplete).
+	 */
+	cleanSource?: boolean;
 	/** Progress callback — fires once per domain. */
 	onProgress?: (event: MigrateProgressEvent) => void;
 }
@@ -76,11 +93,35 @@ export interface MigrateReport {
 		error?: string;
 	}>;
 	sentinelWritten: boolean;
+	/** True when the local filesystem source was wiped after a verified convex
+	 *  migrate (see `MigrateOptions.cleanSource`). Always false for `--to
+	 *  filesystem`, dry-run, `--keep-source`, or a run with any domain error. */
+	sourceCleaned: boolean;
 	durationMs: number;
 }
 
 function sha256OfJson(value: unknown): string {
 	return createHash("sha256").update(JSON.stringify(value ?? null)).digest("hex");
+}
+
+/**
+ * Post-migrate hygiene for `filesystem → convex`: once every domain has copied
+ * into convex (which is now authoritative and rebuilds the workspace on boot
+ * via restore-on-missing), the local filesystem copy is fully redundant — and
+ * its `agents/<id>/agent/auth-profiles.json` holds the provider key in
+ * PLAINTEXT. Wipe the whole local state dir so nothing stale lingers after the
+ * flip. The wipe also removes `mode.sentinel`, so we immediately re-pin convex;
+ * otherwise the next boot, finding no sentinel, would silently fall back to
+ * filesystem and read an empty store. The encryption key lives OUTSIDE the
+ * state dir, so the wipe can't touch it. Exported so the one destructive step
+ * (wipe-then-re-pin, in that order) is unit-tested in isolation.
+ */
+export function cleanLocalSourceAfterConvexMigrate(
+	stateDir: string,
+	convexUrl: string,
+): void {
+	wipeLocalBrigadeState(stateDir);
+	writeSentinelNow("convex", { convexUrl }, { stateDir });
 }
 
 /** Every agent id in a config (always includes "main"); skips the `defaults`
@@ -210,16 +251,38 @@ export async function runStoreMigrate(opts: MigrateOptions): Promise<MigrateRepo
 		}),
 	);
 
-	// --- workspace personas ----------------------------------------------
+	// --- workspace personas (ALL agents, not just main) ------------------
 	domains.push(
 		await safeDomain("workspace", opts.onProgress, async () => {
-			const files = await source.workspace.listPersona("main");
-			if (!opts.dryRun) {
-				for (const f of files) {
-					await target.workspace.writePersona("main", f.name, f.content);
+			// Every agent in the crew has its OWN persona files. Migrating only
+			// "main" left non-main agents' personas behind (and, in convex mode,
+			// absent from the backend mirror). Enumerate from the source config,
+			// same as the auth domain above.
+			const { value: cfgVal } = await source.config.read();
+			const agentIds = collectAgentIds(cfgVal);
+			let copied = 0;
+			for (const agentId of agentIds) {
+				const files = await source.workspace.listPersona(agentId);
+				if (!opts.dryRun) {
+					for (const f of files) {
+						await target.workspace.writePersona(agentId, f.name, f.content);
+					}
+				}
+				copied += files.length;
+			}
+			let verified = false;
+			if (verifySha && !opts.dryRun) {
+				verified = true;
+				for (const agentId of agentIds) {
+					const srcN = (await source.workspace.listPersona(agentId)).length;
+					const tgtN = (await target.workspace.listPersona(agentId)).length;
+					if (tgtN < srcN) {
+						verified = false;
+						break;
+					}
 				}
 			}
-			return { copied: files.length, verified: !verifySha ? false : files.length === (await target.workspace.listPersona("main")).length };
+			return { copied, verified };
 		}),
 	);
 
@@ -233,57 +296,104 @@ export async function runStoreMigrate(opts: MigrateOptions): Promise<MigrateRepo
 			//   • upsertFactRecordRaw preserves the record's id + timestamps +
 			//     lifecycle and is keyed by id, so re-running is idempotent
 			//     (writeFact mints a fresh id → duplicates on every re-run).
-			const records = await source.memory.listAllFactRecordsRaw("main");
-			if (!opts.dryRun) {
-				for (const record of records) {
-					await target.memory.upsertFactRecordRaw("main", record);
+			// Facts are PER-WORKSPACE ("main" for the shared workspace, the agent
+			// id for each non-main agent) — enumerate the whole crew like the
+			// auth/workspace domains, else non-main agents' facts copy nowhere and
+			// the cleanSource wipe then destroys them.
+			const { value: cfgVal } = await source.config.read();
+			const agentIds = collectAgentIds(cfgVal);
+			let copied = 0;
+			for (const workspaceId of agentIds) {
+				const records = await source.memory.listAllFactRecordsRaw(workspaceId);
+				if (!opts.dryRun) {
+					for (const record of records) {
+						await target.memory.upsertFactRecordRaw(workspaceId, record);
+					}
 				}
+				copied += records.length;
+			}
+			if (!opts.dryRun) {
 				const consolidateAt = await source.memory.getConsolidateLastRunAt();
 				if (consolidateAt !== undefined) {
 					await target.memory.markConsolidateRunAt(consolidateAt);
 				}
 			}
-			const targetCount = (await target.memory.listAllFactRecordsRaw("main")).length;
-			return { copied: records.length, verified: !verifySha ? false : targetCount >= records.length };
+			let verified = false;
+			if (verifySha && !opts.dryRun) {
+				verified = true;
+				for (const workspaceId of agentIds) {
+					const srcN = (await source.memory.listAllFactRecordsRaw(workspaceId)).length;
+					const tgtN = (await target.memory.listAllFactRecordsRaw(workspaceId)).length;
+					if (tgtN < srcN) {
+						verified = false;
+						break;
+					}
+				}
+			}
+			return { copied, verified };
 		}),
 	);
 
-	// --- sessions index --------------------------------------------------
+	// --- sessions index (ALL agents, not just main) ---------------------
 	domains.push(
 		await safeDomain("sessions", opts.onProgress, async () => {
-			const entries = await source.sessions.listEntries("main");
-			if (!opts.dryRun) {
-				for (const { sessionKey, entry } of entries) {
-					await target.sessions.upsertEntry("main", sessionKey, entry as never);
+			// Sessions are per-agent — enumerate the crew like auth/workspace,
+			// else non-main agents' sessions copy nowhere and cleanSource wipes them.
+			const { value: cfgVal } = await source.config.read();
+			const agentIds = collectAgentIds(cfgVal);
+			let copied = 0;
+			for (const agentId of agentIds) {
+				const entries = await source.sessions.listEntries(agentId);
+				if (!opts.dryRun) {
+					for (const { sessionKey, entry } of entries) {
+						await target.sessions.upsertEntry(agentId, sessionKey, entry as never);
+					}
+				}
+				copied += entries.length;
+			}
+			let verified = false;
+			if (verifySha && !opts.dryRun) {
+				verified = true;
+				for (const agentId of agentIds) {
+					const srcN = (await source.sessions.listEntries(agentId)).length;
+					const tgtN = (await target.sessions.listEntries(agentId)).length;
+					if (tgtN < srcN) {
+						verified = false;
+						break;
+					}
 				}
 			}
-			return { copied: entries.length, verified: !verifySha ? false : entries.length === (await target.sessions.listEntries("main")).length };
+			return { copied, verified };
 		}),
 	);
 
 	// --- transcripts (per-session Pi JSONL → sessionTranscriptRecords) ---
 	// The header always claimed transcripts were migrated; they weren't. Walk
-	// every session entry and copy its full transcript. replaceTranscript is a
-	// wholesale transactional swap, so re-running is idempotent (the target
-	// session ends up byte-identical, no duplicated rows).
+	// every agent's session entries and copy each full transcript.
+	// replaceTranscript is a wholesale transactional swap, so re-running is
+	// idempotent (the target session ends up byte-identical, no duplicated rows).
 	domains.push(
 		await safeDomain("transcripts", opts.onProgress, async () => {
-			const entries = await source.sessions.listEntries("main");
+			const { value: cfgVal } = await source.config.read();
+			const agentIds = collectAgentIds(cfgVal);
 			let copied = 0;
-			for (const { entry } of entries) {
-				const sessionId = (entry as { sessionId?: string }).sessionId;
-				if (!sessionId) continue;
-				// A high limit (well above Pi's per-session row counts) so the
-				// whole transcript comes back in one read; the convex reader
-				// paginates internally to honour it.
-				const records = await source.messages.readTranscript("main", sessionId, {
-					limit: 1_000_000,
-				});
-				if (records.length === 0) continue;
-				if (!opts.dryRun) {
-					await target.messages.replaceTranscript("main", sessionId, records);
+			for (const agentId of agentIds) {
+				const entries = await source.sessions.listEntries(agentId);
+				for (const { entry } of entries) {
+					const sessionId = (entry as { sessionId?: string }).sessionId;
+					if (!sessionId) continue;
+					// A high limit (well above Pi's per-session row counts) so the
+					// whole transcript comes back in one read; the convex reader
+					// paginates internally to honour it.
+					const records = await source.messages.readTranscript(agentId, sessionId, {
+						limit: 1_000_000,
+					});
+					if (records.length === 0) continue;
+					if (!opts.dryRun) {
+						await target.messages.replaceTranscript(agentId, sessionId, records);
+					}
+					copied += records.length;
 				}
-				copied += records.length;
 			}
 			return { copied, verified: false };
 		}),
@@ -292,26 +402,16 @@ export async function runStoreMigrate(opts: MigrateOptions): Promise<MigrateRepo
 	// --- exec approvals --------------------------------------------------
 	domains.push(
 		await safeDomain("execApprovals", opts.onProgress, async () => {
-			// Enumerate full list when the source supports it (filesystem mode).
-			// Convex mode also enumerates via its `list` query — we hand each
-			// command + pattern to the target's typed recordApproval API so
-			// dedup + hard-deny guards on the destination side apply.
-			let commands: string[] = [];
-			let patterns: string[] = [];
-			const localLister = (source.execApprovals as {
-				listAll?: (agentId: string) => Promise<{ commands: string[]; patterns: string[] }>;
-			}).listAll;
-			if (typeof localLister === "function") {
-				const all = await localLister.call(source.execApprovals, "main");
-				commands = all.commands;
-				patterns = all.patterns;
-			} else {
-				// Convex source — re-derive by calling the underlying list query
-				// via readSummary's path (not ideal, but covers the migrate-from-
-				// convex case until ConvexExecApprovalStore exposes listAll).
-				const summary = await source.execApprovals.readSummary("main");
-				return { copied: summary.commandCount + summary.patternCount, verified: false };
-			}
+			// `list` is on the ExecApprovalStore interface and BOTH modes
+			// implement it (returns {commands, patterns}). The old code used an
+			// optional `listAll` that only existed on the filesystem store, so the
+			// convex→filesystem direction returned a count-only stub and copied
+			// NOTHING while still reporting success. Use the interface method so
+			// the copy loop below runs in both directions; the target's typed
+			// recordApproval API applies dedup + hard-deny guards.
+			const all = await source.execApprovals.list("main");
+			const commands = all.commands;
+			const patterns = all.patterns;
 			if (!opts.dryRun) {
 				for (const value of commands) {
 					try {
@@ -345,32 +445,82 @@ export async function runStoreMigrate(opts: MigrateOptions): Promise<MigrateRepo
 		}),
 	);
 
-	// --- skills ----------------------------------------------------------
+	// --- skills (managed root + per-agent workspace) --------------------
 	domains.push(
 		await safeDomain("skills", opts.onProgress, async () => {
-			const { records } = await source.skills.list({ workspaceDir: opts.stateDir });
-			if (!opts.dryRun) {
-				for (const r of records as Array<Record<string, unknown>>) {
-					// Read ref differs by store: filesystem keys on the SKILL.md path
-					// (`filePath`), convex on the name. Pass filePath when present.
-					const ref = (r.filePath as string) ?? (r.name as string) ?? "";
-					const body = await source.skills.read(ref);
-					// Prefer the fence-reconstructed full content (convex `read`
-					// surfaces it as `content`); the filesystem `read` returns the
-					// whole SKILL.md in `body`. Either gives the target a complete
-					// file so its split preserves the frontmatter.
-					const content =
-						(body as { content?: string; body?: string })?.content ??
-						(body as { body?: string })?.body ??
-						"";
-					await target.skills.write({
-						scope: "managed",
-						name: r.name as string,
-						content,
-					});
+			// Copy ONLY Brigade-owned skills, preserving scope + agent:
+			//   • MANAGED — one shared root, agent-independent.
+			//   • WORKSPACE — one set PER AGENT (the boot reconcile already does this;
+			//     migrate used to walk only "main", orphaning the rest).
+			// The other discovery sources (bundled / config / personal `~/.agents` /
+			// project) ship with the code or live outside Brigade — never copied.
+			// The old code copied list() wholesale and wrote everything as
+			// scope:"managed", which dragged in foreign sources AND destroyed the
+			// scope/agent distinction.
+			const { value: cfgVal } = await source.config.read();
+			const agentIds = collectAgentIds(cfgVal);
+			// Pin the managed list to an agent workspace dir (NOT stateDir) so the
+			// filesystem store's workspace-skills root can't collide with the managed
+			// root in discovery. The convex store ignores workspaceDir and keys on
+			// source/agentId — passing both keeps a single call correct for either.
+			const mainWs = resolveAgentWorkspaceDir("main");
+			const readContent = async (r: SkillRecord): Promise<string> => {
+				const ref = (r.filePath as string) ?? (r.name as string) ?? "";
+				const body = await source.skills.read(ref);
+				return (
+					(body as { content?: string; body?: string })?.content ??
+					(body as { body?: string })?.body ??
+					""
+				);
+			};
+			const copied: string[] = []; // keys: `managed::name` | `workspace:<agent>:name`
+
+			// MANAGED
+			{
+				const { records } = await source.skills.list({ workspaceDir: mainWs, source: "managed" });
+				for (const r of (records as SkillRecord[]).filter((x) => x.source === "managed")) {
+					const content = await readContent(r);
+					if (!content) continue;
+					if (!opts.dryRun) await target.skills.write({ scope: "managed", name: r.name as string, content });
+					copied.push(`managed::${String(r.name)}`);
 				}
 			}
-			return { copied: records.length, verified: !verifySha ? false : records.length === (await target.skills.list({ workspaceDir: opts.stateDir })).records.length };
+			// WORKSPACE — per agent
+			for (const agentId of agentIds) {
+				const wsDir = resolveAgentWorkspaceDir(agentId);
+				const { records } = await source.skills.list({ workspaceDir: wsDir, agentId, source: "workspace" });
+				for (const r of (records as SkillRecord[]).filter((x) => x.source === "workspace")) {
+					const content = await readContent(r);
+					if (!content) continue;
+					if (!opts.dryRun) {
+						await target.skills.write({ scope: "workspace", agentId, name: r.name as string, content });
+					}
+					copied.push(`workspace:${agentId}:${String(r.name)}`);
+				}
+			}
+
+			// Verify by the NAME+SCOPE+AGENT key set, not by count (a count match was
+			// a false green when scopes/agents were collapsed).
+			let verified = false;
+			if (verifySha && !opts.dryRun) {
+				const got = new Set<string>();
+				const m = await target.skills.list({ workspaceDir: mainWs, source: "managed" });
+				for (const r of (m.records as SkillRecord[]).filter((x) => x.source === "managed")) {
+					got.add(`managed::${String(r.name)}`);
+				}
+				for (const agentId of agentIds) {
+					const w = await target.skills.list({
+						workspaceDir: resolveAgentWorkspaceDir(agentId),
+						agentId,
+						source: "workspace",
+					});
+					for (const r of (w.records as SkillRecord[]).filter((x) => x.source === "workspace")) {
+						got.add(`workspace:${agentId}:${String(r.name)}`);
+					}
+				}
+				verified = copied.every((k) => got.has(k));
+			}
+			return { copied: copied.length, verified };
 		}),
 	);
 
@@ -395,20 +545,28 @@ export async function runStoreMigrate(opts: MigrateOptions): Promise<MigrateRepo
 			for (const channelId of channelsToScan) {
 				const accounts = ["default"];
 				for (const accountId of accounts) {
-					const allowed = await source.channels.listAllowedSenders({
-						channelId,
-						accountId,
-					});
-					if (!opts.dryRun) {
-						for (const senderId of allowed) {
-							await target.channels.addAllowedSender({
-								channelId,
-								accountId,
-								senderId,
-							});
+					// Copy BOTH the direct allow-list and the group allow-list —
+					// they're separate lists keyed by the `group` flag. Migrating
+					// only direct senders silently dropped every approved group on a
+					// mode switch (and cleanSource then wiped the local copy).
+					for (const group of [false, true]) {
+						const allowed = await source.channels.listAllowedSenders({
+							channelId,
+							accountId,
+							group,
+						});
+						if (!opts.dryRun) {
+							for (const senderId of allowed) {
+								await target.channels.addAllowedSender({
+									channelId,
+									accountId,
+									senderId,
+									group,
+								});
+							}
 						}
+						total += allowed.length;
 					}
-					total += allowed.length;
 				}
 			}
 			return { copied: total, verified: false };
@@ -463,6 +621,7 @@ export async function runStoreMigrate(opts: MigrateOptions): Promise<MigrateRepo
 
 	// --- mode.sentinel flip ----------------------------------------------
 	let sentinelWritten = false;
+	let convexPin: string | undefined;
 	if (!opts.dryRun) {
 		try {
 			if (opts.to === "convex") {
@@ -470,10 +629,10 @@ export async function runStoreMigrate(opts: MigrateOptions): Promise<MigrateRepo
 				// not just the flag — else a flag-less run wrote `{}` here and
 				// writeSentinel threw "convex mode requires a convexUrl".
 				const { resolveConvexUrl } = await import("./convex/client.js");
-				const pin = resolveConvexUrl(
+				convexPin = resolveConvexUrl(
 					resolvedConvexUrl !== undefined ? { url: resolvedConvexUrl } : {},
 				);
-				writeSentinelNow("convex", { convexUrl: pin }, { stateDir: opts.stateDir });
+				writeSentinelNow("convex", { convexUrl: convexPin }, { stateDir: opts.stateDir });
 			} else {
 				// → filesystem: keep the prior convexUrl as a dormant field so a
 				// later `--to convex` round-trips without re-supplying the URL.
@@ -491,8 +650,33 @@ export async function runStoreMigrate(opts: MigrateOptions): Promise<MigrateRepo
 		}
 	}
 
+	// Close BEFORE wiping — release any handles on the local dir (Windows EBUSY).
 	await source.close();
 	await target.close();
+
+	// --- clean the local source after a verified convex migrate ----------
+	// Only when: the caller didn't opt out, we're going TO convex, the flip
+	// succeeded, and EVERY domain copied without error (a partial copy must
+	// keep the source — it's the only complete copy left). Failure here is
+	// non-fatal: the data is safely in convex and the sentinel points there;
+	// a leftover local source is hygiene, not correctness.
+	let sourceCleaned = false;
+	const cleanSource = opts.cleanSource !== false; // default ON
+	if (
+		!opts.dryRun &&
+		opts.to === "convex" &&
+		cleanSource &&
+		sentinelWritten &&
+		convexPin !== undefined &&
+		domains.every((d) => !d.error)
+	) {
+		try {
+			cleanLocalSourceAfterConvexMigrate(opts.stateDir, convexPin);
+			sourceCleaned = true;
+		} catch {
+			// keep going — report sourceCleaned: false
+		}
+	}
 
 	return {
 		to: opts.to,
@@ -501,6 +685,7 @@ export async function runStoreMigrate(opts: MigrateOptions): Promise<MigrateRepo
 		skipVerify: !!opts.skipVerify,
 		domains,
 		sentinelWritten,
+		sourceCleaned,
 		durationMs: Date.now() - startedAt,
 	};
 }
