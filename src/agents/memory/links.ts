@@ -25,8 +25,9 @@ import type { MemoryRecord } from "./records.js";
  */
 export type MemoryLinkKind =
 	| "supersedes" // this fact replaces the target (the correction edge)
+	| "transition" // temporal evolution: this fact is what the target BECAME (Step 19)
 	| "corrects" // amends the target without fully replacing it
-	| "relates" // generic association
+	| "relates" // generic association (synonymy edges land here, Step 19)
 	| "derived_from" // distilled/extracted from the target
 	| "supports" // corroborates the target
 	| "contradicts"; // conflicts with the target

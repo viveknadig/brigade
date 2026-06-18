@@ -74,6 +74,19 @@ describe("storeExtractedFacts", () => {
 		assert.equal(correction?.metadata?.corrects, "pnpm");
 		assert.equal(correction?.sourceTurn, "turn-1");
 	});
+
+	it("stamps a CHANNEL origin + sourceType so peer-derived facts are ISOLATED, not owner-scoped (poisoned-inbox guard)", () => {
+		const peer = { kind: "channel", channelId: "wa", conversationId: "c1", sessionKey: "s1" } as const;
+		storeExtractedFacts(dir, [{ content: "the user prefers tabs", segment: "preference" }], "turn-peer", {
+			origin: peer,
+			sourceType: "channel_message",
+		});
+		const store = new FactStore(dir);
+		assert.equal(store.list({ origin: { kind: "owner" } }).length, 0, "NOT in owner scope — can't poison the operator's recall");
+		const peerFacts = store.list({ origin: peer });
+		assert.equal(peerFacts.length, 1, "present only in the peer's own isolated scope");
+		assert.equal(peerFacts[0]?.sourceType, "channel_message", "honest provenance stamp");
+	});
 });
 
 describe("flattenConversation", () => {
@@ -102,6 +115,20 @@ describe("runExtractionSweep — batched, cursor-tracked, LLM injected", () => {
 		assert.equal(res.processedTo, 2);
 		assert.equal(getCursor(dir, "s1"), 2);
 		assert.equal(new FactStore(dir).list()[0]?.content, "User name is Bhasvanth.");
+	});
+
+	it("a CHANNEL-origin sweep isolates peer-derived facts; an owner sweep stays owner-scoped (the live poisoned-inbox fix)", async () => {
+		const peer = { kind: "channel", channelId: "wa", conversationId: "c1", sessionKey: "s1" } as const;
+		const llm = async () => '{"facts":[{"content":"prefers deploying on Mondays","segment":"preference"}]}';
+		// A peer turn's extraction must land in the PEER's scope, never the operator's.
+		await runExtractionSweep({ workspaceDir: dir, sessionId: "peer-sess", messages, llm, origin: peer, sourceType: "channel_message" });
+		const store = new FactStore(dir);
+		assert.equal(store.list({ origin: { kind: "owner" } }).length, 0, "peer extraction did NOT leak into owner scope");
+		assert.equal(store.list({ origin: peer }).length, 1, "peer extraction isolated to the peer");
+
+		// An owner turn's extraction is owner-scoped, as before.
+		await runExtractionSweep({ workspaceDir: dir, sessionId: "owner-sess", messages, llm, origin: { kind: "owner" } });
+		assert.equal(store.list({ origin: { kind: "owner" } }).length, 1, "owner extraction lands in owner scope");
 	});
 
 	it("is a no-op when there's nothing new since the cursor (no LLM call)", async () => {

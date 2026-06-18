@@ -213,8 +213,10 @@ export class Tideline {
 	}
 
 	// ── purge ──
-	/** Retract facts — v1 soft purge: lifecycle → `pruned` (excluded from recall).
-	 *  Phase-3 `purge` (step 24) adds crypto-shred + cascade along `sourcePointers`. */
+	/** SOFT purge (reversible): lifecycle → `pruned` (excluded from recall, record
+	 *  retained). This is the facade's gentle retract. For the DESTRUCTIVE Step-24
+	 *  crypto-shred (hard-delete + cascade along `sourcePointers`), use
+	 *  `governance.purge` / `FactStore.purge` — a different, irreversible verb. */
 	purge(memoryIds: string[]): void {
 		this.store.setLifecycle(memoryIds, "pruned");
 	}

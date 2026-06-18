@@ -1,6 +1,11 @@
+import { execFileSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
+
 import { Command } from "commander";
 
 import { runSingleTurn } from "../../agents/agent-loop.js";
+import type { SlopFile } from "../../agents/quality/slop-index.js";
 import {
   parseSlashCommand,
   SLASH_COMMAND_HELP,
@@ -21,6 +26,11 @@ interface AgentOptions {
   model?: string;
   workspace?: string;
   thinkingLevel?: "off" | "low" | "medium" | "high";
+  /** Drive the message as an AUTONOMOUS task across multiple turns until the
+   *  agent emits the completion marker or a guard fires. */
+  autonomous?: boolean;
+  /** Autonomous turn cap (the runaway bound). Default 25. */
+  maxIterations?: number;
 }
 
 export function registerAgentCommand(program: Command): void {
@@ -38,6 +48,8 @@ export function registerAgentCommand(program: Command): void {
       "off | low | medium | high (model-dependent)",
       "off",
     )
+    .option("--autonomous", "drive the message as a task across multiple turns until done or a limit")
+    .option("--max-iterations <n>", "autonomous turn cap (default 25)", (v) => Number.parseInt(v, 10))
     .action(async (raw: AgentOptions) => {
       await runAgentTurn(raw);
     });
@@ -170,6 +182,55 @@ export async function runAgentTurn(opts: AgentOptions): Promise<void> {
   process.on("SIGINT", onSigint);
   process.on("SIGTERM", onSigint);
 
+  // ── Autonomous mode: drive the task across MULTIPLE turns under the loop
+  // guards until the agent emits the completion marker (or doneChecks/guards
+  // fire). The SAME sessionKey each turn carries the conversation + tool
+  // results forward; the done-model is the loop-runner's (marker / objective
+  // checks / max-iterations). Ctrl-C aborts via the shared signal.
+  if (opts.autonomous) {
+    const { DEFAULT_COMPLETION_MARKER, autonomousModePrompt, runAutonomousAgent } = await import(
+      "../../agents/loop/autonomous-agent.js"
+    );
+    const marker = DEFAULT_COMPLETION_MARKER;
+    // Code Slop-Index gate (Step 33): won't let the run "finish" on a high-slop
+    // diff. Self-disabling outside a git repo / for non-code tasks.
+    const slopGate = buildSlopGate(process.cwd());
+    let turns = 0;
+    try {
+      const auto = await runAutonomousAgent({
+        task: `${autonomousModePrompt(marker)}\n\nYour task:\n${messageForAgent}`,
+        completionMarker: marker,
+        maxIterations: opts.maxIterations && opts.maxIterations > 0 ? opts.maxIterations : 25,
+        ...(slopGate ? { slopGate } : {}),
+        runTurn: async (prompt) => {
+          turns++;
+          const r = await runSingleTurn({
+            agentId,
+            provider,
+            modelId,
+            message: prompt,
+            sessionKey,
+            workspaceDir: opts.workspace,
+            thinkingLevel: opts.thinkingLevel ?? "off",
+            signal: abortController.signal,
+          });
+          process.stdout.write(`\n[turn ${turns}] ${r.reply}\n`);
+          return r.reply;
+        },
+      });
+      console.error(
+        `[brigade] autonomous run ${auto.done ? "✓ completed" : "stopped"} — ` +
+          `reason=${auto.stopReason}, turns=${auto.outputs.length}` +
+          (auto.slopRepairs > 0 ? `, slop-rewrites=${auto.slopRepairs}` : "") +
+          (auto.completionVetoes > 0 ? `, slop-gate-vetoes=${auto.completionVetoes}` : ""),
+      );
+    } finally {
+      process.off("SIGINT", onSigint);
+      process.off("SIGTERM", onSigint);
+    }
+    return;
+  }
+
   let result: Awaited<ReturnType<typeof runSingleTurn>>;
   try {
     // No try/catch around runSingleTurn for the *non-abort* path — runtime
@@ -245,4 +306,54 @@ function resetSession(args: { agentId: string; sessionKey: string }): void {
     delete store.sessions[args.sessionKey];
     writeSessionStore(args.agentId, store);
   }
+}
+
+// Source files the code Slop-Index scores (Step 33). Non-code edits (docs,
+// config) are not graded — the gate is about code quality.
+const CODE_FILE = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|c|cc|cpp|h|hpp|cs|swift|kt)$/i;
+
+function gitOutput(cwd: string, args: string[]): string | undefined {
+  try {
+    return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
+  } catch {
+    return undefined;
+  }
+}
+
+// Working-tree-dirty paths (relative to the repo root), NUL-separated so paths
+// with spaces are safe. Empty when not a git repo / git missing.
+function gitDirtyPaths(repoRoot: string): string[] {
+  const out = gitOutput(repoRoot, ["status", "--porcelain", "-z"]);
+  if (out === undefined) return [];
+  return out
+    .split("\0")
+    .map((entry) => entry.slice(3)) // strip the 2-char XY status + space
+    .filter((p) => p.length > 0);
+}
+
+/**
+ * Build the code Slop-Index completion gate for the LIVE autonomous run. Snapshots
+ * the already-dirty files at run start, then scores only the code files the agent
+ * NEWLY changed — so pre-existing uncommitted work isn't blamed for the agent's
+ * slop. Returns undefined (no gate) when the cwd isn't a git repo or git is absent,
+ * so the gate can never wrongly block a non-git or non-code run.
+ */
+function buildSlopGate(cwd: string): { getChangedFiles: () => SlopFile[] } | undefined {
+  const root = gitOutput(cwd, ["rev-parse", "--show-toplevel"])?.trim();
+  if (!root) return undefined;
+  const baseline = new Set(gitDirtyPaths(root));
+  return {
+    getChangedFiles: () => {
+      const fresh = gitDirtyPaths(root).filter((p) => !baseline.has(p) && CODE_FILE.test(p));
+      const files: SlopFile[] = [];
+      for (const rel of fresh) {
+        try {
+          files.push({ path: rel, content: fs.readFileSync(path.join(root, rel), "utf8") });
+        } catch {
+          /* deleted / unreadable since the diff — skip */
+        }
+      }
+      return files;
+    },
+  };
 }

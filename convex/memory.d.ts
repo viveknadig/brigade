@@ -6,12 +6,12 @@ export declare const listFacts: import("convex/server").RegisteredQuery<"public"
     _id: import("convex/values").GenericId<"memoryFacts">;
     _creationTime: number;
     metadata?: any;
-    status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
+    status?: "confirmed" | "asserted" | "provisional" | "disputed" | "retracted" | undefined;
     sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
-        kind: "supersedes" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        kind: "supersedes" | "transition" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
         target: string;
     }[] | undefined;
     validFrom?: number | undefined;
@@ -41,12 +41,12 @@ export declare const listFacts: import("convex/server").RegisteredQuery<"public"
 }[]>>;
 export declare const writeFact: import("convex/server").RegisteredMutation<"public", {
     metadata?: any;
-    status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
+    status?: "confirmed" | "asserted" | "provisional" | "disputed" | "retracted" | undefined;
     sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
-        kind: "supersedes" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        kind: "supersedes" | "transition" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
         target: string;
     }[] | undefined;
     validFrom?: number | undefined;
@@ -73,12 +73,12 @@ export declare const writeFact: import("convex/server").RegisteredMutation<"publ
     _id: import("convex/values").GenericId<"memoryFacts">;
     _creationTime: number;
     metadata?: any;
-    status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
+    status?: "confirmed" | "asserted" | "provisional" | "disputed" | "retracted" | undefined;
     sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
-        kind: "supersedes" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        kind: "supersedes" | "transition" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
         target: string;
     }[] | undefined;
     validFrom?: number | undefined;
@@ -116,12 +116,12 @@ export declare const listAllFacts: import("convex/server").RegisteredQuery<"publ
     _id: import("convex/values").GenericId<"memoryFacts">;
     _creationTime: number;
     metadata?: any;
-    status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
+    status?: "confirmed" | "asserted" | "provisional" | "disputed" | "retracted" | undefined;
     sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
-        kind: "supersedes" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        kind: "supersedes" | "transition" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
         target: string;
     }[] | undefined;
     validFrom?: number | undefined;
@@ -154,12 +154,12 @@ export declare const listAllFacts: import("convex/server").RegisteredQuery<"publ
  *  realises its whole-file diffs through this. */
 export declare const upsertFactRecord: import("convex/server").RegisteredMutation<"public", {
     metadata?: any;
-    status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
+    status?: "confirmed" | "asserted" | "provisional" | "disputed" | "retracted" | undefined;
     sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
-        kind: "supersedes" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        kind: "supersedes" | "transition" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
         target: string;
     }[] | undefined;
     validFrom?: number | undefined;
@@ -250,12 +250,12 @@ export declare const searchContent: import("convex/server").RegisteredQuery<"pub
     _id: import("convex/values").GenericId<"memoryFacts">;
     _creationTime: number;
     metadata?: any;
-    status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
+    status?: "confirmed" | "asserted" | "provisional" | "disputed" | "retracted" | undefined;
     sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
-        kind: "supersedes" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        kind: "supersedes" | "transition" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
         target: string;
     }[] | undefined;
     validFrom?: number | undefined;
@@ -292,12 +292,12 @@ export declare const findSimilar: import("convex/server").RegisteredQuery<"publi
     _id: import("convex/values").GenericId<"memoryFacts">;
     _creationTime: number;
     metadata?: any;
-    status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
+    status?: "confirmed" | "asserted" | "provisional" | "disputed" | "retracted" | undefined;
     sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
-        kind: "supersedes" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        kind: "supersedes" | "transition" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
         target: string;
     }[] | undefined;
     validFrom?: number | undefined;

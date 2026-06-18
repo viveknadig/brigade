@@ -29,7 +29,7 @@ import { pickInitialThinkingLevel } from "../../core/model-caps.js";
 import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { applyPersonaOverrideToSession } from "../../system-prompt/pi-injection.js";
 import { wrapStreamFnWithPayloadMutations } from "../payload-mutators.js";
-import { FactStore, MEMORY_SEGMENTS, type MemorySegment } from "./records.js";
+import { FactStore, MEMORY_SEGMENTS, type MemoryRecordOrigin, type MemorySegment, type MemorySourceType } from "./records.js";
 
 const log = createSubsystemLogger("memory/extract");
 
@@ -101,6 +101,7 @@ export function storeExtractedFacts(
 	workspaceDir: string,
 	facts: ExtractedFact[],
 	sourceTurn?: string,
+	opts: { origin?: MemoryRecordOrigin; sourceType?: MemorySourceType } = {},
 ): number {
 	if (facts.length === 0) return 0;
 	const store = new FactStore(workspaceDir);
@@ -112,6 +113,14 @@ export function storeExtractedFacts(
 			segment: f.segment as MemorySegment,
 			...(f.importance !== undefined ? { importance: f.importance } : {}),
 			...(sourceTurn ? { sourceTurn } : {}),
+			// ORIGIN + sourceType — the security-critical stamp. Peer-derived
+			// extraction MUST carry the turn's CHANNEL origin (isolated by the origin
+			// filter) so it can't surface as the operator's own ground truth, and an
+			// honest sourceType so the write-gate sees it for what it is. Left
+			// undefined, a write resolves to OWNER origin and skips the gate — the
+			// poisoned-inbox breach. Owner-turn extraction passes the owner origin.
+			...(opts.origin ? { createdBy: opts.origin } : {}),
+			...(opts.sourceType ? { sourceType: opts.sourceType } : {}),
 			// `corrects` only belongs on a correction; a misbehaving model
 			// could attach it to any segment, so we drop it elsewhere.
 			...(f.corrects && f.segment === "correction" ? { metadata: { corrects: f.corrects } } : {}),
@@ -218,6 +227,15 @@ export interface SweepArgs {
 	llm: ExtractionLlm;
 	/** Minimum NEW messages since the cursor before a sweep runs. Default 2. */
 	minNewMessages?: number;
+	/**
+	 * Origin to stamp on every extracted fact (`createdBy`). Owner-turn ⇒ owner
+	 * scope; channel-turn ⇒ the peer's channel origin, so peer-derived facts are
+	 * ISOLATED and can't poison the operator's recall. Omitted ⇒ owner-default
+	 * (test-only convenience). The gateway always threads it from the turn.
+	 */
+	origin?: MemoryRecordOrigin;
+	/** Provenance sourceType (e.g. "channel_message" for peer-derived facts). */
+	sourceType?: MemorySourceType;
 }
 
 export interface SweepResult {
@@ -252,7 +270,10 @@ export async function runExtractionSweep(args: SweepArgs): Promise<SweepResult> 
 		return { ran: false, stored: 0, processedTo: from };
 	}
 	const facts = parseExtractedFacts(reply);
-	const stored = storeExtractedFacts(args.workspaceDir, facts, args.sessionId);
+	const stored = storeExtractedFacts(args.workspaceDir, facts, args.sessionId, {
+		...(args.origin ? { origin: args.origin } : {}),
+		...(args.sourceType ? { sourceType: args.sourceType } : {}),
+	});
 	// Advance the cursor past everything we just considered (even if 0 stored —
 	// re-distilling the same turns would only waste calls).
 	writeCursor(args.workspaceDir, args.sessionId, total);

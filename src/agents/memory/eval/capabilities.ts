@@ -14,6 +14,7 @@
  * have no fixed cap, so their default is "return all matching candidates".
  */
 
+import { recallWithGraph } from "../graph-recall.js";
 import { FactStore, type RecordOriginFilter } from "../records.js";
 import { bm25Score, linearScanScore } from "../scoring.js";
 import type { RecallCapability } from "./harness.js";
@@ -116,6 +117,31 @@ export function hybridRecallCapability(store: FactStore, origin?: RecordOriginFi
  * earns its keep on PRECISION / ranking / abstention / latency at scale (the
  * oracle has perfect recall but answers every abstention query wrongly).
  */
+/**
+ * **Graph-augmented recall** (Step 20) — the gated spreading-activation walk
+ * over the store's active + origin-filtered records. `forceWalk` is ON for the
+ * eval lane so the multi-hop benefit is measurable on a multi-hop gold set (the
+ * route-gate's "single-fact flat" behaviour is asserted separately in
+ * graph-recall.test.ts). Lets the harness show "multi-hop category ↑ vs hybrid".
+ */
+export function graphRecallCapability(store: FactStore, origin?: RecordOriginFilter): RecallCapability {
+	return {
+		async search(query, opts) {
+			// `store.list` is gated by lifecycle/segment/origin only; the bi-temporal
+			// valid-time gate (validTo > now) is applied INSIDE recallWithGraph, so
+			// this lane and oracleCapability score the SAME candidate set (expired
+			// future-dated facts excluded from both) — the multi-hop comparison stays
+			// apples-to-apples.
+			const active = store.list(origin !== undefined ? { origin } : {});
+			const hits = recallWithGraph(active, query, {
+				forceWalk: true,
+				...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
+			});
+			return hits.map((h) => ({ id: h.record.memoryId, score: h.score }));
+		},
+	};
+}
+
 export function oracleCapability(store: FactStore, origin?: RecordOriginFilter): RecallCapability {
 	return {
 		async search(_query, opts) {

@@ -49,6 +49,7 @@ import { makeManageSkillTool } from "./manage-skill-tool.js";
 // happen inside the action body.
 import { makeOrgTool } from "./org-tool.js";
 import { loadConfig as _loadConfigForOrgGate } from "../../core/config.js";
+import { makeManageMemoryTool } from "./manage-memory-tool.js";
 import { makeReadMemoryTool, makeRecallMemoryTool, makeWriteMemoryTool } from "./memory-tools.js";
 import { makeSendMediaTool } from "./send-media-tool.js";
 import { makeSendMessageTool } from "./send-message-tool.js";
@@ -219,6 +220,11 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// capability. The per-call gate inside the tool stamps the right
 		// MemoryRecordOrigin so subsequent recalls can filter to caller-own.
 		makeWriteMemoryTool(capability, memoryScope),
+		// manage_memory — owner-only Phase-3 maintenance + governance: run a dream
+		// reflection on demand, crypto-shred a fact (+ cascade), inspect provenance,
+		// export, or apply retention. The live operator surface for Tideline's
+		// dream/governance behaviours (otherwise library-only).
+		makeManageMemoryTool(opts.workspaceDir),
 		// agents_list — read-only enumeration of agents the caller can target.
 		// Mirrors the reference codebase's posture: the model can SEE the agent
 		// catalog without any privilege check.

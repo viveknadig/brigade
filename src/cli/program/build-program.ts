@@ -1467,6 +1467,21 @@ export function buildProgram(): Command {
       },
     );
 
+  // `brigade mcp` — serve this agent's long-term memory as an MCP server over
+  // stdio (add / search / context), owner-bound. Point an MCP client at
+  // `brigade mcp` as the command.
+  program
+    .command("mcp")
+    .description(
+      "Serve your long-term memory as an MCP server over stdio (add / search / context).\n" +
+        "  Point an MCP client at:  brigade mcp",
+    )
+    .option("--agent <id>", "agent whose memory to serve (default: main)")
+    .action(async (opts: { agent?: string }) => {
+      const { runMemoryMcpServerCli } = await import("../commands/mcp-cmd.js");
+      await exitAfterFlush(await runMemoryMcpServerCli({ ...(opts.agent ? { agentId: opts.agent } : {}) }));
+    });
+
   return program;
 }
 

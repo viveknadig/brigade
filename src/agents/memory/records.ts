@@ -264,6 +264,17 @@ export function resolveRecordOrigin(
 	return origin ?? { kind: "owner" };
 }
 
+/** Origin-isolation bucket key. Owner (and legacy/undefined-origin) facts share
+ *  one bucket; each channel peer (channelId+conversationId+sessionKey) is its
+ *  OWN bucket — so any cross-fact operation (consolidation, dream merges) can
+ *  group by this and never mix origins. The canonical key; consolidate.ts +
+ *  dream.ts + FactStore.distinctOrigins all route through it. */
+export function originBucketKey(r: Pick<MemoryRecord, "createdBy">): string {
+	const o = resolveRecordOrigin(r.createdBy);
+	if (o.kind !== "channel") return "owner";
+	return `channel:${o.channelId ?? ""}:${o.conversationId ?? ""}:${o.sessionKey ?? ""}`;
+}
+
 /** Two origins are the same when both fields-by-fields match. */
 export function sameOrigin(
 	a: MemoryRecordOrigin | undefined,
@@ -577,9 +588,15 @@ export class FactStore {
 				slotSuperseded.push(r.memoryId);
 			}
 			if (slotSuperseded.length > 0) {
+				// `contradicts` flags the conflict for consolidation; `transition`
+				// records the temporal evolution (Step 19) so the graph walk + the
+				// dream can trace what this belief BECAME and count repeated changes.
 				record.links = [
 					...(record.links ?? []),
-					...slotSuperseded.map((target) => ({ kind: "contradicts" as const, target })),
+					...slotSuperseded.flatMap((target) => [
+						{ kind: "contradicts" as const, target },
+						{ kind: "transition" as const, target },
+					]),
 				];
 			}
 		}
@@ -840,8 +857,17 @@ export class FactStore {
 		if (opts.supersededBy) {
 			const by = all.find((r) => r.memoryId === opts.supersededBy);
 			if (by) {
-				const kept = (by.links ?? []).filter((l) => !(l.kind === "contradicts" && l.target === staleId));
-				const links: MemoryLink[] = [...kept, { kind: "contradicts", target: staleId }];
+				// Idempotent: drop any prior contradicts/transition edge to this
+				// stale id, then re-add both — `contradicts` (conflict flag) +
+				// `transition` (Step 19 temporal evolution edge for the graph/dream).
+				const kept = (by.links ?? []).filter(
+					(l) => !((l.kind === "contradicts" || l.kind === "transition") && l.target === staleId),
+				);
+				const links: MemoryLink[] = [
+					...kept,
+					{ kind: "contradicts", target: staleId },
+					{ kind: "transition", target: staleId },
+				];
 				by.links = links;
 			}
 		}
@@ -854,6 +880,113 @@ export class FactStore {
 			...(opts.supersededBy ? { targets: [opts.supersededBy] } : {}),
 		});
 		return stale;
+	}
+
+	/**
+	 * Lane B (Step 25) — REVERSE a retraction: re-activate an `archived` fact and
+	 * clear its valid-time bound so it surfaces again. The reversible counterpart
+	 * to {@link invalidate} — the operator's "restore" after an over-eager
+	 * retraction. Persisted + logged (a `reinforced` event: the fact is reasserted
+	 * as valid). Returns the record, or `undefined` if it's missing / not archived.
+	 */
+	reactivate(id: string, opts: { now?: number } = {}): MemoryRecord | undefined {
+		const all = this.readAll();
+		const rec = all.find((r) => r.memoryId === id);
+		if (!rec || rec.lifecycle !== "archived") return undefined;
+		rec.lifecycle = "active";
+		rec.validTo = undefined;
+		this.writeAll(all);
+		this.emit({ at: opts.now ?? Date.now(), kind: "reinforced", memoryId: id, segment: rec.segment });
+		return rec;
+	}
+
+	/**
+	 * Dream/curator lane (Step 22) — REVERSIBLE: patch cognition fields on an
+	 * ACTIVE record, used to PROMOTE a repeatedly-corrected belief to a confirmed
+	 * preference. Returns the PRIOR {confidence,status,importance} (also recorded
+	 * in the "confirmed" event) so a dream pass can be undone — Lane A is
+	 * reversible by design. No-op (undefined) if `memoryId` isn't an active record.
+	 */
+	promote(
+		memoryId: string,
+		patch: { status?: MemoryStatus; confidence?: number; importance?: number },
+		opts: { now?: number } = {},
+	): { confidence?: number; status?: MemoryStatus; importance?: number } | undefined {
+		const clamp01 = (x: number): number => Math.max(0, Math.min(1, x));
+		const all = this.readAll();
+		const rec = all.find((r) => r.memoryId === memoryId);
+		if (!rec || rec.lifecycle !== "active") return undefined;
+		const prior: { confidence?: number; status?: MemoryStatus; importance?: number } = {
+			...(rec.confidence !== undefined ? { confidence: rec.confidence } : {}),
+			...(rec.status !== undefined ? { status: rec.status } : {}),
+			importance: rec.importance,
+		};
+		if (patch.status !== undefined) rec.status = patch.status;
+		if (patch.confidence !== undefined) rec.confidence = clamp01(patch.confidence);
+		if (patch.importance !== undefined) rec.importance = clamp01(patch.importance);
+		this.writeAll(all);
+		this.emit({ at: opts.now ?? Date.now(), kind: "confirmed", memoryId, segment: rec.segment, prior });
+		return prior;
+	}
+
+	/**
+	 * Dream/curator lane (Step 22): archive low-value decayed facts, emitting an
+	 * "evicted" event per fact. Returns the ids actually archived (skips already
+	 * non-active ones). Distinct from decay GC's `setLifecycle` in that it logs.
+	 */
+	evict(ids: readonly string[], opts: { now?: number } = {}): string[] {
+		if (ids.length === 0) return [];
+		const now = opts.now ?? Date.now();
+		const set = new Set(ids);
+		const all = this.readAll();
+		const evicted: string[] = [];
+		for (const r of all) {
+			if (set.has(r.memoryId) && r.lifecycle === "active") {
+				r.lifecycle = "archived";
+				r.validTo = r.validTo ?? now;
+				evicted.push(r.memoryId);
+			}
+		}
+		if (evicted.length === 0) return [];
+		this.writeAll(all);
+		for (const id of evicted) {
+			const seg = all.find((r) => r.memoryId === id)?.segment;
+			this.emit({ at: now, kind: "evicted", memoryId: id, ...(seg ? { segment: seg } : {}) });
+		}
+		return evicted;
+	}
+
+	/**
+	 * Governance (Step 24) — HARD-delete records (crypto-shred: the sealed
+	 * content is REMOVED, not archived, so it's unrecoverable even with the key).
+	 * Returns the ids actually removed. Filesystem rewrites the JSONL without
+	 * them; convex mode realises the deletion through the write-through diff.
+	 * Distinct from evict/setLifecycle, which only flip lifecycle.
+	 */
+	purge(ids: readonly string[]): string[] {
+		if (ids.length === 0) return [];
+		const set = new Set(ids);
+		const all = this.readAll();
+		const removed = all.filter((r) => set.has(r.memoryId)).map((r) => r.memoryId);
+		if (removed.length === 0) return [];
+		this.writeAll(all.filter((r) => !set.has(r.memoryId)));
+		return removed;
+	}
+
+	/**
+	 * The DISTINCT origins present in the active store (owner + each channel
+	 * peer). The per-origin fan-out seam: the curator/dream run one pass per
+	 * origin so a cross-fact operation never mixes principals. Deduped by
+	 * {@link originBucketKey}; owner first, then channels in stable key order.
+	 */
+	distinctOrigins(): MemoryRecordOrigin[] {
+		const byKey = new Map<string, MemoryRecordOrigin>();
+		for (const r of this.readAll()) {
+			if (r.lifecycle !== "active") continue;
+			const key = originBucketKey(r);
+			if (!byKey.has(key)) byKey.set(key, resolveRecordOrigin(r.createdBy));
+		}
+		return [...byKey.entries()].sort((a, b) => (a[0] === "owner" ? -1 : b[0] === "owner" ? 1 : a[0].localeCompare(b[0]))).map(([, o]) => o);
 	}
 
 	/** Set the lifecycle of specific records (used by decay GC). */

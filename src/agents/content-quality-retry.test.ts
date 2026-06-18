@@ -170,3 +170,22 @@ describe("detectContentIssue — empty fallthrough", () => {
 		);
 	});
 });
+
+describe("detectContentIssue — slop (Step 31 post-generation gate)", () => {
+	const txt = (text: string) => ({ role: "assistant" as const, content: [{ type: "text", text }] });
+	it("flags a reply dense with filler / cliché phrasing", () => {
+		const slop =
+			"At the end of the day, it's important to note that we need to leverage synergy to unlock value. " +
+			"In today's fast-paced world, let's circle back and move the needle going forward to take it to the next level.";
+		assert.equal(detectContentIssue(txt(slop), true), "slop");
+	});
+	it("does NOT flag a concrete, substantive reply", () => {
+		assert.equal(
+			detectContentIssue(txt("Fixed the null check in parseConfig() at line 42; the failing test passes now."), true),
+			null,
+		);
+	});
+	it("structural issues take priority over slop (empty content stays empty)", () => {
+		assert.equal(detectContentIssue({ role: "assistant", content: [] }, true), "empty");
+	});
+});

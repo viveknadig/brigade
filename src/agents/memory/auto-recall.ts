@@ -25,6 +25,7 @@
 
 import type { MemoryCapability } from "../extensions/types.js";
 import { wrapUntrustedDataBlock } from "../../system-prompt/sanitize.js";
+import { recallWithGraph } from "./graph-recall.js";
 import { isDefaultMemoryCapability } from "./plugin-runtime.js";
 import { FactStore, type MemoryRecordOrigin, type RecordOriginFilter } from "./records.js";
 
@@ -124,13 +125,17 @@ async function buildBlockFromCapability(
 	opts: { origin?: RecordOriginFilter } = {},
 ): Promise<string | undefined> {
 	if (isDefaultMemoryCapability(capability)) {
-		const hits = capability.factStore.recall(query, {
-			limit: MAX_AUTO_RECALL_FACTS,
-			markAccessed: false,
-			...(opts.origin !== undefined ? { origin: opts.origin } : {}),
-		});
+		// Graph-augmented recall (Step 20) over the origin-filtered ACTIVE set —
+		// the walk's universe. recallWithGraph SEEDS via the same `recallHybrid`
+		// that `factStore.recall` uses, so a plain single-fact query (the route-
+		// gate declines) is IDENTICAL to hybrid recall; a multi-hop / temporal /
+		// relational message ALSO pulls in graph-connected facts. Read-only over
+		// `active` ⇒ passive (no decay reinforcement), matching markAccessed:false.
+		const store = capability.factStore;
+		const active = store.list(opts.origin !== undefined ? { origin: opts.origin } : {});
+		const hits = recallWithGraph(active, query, { limit: MAX_AUTO_RECALL_FACTS });
 		if (hits.length === 0) return undefined;
-		const facts = hits.map((f) => `- [${f.segment}] ${f.content}`).join("\n");
+		const facts = hits.map((h) => `- [${h.record.segment}] ${h.record.content}`).join("\n");
 		return renderBlock(facts);
 	}
 	// Plugin backends scope per-origin via the SDK `search` sessionKey (the

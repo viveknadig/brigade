@@ -161,6 +161,7 @@ export default defineSchema({
         v.object({
           kind: v.union(
             v.literal("supersedes"),
+            v.literal("transition"), // Step 19 — must mirror MemoryLinkKind (links.ts) exactly
             v.literal("corrects"),
             v.literal("relates"),
             v.literal("derived_from"),

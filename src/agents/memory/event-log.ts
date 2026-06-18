@@ -20,14 +20,16 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import type { MemorySegment, MemorySourceType } from "./records.js";
+import type { MemorySegment, MemorySourceType, MemoryStatus } from "./records.js";
 
 export type MemoryEventKind =
 	| "created" // a new fact was persisted (carries `targets` if it superseded any)
 	| "reinforced" // a near-duplicate write merged into an existing fact (decay bump)
 	| "blocked" // the write-gate rejected a poisoning write (carries `reason`)
 	| "feedback" // recall feedback adjusted a fact's importance/confidence (carries `signal`)
-	| "invalidated"; // a fact was bi-temporally invalidated (validTo closed; carries the superseder in `targets`)
+	| "invalidated" // a fact was bi-temporally invalidated (validTo closed; carries the superseder in `targets`)
+	| "confirmed" // the dream promoted a repeatedly-corrected belief to a confirmed preference (carries `prior` for reversal)
+	| "evicted"; // the dream archived a low-value decayed fact
 
 export interface MemoryEvent {
 	/** Event time (ms). Stamped by the caller so it matches the record's time. */
@@ -43,6 +45,9 @@ export interface MemoryEvent {
 	reason?: string;
 	/** On "feedback": the relevance signal that drove the importance/confidence update. */
 	signal?: "up" | "down";
+	/** On "confirmed": the pre-promotion cognition fields, so a dream pass is
+	 *  REVERSIBLE (Lane A is reversible by design). */
+	prior?: { confidence?: number; status?: MemoryStatus; importance?: number };
 }
 
 /** Append-only JSONL event log. Best-effort: a log failure NEVER fails a write

@@ -187,7 +187,10 @@ import { defaultSessionKey, readSessionStore } from "../sessions/session-store.j
 import { parseAgentSessionKey } from "../sessions/session-key-utils.js";
 import { resolveSessionTranscriptPath } from "../config/paths.js";
 import { makeExtractionLlm, runExtractionSweep } from "../agents/memory/extract.js";
+import { resolveAutoRecallOrigin } from "../agents/memory/auto-recall.js";
+import { runCurator } from "../agents/memory/curator.js";
 import { runDecayGc } from "../agents/memory/decay.js";
+import { FactStore, type MemoryRecordOrigin, type MemorySourceType } from "../agents/memory/records.js";
 import {
 	makeConsolidationLlm,
 	markConsolidationRun,
@@ -929,7 +932,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// would let one overwrite another and silently drop its turns. Re-setting
 	// the same (agentId, sessionId) just refreshes that conversation's batch
 	// with the latest transcript.
-	const pendingExtracts = new Map<string, Map<string, unknown[]>>();
+	// Per-session extraction queue. The entry carries the turn's resolved memory
+	// ORIGIN (+ sourceType) so the off-hot-path sweep stamps peer-derived facts
+	// with the peer's channel scope (isolated) instead of the operator's — closing
+	// the poisoned-inbox extraction breach.
+	type ExtractEntry = { messages: unknown[]; origin: MemoryRecordOrigin; sourceType?: MemorySourceType };
+	const pendingExtracts = new Map<string, Map<string, ExtractEntry>>();
 	/** Agents currently mid-extraction. Replaces the process-wide `extracting`
 	 * boolean so N agents can sweep concurrently without blocking each other. */
 	const extractingAgents = new Set<string>();
@@ -1026,12 +1034,37 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						modelRegistry,
 						model: agentModel,
 					});
-					for (const [sessionId, messages] of sessions) {
-						await runExtractionSweep({ workspaceDir, sessionId, messages, llm });
+					for (const [sessionId, entry] of sessions) {
+						await runExtractionSweep({
+							workspaceDir,
+							sessionId,
+							messages: entry.messages,
+							llm,
+							origin: entry.origin,
+							...(entry.sourceType ? { sourceType: entry.sourceType } : {}),
+						});
 					}
 					// Cheap, no-model-call decay GC in the same quiet window for THIS
 					// agent's workspace. Runs once per drain per agent.
 					runDecayGc(workspaceDir);
+					// Deterministic memory maintenance (no LLM): PER-ORIGIN confirm of
+					// repeatedly-asserted/corrected beliefs + near-duplicate merge.
+					// Eviction is intentionally left to runDecayGc above (no double-GC),
+					// so this is cheap + idempotent and rides every drain. Its own
+					// try/catch so a maintenance hiccup can't skip consolidation below.
+					try {
+						// `vaultDir` re-renders the owner's Obsidian-style markdown vault
+						// AFTER a pass that actually changed facts (change-gated inside the
+						// curator; filesystem mode only) — preserving any human-pinned edits.
+						runCurator(new FactStore(workspaceDir), {
+							dream: { evictMinAgeMs: Number.POSITIVE_INFINITY },
+							vaultDir: joinPath(workspaceDir, "memory-vault"),
+						});
+					} catch (curErr) {
+						opts.consoleStream?.info?.(
+							`memory curator error (agent=${targetAgentId}): ${curErr instanceof Error ? curErr.message : String(curErr)}`,
+						);
+					}
 					// Lean semantic consolidation (1 LLM call) per agent — THROTTLED
 					// per-workspace via shouldRunConsolidation's mtime gate, so each
 					// agent's workspace tracks its own consolidation cadence.
@@ -1070,15 +1103,34 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		agentId?: string;
 		sessionId: string;
 		messages: unknown[];
+		/** Turn's owner verdict (undefined ⇒ owner: TUI / direct RPC). */
+		senderIsOwner?: boolean;
+		channelApprovalRoute?: { channelId: string; conversationId: string; accountId?: string };
+		sessionKey: string;
 	}): void => {
 		if (!memoryExtractEnabled || serverStopped) return;
+		// Resolve the SAFE origin for the facts this sweep will write — fail CLOSED,
+		// exactly like auto-recall and the write_memory tool: an owner turn ⇒ owner
+		// scope; a channel-routed peer ⇒ the peer's channel scope (isolated); a
+		// non-owner turn with NO route ⇒ undefined ⇒ SKIP extraction entirely (never
+		// author owner-attributed facts from an unidentified peer).
+		const origin = resolveAutoRecallOrigin({
+			senderIsOwner: result.senderIsOwner ?? true,
+			...(result.channelApprovalRoute ? { channelApprovalRoute: result.channelApprovalRoute } : {}),
+			sessionKey: result.sessionKey,
+		});
+		if (!origin) return;
+		// Owner extraction stays untyped (trusted, as before); peer-derived facts are
+		// tagged channel_message — honest provenance + the write-gate's documented
+		// "isolated-by-origin" trust model.
+		const sourceType: MemorySourceType | undefined = origin.kind === "owner" ? undefined : "channel_message";
 		const targetAgentId = result.agentId ?? agentId;
 		let perAgent = pendingExtracts.get(targetAgentId);
 		if (!perAgent) {
-			perAgent = new Map<string, unknown[]>();
+			perAgent = new Map<string, ExtractEntry>();
 			pendingExtracts.set(targetAgentId, perAgent);
 		}
-		perAgent.set(result.sessionId, result.messages);
+		perAgent.set(result.sessionId, { messages: result.messages, origin, ...(sourceType ? { sourceType } : {}) });
 		armExtractTimer();
 	};
 
@@ -2082,6 +2134,11 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					agentId: targetAgentId,
 					sessionId: result.sessionId,
 					messages: result.messages,
+					// Thread the turn's origin context so peer-derived facts are written
+					// to the peer's channel scope, never the operator's (isolation).
+					senderIsOwner: turn.senderIsOwner,
+					...(turn.channelApprovalRoute !== undefined ? { channelApprovalRoute: turn.channelApprovalRoute } : {}),
+					sessionKey: turn.sessionKey,
 				});
 				return result;
 			} finally {

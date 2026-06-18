@@ -23,7 +23,9 @@
 
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
 
-export type ContentQualityIssue = "empty" | "reasoning-only" | "planning-only" | null;
+import { detectSlop } from "./quality/slop-detector.js";
+
+export type ContentQualityIssue = "empty" | "reasoning-only" | "planning-only" | "slop" | null;
 
 /**
  * Sentence-start anchor — `(?:^|[.!?\n]\s+)`. Used by every planning-phrase
@@ -57,6 +59,8 @@ const STEER_FOR: Record<NonNullable<ContentQualityIssue>, string> = {
 		"You produced reasoning but no visible answer. Provide your final visible answer to the user now, in plain text outside of any reasoning blocks.",
 	"planning-only":
 		"You described an action you would take, but you did not actually invoke the tool to do it. Take the action now using the appropriate tool — do not just describe it again.",
+	slop:
+		"Your reply leaned on filler / cliché phrasing (formulaic openers, empty intensifiers, boilerplate). Rewrite it concretely and concisely — keep the substance, drop the padding.",
 };
 
 /**
@@ -105,6 +109,12 @@ export function detectContentIssue(
 	if (hadTools && toolCallBlocks.length === 0 && totalText.length > 0) {
 		if (PLANNING_PHRASES.some((re) => re.test(totalText))) return "planning-only";
 	}
+
+	// Slop (Step 31's post-generation gate) — LOWEST priority, only on a visible
+	// text reply that isn't otherwise broken. The detector's density threshold
+	// keeps this rare (it takes several distinct filler/cliché hits to trip), and
+	// the one-shot cap below means at most one rewrite re-prompt.
+	if (totalText.length > 0 && detectSlop(totalText).isSlop) return "slop";
 
 	return null;
 }
