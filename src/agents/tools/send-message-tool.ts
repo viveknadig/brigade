@@ -3,7 +3,7 @@
  *
  * Lets the agent send a text message via any started channel adapter mid-
  * turn. Before this tool existed, the only way for the agent to "send
- * Bhasvanth a WhatsApp" was to schedule a cron — which is the wrong
+ * a contact a WhatsApp" was to schedule a cron — which is the wrong
  * primitive for "do it right now". This tool covers the immediate path;
  * `cron` covers the scheduled path.
  *
@@ -143,7 +143,7 @@ export function makeSendMessageTool(
 			"originating conversation — so a 'reply with hi' becomes " +
 			"`{text: 'hi'}` without needing channel/to. Override by passing " +
 			"explicit `channel` + `to` to target a DIFFERENT chat (e.g. 'tell " +
-			"Bhasvanth on WhatsApp I'm in a meeting' from a TUI turn).\n\n" +
+			"Alex on WhatsApp I'm in a meeting' from a TUI turn).\n\n" +
 			"Validation: `channel` MUST match a started channel adapter. The " +
 			"`## Channels` section of your system prompt lists what's available.",
 		parameters: SendMessageParams,

@@ -12,7 +12,7 @@
  *     json } }` where the four formats are non-empty, DISTINCT strings/
  *     objects so a caller can tell them apart.
  *
- * No openclaw / clawd / hermes / boop / paperclip / nanoclaw identifiers
+ * No external agent-codebase identifiers
  * appear in this file.
  */
 

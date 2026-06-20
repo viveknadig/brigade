@@ -117,7 +117,7 @@ function createWikipediaSearchProvider(): WebSearchProvider {
 							headers: {
 								accept: "application/json",
 								// MediaWiki asks API consumers to identify themselves.
-								"user-agent": "Brigade/1.0 (https://github.com/Bhasvanth-Dev9380/brigade) Node.js",
+								"user-agent": "Brigade/1.0 (https://github.com/spinabot/brigade) Node.js",
 							},
 							signal: combined,
 						});

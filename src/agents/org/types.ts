@@ -17,7 +17,7 @@
  *   - `deriveOrgGraph(cfg)` returns `OrgGraph | undefined`. Undefined
  *     signals "legacy mode" to every consumer.
  *
- * No openclaw/clawd/boop/hermes/paperclip/nanoclaw identifiers are
+ * No external agent-codebase identifiers are
  * referenced from this file.
  */
 

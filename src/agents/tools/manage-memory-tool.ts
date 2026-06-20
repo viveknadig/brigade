@@ -16,6 +16,7 @@ import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
 import { runDream } from "../memory/dream.js";
 import { applyRetention, exportMemory, inspect, purge } from "../memory/governance.js";
 import { FactStore, type MemoryRecordOrigin } from "../memory/records.js";
+import { type RelinkLlm, resolveRelinkLlm, runRelinkPass } from "../memory/relationship-extract.js";
 import { applyProposal, approve, type Proposal, proposeFromTelemetry, revertProposal } from "../memory/self-improve.js";
 import { writeVault } from "../memory/vault.js";
 
@@ -56,6 +57,7 @@ const Params = Type.Object({
 			Type.Literal("propose"),
 			Type.Literal("retract"),
 			Type.Literal("restore"),
+			Type.Literal("relink"),
 		],
 		{
 			description:
@@ -65,7 +67,8 @@ const Params = Type.Object({
 				"retention: hard-purge facts older than ttl_days (confirmed beliefs retained). " +
 				"vault: write your memory out as an Obsidian-style markdown vault (preserves your hand edits). " +
 				"propose: review behaviour-change suggestions drawn from your feedback. " +
-				"retract: stop acting on a fact (reversible). restore: undo a retract.",
+				"retract: stop acting on a fact (reversible). restore: undo a retract. " +
+				"relink: one LLM pass over your active facts that links genuinely-related ones (rebuilds the meaning graph).",
 		},
 	),
 	memory_id: Type.Optional(Type.String({ description: "fact id — required for purge / inspect / retract / restore", maxLength: 128 })),
@@ -73,13 +76,30 @@ const Params = Type.Object({
 });
 
 interface ManageMemoryResult {
-	action: "dream" | "purge" | "inspect" | "export" | "retention" | "vault" | "propose" | "retract" | "restore";
+	action: "dream" | "purge" | "inspect" | "export" | "retention" | "vault" | "propose" | "retract" | "restore" | "relink";
 	ok: boolean;
 	message: string;
 	[key: string]: unknown;
 }
 
-export function makeManageMemoryTool(workspaceDir: string): BrigadeTool<typeof Params, ManageMemoryResult> {
+/**
+ * Optional injection for the `relink` action — the tool-less isolated LLM that judges
+ * relationships. Production wires this to a `makeIsolatedLlm(RELINK_PROMPT, …)` runner
+ * (one model call per fact-window, only on an explicit operator `relink`); when absent
+ * (the bare `makeManageMemoryTool(dir)` used by most call sites + tests) the action
+ * reports that relink isn't available rather than fabricating edges. Tests inject a stub.
+ */
+export interface ManageMemoryDeps {
+	relinkLlm?: RelinkLlm;
+	/** The owning agent id — lets `relink` resolve the gateway's boot-wired LLM
+	 *  factory when no `relinkLlm` is injected directly. Defaults to "main". */
+	agentId?: string;
+}
+
+export function makeManageMemoryTool(
+	workspaceDir: string,
+	deps: ManageMemoryDeps = {},
+): BrigadeTool<typeof Params, ManageMemoryResult> {
 	const result = (r: ManageMemoryResult): AgentToolResult<ManageMemoryResult> =>
 		jsonResult(r) as AgentToolResult<ManageMemoryResult>;
 
@@ -98,6 +118,7 @@ export function makeManageMemoryTool(workspaceDir: string): BrigadeTool<typeof P
 			"action 'vault': save your memory as an Obsidian-style markdown vault, preserving your hand-pinned edits.",
 			"action 'propose': review behaviour-change suggestions drawn from your feedback (down-votes); review-only.",
 			"action 'retract': reversibly stop acting on the fact with `memory_id`. action 'restore': undo a retract.",
+			"action 'relink': run ONE LLM pass over your active facts and link the genuinely-related ones (semantic `relates` edges) — rebuilds the meaning graph; idempotent.",
 			"Call only on an explicit operator request.",
 		].join(" "),
 		parameters: Params,
@@ -280,6 +301,37 @@ export function makeManageMemoryTool(workspaceDir: string): BrigadeTool<typeof P
 						action: "restore",
 						ok: restored,
 						message: restored ? `Restored ${target} — it can surface in recall again.` : `No retracted fact found with id ${target}.`,
+					});
+				}
+				case "relink": {
+					// One-shot LLM pass that links genuinely-related ACTIVE facts (semantic
+					// `relates` edges → the renderer's `## Related` wikilinks). Owner-scoped
+					// (the tool is ownerOnly; the pass runs on the OWNER origin so no edge
+					// crosses into a channel peer). Cost-bounded inside runRelinkPass (a hard
+					// fact cap + windowed calls) and idempotent (linkRelated dedupes), so
+					// re-running adds nothing already present. Resolve the LLM: an explicitly-
+					// injected one (tests) wins; else the gateway's boot-wired factory builds
+					// one for this workspace. The bare tool with neither (a library/unit-test
+					// path) can't fabricate edges, so it says so honestly.
+					const relinkLlm = deps.relinkLlm ?? resolveRelinkLlm(deps.agentId ?? "main");
+					if (!relinkLlm) {
+						return result({
+							action: "relink",
+							ok: false,
+							message: "Relink needs a model and isn't available in this context.",
+						});
+					}
+					const r = await runRelinkPass({ store, llm: relinkLlm, origin: OWNER });
+					return result({
+						action: "relink",
+						ok: true,
+						edgesWritten: r.edgesWritten,
+						considered: r.considered,
+						windows: r.windows,
+						message:
+							r.considered < 2
+								? "Relink: fewer than 2 active facts — nothing to link yet."
+								: `Relink: wrote ${r.edgesWritten} new relationship edge(s) across ${r.considered} active fact(s) (${r.windows} pass${r.windows === 1 ? "" : "es"}). Re-running won't duplicate them.`,
 					});
 				}
 				default:

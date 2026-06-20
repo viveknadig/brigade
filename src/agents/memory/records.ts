@@ -36,7 +36,7 @@ import {
 } from "./host-ports.js";
 import { bm25Score, type ScoreBreakdown, tokenize } from "./scoring.js";
 import { evaluateWriteGate, isTrustedTarget, isUntrustedSource, WriteGateError } from "./write-gate.js";
-import type { MemoryLink } from "./links.js";
+import { inverseLinkKind, type MemoryLink } from "./links.js";
 import { MemoryEventLog, type MemoryEvent } from "./event-log.js";
 import { cosine, getDefaultEmbedder } from "./embedder.js";
 import { recallHybrid, recallHybridAsync } from "./hybrid.js";
@@ -1357,40 +1357,65 @@ export class FactStore {
 	}
 
 	/**
-	 * Step 19 — persist generic `relates` association edges between fact pairs
-	 * (where synonymy/relatedness edges land). Bidirectional, deduped, and capped
-	 * per record (a hub-fact fan-out guard); only ACTIVE facts are linked. Idempotent
-	 * — re-running adds nothing already present. Goes through readAll/writeAll like
-	 * every mutation, so it is fs↔convex parity by construction. Returns the number
-	 * of NEW link entries written.
+	 * Step 19 — persist TYPED association edges between fact pairs (where the
+	 * relationship extractor's typed taxonomy AND the dream's synonymy/relatedness
+	 * edges land). Bidirectional, deduped per (kind,target), and capped per record per
+	 * kind (a hub-fact fan-out guard); only ACTIVE facts are linked. Each edge carries
+	 * the edge `kind` (default `relates` for legacy synonymy callers), an optional
+	 * `reason` (the model's justification, for explainable rendering) and `strength`.
+	 * Idempotent — re-running adds nothing already present (a later write may BACKFILL a
+	 * reason onto a prior reason-less edge of the same kind, which is not counted as a
+	 * new edge). Goes through readAll/writeAll like every mutation, so it is fs↔convex
+	 * parity by construction. Returns the number of NEW link entries written.
 	 *
 	 * Callers MUST pass only SAME-ORIGIN pairs (the dream computes synonymy per origin
-	 * bucket) — a cross-principal `relates` edge would leak one peer's facts into
-	 * another principal's graph-recall walk.
+	 * bucket; the extractor pre-filters to one origin) — a cross-principal edge would
+	 * leak one peer's facts into another principal's graph-recall walk.
+	 *
+	 * The edge is written DIRECTED on the kind the caller supplies, and the REVERSE
+	 * endpoint records the INVERSE kind (causes↔caused_by, precedes↔follows,
+	 * enables/blocks→caused_by/blocks, part_of→part_of, …) so the graph reads
+	 * correctly from either note; symmetric kinds (co_constrains/contrasts_with/
+	 * same_topic/relates/relates_to/uses/works_on/located_at) mirror unchanged.
 	 */
-	linkRelated(pairs: ReadonlyArray<{ a: string; b: string }>, opts: { maxPerRecord?: number } = {}): number {
+	linkRelated(
+		pairs: ReadonlyArray<{ a: string; b: string; kind?: MemoryLink["kind"]; reason?: string; strength?: number }>,
+		opts: { maxPerRecord?: number } = {},
+	): number {
 		if (pairs.length === 0) return 0;
 		const maxPerRecord = opts.maxPerRecord && opts.maxPerRecord > 0 ? opts.maxPerRecord : 12;
 		const all = this.readAll();
 		const byId = new Map(all.map((r) => [r.memoryId, r]));
 		let added = 0;
-		const addOne = (fromId: string, toId: string): void => {
+		const addOne = (fromId: string, toId: string, kind: MemoryLink["kind"], reason?: string, strength?: number): void => {
 			if (fromId === toId) return;
 			const rec = byId.get(fromId);
 			if (!rec || rec.lifecycle !== "active") return;
 			const links = rec.links ?? [];
-			if (links.some((l) => l.kind === "relates" && l.target === toId)) return; // dedup
-			if (links.filter((l) => l.kind === "relates").length >= maxPerRecord) return; // fan-out cap
-			rec.links = [...links, { kind: "relates", target: toId }];
+			const existing = links.find((l) => l.kind === kind && l.target === toId);
+			if (existing) {
+				// Idempotent: edge already present. BACKFILL a reason/strength onto a
+				// prior reason-less edge (a relink pass enriches an earlier bare edge)
+				// without counting it as a new edge — keeps re-runs at 0 new.
+				if (reason && !existing.reason) existing.reason = reason;
+				if (strength !== undefined && existing.strength === undefined) existing.strength = strength;
+				return;
+			}
+			if (links.filter((l) => l.kind === kind).length >= maxPerRecord) return; // per-kind fan-out cap
+			rec.links = [
+				...links,
+				{ kind, target: toId, ...(reason ? { reason } : {}), ...(strength !== undefined ? { strength } : {}) },
+			];
 			added++;
 		};
-		for (const { a, b } of pairs) {
+		for (const { a, b, kind, reason, strength } of pairs) {
 			// Both endpoints must be ACTIVE — skip a pair where either was archived
 			// (e.g. consolidated away this same dream pass): a relation to a dead fact
 			// is noise, and a supersede already carries that pair's relationship.
 			if (byId.get(a)?.lifecycle !== "active" || byId.get(b)?.lifecycle !== "active") continue;
-			addOne(a, b);
-			addOne(b, a);
+			const fwd = kind ?? "relates";
+			addOne(a, b, fwd, reason, strength);
+			addOne(b, a, inverseLinkKind(fwd), reason, strength);
 		}
 		if (added > 0) this.writeAll(all);
 		return added;

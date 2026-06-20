@@ -57,19 +57,34 @@ export interface MemoryGraphExport {
 const DAY_MS = 86_400_000;
 
 /** Edge strength by kind → the UI's strong/medium/weak line styles. Definitive
- *  lifecycle edges = strong; derivation/support = medium; generic association = weak. */
+ *  lifecycle edges + genuine conflicts = strong; derivation/support + the typed
+ *  factual taxonomy = medium; generic/thematic association = weak. */
 function strengthOf(kind: MemoryLinkKind): EdgeStrength {
 	switch (kind) {
 		case "supersedes":
 		case "transition":
 		case "corrects":
 		case "contradicts":
+		case "contrasts_with": // a genuine tension/conflict reads as a strong, review-worthy edge
 			return "strong";
 		case "derived_from":
 		case "supports":
+		// the typed factual taxonomy — real, directly-supported relationships
+		case "causes":
+		case "caused_by":
+		case "part_of":
+		case "precedes":
+		case "follows":
+		case "enables":
+		case "blocks":
+		case "co_constrains":
+		case "located_at":
+		case "uses":
+		case "works_on":
+		case "relates_to":
 			return "medium";
 		default:
-			return "weak"; // relates
+			return "weak"; // relates, same_topic (thematic/quarantined)
 	}
 }
 const STRENGTH_WEIGHT: Record<EdgeStrength, number> = { strong: 1, medium: 0.6, weak: 0.3 };

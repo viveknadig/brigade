@@ -17,9 +17,9 @@
  * fall back to the raw peer id.
  *
  * Use case: an operator chats with the same human via WhatsApp
- * (`+91 77026 16808`) and via Telegram (`@kartheek`). Config maps both
- * aliases to canonical `"kartheek"`. With `dmScope: "per-peer"`, both
- * inbounds route to `agent:main:direct:kartheek` — one session, two
+ * (`+1 555 010 0001`) and via Telegram (`@alex`). Config maps both
+ * aliases to canonical `"alex"`. With `dmScope: "per-peer"`, both
+ * inbounds route to `agent:main:direct:alex` — one session, two
  * surfaces. Without identity-links, they'd be two separate sessions.
  */
 
@@ -34,15 +34,15 @@ function normalizeToken(value: string | undefined | null): string {
  *
  * Algorithm (verbatim from upstream):
  *   1. Build a candidate set with two normalised forms:
- *      a. The raw peer id alone (`+91 77026 16808` → `+91 77026 16808`)
- *      b. The channel-scoped form (`whatsapp:+91 77026 16808`)
+ *      a. The raw peer id alone (`+1 555 010 0001` → `+1 555 010 0001`)
+ *      b. The channel-scoped form (`whatsapp:+1 555 010 0001`)
  *   2. For each canonical name in `identityLinks`, scan its alias array.
  *   3. If any alias normalises into the candidate set, return the canonical.
  *   4. No match → return `null` (caller uses raw peer id as-is).
  *
  * Returns the canonical name UNTRIMMED apart from leading/trailing
  * whitespace — preserves the operator's chosen casing (so display layers
- * can render `Kartheek` not `kartheek`).
+ * can render `Alex` not `alex`).
  */
 export function resolveLinkedPeerId(params: {
 	identityLinks?: Record<string, string[]>;

@@ -189,9 +189,11 @@ import { resolveSessionTranscriptPath } from "../config/paths.js";
 import {
 	flattenConversation,
 	makeExtractionLlm,
+	makeIsolatedLlm,
 	runExtractionSweep,
 	setPreCompactionExtractionHook,
 } from "../agents/memory/extract.js";
+import { RELINK_PROMPT, setRelinkLlmFactory } from "../agents/memory/relationship-extract.js";
 import { makeSkillReviewer, runSkillReview, shouldReviewSkills } from "../agents/skills/skill-review.js";
 import { detectAndRecordSkillUses, runSkillCurator } from "../agents/skills/skill-curator.js";
 import { makeSkillConsolidationLlm, runSkillConsolidation } from "../agents/skills/skill-consolidate.js";
@@ -1210,6 +1212,29 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		} finally {
 			extractingAgents.delete(agentId);
 			extractingSince.delete(agentId);
+		}
+	});
+
+	// RELINK factory (manage_memory action=relink) — build a tool-less isolated LLM
+	// with the RELINK_PROMPT pinned for the requested agent, so the operator's
+	// on-demand "link my related facts" pass has a model. Keyed by agentId (the tool
+	// registry knows it) → resolve auth/model/dir directly. DELIBERATELY NOT gated by
+	// memoryExtractEnabled: the kill-switch freezes the BACKGROUND sweep, but relink is
+	// an explicit one-shot operator action that must still work on demand. One model
+	// call per fact-window, only when the operator invokes it. Best-effort: a resolve
+	// failure (unknown agent) returns undefined → the tool reports relink unavailable.
+	setRelinkLlmFactory((targetAgentId: string) => {
+		if (serverStopped) return undefined;
+		try {
+			return makeIsolatedLlm(RELINK_PROMPT, {
+				workspaceDir: resolveAgentWorkspaceDir(targetAgentId),
+				agentDir: resolveAgentDir(targetAgentId),
+				authStorage: getAuthStorageForAgent(targetAgentId),
+				modelRegistry,
+				model: getAgentRuntime(targetAgentId).model,
+			});
+		} catch {
+			return undefined;
 		}
 	});
 
@@ -5205,6 +5230,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				/* best-effort — never block shutdown on extraction */
 			}
 			setPreCompactionExtractionHook(undefined); // drop the module hook → no stale closure
+			setRelinkLlmFactory(undefined); // drop the relink factory → no stale agent-context closure
 			serverStopped = true; // freeze background memory work
 			// Signal the lane engine to reject new enqueues. Channel inbounds
 			// that arrive during shutdown get a clean `GatewayDrainingError`

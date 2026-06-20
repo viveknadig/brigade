@@ -20,8 +20,12 @@ import { cosine, getDefaultEmbedder, type Embedder } from "./embedder.js";
 import { linksFrom, type MemoryLink, type MemoryLinkKind } from "./links.js";
 import type { MemoryRecord } from "./records.js";
 
-/** Temporal-evolution edge kinds — a supersede/correction chain. The walk and
- *  the dream follow these to trace how a belief changed over time. */
+/** Temporal-evolution edge kinds — a supersede/correction chain (a belief being
+ *  REPLACED over time). The walk and the dream follow these to trace how a belief
+ *  changed. NOTE: the typed taxonomy's `precedes`/`follows` are SEQUENCE relations
+ *  between two DISTINCT facts (e.g. event ordering), not belief-replacement chains, so
+ *  they are intentionally NOT here — a supersede chain and a sequence link have
+ *  different walk semantics. */
 export const TRANSITION_KINDS: readonly MemoryLinkKind[] = ["supersedes", "transition", "corrects"];
 
 export interface MemoryGraph {

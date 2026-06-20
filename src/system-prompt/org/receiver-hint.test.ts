@@ -9,7 +9,7 @@
  *   - Heading falls back to the sender's agent id when no department is
  *     encoded in the contextKey.
  *
- * No openclaw / clawd / hermes / boop / paperclip / nanoclaw tokens.
+ * No external agent-codebase tokens.
  */
 
 import { strict as assert } from "node:assert";

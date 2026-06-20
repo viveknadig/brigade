@@ -22,7 +22,7 @@
  *     gets a terse pointer to the new consolidated `org` tool for the
  *     full peer / reachability picture; the prompt itself stays lean.
  *
- * NO OPENCLAW / CLAWD / HERMES / BOOP / PAPERCLIP / NANOCLAW IDENTIFIERS.
+ * NO external agent-codebase IDENTIFIERS.
  * All literal text in this module is fully Brigade-native.
  */
 

@@ -124,4 +124,66 @@ describe("manage_memory tool", () => {
 		assert.equal(prop.ok, true);
 		assert.equal(prop.count, 0, "one down-vote is not enough to propose a change");
 	});
+
+	// ── action=relink: the on-demand semantic-link pass (owner-gated, idempotent) ──
+	// Run the tool with an INJECTED stub LLM (the gateway wires a real one at boot).
+	const relinkDetails = async (
+		stub: (block: string) => Promise<string>,
+	): Promise<Record<string, unknown>> => {
+		const tool = makeManageMemoryTool(dir, { relinkLlm: stub });
+		const res = await tool.execute("call-1", { action: "relink" } as never);
+		return (res as { details: Record<string, unknown> }).details;
+	};
+
+	it("action=relink writes semantic `relates` edges over the active set + reports a count", async () => {
+		const store = new FactStore(dir);
+		const veg = store.write({ content: "User is vegetarian", segment: "identity" });
+		const peanut = store.write({ content: "User has a peanut allergy", segment: "identity" });
+		store.write({ content: "User lives in Bangalore", segment: "identity" }); // unrelated → no edge
+		// Stub: relate the two dietary facts (both appear in the window), nothing else.
+		const stub = async (block: string) =>
+			block.includes(veg.memoryId) && block.includes(peanut.memoryId)
+				? JSON.stringify({
+						relationships: [{ a: veg.memoryId, b: peanut.memoryId, type: "co_constrains", reason: "both dietary constraints", strength: 4 }],
+					})
+				: '{"relationships":[]}';
+		const d = await relinkDetails(stub);
+		assert.equal(d.ok, true);
+		assert.equal(d.considered, 3, "all three active facts considered");
+		assert.equal(d.edgesWritten, 2, "one bidirectional relationship = 2 link entries");
+		const after = new FactStore(dir);
+		const vegRec = after.readAll().find((r) => r.memoryId === veg.memoryId)!;
+		assert.deepEqual((vegRec.links ?? []).filter((l) => l.kind === "co_constrains").map((l) => l.target), [peanut.memoryId]);
+	});
+
+	it("action=relink is IDEMPOTENT — a second run writes no new edges", async () => {
+		const store = new FactStore(dir);
+		const a = store.write({ content: "User is vegetarian", segment: "identity" });
+		const b = store.write({ content: "User has a peanut allergy", segment: "identity" });
+		const stub = async () =>
+			JSON.stringify({ relationships: [{ a: a.memoryId, b: b.memoryId, type: "co_constrains", reason: "both dietary constraints", strength: 4 }] });
+		const first = await relinkDetails(stub);
+		assert.equal(first.edgesWritten, 2);
+		const second = await relinkDetails(stub);
+		assert.equal(second.edgesWritten, 0, "re-running the pass adds nothing already present");
+	});
+
+	it("action=relink drops a fabricated id from the model (no-fabrication, end-to-end)", async () => {
+		const store = new FactStore(dir);
+		const a = store.write({ content: "User is vegetarian", segment: "identity" });
+		store.write({ content: "User deploys on Fridays", segment: "project" });
+		// A VALID type — so this proves the FABRICATION guard (not the type gate) drops it.
+		const stub = async () =>
+			JSON.stringify({ relationships: [{ a: a.memoryId, b: "mem_HALLUCINATED", type: "co_constrains", reason: "made up", strength: 4 }] });
+		const d = await relinkDetails(stub);
+		assert.equal(d.edgesWritten, 0, "the fabricated endpoint is never written");
+	});
+
+	it("action=relink is owner-gated and reports unavailable when no LLM is wired", async () => {
+		// The bare tool (no injected llm, no boot-wired factory in a unit test) must NOT
+		// fabricate edges — it reports relink is unavailable.
+		assert.equal(makeManageMemoryTool(dir).ownerOnly, true);
+		const d = await details("relink");
+		assert.equal(d.ok, false, "no model wired ⇒ relink reports unavailable, never silently no-ops as success");
+	});
 });

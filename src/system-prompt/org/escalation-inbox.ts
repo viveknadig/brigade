@@ -20,7 +20,7 @@
  *     the cap get a "+N more" tail — the receiver-hint section already
  *     lists every event individually so the inbox is a summary view.
  *
- * No openclaw / clawd / hermes / boop / paperclip / nanoclaw identifiers
+ * No external agent-codebase identifiers
  * are referenced from this file.
  */
 

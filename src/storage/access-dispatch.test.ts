@@ -72,17 +72,17 @@ describe("access-control dispatcher (convex mode)", () => {
 
 	it("addAllowFrom is visible immediately and reconciles the row set — zero files written", async () => {
 		installConvexContext(fake, stateDir);
-		const changed = addAllowFrom("whatsapp", "917702616808", null);
+		const changed = addAllowFrom("whatsapp", "15550100001", null);
 		assert.equal(changed, true);
-		assert.equal(isAllowed("whatsapp", "917702616808", null), true);
-		assert.deepEqual(readAllowFrom("whatsapp", null), ["917702616808"]);
+		assert.equal(isAllowed("whatsapp", "15550100001", null), true);
+		assert.deepEqual(readAllowFrom("whatsapp", null), ["15550100001"]);
 
 		await awaitAccessFlush();
 		assert.equal(fake.reconciles.length, 1);
 		assert.equal(fake.reconciles[0]?.kind, "allow-from");
 		assert.deepEqual(
 			fake.reconciles[0]?.rows.map((r) => r.senderId),
-			["917702616808"],
+			["15550100001"],
 		);
 
 		// THE strict-zero check: nothing under the state dir.
@@ -136,7 +136,7 @@ describe("access-control dispatcher (convex mode)", () => {
 				channelId: "whatsapp",
 				accountId: "default",
 				kind: "allow-from",
-				senderId: "917702616808",
+				senderId: "15550100001",
 				createdAt: "2026-06-01T00:00:00.000Z",
 				lastSeenAt: "2026-06-01T00:00:00.000Z",
 			},
@@ -150,7 +150,7 @@ describe("access-control dispatcher (convex mode)", () => {
 				lastSeenAt: new Date().toISOString(),
 			},
 		]);
-		assert.equal(isAllowed("whatsapp", "917702616808", null), true);
+		assert.equal(isAllowed("whatsapp", "15550100001", null), true);
 		const pending = readPendingPairings("whatsapp", null);
 		assert.equal(pending.length, 1);
 		assert.equal(pending[0]?.code, "ABCDEFGH");

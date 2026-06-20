@@ -32,7 +32,7 @@
  *     command merges them into the existing config so they do NOT
  *     replace fields the operator has already set.
  *
- * No openclaw / clawd / hermes / boop / paperclip / nanoclaw
+ * No external agent-codebase
  * identifiers are referenced from this file.
  */
 

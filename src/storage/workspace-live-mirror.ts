@@ -28,8 +28,7 @@
 // Filesystem mode never starts this module. Workspace stays local-
 // authoritative in both modes (operator decision 2026-06-10) — this is a
 // durability mirror, not an ownership change; the convex-authoritative flip
-// is scoped separately in .brigade-design-docs/workspace-convex-
-// authoritative-flip.md (Phase 3).
+// is scoped separately (Phase 3).
 
 import { promises as fsp } from "node:fs";
 import path from "node:path";

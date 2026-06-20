@@ -11,7 +11,9 @@ export declare const listFacts: import("convex/server").RegisteredQuery<"public"
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
-        kind: "supersedes" | "transition" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        reason?: string | undefined;
+        strength?: number | undefined;
+        kind: "supersedes" | "transition" | "corrects" | "derived_from" | "supports" | "causes" | "caused_by" | "part_of" | "precedes" | "follows" | "enables" | "blocks" | "co_constrains" | "located_at" | "uses" | "works_on" | "contrasts_with" | "contradicts" | "relates_to" | "same_topic" | "relates";
         target: string;
     }[] | undefined;
     validFrom?: number | undefined;
@@ -46,7 +48,9 @@ export declare const writeFact: import("convex/server").RegisteredMutation<"publ
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
-        kind: "supersedes" | "transition" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        reason?: string | undefined;
+        strength?: number | undefined;
+        kind: "supersedes" | "transition" | "corrects" | "derived_from" | "supports" | "causes" | "caused_by" | "part_of" | "precedes" | "follows" | "enables" | "blocks" | "co_constrains" | "located_at" | "uses" | "works_on" | "contrasts_with" | "contradicts" | "relates_to" | "same_topic" | "relates";
         target: string;
     }[] | undefined;
     validFrom?: number | undefined;
@@ -78,7 +82,9 @@ export declare const writeFact: import("convex/server").RegisteredMutation<"publ
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
-        kind: "supersedes" | "transition" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        reason?: string | undefined;
+        strength?: number | undefined;
+        kind: "supersedes" | "transition" | "corrects" | "derived_from" | "supports" | "causes" | "caused_by" | "part_of" | "precedes" | "follows" | "enables" | "blocks" | "co_constrains" | "located_at" | "uses" | "works_on" | "contrasts_with" | "contradicts" | "relates_to" | "same_topic" | "relates";
         target: string;
     }[] | undefined;
     validFrom?: number | undefined;
@@ -121,7 +127,9 @@ export declare const listAllFacts: import("convex/server").RegisteredQuery<"publ
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
-        kind: "supersedes" | "transition" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        reason?: string | undefined;
+        strength?: number | undefined;
+        kind: "supersedes" | "transition" | "corrects" | "derived_from" | "supports" | "causes" | "caused_by" | "part_of" | "precedes" | "follows" | "enables" | "blocks" | "co_constrains" | "located_at" | "uses" | "works_on" | "contrasts_with" | "contradicts" | "relates_to" | "same_topic" | "relates";
         target: string;
     }[] | undefined;
     validFrom?: number | undefined;
@@ -159,7 +167,9 @@ export declare const upsertFactRecord: import("convex/server").RegisteredMutatio
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
-        kind: "supersedes" | "transition" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        reason?: string | undefined;
+        strength?: number | undefined;
+        kind: "supersedes" | "transition" | "corrects" | "derived_from" | "supports" | "causes" | "caused_by" | "part_of" | "precedes" | "follows" | "enables" | "blocks" | "co_constrains" | "located_at" | "uses" | "works_on" | "contrasts_with" | "contradicts" | "relates_to" | "same_topic" | "relates";
         target: string;
     }[] | undefined;
     validFrom?: number | undefined;
@@ -267,7 +277,9 @@ export declare const searchContent: import("convex/server").RegisteredQuery<"pub
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
-        kind: "supersedes" | "transition" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        reason?: string | undefined;
+        strength?: number | undefined;
+        kind: "supersedes" | "transition" | "corrects" | "derived_from" | "supports" | "causes" | "caused_by" | "part_of" | "precedes" | "follows" | "enables" | "blocks" | "co_constrains" | "located_at" | "uses" | "works_on" | "contrasts_with" | "contradicts" | "relates_to" | "same_topic" | "relates";
         target: string;
     }[] | undefined;
     validFrom?: number | undefined;
@@ -309,7 +321,9 @@ export declare const findSimilar: import("convex/server").RegisteredQuery<"publi
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
-        kind: "supersedes" | "transition" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts";
+        reason?: string | undefined;
+        strength?: number | undefined;
+        kind: "supersedes" | "transition" | "corrects" | "derived_from" | "supports" | "causes" | "caused_by" | "part_of" | "precedes" | "follows" | "enables" | "blocks" | "co_constrains" | "located_at" | "uses" | "works_on" | "contrasts_with" | "contradicts" | "relates_to" | "same_topic" | "relates";
         target: string;
     }[] | undefined;
     validFrom?: number | undefined;

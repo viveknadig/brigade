@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { FactStore } from "./records.js";
+import { linksFrom } from "./links.js";
 import {
 	flattenConversation,
 	getCursor,
@@ -12,6 +13,19 @@ import {
 	runExtractionSweep,
 	storeExtractedFacts,
 } from "./extract.js";
+
+/** Targets of a record's EXTRACTOR-written association edges (any typed factual kind,
+ *  same_topic, or the legacy `relates`), by id — i.e. everything the relationship
+ *  extractor can mint, excluding the store-minted lifecycle edges. */
+function relatesTargets(store: FactStore, id: string): string[] {
+	const rec = store.readAll().find((r) => r.memoryId === id);
+	if (!rec) return [];
+	const minted = new Set(["supersedes", "transition", "corrects", "derived_from", "supports"]);
+	return linksFrom(rec)
+		.filter((l) => !minted.has(l.kind))
+		.map((l) => l.target)
+		.sort();
+}
 
 let dir: string;
 beforeEach(() => {
@@ -268,5 +282,84 @@ describe("runExtractionSweep — batched, cursor-tracked, LLM injected", () => {
 		});
 		assert.equal(res.ran, false);
 		assert.equal(called, 0);
+	});
+});
+
+describe("runExtractionSweep — semantic relationship edges (SAME call, no extra round-trip)", () => {
+	const messages = [
+		{ role: "user", content: "I'm vegetarian and I also have a peanut allergy." },
+		{ role: "assistant", content: "Noted — I'll keep both dietary constraints in mind." },
+	];
+
+	it("writes `relates` edges between NEW facts from the SAME extraction reply (single LLM call)", async () => {
+		let calls = 0;
+		// ONE reply carries BOTH facts AND their relationship — proving no second call.
+		const llm = async () => {
+			calls += 1;
+			return JSON.stringify({
+				facts: [
+					{ content: "User is vegetarian", segment: "identity" },
+					{ content: "User has a peanut allergy", segment: "identity" },
+				],
+				relationships: [{ a: "new:0", b: "new:1", type: "co_constrains", reason: "both dietary constraints", strength: 4 }],
+			});
+		};
+		const res = await runExtractionSweep({ workspaceDir: dir, sessionId: "s1", messages, llm, origin: { kind: "owner" } });
+		assert.equal(res.ran, true);
+		assert.equal(res.stored, 2);
+		assert.equal(calls, 1, "exactly ONE model call — relationships rode the extraction reply");
+		const store = new FactStore(dir);
+		const veg = store.readAll().find((r) => r.content === "User is vegetarian")!;
+		const peanut = store.readAll().find((r) => r.content === "User has a peanut allergy")!;
+		assert.deepEqual(relatesTargets(store, veg.memoryId), [peanut.memoryId]);
+		assert.deepEqual(relatesTargets(store, peanut.memoryId), [veg.memoryId], "bidirectional edge");
+	});
+
+	it("relates a NEW fact to an EXISTING candidate fact (mem_ ref resolved against the bounded candidate set)", async () => {
+		const owner = { kind: "owner" } as const;
+		const store = new FactStore(dir);
+		// An existing fact the model should relate the new one to.
+		const existing = store.write({ content: "User is vegetarian — no meat or fish", segment: "identity", subjectKey: "diet", createdBy: owner });
+		const llm = async (prompt: string) => {
+			// The candidate block must carry the existing fact's id (bounded recall surfaced it).
+			assert.ok(prompt.includes(existing.memoryId), "existing candidate id present in the prompt");
+			return JSON.stringify({
+				facts: [{ content: "User avoids all animal products when cooking", segment: "preference" }],
+				relationships: [{ a: "new:0", b: existing.memoryId, type: "co_constrains", reason: "both about the user's diet", strength: 4 }],
+			});
+		};
+		const res = await runExtractionSweep({
+			workspaceDir: dir,
+			sessionId: "s2",
+			messages: [
+				{ role: "user", content: "When I cook I avoid all animal products." },
+				{ role: "assistant", content: "Understood." },
+			],
+			llm,
+			origin: owner,
+		});
+		assert.equal(res.ran, true);
+		const neu = store.readAll().find((r) => r.content === "User avoids all animal products when cooking")!;
+		assert.deepEqual(relatesTargets(store, neu.memoryId), [existing.memoryId], "new fact linked to the existing candidate");
+		assert.deepEqual(relatesTargets(store, existing.memoryId), [neu.memoryId], "edge is bidirectional");
+	});
+
+	it("NO FABRICATION through the sweep — a hallucinated id in the reply is never written", async () => {
+		const llm = async () =>
+			JSON.stringify({
+				facts: [{ content: "User is vegetarian", segment: "identity" }],
+				relationships: [{ a: "new:0", b: "mem_NEVER_EXISTED", type: "co_constrains", reason: "made up", strength: 4 }],
+			});
+		const res = await runExtractionSweep({ workspaceDir: dir, sessionId: "s3", messages, llm, origin: { kind: "owner" } });
+		assert.equal(res.stored, 1);
+		const store = new FactStore(dir);
+		const veg = store.readAll().find((r) => r.content === "User is vegetarian")!;
+		assert.deepEqual(relatesTargets(store, veg.memoryId), [], "no edge to a fabricated id; no self-edge either");
+	});
+
+	it("a malformed/garbage reply stores no facts AND no edges (cursor held, see zero-fact guard)", async () => {
+		const res = await runExtractionSweep({ workspaceDir: dir, sessionId: "s4", messages, llm: async () => "not json", origin: { kind: "owner" } });
+		assert.equal(res.ran, false);
+		assert.equal(new FactStore(dir).readAll().length, 0, "no facts, hence no edges");
 	});
 });

@@ -23,7 +23,7 @@
  *     verbatim. The caller never sees a "less informative" error than
  *     they would have gotten without the org layer.
  *
- * No openclaw / clawd / hermes / boop / paperclip / nanoclaw
+ * No external agent-codebase
  * identifiers are referenced from this file.
  */
 

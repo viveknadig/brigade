@@ -1,0 +1,18 @@
+# Code ownership for review routing.
+# https://docs.github.com/articles/about-code-owners
+# Last-match-wins. Replace @Bhasvanth-Dev9380 with a team (e.g. @spinabot/maintainers)
+# once one exists.
+
+# Default owner for everything.
+*                                   @Bhasvanth-Dev9380
+
+# Security-sensitive surfaces — keep an owner review on these.
+/SECURITY.md                        @Bhasvanth-Dev9380
+/.github/                           @Bhasvanth-Dev9380
+/.github/workflows/release.yml      @Bhasvanth-Dev9380
+/src/auth/                          @Bhasvanth-Dev9380
+/src/security/                      @Bhasvanth-Dev9380
+/src/agents/exec-gate.ts            @Bhasvanth-Dev9380
+/src/core/exec-approvals.ts         @Bhasvanth-Dev9380
+/src/agents/channels/               @Bhasvanth-Dev9380
+/src/cli/commands/secrets-audit.ts  @Bhasvanth-Dev9380

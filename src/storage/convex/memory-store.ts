@@ -307,7 +307,10 @@ export class ConvexMemoryStore implements MemoryStore {
 			supersedes?: string[];
 			createdBy?: { kind?: "owner" | "channel"; channelId?: string; conversationId?: string; sessionKey?: string; accountId?: string };
 			sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream";
-			links?: { kind: "supersedes" | "corrects" | "relates" | "derived_from" | "supports" | "contradicts"; target: string }[];
+			// Canonical edge shape (typed taxonomy + optional reason/strength) — kept in
+			// lockstep with MemoryLink via an inline import type so a new kind never needs
+			// a hand-maintained copy here.
+			links?: import("../../agents/memory/links.js").MemoryLink[];
 			validFrom?: number;
 			validTo?: number;
 			confidence?: number;

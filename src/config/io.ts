@@ -217,7 +217,7 @@ export type AgentToAgentPolicy = {
 export interface BrigadeSessionConfig {
   dmScope?: DmScope;
   /** Cross-channel canonical peer aliases. The session-key builder uses this
-   *  to collapse e.g. `{ kartheek: ["telegram:111", "whatsapp:+91…"] }` into
+   *  to collapse e.g. `{ alex: ["telegram:111", "whatsapp:+1…"] }` into
    *  one canonical peer id, so the same person on two surfaces shares the
    *  same session under `dmScope: "per-peer"`. */
   identityLinks?: Record<string, string[]>;

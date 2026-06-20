@@ -436,7 +436,7 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   if (args.runtime.platform === "win32") {
     lines.push(
       "On Windows: when a bash command argument contains a backslash path " +
-      "(e.g. `F:\\Brigade\\src`), single-quote it — `wc -l 'F:\\Brigade\\package.json'` — " +
+      "(e.g. `C:\\path\\to\\project\\src`), single-quote it — `wc -l 'C:\\path\\to\\project\\package.json'` — " +
       "or bash will interpret `\\B`, `\\s`, etc. as escape sequences and strip them, " +
       "running the command against a mangled path.",
     );

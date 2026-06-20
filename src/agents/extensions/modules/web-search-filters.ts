@@ -36,7 +36,7 @@ const ISO_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
 const PERPLEXITY_DATE_PATTERN = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/;
 
 const BRIGADE_WEB_DOCS_URL =
-	"https://github.com/Bhasvanth-Dev9380/brigade/blob/main/docs/web-tools.md";
+	"https://github.com/spinabot/brigade/blob/main/docs/web-tools.md";
 
 function isValidIsoDate(value: string): boolean {
 	if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;

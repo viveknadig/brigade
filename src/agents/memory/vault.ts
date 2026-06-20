@@ -30,8 +30,9 @@ import * as path from "node:path";
 
 import { renameWithRetry } from "../../infra/fs/atomic-rename.js";
 import { cosine, getDefaultEmbedder } from "./embedder.js";
-import { linksFrom, type MemoryLinkKind } from "./links.js";
+import { linksFrom, type MemoryLink, type MemoryLinkKind } from "./links.js";
 import { originBucketKey, type MemoryRecord, type MemorySegment } from "./records.js";
+import { tokenize } from "./scoring.js";
 
 const PIN_OPEN = "%% pinned %%";
 const PIN_CLOSE = "%% /pinned %%";
@@ -60,14 +61,35 @@ const SENTINEL_RE = /^%% tideline:(?:fact|hub|map) %%$/m;
  *  H1/body ONLY — never the filename — so the file is portable across OSes. */
 const MAP_BASENAME = "Memory Map";
 
-/** Order links render in the `## Related` section (stable, kind-grouped). */
+/** Order STRONG edges render in the `## Related` section (stable, kind-grouped).
+ *  `same_topic` is DELIBERATELY ABSENT — thematic edges render in their own
+ *  quarantined `## Same area` section (see {@link renderSameArea}), never mingled
+ *  with these strong factual/lifecycle edges. An edge kind not listed here sorts
+ *  last (defensive — every non-thematic kind is covered). */
 const LINK_KIND_ORDER: MemoryLinkKind[] = [
+	// store-minted lifecycle / mechanism edges
 	"supersedes",
 	"corrects",
 	"transition",
 	"contradicts",
+	// derivation / support
 	"derived_from",
 	"supports",
+	// strong factual taxonomy (the extractor's closed set)
+	"causes",
+	"caused_by",
+	"part_of",
+	"precedes",
+	"follows",
+	"enables",
+	"blocks",
+	"co_constrains",
+	"located_at",
+	"uses",
+	"works_on",
+	"contrasts_with",
+	"relates_to",
+	// legacy generic association (synonymy/bridge)
 	"relates",
 ];
 
@@ -241,13 +263,18 @@ function renderFrontmatter(r: MemoryRecord): string {
  * already joined by a real edge gets no bridge). Returns "" when nothing links.
  */
 function renderRelated(r: MemoryRecord, names: Map<string, string>, bridges?: ReadonlySet<string>): string {
-	const links = linksFrom(r).filter((l) => names.has(l.target));
-	links.sort((a, b) => LINK_KIND_ORDER.indexOf(a.kind) - LINK_KIND_ORDER.indexOf(b.kind));
-	const items = links.map((l) => `- ${l.kind}: [[${names.get(l.target)!}]]`);
+	// STRONG edges only — `same_topic` (thematic) is quarantined to `## Same area`.
+	const links = linksFrom(r).filter((l) => l.kind !== "same_topic" && names.has(l.target));
+	links.sort((a, b) => orderRank(a.kind) - orderRank(b.kind));
+	// `- <kind>: [[target]] — <reason>` (the explainable, justified edge). The reason
+	// is present on extractor edges (mandatory at extraction); store-minted lifecycle
+	// edges carry none, so they render as the bare typed wikilink.
+	const items = links.map((l) => `- ${l.kind}: [[${names.get(l.target)!}]]${edgeReasonSuffix(l)}`);
 	// Append semantic bridges to targets NOT already joined by a typed edge above
-	// (so a bridge never duplicates a real `relates`/`supersedes`/… edge). Only
-	// targets present in `names` (existing notes) — buildBridges already guarantees
-	// this, but re-check so a stale set can't emit a phantom node.
+	// (so a bridge never duplicates a real edge). Only targets present in `names`
+	// (existing notes) — buildBridges already guarantees this, but re-check so a stale
+	// set can't emit a phantom node. A bridge that coincides with a quarantined
+	// same_topic target is still allowed (it's a stronger embedding-based signal).
 	if (bridges && bridges.size > 0) {
 		const alreadyLinked = new Set(links.map((l) => l.target));
 		for (const target of bridges) {
@@ -257,6 +284,34 @@ function renderRelated(r: MemoryRecord, names: Map<string, string>, bridges?: Re
 	}
 	if (items.length === 0) return "";
 	return `## Related\n${items.join("\n")}\n`;
+}
+
+/** Stable sort rank for a strong edge kind (unlisted kinds sort last). */
+function orderRank(kind: MemoryLinkKind): number {
+	const i = LINK_KIND_ORDER.indexOf(kind);
+	return i === -1 ? LINK_KIND_ORDER.length : i;
+}
+
+/** ` — <reason>` suffix for an edge that carries a justification; "" otherwise. The
+ *  reason is single-line (collapse any stray newline) so one edge stays one bullet. */
+function edgeReasonSuffix(l: MemoryLink): string {
+	const reason = l.reason?.trim();
+	return reason ? ` — ${reason.replace(/\s+/g, " ")}` : "";
+}
+
+/**
+ * The QUARANTINED `## Same area` section — thematic / same-domain `same_topic` edges,
+ * rendered SEPARATELY from the strong `## Related` edges so a same-domain pair (e.g.
+ * dark-mode ~ Obsidian) appears as an HONEST weak thematic link without masquerading
+ * as a strong relationship. Uses `~` (not the typed `- kind:` form) to read as a soft
+ * association. Only targets present in `names`; "" when there are none.
+ */
+function renderSameArea(r: MemoryRecord, names: Map<string, string>): string {
+	const items = linksFrom(r)
+		.filter((l) => l.kind === "same_topic" && names.has(l.target))
+		.map((l) => `- ~ [[${names.get(l.target)!}]]${edgeReasonSuffix(l)}`);
+	if (items.length === 0) return "";
+	return `## Same area\n${items.join("\n")}\n`;
 }
 
 /**
@@ -280,6 +335,10 @@ export function renderNote(r: MemoryRecord, names?: Map<string, string>, bridges
 	}
 	const related = renderRelated(r, resolve, bridges);
 	if (related) sections.push(related.trimEnd());
+	// QUARANTINED thematic edges — their OWN section, after the strong `## Related`
+	// ones, so a same-domain hint never masquerades as a strong relationship.
+	const sameArea = renderSameArea(r, resolve);
+	if (sameArea) sections.push(sameArea.trimEnd());
 	sections.push(`${PIN_OPEN}\n\n${PIN_CLOSE}`);
 	return `${sections.join("\n\n")}\n`;
 }

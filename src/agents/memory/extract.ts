@@ -31,6 +31,17 @@ import { applyPersonaOverrideToSession } from "../../system-prompt/pi-injection.
 import { wrapStreamFnWithPayloadMutations } from "../payload-mutators.js";
 import { FactStore, MEMORY_SEGMENTS, type MemoryRecordOrigin, type MemorySegment, type MemorySourceType } from "./records.js";
 import { confineUntrustedSegment } from "./write-gate.js";
+import { balancedObjects } from "./json-scan.js";
+import {
+	buildCandidateBlock,
+	DEFAULT_CANDIDATE_K,
+	fetchRelationshipCandidates,
+	mapNewFactIds,
+	pairToLinkArg,
+	parseRelationshipRefs,
+	RELATIONSHIP_PROMPT_FRAGMENT,
+	resolveRelationshipPairs,
+} from "./relationship-extract.js";
 
 const log = createSubsystemLogger("memory/extract");
 
@@ -91,7 +102,7 @@ Rules:
 - Use "correction" (not preference/identity) when the user is fixing something rather than stating it fresh. "corrects" is ONLY for segment=correction.
 - Importance defaults by segment: identity 0.85, correction 0.80, relationship 0.75, preference 0.70, project 0.65, knowledge 0.60, context 0.40. Trust the defaults unless something is unusually important or trivial.
 - Return {"facts":[]} if nothing durable.
-Respond with ONLY the JSON object.`;
+Respond with ONLY the JSON object.${RELATIONSHIP_PROMPT_FRAGMENT}`;
 
 export interface ExtractedFact {
 	content: string;
@@ -100,39 +111,12 @@ export interface ExtractedFact {
 	corrects?: string;
 }
 
-/** ALL top-level BALANCED `{...}` objects in `text`, in order (string-aware: braces
- *  inside JSON strings don't count). Replaces a greedy first-to-LAST `{...}` match that
- *  grabbed any trailing brace block AND a single-object scan that let a LEADING stray
- *  object (`{}`, a reasoning artifact) shadow the real `{"facts":[…]}` after it — both
- *  failure modes returned [] and advanced the cursor past un-distilled facts. */
-export function balancedObjects(text: string): string[] {
-	const out: string[] = [];
-	let depth = 0;
-	let inStr = false;
-	let esc = false;
-	let start = -1;
-	for (let i = 0; i < text.length; i++) {
-		const c = text[i];
-		if (inStr) {
-			if (esc) esc = false;
-			else if (c === "\\") esc = true;
-			else if (c === '"') inStr = false;
-			continue;
-		}
-		if (c === '"') inStr = true;
-		else if (c === "{") {
-			if (depth === 0) start = i;
-			depth++;
-		} else if (c === "}" && depth > 0) {
-			depth--;
-			if (depth === 0 && start >= 0) {
-				out.push(text.slice(start, i + 1));
-				start = -1;
-			}
-		}
-	}
-	return out;
-}
+// `balancedObjects` lives in `./json-scan.js` (its own module) so `relationship-extract.ts`
+// can reuse it WITHOUT importing this file — that would form a load-time cycle, since
+// EXTRACTION_PROMPT above is built from relationship-extract.ts's prompt fragment at
+// module top level. Re-exported here so existing importers (skill-review,
+// skill-consolidate, consolidate) keep importing it from `extract.js` unchanged.
+export { balancedObjects };
 
 /**
  * Parse the extraction model's reply AND report whether the model returned a valid
@@ -425,9 +409,29 @@ export async function runExtractionSweep(args: SweepArgs): Promise<SweepResult> 
 		if (compacted) writeCursor(args.workspaceDir, args.sessionId, total);
 		return { ran: false, stored: 0, processedTo: compacted ? total : from };
 	}
+	// RELATIONSHIP EXTRACTION (no extra LLM call): append a BOUNDED candidate set of
+	// existing same-origin facts to the SAME extraction prompt, so the one extraction
+	// call ALSO returns `relationships` between {new facts ∪ candidates}. We fetch the
+	// top-K most-related existing facts via the existing hybrid recall (never the whole
+	// store) using the fresh transcript text as the query. Best-effort: a recall hiccup
+	// just yields no candidates (the model still relates new facts to each other).
+	let candidateBlock = "";
+	let candidateIds: Set<string> = new Set();
+	try {
+		const candidates = fetchRelationshipCandidates(
+			new FactStore(args.workspaceDir),
+			[conversation],
+			args.origin,
+			DEFAULT_CANDIDATE_K,
+		);
+		candidateBlock = buildCandidateBlock(candidates);
+		candidateIds = new Set(candidates.map((c) => c.memoryId));
+	} catch {
+		/* no candidates → relationships limited to new↔new (still valuable) */
+	}
 	let reply = "";
 	try {
-		reply = await args.llm(conversation);
+		reply = await args.llm(conversation + candidateBlock);
 	} catch (err) {
 		log.warn("extraction llm failed; cursor not advanced", {
 			sessionId: args.sessionId,
@@ -465,6 +469,28 @@ export async function runExtractionSweep(args: SweepArgs): Promise<SweepResult> 
 		log.warn("extraction facts flush failed; cursor NOT advanced (next sweep retries)", { sessionId: args.sessionId });
 		return { ran: false, stored: 0, processedTo: from };
 	}
+	// SEMANTIC RELATIONSHIP EDGES — write the TYPED edges the SAME extraction reply
+	// proposed (no extra LLM call; gleaning is reserved for the on-demand relink to keep
+	// the per-turn path cheap). Map the just-written facts back to their stored memoryIds
+	// (in emission order, so `new:<i>` resolves correctly), then resolve+validate the
+	// model's pairs through the single chokepoint: both endpoints must be a REAL id (a
+	// written new fact OR a candidate that was in the prompt), no self-edges, strict type
+	// (closed taxonomy ∪ same_topic), reason mandatory, the strength filter, the
+	// same_topic quarantine cap, deduped. `linkRelated` is same-origin + idempotent, so
+	// this is origin-isolated and re-running adds nothing. Best-effort — never fails the
+	// sweep (the facts already landed; edges are additive connective tissue).
+	let relatesWritten = 0;
+	try {
+		const refs = parseRelationshipRefs(reply);
+		if (refs.length > 0) {
+			const store = new FactStore(args.workspaceDir);
+			const newFactIds = mapNewFactIds(store, facts.map((f) => f.content), args.origin);
+			const pairs = resolveRelationshipPairs(refs, newFactIds, candidateIds);
+			if (pairs.length > 0) relatesWritten = store.linkRelated(pairs.map(pairToLinkArg));
+		}
+	} catch {
+		/* edges are additive — a failure here never undoes the stored facts */
+	}
 	// Advance the cursor past everything we just considered (even if 0 stored —
 	// re-distilling the same turns would only waste calls).
 	writeCursor(args.workspaceDir, args.sessionId, total);
@@ -473,6 +499,7 @@ export async function runExtractionSweep(args: SweepArgs): Promise<SweepResult> 
 		newMessages: fresh.length,
 		candidates: facts.length,
 		stored,
+		relates: relatesWritten,
 	});
 	return { ran: true, stored, processedTo: total };
 }

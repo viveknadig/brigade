@@ -13,7 +13,7 @@
  *     no "null in <dept>" artefacts).
  *   - The rendered anchor is EXACTLY ONE line — no embedded newlines.
  *
- * No openclaw / clawd / hermes / boop / paperclip / nanoclaw tokens.
+ * No external agent-codebase tokens.
  */
 
 import { strict as assert } from "node:assert";

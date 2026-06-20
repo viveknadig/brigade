@@ -196,10 +196,10 @@ export function canonicalWhatsAppId(raw: string | null | undefined): string {
 /**
  * Coerce ANY operator-shaped target into a sendable WhatsApp JID. Accepts:
  *
- *   - `"+91 77026 16808"` / `"+917702616808"` / `"917702616808"` → strips
+ *   - `"+1 555 010 0001"` / `"+15550100001"` / `"15550100001"` → strips
  *     formatting, treats as a personal phone number, returns
- *     `"917702616808@s.whatsapp.net"`.
- *   - `"917702616808@s.whatsapp.net"` → returned unchanged (already canonical).
+ *     `"15550100001@s.whatsapp.net"`.
+ *   - `"15550100001@s.whatsapp.net"` → returned unchanged (already canonical).
  *   - `"123-456-789@g.us"` → returned unchanged (group jid).
  *   - `"260451430568126@lid"` → returned unchanged (LID alias — Baileys handles
  *     the lookup internally during send).

@@ -1,240 +1,405 @@
+# 🦁 Brigade — The self-hosted enterprise AI crew
+
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Bhasvanth-Dev9380/brigade/main/assets/brigade-banner-on-black.gif" alt="BRIGADE — your personal AI crew" width="900" />
+  <img src="https://raw.githubusercontent.com/spinabot/brigade/main/assets/brigade-banner.gif" alt="Brigade — the self-hosted enterprise AI crew" width="900" />
 </p>
 
-<p>
-  <a href="https://github.com/Bhasvanth-Dev9380/brigade/actions/workflows/ci.yml"><img src="https://github.com/Bhasvanth-Dev9380/brigade/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-  <a href="https://www.npmjs.com/package/@spinabot/brigade"><img src="https://img.shields.io/npm/v/@spinabot/brigade" alt="npm version" /></a>
-  <a href="https://www.npmjs.com/package/@spinabot/brigade"><img src="https://img.shields.io/npm/l/@spinabot/brigade" alt="license" /></a>
-  <a href="https://www.npmjs.com/package/@spinabot/brigade"><img src="https://img.shields.io/node/v/@spinabot/brigade" alt="node engine" /></a>
+<p align="center">
+  <strong>Built for enterprise scale. Open for everyone.</strong> &middot; <em>An ecosystem, not an app.</em>
 </p>
 
-🦁 **Brigade is your personal AI crew** — a polished terminal interface for working
-with the world's leading language models (Anthropic Claude, OpenAI GPT, Google
-Gemini, Groq, xAI, DeepSeek, Mistral, OpenRouter, Cerebras) plus your own local
-models via Ollama or any OpenAI-compatible endpoint.
+<p align="center">
+  <a href="https://github.com/spinabot/brigade/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/spinabot/brigade/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI" alt="CI status"></a>
+  <a href="https://www.npmjs.com/package/@spinabot/brigade"><img src="https://img.shields.io/npm/v/@spinabot/brigade?style=for-the-badge&logo=npm&logoColor=white&color=CB3837" alt="npm version"></a>
+  <a href="https://nodejs.org"><img src="https://img.shields.io/node/v/@spinabot/brigade?style=for-the-badge&logo=nodedotjs&logoColor=white&color=5FA04E&label=node" alt="node engine"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge" alt="MIT License"></a>
+  <a href="https://brigade.spinabot.com"><img src="https://img.shields.io/badge/website-brigade.spinabot.com-E8B021?style=for-the-badge&logo=googlechrome&logoColor=white" alt="website"></a>
+</p>
 
-It runs as a single-process chat TUI by default, or as a headless WebSocket
-gateway you can attach multiple thin clients to. Under the hood: isolated
-agents with their own workspaces and credentials, a sub-agent spawn lifecycle,
-memory that persists across sessions, a skill system, a cron scheduler, and
-optional channel adapters (WhatsApp shipped, more coming).
+**Brigade is a self-hosted enterprise AI crew**: a team of AI agents on a real org
+chart that share one long-term memory, Tideline, so what one agent learns, the rest
+can use. They delegate to each other, switch models mid-task without losing the
+thread, and act inside the 1,000+ apps you already use. You run it yourself, with the
+controls and data sovereignty an enterprise needs: no account to create, no SaaS in
+the middle.
+
+The same crew runs on a Raspberry Pi or a server. By default it's a small filesystem
+install; switch to a self-hosted Convex database when you want one. Bring any model:
+Claude, GPT, Gemini, Llama, or a local Ollama. Privileged actions wait for your
+approval, and your keys and data never leave your machine. No telemetry.
+
+It's an ecosystem, not an app: one crew you reach from the terminal and WhatsApp, and
+from your watch, Meta smart glasses, and Meta Quest.
+
+```bash
+npm i -g @spinabot/brigade
+brigade
+```
+
+Start it and you get a fast chat TUI. Keep going and you get isolated agents with
+their own workspaces and credentials, persistent memory, a skill system, a cron
+scheduler, sub-agent fan-out, an org hierarchy, messaging channels like WhatsApp,
+1,000+ app connectors, an MCP memory server, and an optional self-hosted Convex
+backend — all under one `~/.brigade/` directory you fully own.
+
+> One owner, a whole crew — many agents that coordinate through a real org chart,
+> all on hardware and storage **you** control.
+
+---
+
+## Table of contents
+
+- [Why Brigade](#why-brigade)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [How it works](#how-it-works)
+- [Features](#features)
+- [CLI reference](#cli-reference)
+- [In-chat commands](#in-chat-commands)
+- [Built-in tools](#built-in-tools)
+- [Multi-agent isolation](#multi-agent-isolation)
+- [Providers & web search](#providers--web-search)
+- [Configuration & storage](#configuration--storage)
+- [Storage modes: filesystem vs. Convex](#storage-modes-filesystem-vs-convex)
+- [MCP memory server](#mcp-memory-server)
+- [Tideline (long-term memory)](#tideline-long-term-memory)
+- [Extending Brigade](#extending-brigade)
+- [Privacy](#privacy)
+- [Develop from source](#develop-from-source)
+- [Contributing](#contributing)
+- [License](#license)
+- [🦁 Brigadiers](#-brigadiers)
+
+---
+
+## Why Brigade
+
+| | |
+|---|---|
+| 🖥️ **Terminal-first** | A flicker-free chat TUI by default. No browser, no Electron. |
+| 🧠 **Memory that lasts** | Facts persist across sessions with origin scoping, decay, and hybrid (keyword + vector) recall — the **Tideline** engine. |
+| 👥 **A real crew** | Spawn isolated agents with their own personas, credentials, and memory; wire them into an **org chart** that governs who can talk to whom. |
+| 🔌 **Bring any model** | Anthropic, OpenAI, Gemini, OpenRouter, Groq, Cerebras, xAI, DeepSeek, Mistral, local Ollama, or any OpenAI-compatible endpoint. Switch mid-conversation. |
+| 📅 **Always-on** | Run as a headless WebSocket gateway with a crash supervisor, cron jobs, and OS service install. |
+| 💬 **Channels** | Talk to your crew from WhatsApp today; the adapter contract is built for more. |
+| 🔗 **1,000+ connectors** | Gmail, Slack, GitHub, Notion, Calendar, Linear… via the built-in Composio tool. |
+| 🧩 **MCP** | Expose your long-term memory to any MCP client (`brigade mcp`), or connect MCP servers in. |
+| 🗄️ **Your storage** | Default filesystem mode, or an optional **fully self-hosted Convex** backend with at-rest encryption. |
+| 🔐 **Yours** | Everything lives under `~/.brigade/`. Keys are stored locally at mode `0600`. `rm -rf ~/.brigade` wipes it clean. |
+
+---
 
 ## Install
 
 ```bash
-npm install -g @spinabot/brigade
+npm i -g @spinabot/brigade
 ```
 
-Requires Node.js 22.12 or newer.
-
-## From source (run the GitHub repo)
-
-For development, contribution, or running the latest unreleased code:
-
-### Prerequisites
-
-- Node.js **22.12 or newer** (`node --version`) — Pi SDK uses `using`/`AsyncDisposable` and `v22.12` features
-- npm 10+ (ships with Node 22)
-- git
-- (Optional) `tsx` is installed locally — no need to install globally
-
-### Clone & build
-
-```bash
-git clone https://github.com/Bhasvanth-Dev9380/brigade.git
-cd brigade
-npm install          # installs deps (Pi SDK 0.70.6, ws, croner, etc.)
-npm run build        # compiles src/ → dist/ (~300 files, postbuild prints summary)
-```
-
-### Run it
-
-Three ways, depending on what you're doing:
-
-```bash
-# 1. Production-style — run the built dist/ once, fastest startup
-node brigade.mjs                  # → brigade tui (default)
-node brigade.mjs agents list
-node brigade.mjs gateway --port 7777
-
-# 2. Smart dev runner — auto-rebuilds dist/ if src/ is newer
-npm run dev                       # → brigade tui
-npm run agents:list
-npm run gateway
-
-# 3. Pure TypeScript via tsx — no build step (slower per-invocation, no cache)
-npm run dev:tsx                   # → brigade entry directly
-npm run watch                     # auto-restart on file change
-```
-
-### Link globally (so `brigade` works anywhere)
-
-```bash
-npm link              # one-time — creates a global `brigade` symlink → this checkout
-brigade --help        # now works from any directory
-brigade onboard
-```
-
-Run `npm unlink -g brigade` from any directory to remove the link.
-
-### Common dev workflows
-
-```bash
-npm test                          # 1700+ tests via node:test (tempdir-isolated)
-npm run typecheck                 # tsc --noEmit
-npm run build:watch               # incremental build while editing
-npm run clean                     # rm -rf dist/
-
-# Drive a single turn end-to-end (smoke test)
-npm run brigade -- agent --provider anthropic --model claude-sonnet-4-6 -m "hello"
-
-# Convenient subcommand aliases (all wired to scripts/run-brigade.mjs)
-npm run agents:list
-npm run agents:add -- support
-npm run gateway
-npm run gateway:stop
-npm run connect
-npm run tui
-```
-
-### What `npm install` brings down
-
-| Layer                | Package                                  | Why                                  |
-|----------------------|------------------------------------------|--------------------------------------|
-| Loop engine          | `@mariozechner/pi-agent-core@0.70.6`     | The agent loop primitive             |
-| Sessions + tools     | `@mariozechner/pi-coding-agent@0.70.6`   | JSONL sessions, coding tools, skills |
-| Multi-provider       | `@mariozechner/pi-ai@0.70.6`             | Anthropic / OpenAI / Gemini / etc.   |
-| Terminal UI          | `@mariozechner/pi-tui@0.70.6`            | Flicker-free TUI components          |
-| WS server            | `ws@^8.18`                               | Gateway WebSocket transport          |
-| Cron                 | `croner@^10.0.1`                         | Schedule parsing + tick worker       |
-| WhatsApp             | `@whiskeysockets/baileys` (lazy)         | Loaded only when channel is linked   |
-
-Zero runtime telemetry. No magic. Brigade's whole runtime is ~1.5 MB of TypeScript on top of Pi.
-
-## Quick start
+Requires **Node.js 22.12 or newer** (`node --version`). Then launch onboarding:
 
 ```bash
 brigade
 ```
 
+---
+
+## Quick start
+
 First launch walks you through three steps:
 
-1. Pick a provider.
-2. Connect it (paste an API key, or scan your local Ollama).
-3. Choose a default model.
+1. **Pick a provider** — Anthropic, OpenAI, Gemini, OpenRouter, Ollama, and more.
+2. **Connect it** — paste an API key, or scan your local Ollama.
+3. **Choose a default model.**
 
 That's it. Subsequent launches resume right where you left off.
 
-## Commands
+```bash
+brigade                 # chat TUI (default)
+brigade agent -m "summarize ~/today.md"   # one-shot turn
+brigade gateway run     # headless, always-on
+brigade doctor          # health-check your install
+```
 
-Brigade is a single binary with subcommands. `brigade` on its own is shorthand
-for `brigade tui` (the chat TUI).
+---
 
-| Command             | What it does                                                             |
-|---------------------|--------------------------------------------------------------------------|
-| `brigade`           | Start the chat TUI (default)                                             |
-| `brigade tui`       | Start the chat TUI (auto-starts the gateway if needed)                   |
-| `brigade gateway`   | Run or manage the headless WebSocket gateway (no TUI)                    |
-| `brigade connect`   | Open a thin TUI client against a running gateway                         |
-| `brigade agent`     | Drive a single turn through the agent pipeline                           |
-| `brigade agents`    | Manage isolated agents — list, add, delete, bind, set-identity (default: list) |
-| `brigade onboard`   | Re-run the provider/model setup wizard                                   |
-| `brigade doctor`    | Health-check Node, config, providers, prompts, log sink, and gateway     |
-| `brigade status`    | Print a snapshot of config, sessions, and gateway state                  |
-| `brigade config`    | Read & write your Brigade configuration                                  |
-| `brigade channels`  | Manage messaging channels (WhatsApp etc.) — link, status, enable/disable |
-| `brigade sessions`  | List + clean up agent session transcripts                                |
-| `brigade skills`    | Inspect installed Brigade skills                                         |
-| `brigade cron`      | Manage scheduled cron jobs                                               |
-| `brigade exec`      | Manage the bash-tool approval allowlist                                  |
-| `brigade backup`    | Snapshot, verify, and restore your Brigade install as a `.tar.gz`        |
-| `brigade pairing`   | Review and approve/revoke pending channel pairing codes                  |
-| `brigade secrets`   | Find suspected leaked credentials inside your Brigade install            |
-| `brigade logs`      | Tail today's gateway log file                                            |
-| `brigade --version` | Print the version                                                        |
-| `brigade --help`    | Print the full help text                                                 |
+## How it works
+
+Brigade is one binary that can act as a **gateway** (the long-lived process that
+holds all state and runs agents) or as a **thin client** that attaches to it.
+
+```
+            ┌─────────────────────────── ~/.brigade/ ───────────────────────────┐
+            │  config · per-agent workspaces · sessions (JSONL) · memory · cron  │
+            └───────────────────────────────────────────────────────────────────┘
+                                          ▲
+                                          │ reads/writes (filesystem OR Convex)
+                        ┌─────────────────┴─────────────────┐
+   brigade tui ──ws──▶  │            GATEWAY  :7777          │  ◀──ws── brigade connect
+   brigade chat         │  per-turn agent loop · routing    │
+   WhatsApp  ──────────▶│  tools · sub-agents · supervisor  │◀──────── cron jobs
+   MCP client ─stdio──▶ │  (brigade mcp → memory server)    │
+                        └───────────────────────────────────┘
+```
+
+- **Clients are thin.** The TUI (`brigade`/`brigade tui`), `brigade connect`, and
+  channel adapters are all WebSocket clients of the gateway. State lives only in
+  the gateway; clients mirror it. Disconnect, walk away, reconnect later — your
+  agents keep running.
+- **One turn at a time.** Each message runs through a resilient agent loop: resolve
+  the session, assemble the system prompt (persona + skills + org context), stream
+  the model, run tool calls through approval and ownership guards, persist the
+  transcript, reply.
+- **Inbound from anywhere.** A WhatsApp message and a TUI keystroke flow through the
+  same routing pipeline that resolves them to an `(agent, session)` pair, so a peer
+  on one channel never bleeds into another's context.
+- **It stays up.** A heartbeat file plus an out-of-process supervisor restart the
+  gateway if its event loop wedges; per-OS service installers bring it up at login.
+
+---
+
+## Features
+
+### 🧠 Memory (Tideline)
+File-backed facts (`facts.jsonl`) tagged with an **origin** (owner vs. channel peer)
+so a peer's facts never leak into your context. Facts **decay** on three tiers and
+are deduped at write time, behind a **provenance write-gate** that stops untrusted
+sources from overwriting your identity/preferences. The **Tideline** engine adds
+**hybrid recall** (BM25 keyword + model-free vector lane), a typed link graph, and a
+nightly reflect/consolidate pass. Auto-recall injects only origin-matched facts
+before each turn. Tools: `recall_memory`, `read_memory`, `write_memory`,
+`manage_memory`. → **[docs/tideline.md](docs/tideline.md)**
+
+### 🪪 Skills
+Drop a folder with a `SKILL.md` into your workspace and Brigade discovers it next
+turn. Skills are **prompt-resident** (name + description injected; the model reads
+the body on demand). Six discovery roots merge in precedence order with eligibility
+filters for OS, required binaries, env vars, and config. 56 skills ship bundled.
+Manage with `manage_skill`.
+
+### 👥 Sub-agents
+Delegate work to child agents: `spawn_agent` (single) and `spawn_agents` (parallel
+fan-out). Depth-capped (default 3) and child-count-capped (default 5), with an
+**abort cascade** and a completion bridge that wakes the parent when children settle.
+
+### 🏢 Org / Pride hierarchy
+Define a crew as a real org chart (`cfg.org`): members, departments, reporting
+lines. An **A2A (agent-to-agent) policy** derives from the graph and governs which
+agents may message which. Inspect it with `brigade org show` / `explain` / `doctor`,
+or render a 🦁 Pride chart with the `org` tool.
+
+### 💬 Channels
+A typed channel-adapter contract with a shared inbound pipeline (access control,
+dedupe, abort triggers, approval routing). **WhatsApp** is the reference adapter
+(Baileys, QR/code pairing, multi-account, reconnect backoff).
+
+### ⏰ Cron
+Schedule recurring or one-shot work: cron expressions (with IANA timezones and
+stagger), fixed intervals, or one-shot timestamps. Payloads can be a system event
+into your main session, a full agent turn in an isolated session, or a shell script.
+Jobs survive restarts.
+
+### 🔗 Connectors (Composio)
+An owner-only `composio` tool brings **1,000+ app connectors** (Gmail, Slack,
+GitHub, Notion, Calendar, Linear, …) with managed OAuth. Set a key once; discover,
+connect, and execute actions by slug.
+
+### 🧩 MCP
+Run `brigade mcp` to expose your long-term memory to any MCP client (Claude Desktop,
+editors, etc.) as add/search/context tools over stdio, owner-bound.
+
+### 🛡️ Safety & ownership
+Privileged tools use either a **per-call ownership gate** (`cron list` is visible to
+peers; `cron add` is not) or a blanket owner-only refusal. The `bash` tool is gated
+by a per-agent approval allowlist (`brigade exec`). Secrets in config use `${VAR}`
+references that resolve at read time and are never persisted resolved. Optional
+**AES-256-GCM at-rest encryption** in Convex mode (`brigade encrypt`).
+
+### 🔀 Carrow — cross-model continuity
+Switch models mid-conversation **without losing context**. Carrow carries the full
+transcript onto the new model (it's the same session), **re-anchors your thinking
+level** to what the target supports (preserved when it can reason, forced off for a
+non-reasoning model, bumped for a reasoning-only one), and sanitizes provider-specific
+reasoning blocks the next provider would reject. It works **mid-turn** (abort the
+in-flight run and replay your last message on the new model) or **next-turn**. This is
+what makes `/model` and `/provider` switches seamless.
+
+### 🔁 Autonomous loops
+A **loop-runner** drives an agent (or a planner/executor stage) step-by-step under hard
+guards — token / iteration / time **budget**, plus **no-progress** and **repetition**
+detection — and stops only when **independent done-checks** pass or a guard fires,
+*never on the agent's own say-so*. Each step's output is gated through the slop
+detector with a bounded repair retry.
+
+### 🧹 Anti-slop quality gate
+A deterministic, zero-dependency **AI-slop detector** scans generated text in four
+passes (vocabulary crutches, cliché phrases, formulaic openers, structural patterns)
+and flags **density, not single words**. When output trips the threshold it triggers
+**one bounded repair retry**, wired as a post-generation hook — an objective check, not
+the model grading itself.
+
+### 📈 Self-improvement (human-gated)
+Tideline ships a **human-gated** self-improvement loop: propose changes from telemetry
+→ **gate on evaluation** → human approve → apply → revert if needed. Brigade also
+reviews its own behavior and curates/reviews skills from usage. Nothing that affects
+recall changes without passing the eval bar **and** a human approval. Throughout, the
+principle is the same: *independent verification, never the agent judging itself.*
+
+---
+
+## CLI reference
+
+`brigade` on its own is shorthand for `brigade tui`. Run `brigade --help` or
+`brigade <command> --help` for full flags.
+
+### Core
+
+| Command | What it does |
+|---|---|
+| `brigade` · `brigade tui` | Start the chat TUI (auto-starts the gateway if needed) |
+| `brigade connect` | Attach a thin TUI to an already-running gateway (`--host`, `--port`) |
+| `brigade agent <msg>` | Drive a single turn through the agent pipeline (`--provider`, `--model`, `-m`) |
+| `brigade onboard` | Run the provider/model setup wizard |
+| `brigade status` | Snapshot config, sessions, and gateway state (`--json`) |
+| `brigade doctor` | Health-check Node, config, providers, prompts, logs, gateway (`--json`, `--strict`, `--gateway <url>`) |
+| `brigade logs` | Tail today's gateway log (`--follow`) |
+
+### Gateway
+
+| Command | What it does |
+|---|---|
+| `brigade gateway run` | Run the headless WebSocket gateway (`--port`, `--host`, `--verbose`, `--quiet`, `--log-level`) |
+| `brigade gateway status` · `stop` · `restart` | Inspect / stop / restart the running gateway |
+| `brigade gateway install` · `uninstall` | Install/remove as a system service (launchd / systemd / Task Scheduler) |
+| `brigade gateway supervise` | Out-of-process crash watchdog (respawns a wedged gateway) |
+
+### Agents
+
+| Command | What it does |
+|---|---|
+| `brigade agents` · `agents list` | List every configured agent (`--json`, `--bindings`) |
+| `brigade agents add [name]` | Create an isolated agent (`--workspace`, `--model`, `--provider`, `--bind`, `--non-interactive`) |
+| `brigade agents delete <id>` | Delete an agent + its workspace/sessions (`--force`) |
+| `brigade agents bind` · `unbind` | Claim / release channel-account routing slots (`--agent`, `--bind`, `--all`) |
+| `brigade agents bindings` | List routing bindings (`--agent`) |
+| `brigade agents set-identity` | Set name / theme / emoji / avatar (`--agent`, `--from-identity`) |
+
+### Org / Pride
+
+| Command | What it does |
+|---|---|
+| `brigade org init` | Write a starter `cfg.org` block (`--template solo\|family\|company\|custom`, `--skip-editor`) |
+| `brigade org show` | Print an ASCII tree of the current org |
+| `brigade org explain <from> <to>` | Show whether `from` can message `to`, and the derivation/denial reason |
+| `brigade org doctor` | Run org lints (single-member dept, dangling overrides, depth > 5, …) |
+
+### Channels & pairing
+
+| Command | What it does |
+|---|---|
+| `brigade channels list` · `status` · `add` | List channels, probe status, add an account |
+| `brigade channels link` · `unlink` | Pair / unpair a channel (e.g. WhatsApp QR) |
+| `brigade channels enable` · `disable` | Toggle a channel |
+| `brigade channels allow list\|add\|remove` | Manage the per-channel allowlist |
+| `brigade pairing list\|approve\|revoke` | Review / approve / revoke pending pairing codes |
+
+### Cron
+
+| Command | What it does |
+|---|---|
+| `brigade cron list` · `status` · `runs <jobId>` | List jobs, service status, per-job run history |
+| `brigade cron add` | Create a job (`--cron`/`--every`/`--at`, `--tz`, `--message`/`--system-event`, `--model`, `--tools`, `--channel`/`--to`) |
+| `brigade cron edit <jobId>` · `rm <jobId>` | Modify / remove a job |
+| `brigade cron enable\|disable\|run <jobId>` | Toggle or run a job on demand |
+
+### Storage, encryption & data
+
+| Command | What it does |
+|---|---|
+| `brigade store mode show` | Print the active storage mode (filesystem / convex) |
+| `brigade store mode set <mode>` | Pin the mode (`--convex-url` for convex) |
+| `brigade store migrate --to <mode>` | Copy data between backends (`--convex-url`, `--dry-run`, `--keep-source`) |
+| `brigade store reset` | Factory-reset the Convex backend (`--yes`, `--purge-local`) |
+| `brigade encrypt status` · `init` · `test` | Manage the AES-256-GCM at-rest key |
+| `brigade backup create` · `verify` · `restore` | Snapshot / verify / restore your install as a `.tar.gz` |
+| `brigade secrets audit` | Find suspected leaked credentials in your install |
+
+### Config, skills, sessions, exec, MCP
+
+| Command | What it does |
+|---|---|
+| `brigade config list\|get\|set\|unset\|file\|schema\|validate` | Read & write configuration |
+| `brigade skills list\|info <name>` | Inspect installed skills |
+| `brigade sessions list\|cleanup` | List + clean up session transcripts |
+| `brigade exec list\|allow\|allow-pattern\|remove\|deny-test\|file` | Manage the `bash`-tool approval allowlist |
+| `brigade mcp` | Serve your long-term memory as an MCP server over stdio (`--agent <id>`) |
 
 ### `brigade gateway`
 
-Runs Brigade as a WebSocket server with no terminal UI of its own. Useful when
-you want a long-lived process that survives terminal sessions — channel adapters
-(WhatsApp etc.), cron jobs, and sub-agent spawns all need the gateway running.
+Runs Brigade as a WebSocket server with no terminal UI of its own — the long-lived
+process that channel adapters, cron jobs, and sub-agent spawns all need running.
 
 ```bash
-brigade gateway --port 7777 --host 127.0.0.1 --verbose
+brigade gateway run --port 7777 --host 127.0.0.1 --verbose
 brigade gateway status
 brigade gateway stop
 brigade gateway restart
-brigade gateway install     # install as a system service (launchd / systemd / Task Scheduler)
+brigade gateway install      # install as a system service (launchd / systemd / Task Scheduler)
+brigade gateway supervise    # out-of-process crash watchdog
 ```
 
-| Flag             | Default       | Notes                                        |
-|------------------|---------------|----------------------------------------------|
-| `--port N`       | `7777`        | Listen port (also `BRIGADE_PORT` env var)    |
-| `--host A`       | `127.0.0.1`   | Bind address (loopback by design)            |
-| `--verbose`      | off           | Stream a one-line summary of every event     |
-| `--quiet`        | off           | Suppress the live console stream             |
-| `--log-level X`  | `info`        | `debug`, `info`, `warn`, `error`             |
+| Flag | Default | Notes |
+|---|---|---|
+| `--port N` | `7777` | Listen port (also `BRIGADE_PORT`) |
+| `--host A` | `127.0.0.1` | Bind address (loopback by design) |
+| `--verbose` | off | Stream a one-line summary of every event |
+| `--quiet` | off | Suppress the live console stream |
+| `--log-level X` | `info` | `debug` / `info` / `warn` / `error` |
 
 ### `brigade connect`
 
 Attaches a TUI to a running gateway. Same chat experience as `brigade`, but the
 agent runs in the gateway process — so you can disconnect, walk away, reconnect
-later, and pick up where you left off. Other clients (channel adapters, cron
-jobs) continue running while you're away.
+later, and pick up where you left off while channel adapters and cron jobs keep
+running.
 
 ```bash
 brigade connect --host 127.0.0.1 --port 7777
 ```
 
-| Flag           | Default       | Notes                                |
-|----------------|---------------|--------------------------------------|
-| `--host A`     | `127.0.0.1`   | Gateway host to connect to           |
-| `--port N`     | `7777`        | Gateway port                         |
-| `--timeout MS` | `60000`       | Per-request timeout                  |
-
 ### `brigade agents`
 
-Brigade ships with a default agent called `main`. You can add more — each agent
-has its own workspace (persona files), auth profiles, exec allowlist, sessions,
-and optional channel/account routing bindings.
+Brigade ships with a default agent called `main`. Add more — each agent has its own
+workspace (persona files), auth profiles, exec allowlist, sessions, and optional
+channel/account routing bindings.
 
 ```bash
-brigade agents                                                # list every agent (default)
+brigade agents                                          # list every agent (default)
 brigade agents list [--json] [--bindings]
 brigade agents bindings [--agent <id>] [--json]
 brigade agents bind --agent <id> --bind <spec> [--bind <spec> …] [--json]
-brigade agents unbind --agent <id> (--bind <spec> [--bind <spec> …] | --all) [--json]
-brigade agents add <name> [--workspace <dir>]
-                  [--model <id>] [--provider <id>] [--agent-dir <dir>]
-                  [--bind <spec> [--bind <spec> …]]
-                  [--non-interactive] [--json]
-brigade agents set-identity --agent <id>
-                  [--workspace <dir>] [--identity-file <path>] [--from-identity]
-                  [--name <…>] [--theme <…>] [--emoji <…>] [--avatar <…>]
-                  [--json]
+brigade agents unbind --agent <id> (--bind <spec> … | --all) [--json]
+brigade agents add [name] [--workspace <dir>] [--model <id>] [--provider <id>]
+                  [--agent-dir <dir>] [--bind <spec> …] [--non-interactive] [--json]
+brigade agents set-identity --agent <id> [--from-identity]
+                  [--name <…>] [--theme <…>] [--emoji <…>] [--avatar <…>] [--json]
 brigade agents delete <id> --force [--json]
 ```
 
-`agents add <name>` without `--workspace` defaults to
-`~/.brigade/agents/<name>/workspace/`. Delete is a soft-delete — the workspace
-moves into `.brigade-trash/` so you can recover it.
-
-Reserved ids: `main` (the default), `none`, `null`, `undefined`, `default`,
-`all`, `any` — these cannot be used as agent names.
+`agents add` without `--workspace` defaults to `~/.brigade/agents/<id>/workspace/`.
+A binding `<spec>` is `"<channel>"` or `"<channel>:<accountId>"`. Delete requires
+`--force`.
 
 ### `brigade doctor`
 
-Runs a health check across Node version, your `~/.brigade/` directory, config,
-configured providers, log sink, prompt files, and (optionally) a running
-gateway. Exits 0 if everything passes, 1 if anything fails.
+Health-checks Node version, your `~/.brigade/` directory, config, configured
+providers, log sink, prompt files, and (optionally) a running gateway. Exits 0 on
+pass, 1 on failure.
 
 ```bash
 brigade doctor
 brigade doctor --gateway ws://127.0.0.1:7777
-brigade doctor --json           # machine-readable
-brigade doctor --strict         # exit 1 on warnings (CI mode)
+brigade doctor --json            # machine-readable
+brigade doctor --strict          # exit 1 on warnings (CI mode)
 ```
 
 ### `brigade config`
@@ -245,171 +410,359 @@ Read and write the local config without opening the TUI.
 brigade config list
 brigade config get agents.defaults.provider
 brigade config set agents.defaults.provider openrouter
-brigade config set agents.defaults.model.primary "anthropic/claude-sonnet-4.6"
 brigade config unset agents.defaults.thinking
+brigade config file              # print the resolved config path
+brigade config validate          # schema-check the current config
 ```
 
 ### `brigade cron`
 
-Schedule recurring or one-shot agent turns — useful for daily briefings,
-reminders, or background scans.
+Schedule recurring or one-shot agent turns. Pick exactly one of `--cron`, `--every`,
+or `--at`; pair `--cron` with an IANA `--tz`.
 
 ```bash
 brigade cron list
-brigade cron add --schedule "every 1 hour" --message "drink water"
-brigade cron add --at "2026-06-04T09:00:00+05:30" --message "good morning"
-brigade cron remove <jobId>
+brigade cron add --cron "0 9 * * *" --tz "Asia/Kolkata" --message "good morning"
+brigade cron add --at "2026-06-04T09:00:00+05:30" --message "stand-up reminder"
+brigade cron run <jobId>         # fire it now
+brigade cron enable <jobId>      # / disable / rm <jobId>
 ```
 
-Cron jobs survive gateway restarts and missed-fire windows replay on next boot.
+A payload can be a `--message` (system event into your main session), an isolated
+agent turn (`--model`, `--tools`, `--light-context`), and an optional delivery
+target (`--channel`, `--to`).
 
 ### `brigade channels`
 
-Connect external messaging channels — WhatsApp is shipping today; Slack,
-Discord, Telegram queued.
+Connect external messaging channels — WhatsApp ships today.
 
 ```bash
 brigade channels list
-brigade channels link --channel whatsapp
-brigade channels status --channel whatsapp --probe
+brigade channels link --channel whatsapp        # pair via QR / code
+brigade channels status --channel whatsapp
+brigade channels allow list --channel whatsapp  # add / remove allowed senders
 brigade channels disable --channel whatsapp
 ```
 
+---
+
 ## In-chat commands
 
-When you're in the chat TUI (whether via `brigade` or `brigade connect`):
+When you're in the chat TUI (`brigade` or `brigade connect`):
 
-| Command             | What it does                                                |
-|---------------------|-------------------------------------------------------------|
-| `/agent`            | Show the agent your messages are currently bound to         |
-| `/agent <id>`       | Bind this connection to a different agent                   |
-| `/agents`           | List every agent the gateway knows about                    |
-| `/sessions`         | List sessions for the currently-bound agent                 |
-| `/session <key>`    | Switch to a different session of the same agent             |
-| `/model`            | Switch to a different configured model (picker)             |
-| `/model <id>`       | Switch directly by model id                                 |
-| `/provider`         | Add a new provider mid-session — no restart required        |
-| `/thinking <level>` | Adjust reasoning effort (off, minimal, low, medium, high)   |
-| `/reasoning [on\|off]` | Toggle whether thinking blocks render before each reply  |
-| `/compact`          | Force a context compaction now                              |
-| `/abort`            | Stop the current turn (same as Ctrl+C)                      |
-| `/steer "<text>"`   | Inject mid-turn guidance without aborting                   |
-| `/mute`             | Silence agent voice output (TTS) until /unmute              |
-| `/usage`            | Show token + cost usage for this session                    |
-| `/help`             | Show all commands                                           |
-| `/exit`             | Quit Brigade                                                |
+| Command | What it does |
+|---|---|
+| `/agent [<id>]` | Show or switch the agent this connection is bound to |
+| `/agents` | List every agent the gateway knows about |
+| `/sessions`, `/session <key>` | List or switch sessions for the current agent |
+| `/model [<id>]`, `/provider` | Switch model (picker or by id), or add a provider mid-session |
+| `/thinking <level>` | Reasoning effort (off, minimal, low, medium, high) |
+| `/reasoning [on\|off]` | Toggle whether thinking blocks render |
+| `/compact` | Force a context compaction now |
+| `/abort`, `/steer "<text>"` | Stop the current turn, or inject mid-turn guidance |
+| `/usage` | Token + cost usage for this session |
+| `/help`, `/exit` | Show all commands / quit |
 
-Keyboard:
+Keyboard: **Enter** sends · **Ctrl+C** stops the current response · **Ctrl+D**
+quits · **↑/↓** history.
 
-- **Enter** — send (mid-turn submits steer the model without aborting)
-- **Ctrl+C** — stop the current response (doesn't exit)
-- **Ctrl+D** — quit
-- **↑** / **↓** — message history
+---
 
 ## Built-in tools
 
-Every Brigade agent gets a curated toolset out of the box:
+Every agent gets a curated toolset. Mutating/privileged tools are owner-gated
+(either per-call or owner-only).
 
-- `read`, `bash`, `edit`, `write`, `grep` — Pi SDK coding tools
-- `write_memory`, `recall_memory` — persistent file-based memory with auto-recall
-- `spawn_agent` — sync sub-agent for delegated tasks (returns the reply inline)
-- `sessions_spawn` — async sub-agent that delivers its result into your transcript on the next turn
-- `sessions_send`, `sessions_history`, `sessions_list` — cross-session messaging (gated by visibility + A2A policy)
-- `cron` — schedule jobs from inside a turn
-- `web_search` — when a search provider is configured
-- Channel-specific tools (e.g. `send_whatsapp_message`) when a channel is linked
+- **Coding (pi SDK):** `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`
+- **Memory:** `recall_memory`, `read_memory`, `write_memory`, `manage_memory`
+- **Sub-agents:** `spawn_agent` (sync), `spawn_agents` (parallel fan-out)
+- **Cross-session:** `sessions_send`, `sessions_spawn`, `sessions_list`,
+  `sessions_history` (gated by visibility + A2A policy)
+- **Crew management:** `agents_list`, `manage_agent`, `manage_skill`,
+  `manage_provider`, `manage_access`, `manage_channel_access`, `org` (when
+  `cfg.org` is set)
+- **Scheduling:** `cron` (schedule jobs from inside a turn)
+- **Web:** `web_search`, `fetch_url`, `browser` (when a provider is configured)
+- **Connectors:** `composio` (1,000+ apps), `oauth_authorize`
+- **Generation:** `generate_image`
+- **Channels:** `send_message`, `send_media` (when a channel is linked)
 
-## Skills
-
-Drop a folder into `~/.brigade/workspace/skills/<name>/` containing a
-`SKILL.md` file, and Brigade auto-discovers it on the next turn. Skills are
-prompt-resident — they get injected into the system prompt with name +
-description, and the model reads the body on demand via the `read` tool.
-
-Six scan roots in precedence order (lowest → highest):
-
-1. **Bundled** — shipped with the install
-2. **Config extras** — paths from `config.skills.paths[]`
-3. **Managed** — `~/.brigade/skills/` (shared across agents)
-4. **Personal** — `~/.agents/skills/`
-5. **Project** — `<workspace>/.agents/skills/`
-6. **Workspace** — `<workspace>/skills/` (workspace wins on name collision)
-
-Per-agent allowlists: `cfg.agents.<id>.skills = ["skill1", "skill2"]` restricts
-that agent to those skills. Defaults inherit via `cfg.agents.defaults.skills`.
-
-## Filesystem layout
-
-Brigade keeps every byte of state under `~/.brigade/` — `rm -rf ~/.brigade/`
-truly wipes everything Brigade knows.
-
-```
-~/.brigade/
-├── brigade.json                          # main config (JSON5, ${VAR} refs preserved on write)
-├── brigade.json.bak{,.1..4}              # rotating backups
-├── workspace/                            # default agent (main) — shared v1-compat layout
-│   ├── SOUL.md, IDENTITY.md, AGENTS.md   # persona files (auto-seeded)
-│   ├── TOOLS.md, USER.md, HEARTBEAT.md
-│   ├── memory/facts.jsonl                # write_memory / recall_memory
-│   └── skills/                           # drop-a-folder skills
-├── agents/<id>/                          # per-agent isolation
-│   ├── workspace/                        # same shape as above, per agent
-│   ├── sessions/                         # JSONL transcripts (Pi SDK)
-│   ├── inbox/<sessionKey>.jsonl          # async sub-agent result delivery
-│   ├── auth-profiles.json                # OAuth + API keys (mode 0600)
-│   ├── exec-approvals.json               # bash-tool allowlist
-│   └── .brigade-trash/                   # soft-deleted dirs (recoverable)
-├── skills/                               # managed skills (shared across agents)
-├── cron.json                             # scheduled jobs (versioned)
-├── models.json                           # custom provider catalog
-├── channels/<id>/...                     # channel state (allow-from, pairings)
-├── identity/                             # gateway Ed25519 keypair
-├── oauth/                                # pairing codes + allowlists
-└── logs/                                 # daily rolling logs
-```
-
-## Supported providers
-
-Out of the box: Anthropic, OpenAI, Google Gemini, OpenRouter, Groq, xAI,
-Cerebras, DeepSeek, Mistral, **Ollama** (local), and **Custom OpenAI-compatible**
-endpoints (Together AI, Fireworks, vLLM, on-prem gateways, anything that
-speaks `/v1/chat/completions`).
-
-You can mix and match — connect three providers, switch between their models
-with `/model`, and Brigade keeps your conversation context across the switch.
+---
 
 ## Multi-agent isolation
 
-Every agent has its own workspace, persona, credentials, memory, sessions,
-exec approvals, and routing bindings. By design:
+Every agent has its own workspace, persona, credentials, memory, sessions, exec
+approvals, and routing bindings. By design:
 
-- Agent A cannot read agent B's session transcripts (unless visibility ≠ `self`)
-- Agent A cannot send to agent B's session (unless `cfg.session.agentToAgent.allow` permits)
-- Memory facts are per-agent — they don't bleed between agents
-- Provider credentials are per-agent — `support` and `prod-bot` can use different Anthropic accounts
+- Agent A cannot read agent B's session transcripts (unless visibility ≠ `self`).
+- Agent A cannot send to agent B's session unless `cfg.session.agentToAgent` (the
+  A2A policy) permits it.
+- Memory facts are per-agent and origin-scoped — they don't bleed between agents.
+- Provider credentials are per-agent — e.g. `support` and `prod-bot` can use
+  different accounts.
 
-The default policy is `visibility: "self"` (an agent only sees its own sessions).
-Switch to `"tree"` to allow a parent to see sub-agents it spawned.
+The default policy is `visibility: "self"` (an agent only sees its own sessions);
+switch to `"tree"` to let a parent see sub-agents it spawned.
+
+---
+
+## Providers & web search
+
+**Models out of the box:** Anthropic, OpenAI, Google Gemini, OpenRouter, Groq,
+Cerebras, xAI, DeepSeek, Mistral, **Ollama** (local), and **Custom**
+OpenAI-compatible endpoints (Together, Fireworks, vLLM, LM Studio, on-prem gateways
+— anything that speaks `/v1/chat/completions`). Connect several at once, switch with
+`/model`, and Brigade keeps your context across the switch.
+
+**Web search** is pluggable and auto-selected by what you've configured: Tavily,
+Brave, Exa, Perplexity, Firecrawl, SearXNG (keyed) and DuckDuckGo, Wikipedia, Hacker
+News, arXiv, GitHub, npm, local Ollama (keyless).
+
+---
+
+## Configuration & storage
+
+Brigade keeps every byte of state under `~/.brigade/` — `rm -rf ~/.brigade` truly
+wipes everything it knows.
+
+```
+~/.brigade/
+├── brigade.json              # main config (JSON5; ${VAR} secret refs preserved on write)
+├── brigade.json.bak{,.1..4}  # rotating forensic backups (mode 0600)
+├── models.json               # custom provider catalog (Ollama / custom endpoints)
+├── workspace/                # default agent (main): SOUL/IDENTITY/AGENTS/USER/TOOLS/
+│   │                         #   BOOTSTRAP/HEARTBEAT.md persona files
+│   ├── memory/facts.jsonl    # write_memory / recall_memory
+│   └── skills/               # drop-a-folder skills
+├── agents/<id>/              # per-agent isolation
+│   ├── workspace/            # same shape, per agent
+│   ├── sessions/<id>.jsonl   # transcripts (one file per session)
+│   └── agent/                # auth-profiles.json, models.json (mode 0600)
+├── channels/<id>/<account>/  # channel state (auth, allow-from, pairings)
+├── cron/runs/<jobId>.jsonl   # cron state + per-run logs
+├── logs/                     # daily rolling logs + config audit
+└── gateway.{pid,lock,heartbeat}
+```
+
+**Useful environment overrides:**
+
+| Var | Purpose |
+|---|---|
+| `BRIGADE_STATE_DIR` | Alternate state directory (default `~/.brigade`) |
+| `BRIGADE_CONFIG_PATH` | Alternate config file path |
+| `BRIGADE_PORT` | Gateway port (default `7777`) |
+| `BRIGADE_PROFILE` | Named profile (`workspace-<profile>/`) |
+| `BRIGADE_MODE` | `filesystem` or `convex` |
+| `BRIGADE_CONVEX_URL` | Convex deployment URL (implies convex mode) |
+| `BRIGADE_ENCRYPTION_KEY` | At-rest encryption master key (hex) |
+| `BRIGADE_ENABLE_INBOX_PERSIST` | Persist the sub-agent inbox to JSONL (auto-on at gateway boot) |
+| `BRIGADE_HOST_ENV` | Override the host-environment tag in the system prompt's runtime line |
+
+---
+
+## Storage modes: filesystem vs. Convex
+
+Brigade defaults to **filesystem** mode (everything under `~/.brigade/`). It also
+ships an optional **Convex** backend you can run **fully self-hosted** — no cloud
+account, no telemetry. The mode resolves from a sticky sentinel and **freezes once
+at boot**.
+
+```bash
+brigade store mode show                                   # what mode am I in?
+brigade store mode set convex --convex-url http://127.0.0.1:3210
+brigade store migrate --to convex --dry-run               # preview a migration
+brigade store migrate --to filesystem                     # copy data back
+```
+
+Run the local Convex backend (downloads a standalone binary, no account):
+
+```bash
+npm run convex:install   # fetch convex-local-backend + dashboard into bin/
+npm run convex:dev       # backend :3210, site proxy :3211, dashboard :6791
+npm run convex:codegen   # regenerate convex/_generated/ against the local backend
+```
+
+Turn on **at-rest encryption** for Convex byte columns (credentials, persona,
+memory, cron payloads, transcripts) with `BRIGADE_ENCRYPTION_KEY`:
+
+```bash
+brigade encrypt init     # generate a 32-byte key
+brigade encrypt status   # is a key configured? self-check
+brigade encrypt test     # round-trip seal/open
+```
+
+See [docs/convex-mode.md](docs/convex-mode.md) for the full runbook.
+
+---
+
+## MCP memory server
+
+Brigade can expose your long-term memory to any MCP client over stdio:
+
+```bash
+brigade mcp                 # serves the `main` agent's memory
+brigade mcp --agent support # a specific agent
+```
+
+It surfaces add / search / context tools, owner-bound. Point an MCP client (an
+editor, a desktop assistant, etc.) at the command `brigade mcp`.
+
+---
+
+## Tideline (long-term memory)
+
+Tideline is the **model-agnostic long-term memory engine** that backs Brigade.
+Where a transcript is what an agent *just said*, Tideline is what it *knows* —
+durable facts about you and your work, written under a trust gate, recalled by
+meaning, decayed when stale, and reconciled over time. It's structured to be lifted
+out as its own package (`brigade-tideline`).
+
+It's built to survive the three ways naive "vector store" memory breaks:
+
+| Pillar | What it does |
+|---|---|
+| 🛡️ **Provenance write-gate** | An untrusted source (a web page, a tool result) can't author or overwrite your identity/preferences/corrections. Poisoning writes are rejected. |
+| 🔒 **Per-origin isolation** | Owner facts and per-channel/peer facts are scoped so one principal's memory never surfaces in another's recall. |
+| 🔎 **Hybrid recall, no model needed** | BM25 keyword search + a **model-free** HRR vector recovery lane, so semantically-close phrasings match offline. Plug in a learned embedder to upgrade. |
+| ⏳ **Bi-temporal decay + trust** | Recency/usage decay and source-trust fold into one effective ranking score; `permanent` facts never decay. |
+| 🔗 **Typed link graph** | `supersedes` / `corrects` / `relates` / `supports` / `contradicts` edges power graph-recall and contradiction handling. |
+| 🌙 **Reflect / consolidate** | A nightly pass confirms repeated beliefs, merges duplicates, writes association edges, and evicts decayed noise. |
+
+**The flow, end to end:**
+
+```
+WRITE    add() → write-gate (trusted vs untrusted × protected segment) → dedup → store
+RECALL   query → BM25 + HRR vector → graph walk → decay×trust score → origin filter → budgeted block
+MAINTAIN decay GC → nightly dream (consolidate/relate) → contradiction detection
+```
+
+Each record carries a `segment` (identity / preference / correction / relationship /
+project / knowledge / context), a `tier` (short / long / permanent), an `importance`,
+and an `origin`.
+
+```ts
+import { Tideline } from "brigade-tideline";
+
+const memory = Tideline.open("/path/to/workspace");
+memory.add({ content: "I keep a strict vegetarian diet.", segment: "preference" });
+const block = memory.context("dietary restrictions", { maxChars: 800 });
+```
+
+In Brigade you reach it through the `recall_memory` / `read_memory` / `write_memory` /
+`manage_memory` tools and via auto-recall (which **fails closed** for unknown peers,
+so operator memory never leaks). An evaluation harness (`brigade-tideline/eval`)
+measures recall@k / MRR / nDCG@k on deterministic gold sets — run `npm run bench`.
+
+📖 Full write-up: **[docs/tideline.md](docs/tideline.md)** ·
+package surface: [`src/tideline/`](src/tideline/)
+
+---
+
+## Extending Brigade
+
+Brigade ships a typed extension SDK. Drop a module into `~/.brigade/extensions/` and
+register against a slot:
+
+```ts
+import { defineModule } from "@spinabot/brigade/extension-sdk";
+
+export default defineModule((b) => {
+  b.tool({ /* a custom agent tool */ });
+  b.webSearch({ /* a search provider */ });
+  b.channel({ /* a messaging adapter */ });
+  b.gatewayMethod({ /* a gateway RPC */ });
+});
+```
+
+Shipped slots include `tool`, `hook`, `command`, `modelProvider`, `channel`,
+`webSearch`, `webFetch`, `integration`, `service`, `httpRoute`, and `gatewayMethod`.
+Voice/media slots (`tts`, `stt`, `mediaGen`) and pluggable `memory` backends have
+locked contracts with implementations on the roadmap. See [AGENTS.md](AGENTS.md) for
+how to add a tool, channel, skill, or provider.
+
+---
 
 ## Privacy
 
-Brigade is a local CLI. Your API keys never leave your computer; they're stored
-in your home directory under mode 0600 and used only to talk to the providers
-you connect. No telemetry, no analytics, no cloud component.
+Brigade is a local CLI. Your API keys never leave your computer; they're stored in
+your home directory at mode `0600` and used only to talk to the providers you
+connect. **No telemetry, no analytics, no cloud component.** For Ollama and custom
+endpoints, requests stay on your network. The gateway binds to `127.0.0.1` by
+default.
 
-For Ollama and Custom endpoints, requests stay entirely on your network.
+---
 
-The gateway binds to `127.0.0.1` by default — no external network exposure.
+## Develop from source
 
-## Environment overrides
+```bash
+git clone https://github.com/spinabot/brigade.git
+cd brigade
+npm install
+npm run build        # tsc → dist/
+```
 
-- `BRIGADE_STATE_DIR` — alternate state directory (default: `~/.brigade`)
-- `BRIGADE_CONFIG_PATH` — alternate config file path
-- `BRIGADE_PORT` — gateway port (default `7777`)
-- `BRIGADE_PROFILE` — named profile (`workspace-<profile>/` instead of `workspace/`)
-- `BRIGADE_ENABLE_INBOX_PERSIST` — enable JSONL persistence for the sub-agent inbox (auto-on at gateway boot)
-- `BRIGADE_HOST_ENV` — operator-override host-environment tag (for the system prompt's runtime line)
+**Run from your checkout** (npm scripts wrap the binary so you don't type `node`):
+
+```bash
+npm run dev          # smart runner: rebuilds dist/ if src/ is newer, then runs
+npm run dev:tsx      # run TypeScript directly via tsx (no build, slower per call)
+npm run watch        # tsx --watch: auto-restart on edit
+npm link             # make `brigade` available globally → this checkout
+```
+
+**Surface shortcuts** (all wrap `scripts/run-brigade.mjs`):
+
+```bash
+npm run onboard          # brigade onboard
+npm run tui              # brigade tui
+npm run gateway          # brigade gateway run     (also gateway:status / gateway:stop)
+npm run connect          # brigade connect
+npm run agent -- -m hi   # brigade agent -m hi
+npm run agents:list      # brigade agents list     (agents:add / agents:bind / …)
+npm run status           # brigade status          (status:json)
+npm run doctor           # brigade doctor          (doctor:json / doctor:strict)
+npm run channels:list    # brigade channels list   (wa:link / pairing:list / …)
+npm run skills:list      # brigade skills list
+npm run logs             # brigade logs            (logs:follow)
+```
+
+**Checks** (CI runs the same three):
+
+```bash
+npm run typecheck    # tsc --noEmit, strict
+npm test             # node:test, tempdir-isolated (281 test files)
+npm run build        # ensure the production build compiles
+npm run bench        # memory / recall evaluation benchmarks
+```
+
+**Storage / Convex dev:** `npm run store:mode:show`, `npm run convex:install`,
+`npm run convex:dev`, `npm run convex:codegen`.
+
+Full contributor guide, repo layout, and conventions live in **[AGENTS.md](AGENTS.md)**.
+
+---
+
+## Contributing
+
+Contributions are welcome! Read **[CONTRIBUTING.md](CONTRIBUTING.md)** for dev setup,
+coding conventions, and the Conventional-Commits release flow, and
+**[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)**. For security issues, see
+**[SECURITY.md](SECURITY.md)** — please report privately. Releases are automated with
+release-please; see **[docs/RELEASING.md](docs/RELEASING.md)**.
+
+---
 
 ## License
 
-MIT
+[MIT](LICENSE) © Spinabot
+
+## 🦁 Brigadiers
+
+A pride of contributors who make Brigade better. Thank you to everyone who has
+joined the crew!
+
+<a href="https://github.com/spinabot/brigade/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=spinabot/brigade" alt="Brigade contributors — the Brigadiers" />
+</a>
+
+Want to join the pride? See [CONTRIBUTING.md](CONTRIBUTING.md).

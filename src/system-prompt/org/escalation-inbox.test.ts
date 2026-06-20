@@ -10,7 +10,7 @@
  *     (delegation / review / legacy events are filtered).
  *   - Truncates long lists with a "+N more escalation(s)" tail.
  *
- * No openclaw / clawd / hermes / boop / paperclip / nanoclaw tokens.
+ * No external agent-codebase tokens.
  */
 
 import { strict as assert } from "node:assert";

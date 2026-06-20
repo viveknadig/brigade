@@ -12,10 +12,6 @@
 // loose (`unknown`) where they would cascade imports across the codebase;
 // subsequent PRs (one per domain) tighten each sub-store's payload types
 // alongside the LocalXStore that wraps the existing file code.
-//
-// Source-of-truth design doc:
-//   C:\Users\SmartSystems\.brigade-design-docs\toggle-migration-plan.md
-//   Part A (locked 2026-06-09 after 18-agent audit).
 
 import type { BrigadeConfig } from "../config/types.js";
 

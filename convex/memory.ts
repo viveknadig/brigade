@@ -25,15 +25,40 @@ const SourceType = v.union(
 	v.literal("dream"),
 );
 const LinkKind = v.union(
+	// MUST mirror MemoryLinkKind (links.ts / MEMORY_LINK_KINDS) EXACTLY — a kind not
+	// listed here makes the fact write THROW in convex mode (strict object validator).
 	v.literal("supersedes"),
-	v.literal("transition"), // Step 19 — must mirror MemoryLinkKind (links.ts) exactly
+	v.literal("transition"), // Step 19
 	v.literal("corrects"),
-	v.literal("relates"),
 	v.literal("derived_from"),
 	v.literal("supports"),
+	// typed factual taxonomy (the relationship extractor's closed set)
+	v.literal("causes"),
+	v.literal("caused_by"),
+	v.literal("part_of"),
+	v.literal("precedes"),
+	v.literal("follows"),
+	v.literal("enables"),
+	v.literal("blocks"),
+	v.literal("co_constrains"),
+	v.literal("located_at"),
+	v.literal("uses"),
+	v.literal("works_on"),
+	v.literal("contrasts_with"),
 	v.literal("contradicts"),
+	v.literal("relates_to"),
+	v.literal("same_topic"), // thematic / quarantined lane
+	v.literal("relates"), // legacy generic association (synonymy/bridge)
 );
-const Link = v.object({ kind: LinkKind, target: v.string() });
+// `reason`/`strength` are OPTIONAL + additive — a store-minted edge (supersede/
+// transition) carries neither; an extractor edge carries both. Optional ⇒ existing
+// rows still validate (back-compat) and the round-trip through ctx.db.replace holds.
+const Link = v.object({
+	kind: LinkKind,
+	target: v.string(),
+	reason: v.optional(v.string()),
+	strength: v.optional(v.number()),
+});
 const Status = v.union(
 	v.literal("asserted"),
 	v.literal("provisional"),

@@ -224,7 +224,7 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// reflection on demand, crypto-shred a fact (+ cascade), inspect provenance,
 		// export, or apply retention. The live operator surface for Tideline's
 		// dream/governance behaviours (otherwise library-only).
-		makeManageMemoryTool(opts.workspaceDir),
+		makeManageMemoryTool(opts.workspaceDir, { agentId: opts.agentId }),
 		// agents_list — read-only enumeration of agents the caller can target.
 		// Mirrors the reference codebase's posture: the model can SEE the agent
 		// catalog without any privilege check.

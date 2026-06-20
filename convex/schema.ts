@@ -159,16 +159,34 @@ export default defineSchema({
     links: v.optional(
       v.array(
         v.object({
+          // MUST mirror MemoryLinkKind (links.ts / MEMORY_LINK_KINDS) EXACTLY.
           kind: v.union(
             v.literal("supersedes"),
-            v.literal("transition"), // Step 19 — must mirror MemoryLinkKind (links.ts) exactly
+            v.literal("transition"), // Step 19
             v.literal("corrects"),
-            v.literal("relates"),
             v.literal("derived_from"),
             v.literal("supports"),
+            v.literal("causes"),
+            v.literal("caused_by"),
+            v.literal("part_of"),
+            v.literal("precedes"),
+            v.literal("follows"),
+            v.literal("enables"),
+            v.literal("blocks"),
+            v.literal("co_constrains"),
+            v.literal("located_at"),
+            v.literal("uses"),
+            v.literal("works_on"),
+            v.literal("contrasts_with"),
             v.literal("contradicts"),
+            v.literal("relates_to"),
+            v.literal("same_topic"),
+            v.literal("relates"),
           ),
           target: v.string(),
+          // optional + additive (back-compat with existing rows / store-minted edges)
+          reason: v.optional(v.string()),
+          strength: v.optional(v.number()),
         }),
       ),
     ),
