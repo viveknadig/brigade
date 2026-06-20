@@ -237,17 +237,17 @@ export function createWhatsAppAdapter(opts: CreateWhatsAppAdapterOptions = {}): 
 				throw new Error("WhatsApp socket is reconnecting — try again in a moment.");
 			}
 			// Normalise to a JID — accept human-shaped phone numbers like
-			// "+91 77026 16808" / "+917702616808" / "917702616808" by stripping
+			// "+1 555 010 0001" / "+15550100001" / "15550100001" by stripping
 			// formatting and appending `@s.whatsapp.net`. Without this Baileys'
 			// `jidDecode` returns undefined for a bare-phone input and the send
 			// crashes with the opaque "Cannot destructure property 'user' of
 			// 'jidDecode(...)' as it is undefined" — exactly what the operator
-			// hit when telling the model "send hi to +91...". JIDs / group ids /
+			// hit when telling the model "send hi to a bare number". JIDs / group ids /
 			// LID aliases pass through unchanged.
 			const jid = toWhatsAppJid(conversationId);
 			if (!jid) {
 				throw new Error(
-					`WhatsApp: couldn't normalise recipient "${conversationId}" — pass a phone number (e.g. +917702616808) or a WhatsApp JID.`,
+					`WhatsApp: couldn't normalise recipient "${conversationId}" — pass a phone number (e.g. +15550100001) or a WhatsApp JID.`,
 				);
 			}
 			// WhatsApp has no thread routing — `opts.threadId` is accepted for

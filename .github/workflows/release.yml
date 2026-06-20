@@ -1,0 +1,89 @@
+name: Release
+
+# Automated release flow (release-please + npm publish).
+#
+# How it works:
+#   1. Every push to `main` runs release-please, which maintains a "Release PR"
+#      that bumps the version and updates CHANGELOG.md from Conventional Commits
+#      (feat/fix/perf/deps/revert). docs/refactor/test/ci/chore do not release.
+#   2. When you MERGE that Release PR, release-please creates a GitHub Release +
+#      git tag. That sets `release_created=true`, which triggers the publish job
+#      below — building, testing, and publishing to npm as @spinabot/brigade.
+#
+# One-time setup (repo settings):
+#   - Add a repository secret `NPM_TOKEN` = an npm Automation token with publish
+#     rights to the @spinabot scope.
+#   - (Optional, more secure) Switch to npm Trusted Publishing (OIDC) instead of
+#     NPM_TOKEN: configure a trusted publisher for @spinabot/brigade on npmjs.com
+#     pointing at this repo + `release.yml`, then drop `NODE_AUTH_TOKEN` below.
+#     `id-token: write` is already granted for provenance either way.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          # Default GITHUB_TOKEN is fine. Swap for a PAT (secrets.RELEASE_PLEASE_TOKEN)
+          # if you want the Release PR to trigger the CI workflow.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-npm:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    environment: npm-release
+    permissions:
+      contents: read
+      id-token: write # required for npm provenance / OIDC trusted publishing
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+
+      - name: Ensure recent npm (provenance + trusted publishing)
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Publish to npm
+        # Provenance requires a public repo + public CI run. We enable it
+        # automatically once the repo is public, and skip it while private so the
+        # publish still succeeds. No manual edit needed when you flip visibility.
+        run: |
+          if [ "${{ github.event.repository.private }}" = "false" ]; then
+            echo "Repo is public — publishing with provenance."
+            npm publish --provenance --access public
+          else
+            echo "Repo is private — publishing without provenance."
+            npm publish --access public
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

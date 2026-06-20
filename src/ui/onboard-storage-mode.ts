@@ -12,12 +12,16 @@
 // wizard completes.
 
 import { createHash } from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 import { CancellableLoader, Input, type SelectItem, SelectList, Text, type TUI } from "@mariozechner/pi-tui";
 
 import { renderBrandHeader } from "./brand.js";
 import { brand, selectListTheme } from "./theme.js";
+import { resolveStateDir } from "../config/paths.js";
 import type { StorageMode } from "../storage/runtime-context.js";
+import { wipeLocalBrigadeState } from "../storage/factory-reset.js";
 import {
 	encryptionKeySource,
 	encryptionStatus,
@@ -90,12 +94,128 @@ export async function pickStorageMode(
 	const mode = chosen.value as StorageMode;
 
 	if (mode === "filesystem") {
+		// Re-onboard hygiene (mirrors the convex "Restore / Start fresh" branch):
+		// if a previous local Brigade exists, offer to keep it OR wipe it so the
+		// re-onboard starts VIRGIN — identical to a first-ever onboard. A first
+		// onboard (no prior state) just proceeds. "Start fresh" deletes outright.
+		const stateDir = resolveStateDir();
+		const hasPriorState =
+			fs.existsSync(path.join(stateDir, "workspace")) ||
+			fs.existsSync(path.join(stateDir, "agents")) ||
+			fs.existsSync(path.join(stateDir, "sessions"));
+		if (!hasPriorState) return { mode };
+
+		renderScreen(tui, "Step 0 of 5 · Found an existing Brigade");
+		tui.addChild(new Text(`  ${brand.dim(`Local Brigade data found at ${stateDir}`)}`, 0, 0));
+		tui.addChild(new Text("", 0, 0));
+		const items: SelectItem[] = [
+			{
+				value: "restore",
+				label: "Restore",
+				description: "Keep your existing memories, sessions, personas, and skills",
+			},
+			{
+				value: "fresh",
+				label: "Start fresh",
+				description: "Permanently erase local data and begin new — cannot be undone",
+			},
+		];
+		const list = new SelectList(items, items.length, selectListTheme, {
+			minPrimaryColumnWidth: 12,
+			maxPrimaryColumnWidth: 14,
+		});
+		tui.addChild(list);
+		tui.setFocus(list);
+		tui.requestRender();
+		let choice: string;
+		try {
+			const chosen = await new Promise<SelectItem>((resolve, reject) => {
+				list.onSelect = (item) => resolve(item);
+				list.onCancel = () => reject(new Error("back"));
+			});
+			choice = String(chosen.value);
+		} catch {
+			return { mode }; // Esc = keep existing (the safe default)
+		}
+		if (choice === "fresh") {
+			// Wipe the local state so the next boot re-seeds defaults (virgin). The
+			// encryption key lives outside the state dir and is preserved.
+			wipeLocalBrigadeState(stateDir);
+		}
 		return { mode };
 	}
 
 	// Convex path — connection sub-prompts.
+	// Re-onboard hygiene (symmetric with the filesystem branch above): in convex
+	// mode the local filesystem copy is NEVER read — convex is authoritative and
+	// rebuilds the workspace on boot via restore-on-missing — and a leftover
+	// agents/<id>/agent/auth-profiles.json holds the provider key in PLAINTEXT.
+	// If a prior local Brigade exists, offer to clear it so the convex footprint
+	// is virgin: the SAME end-state as a first-ever convex onboard (the
+	// determinism invariant). The decision is captured now but executed only
+	// AFTER convex is committed — an Esc inside pickConvexBackend reverts to
+	// filesystem mode, and we must never wipe the data we'd fall back to.
+	const stateDir = resolveStateDir();
+	const clearLocal = await maybePromptClearLocalForConvex(tui, stateDir);
 	const url = await pickConvexBackend(tui);
+	if (clearLocal) wipeLocalBrigadeState(stateDir);
 	return { mode: "convex", convexUrl: url };
+}
+
+/**
+ * Convex re-onboard hygiene — the convex-mode counterpart to the filesystem
+ * branch's Restore/Start-fresh prompt. Because convex never reads the local
+ * filesystem copy, there's no "Restore" to offer (that's `store migrate`); the
+ * only question is whether to clear the unused (and plaintext-secret-bearing)
+ * leftover. Returns true ONLY when the user explicitly chooses to clear; no
+ * prior state, "Keep", or Esc → false (the safe default). The caller runs the
+ * wipe after convex is committed.
+ */
+async function maybePromptClearLocalForConvex(tui: TUI, stateDir: string): Promise<boolean> {
+	const hasPriorState =
+		fs.existsSync(path.join(stateDir, "workspace")) ||
+		fs.existsSync(path.join(stateDir, "agents")) ||
+		fs.existsSync(path.join(stateDir, "sessions"));
+	if (!hasPriorState) return false;
+
+	renderScreen(tui, "Step 0 of 5 · Found data from a previous setup");
+	tui.addChild(new Text(`  ${brand.dim(`Local data found at ${stateDir}`)}`, 0, 0));
+	tui.addChild(
+		new Text(
+			`  ${brand.dim("Convex keeps everything in the backend, so this local copy won't be used.")}`,
+			0,
+			0,
+		),
+	);
+	tui.addChild(new Text("", 0, 0));
+	const items: SelectItem[] = [
+		{
+			value: "clear",
+			label: "Clear it",
+			description: "Remove the unused local copy for a clean start — recommended",
+		},
+		{
+			value: "keep",
+			label: "Keep it",
+			description: "Leave it on disk (it stays unused while you're in Convex mode)",
+		},
+	];
+	const list = new SelectList(items, items.length, selectListTheme, {
+		minPrimaryColumnWidth: 10,
+		maxPrimaryColumnWidth: 12,
+	});
+	tui.addChild(list);
+	tui.setFocus(list);
+	tui.requestRender();
+	try {
+		const chosen = await new Promise<SelectItem>((resolve, reject) => {
+			list.onSelect = (item) => resolve(item);
+			list.onCancel = () => reject(new Error("back"));
+		});
+		return String(chosen.value) === "clear";
+	} catch {
+		return false; // Esc = keep (the safe default)
+	}
 }
 
 /**
@@ -602,6 +722,13 @@ async function confirmAndErase(
 	tui.addChild(new Text(`  ${brand.amber("✓")} Erased ${deletedTotal} records.`, 0, 0));
 	tui.requestRender();
 	await delay(400);
+
+	// Also wipe the LOCAL state so the fresh start is truly VIRGIN. Otherwise the
+	// surviving ~/.brigade workspace/skills/sessions/facts get re-mirrored back
+	// into the just-erased backend on the next boot (and a stale local persona can
+	// clobber the new copy). The encryption key lives OUTSIDE the state dir, so the
+	// wipe can't touch it — it's re-minted just below.
+	wipeLocalBrigadeState();
 
 	// Fresh start hygiene: when the key lives in the key file, mint a new one
 	// (the old key may exist in old backups of the erased data). The previous

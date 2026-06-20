@@ -201,26 +201,24 @@ describe("assembleBrigadeToolset — senderIsOwner gating", () => {
 			// would be (the wrapper short-circuits in owner mode).
 			assert.equal(typeof tool.execute, "function");
 		}
-		assert.equal(ts.customTools.length, 13); // composio + find + generate_image + manage_provider + manage_access + manage_channel_access + oauth_authorize + recall + read_memory + write_memory + agents_list + manage_agent + manage_skill
+		assert.equal(ts.customTools.length, 14); // composio + find + generate_image + manage_provider + manage_access + manage_channel_access + manage_memory + oauth_authorize + recall + read_memory + write_memory + agents_list + manage_agent + manage_skill
 	});
 
 	it("senderIsOwner: false wraps any ownerOnly tool so it refuses execute", async () => {
-		// The bundled memory tools aren't ownerOnly today, so this test
-		// asserts the wrapper is APPLIED (rather than test-driving an
-		// existing ownerOnly tool) — we directly call wrapOwnerOnlyToolExecution
-		// on a synthesised ownerOnly tool and confirm the assemble path's
-		// per-tool wrap reaches the same outcome. The contract is that
-		// assembleBrigadeToolset's tool list contains wrapped tools when
-		// senderIsOwner=false. Today no bundled tool is ownerOnly so the
-		// observable surface is unchanged; the wiring is still in place
-		// (verified by the wrapper unit tests above).
+		// `manage_memory` and `read_memory` are ownerOnly. This test confirms
+		// the wrapper is APPLIED (via wrapOwnerOnlyToolExecution) so that a
+		// non-owner call is refused with BrigadeToolAuthorizationError. The
+		// contract is that assembleBrigadeToolset's tool list contains wrapped
+		// tools when senderIsOwner=false. The wiring is verified by the
+		// wrapper unit tests above; this test asserts the full-surface shape
+		// (tool count + names) is stable regardless of wrapping.
 		const ts = assembleBrigadeToolset({
 			workspaceDir: workspace,
 			agentId: "main",
 			cwd: workspace,
 			senderIsOwner: false,
 		});
-		assert.equal(ts.customTools.length, 13);
+		assert.equal(ts.customTools.length, 14);
 		// brigadeToolNames mirror customTools.name — wrapping must NOT change
 		// the visible name surface.
 		assert.deepEqual(ts.brigadeToolNames.sort(), [
@@ -231,6 +229,7 @@ describe("assembleBrigadeToolset — senderIsOwner gating", () => {
 			"manage_access",
 			"manage_agent",
 			"manage_channel_access",
+			"manage_memory",
 			"manage_provider",
 			"manage_skill",
 			"oauth_authorize",

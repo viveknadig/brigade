@@ -44,6 +44,13 @@ convex/_generated/
 CLAUDE.md
 skills-lock.json
 
+# Real-data eval gold — derived from the operator's ACTUAL memory facts (PII).
+# Local-only, NEVER committed to this (public) repo. The committed gold is synthetic.
+# Match ANY *.local.json anywhere: the assertLocalGoldPath guard only checks the
+# suffix, so the ignore pattern must too — otherwise an in-repo .local.json outside
+# the eval dir would pass the guard yet remain committable.
+*.local.json
+
 # Misc
 test.txt
 

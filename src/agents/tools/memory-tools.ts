@@ -1,9 +1,9 @@
 /**
  * Brigade memory tools — Primitive #4. Three tools:
  *
- *   - `recall_memory` — lexical search across MEMORY.md + memory/*.md daily
- *     notes (markdown, via BrigadeStorage) AND the structured fact store
- *     (memory/facts.jsonl, via FactStore).
+ *   - `recall_memory` — recall (hybrid BM25 + vector) over the structured
+ *     fact store (memory/facts.jsonl, via FactStore), plus lexical search
+ *     over MEMORY.md / memory/*.md daily notes (markdown, via BrigadeStorage).
  *   - `read_memory`   — bounded excerpt read of one memory file.
  *   - `write_memory`  — persist a structured durable fact: one sentence +
  *     segment + importance. Recall hits bump the fact's accessCount (decay
@@ -138,6 +138,9 @@ interface RecalledFact {
 	segment: string;
 	importance: number;
 	score: number;
+	/** The single-valued attribute slot, if any — surfaced so a correction can
+	 *  reuse the SAME subjectKey and auto-supersede this value. */
+	subjectKey?: string;
 }
 
 /**
@@ -236,19 +239,27 @@ export function makeRecallMemoryTool(
 			// citations, segment + importance). Plugin backend → render the
 			// minimal SDK shape (id / content / score / source).
 			if (isDefaultMemoryCapability(capability)) {
-				const { notes, facts } = await capability.searchRich(
+				const { notes: rawNotes, facts } = await capability.searchRich(
 					query,
 					{
 						...(maxResults !== undefined ? { limit: maxResults } : {}),
 						origin: recallFilter,
 					},
 				);
+				// Markdown NOTES (MEMORY.md + memory/*.md) are OPERATOR-authored
+				// workspace content with no per-peer scoping — they are owner-only.
+				// `facts` are origin-filtered inside searchRich, but notes are not (and
+				// can't be — they're the operator's files), so a channel-peer turn must
+				// never see them. Gate the whole notes lane on owner origin here, in the
+				// tool, so it holds regardless of which capability is wired.
+				const notes = recallFilter?.kind === "owner" ? rawNotes : [];
 				const factHits = facts.map((f) => ({
 					memoryId: f.memoryId,
 					content: f.content,
 					segment: f.segment,
 					importance: f.importance,
 					score: f.score,
+					...(f.subjectKey ? { subjectKey: f.subjectKey } : {}),
 				}));
 				const details: RecallMemoryDetails = {
 					query,
@@ -269,8 +280,12 @@ export function makeRecallMemoryTool(
 					sections.push(
 						"Facts:\n" +
 							factHits
-								.map((f) => `- [${f.segment}] ${f.content} (importance ${f.importance.toFixed(2)})`)
-								.join("\n"),
+								.map(
+									(f) =>
+										`- [id ${f.memoryId}${f.subjectKey ? ` · slot ${f.subjectKey}` : ""} · ${f.segment}] ${f.content} (importance ${f.importance.toFixed(2)})`,
+								)
+								.join("\n") +
+							"\nTo correct one of these: re-write with the SAME subjectKey shown (slot …) to auto-supersede it, or pass its id in supersedes.",
 					);
 				}
 				if (notes.length > 0) {
@@ -294,10 +309,16 @@ export function makeRecallMemoryTool(
 			// scoring; we render id / content / score / source so the model
 			// still sees actionable context (and the plugin's id, so a debug
 			// transcript shows which backend handled the call).
-			const hits = await capability.search(
-				query,
-				maxResults !== undefined ? { limit: maxResults } : {},
-			);
+			// Thread the per-origin sessionKey into the plugin search the SAME way
+			// auto-recall does — without it a channel-routed peer's recall is
+			// unscoped and the plugin returns the operator's + other peers' facts
+			// (a cross-origin leak). An owner origin intentionally omits sessionKey.
+			const channelSessionKey =
+				recallFilter?.kind === "channel" ? recallFilter.sessionKey : undefined;
+			const hits = await capability.search(query, {
+				...(maxResults !== undefined ? { limit: maxResults } : {}),
+				...(channelSessionKey ? { sessionKey: channelSessionKey } : {}),
+			});
 			const pluginHits: PluginRecalledItem[] = hits.map((h) => ({
 				id: h.id,
 				content: h.content,
@@ -365,6 +386,7 @@ export function makeReadMemoryTool(
 		name: "read_memory",
 		label: "read memory",
 		displaySummary: "reading memory",
+		ownerOnly: true,
 		description:
 			"Read a bounded excerpt of a memory file (MEMORY.md or a memory/<name>.md daily " +
 			"note). Use after recall_memory to pull the full context around a snippet. " +
@@ -434,12 +456,29 @@ const WriteMemoryParams = Type.Object({
 			description: "memoryIds this fact replaces (use for corrections/updates).",
 		}),
 	),
+	subjectKey: Type.Optional(
+		Type.String({
+			description:
+				"For a SINGLE-VALUED attribute that has one current value — where they live, " +
+				'their deploy day, a setting — pass a short stable snake_case slot name (e.g. "deploy_day", ' +
+				'"home_city", "ui_theme"). A new fact with the SAME subjectKey AUTOMATICALLY supersedes the ' +
+				"old value (no need to recall its id). Reuse the exact subjectKey shown in recall results. " +
+				"OMIT for additive facts that should coexist (pets, skills, people).",
+		}),
+	),
 });
 
 interface WriteMemoryDetails {
 	memoryId: string;
 	segment: string;
-	importance: number;
+	/**
+	 * Importance the backend persisted. The default backend always resolves a
+	 * concrete value (segment default when omitted), so it's a number there.
+	 * A plugin backend owns its own importance handling and may not surface
+	 * one — when the caller omitted `importance`, this stays `undefined`
+	 * rather than reporting a misleading `0` the plugin never persisted.
+	 */
+	importance?: number;
 	backend: string;
 }
 
@@ -470,8 +509,11 @@ export function makeWriteMemoryTool(
 			"Persist a durable fact to long-term memory. Prefer aggressive writing — memory is " +
 			"cheap, forgetting is expensive. Save the user's identity, preferences, corrections, " +
 			"project conventions, relationships, and ongoing context. Skip transient things " +
-			'("I\'m tired right now"). One clear sentence per fact. For a correction, set ' +
-			"segment=correction and pass the prior fact's id in supersedes.",
+			'("I\'m tired right now"). One clear sentence per fact. CORRECTING something the ' +
+			"user already told you? Use segment=correction — the new fact AUTOMATICALLY supersedes " +
+			"the same-subject belief you had saved (no need to recall its id). For extra precision on " +
+			"a single-valued attribute (where they live, deploy day, a setting) also pass a stable " +
+			"subjectKey (e.g. deploy_day); or pass the prior fact's id in supersedes for an explicit replace.",
 		parameters: WriteMemoryParams,
 		async execute(_toolCallId, params): Promise<AgentToolResult<WriteMemoryDetails>> {
 			const p = params as Record<string, unknown>;
@@ -484,6 +526,7 @@ export function makeWriteMemoryTool(
 			const supersedes = Array.isArray(p.supersedes)
 				? (p.supersedes as unknown[]).filter((x): x is string => typeof x === "string")
 				: undefined;
+			const subjectKey = readStringParam(p, "subjectKey", { label: "subjectKey" });
 
 			// Resolve the writer's origin BEFORE touching the store. A
 			// non-owner turn without a channelContext or sessionKey is a
@@ -514,6 +557,7 @@ export function makeWriteMemoryTool(
 					segment,
 					...(importance !== undefined ? { importance } : {}),
 					...(supersedes && supersedes.length > 0 ? { supersedes } : {}),
+					...(subjectKey ? { subjectKey } : {}),
 					...(writerOrigin !== undefined ? { createdBy: writerOrigin } : {}),
 				});
 				return textResult(
@@ -532,6 +576,7 @@ export function makeWriteMemoryTool(
 			const meta: Record<string, string> = { segment };
 			if (importance !== undefined) meta.importance = String(importance);
 			if (supersedes && supersedes.length > 0) meta.supersedes = supersedes.join(",");
+			if (subjectKey) meta.subjectKey = subjectKey;
 			if (writerOrigin !== undefined) {
 				// Plugins that want to honour origin can parse this JSON;
 				// the bundled FactStore does it natively via `createdBy`.
@@ -543,7 +588,10 @@ export function makeWriteMemoryTool(
 				{
 					memoryId: id,
 					segment,
-					importance: importance ?? 0,
+					// Report what the caller supplied (undefined when omitted) —
+					// the plugin owns importance and we must not invent a `0` it
+					// never persisted.
+					...(importance !== undefined ? { importance } : {}),
 					backend: capability.id,
 				},
 			);
@@ -590,13 +638,13 @@ function resolveToolCapability(
 			const factOpts: { limit?: number; origin?: RecordOriginFilter } = {};
 			if (limit !== undefined) factOpts.limit = limit;
 			if (origin !== undefined) factOpts.origin = origin;
-			const facts = factStore?.search(query, factOpts) ?? [];
+			const facts = factStore?.recall(query, factOpts) ?? [];
 			return { notes, facts };
 		},
 		async search(query: string, opts?: { limit?: number }) {
 			const limit = opts?.limit;
 			const notes = await fileStore.search(query, limit !== undefined ? { maxResults: limit } : {});
-			const facts = factStore?.search(query, limit !== undefined ? { limit } : {}) ?? [];
+			const facts = factStore?.recall(query, limit !== undefined ? { limit } : {}) ?? [];
 			const factHits: DefaultMemoryHit[] = facts.map((f) => ({
 				id: f.memoryId,
 				content: f.content,

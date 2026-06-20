@@ -196,13 +196,16 @@ async function hydrateFactsCaches(
 	store: BrigadeStore,
 	cfg: Record<string, unknown>,
 ): Promise<void> {
-	const { primeFactsCache } = await import("./facts-cache.js");
+	const { primeFactsCache, canonicalWorkspaceId } = await import("./facts-cache.js");
 	const agents = cfg.agents as Record<string, unknown> | undefined;
 	const ids = new Set<string>(["main"]);
 	if (agents && typeof agents === "object") {
 		for (const key of Object.keys(agents)) {
 			if (key === "defaults" || !key.trim()) continue;
-			ids.add(key.trim());
+			// CANONICAL key — must match the runtime FactStore's path-derived key (which
+			// `resolveAgentWorkspaceDir` lowercases), or the runtime read misses this
+			// boot-primed cache and the agent reads empty memory forever.
+			ids.add(canonicalWorkspaceId(key));
 		}
 	}
 	await Promise.all(
@@ -437,8 +440,19 @@ async function syncWorkspaceMirrors(
 							}
 						}
 					}
+					// Skills the curator/consolidation ARCHIVED were moved aside to the
+					// sibling `skills-archive/` dir (reversible, intentional). They are
+					// gone from the live dir on purpose — never restore them, and reap the
+					// stale table row so they can't resurrect on a later boot (same guard
+					// shape as the consumed-BOOTSTRAP reap above). Without this, every
+					// auto-aged/merged/pruned skill comes back on the next gateway restart.
+					const archiveDir = path.join(path.dirname(skillsDir), "skills-archive");
 					for (const [name, record] of convexByName) {
 						if (diskNames.has(name)) continue;
+						if (existsSync(path.join(archiveDir, name, "SKILL.md"))) {
+							await store.skills.remove({ scope: "workspace", agentId, name } as never);
+							continue;
+						}
 						const skillFile = path.join(skillsDir, name, "SKILL.md");
 						await fsp.mkdir(path.dirname(skillFile), { recursive: true });
 						await fsp.writeFile(

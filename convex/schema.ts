@@ -2,8 +2,8 @@
 //
 // Brigade Phase 2 — single-operator Convex schema.
 //
-// Every Brigade subsystem gets its proper-shape table (nodebase + Convex
-// agent-component pattern: one row per record), NOT a `files` table holding
+// Every Brigade subsystem gets its proper-shape table (one row per record, the
+// Convex agent-component pattern), NOT a `files` table holding
 // JSONL blobs. Indexes + search + vector per domain. Encrypted-payload
 // columns use v.bytes() at the schema layer; libsodium seal/open happens at
 // the BrigadeStore adapter boundary so primitive code never sees ciphertext.
@@ -43,6 +43,11 @@ export default defineSchema({
     // Catch-all for any top-level key not named above — preserves the disk
     // path's unknown-key round-trip guarantee (io.ts orderTopLevelKeys).
     extra:    v.optional(v.any()),
+    // RESERVED (not yet written): gateway secrets are expected to be ${ENV}
+    // references, so no resolved secret is persisted today. These sealed columns
+    // are kept for the future "seal a literal gateway secret at rest" path; if
+    // that path never lands, drop them. Optional, so absence is valid for every
+    // current row.
     encryptedGatewayAuthToken:    v.optional(Enc()),
     encryptedGatewayAuthPassword: v.optional(Enc()),
     contentSha256: v.string(),
@@ -139,6 +144,76 @@ export default defineSchema({
     createdByConversationId: v.optional(v.string()),
     createdBySessionKey: v.optional(v.string()),
     createdByAccountId: v.optional(v.string()),
+    sourceType: v.optional(
+      v.union(
+        v.literal("user_instruction"),
+        v.literal("owner_message"),
+        v.literal("channel_message"),
+        v.literal("tool_output"),
+        v.literal("retrieved_document"),
+        v.literal("compaction"),
+        v.literal("extraction"),
+        v.literal("dream"),
+      ),
+    ),
+    links: v.optional(
+      v.array(
+        v.object({
+          // MUST mirror MemoryLinkKind (links.ts / MEMORY_LINK_KINDS) EXACTLY.
+          kind: v.union(
+            v.literal("supersedes"),
+            v.literal("transition"), // Step 19
+            v.literal("corrects"),
+            v.literal("derived_from"),
+            v.literal("supports"),
+            v.literal("causes"),
+            v.literal("caused_by"),
+            v.literal("part_of"),
+            v.literal("precedes"),
+            v.literal("follows"),
+            v.literal("enables"),
+            v.literal("blocks"),
+            v.literal("co_constrains"),
+            v.literal("located_at"),
+            v.literal("uses"),
+            v.literal("works_on"),
+            v.literal("contrasts_with"),
+            v.literal("contradicts"),
+            v.literal("relates_to"),
+            v.literal("same_topic"),
+            v.literal("relates"),
+          ),
+          target: v.string(),
+          // optional + additive (back-compat with existing rows / store-minted edges)
+          reason: v.optional(v.string()),
+          strength: v.optional(v.number()),
+        }),
+      ),
+    ),
+    validFrom: v.optional(v.number()),
+    validTo: v.optional(v.number()),
+    confidence: v.optional(v.number()),
+    status: v.optional(
+      v.union(
+        v.literal("asserted"),
+        v.literal("provisional"),
+        v.literal("confirmed"),
+        v.literal("disputed"),
+        v.literal("retracted"),
+      ),
+    ),
+    sourcePointers: v.optional(v.array(v.string())),
+    modality: v.optional(
+      v.union(
+        v.literal("text"),
+        v.literal("audio"),
+        v.literal("image"),
+        v.literal("video"),
+        v.literal("document"),
+      ),
+    ),
+    mediaPointer: v.optional(v.string()),
+    subjectKey: v.optional(v.string()),
     metadata: v.optional(v.any()),
     embedding: v.optional(v.array(v.number())),
   })
@@ -152,6 +227,14 @@ export default defineSchema({
       "createdByConversationId",
       "createdBySessionKey",
     ])
+    // ⚠️ DO NOT RELY ON THIS FOR RECALL while `content` is sealed. The
+    // `content` column stores CIPHERTEXT, so full-text (BM25) matching here
+    // runs over encrypted bytes and yields dead results. Live recall ranks
+    // BM25 in-app over decrypted content; this index is kept only because a
+    // latent server-side search query still references it (and is never on the
+    // live recall path). Drop or repurpose it if/when content stops being
+    // sealed at rest, or when the search query is reworked to scan decrypted
+    // rows.
     .searchIndex("search_content", {
       searchField: "content",
       filterFields: [
@@ -165,7 +248,7 @@ export default defineSchema({
     })
     .vectorIndex("by_embedding", {
       vectorField: "embedding",
-      dimensions: 1536,
+      dimensions: 256,
       filterFields: ["workspaceId", "lifecycle"],
     }),
 
@@ -180,6 +263,16 @@ export default defineSchema({
     workspaceId: v.string(),
     lastRunAt: v.number(),
   }).index("by_workspace", ["workspaceId"]),
+
+  // Append-only memory AUDIT trail (the convex-mode provenance log; fs mode uses
+  // events.jsonl). `data` is the full MemoryEvent JSON-serialized (loose by-kind
+  // shape); `at`/`kind` are surfaced for ordering + filtering.
+  memoryEvents: defineTable({
+    workspaceId: v.string(),
+    at: v.number(),
+    kind: v.string(),
+    data: v.string(),
+  }).index("by_workspace_at", ["workspaceId", "at"]),
 
   // ===========================================================================
   // 4 & 5. SESSIONS + MESSAGES  (REPORT 2)
@@ -210,6 +303,8 @@ export default defineSchema({
     .index("by_agent_key", ["agentId", "sessionKey"])
     .index("by_agent_sessionId", ["agentId", "sessionId"])
     .index("by_agent_lastUsed", ["agentId", "lastUsedAt"])
+    // RESERVED: not yet queried; kept for a planned reverse-lookup of all
+    // sessions spawned by a given parent (subagent provenance views).
     .index("by_spawnedBy", ["subagent.spawnedBy"]),
 
   sessionTranscriptRecords: defineTable({
@@ -403,8 +498,7 @@ export default defineSchema({
     createdAt: v.optional(v.number()),
     lastSeenAt: v.optional(v.number()),
   })
-    .index("by_owner_channel_account_kind", ["ownerId", "channelId", "accountId", "kind"])
-    .index("by_pairing_code", ["ownerId", "channelId", "accountId", "code"]),
+    .index("by_owner_channel_account_kind", ["ownerId", "channelId", "accountId", "kind"]),
 
   whatsappAuthFile: defineTable({
     ownerId: v.string(),
@@ -505,14 +599,6 @@ export default defineSchema({
     updatedAt: v.number(),
   }).index("by_owner_agent_kind", ["ownerId", "agentId", "kind"]),
 
-  // WhatsApp Baileys auth — replaces the ~900-file multi-file auth dir in
-  // convex mode. creds.json rides as ONE sealed BufferJSON blob (small,
-  // atomic updates); every signal key (pre-key / session / sender-key /
-  // app-state-sync-key / …) is a row keyed (keyType, keyId). Oversized
-  // values (LTHashState app-state-sync-version grows with contacts and can
-  // exceed the mutation arg cap) spill to Convex File Storage via
-  // `storageId`. keyType is a plain string — Baileys adds types across
-  // versions and a locked union would reject them.
   // Small system-level key/value facts (encryption-key fingerprint, schema
   // markers). Generic so future singletons don't need their own tables.
   systemMeta: defineTable({
@@ -535,6 +621,14 @@ export default defineSchema({
     .index("by_run", ["runId"])
     .index("by_run_table", ["runId", "table"]),
 
+  // WhatsApp Baileys auth — replaces the ~900-file multi-file auth dir in
+  // convex mode. creds.json rides as ONE sealed BufferJSON blob (small,
+  // atomic updates); every signal key (pre-key / session / sender-key /
+  // app-state-sync-key / …) is a row keyed (keyType, keyId). Oversized
+  // values (LTHashState app-state-sync-version grows with contacts and can
+  // exceed the mutation arg cap) spill to Convex File Storage via
+  // `storageId`. keyType is a plain string — Baileys adds types across
+  // versions and a locked union would reject them.
   whatsappAuthCreds: defineTable({
     ownerId: v.string(),
     accountId: v.string(),

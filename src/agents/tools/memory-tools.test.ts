@@ -192,6 +192,19 @@ describe("write_memory + recall_memory — session-scoped origin tracking", () =
 		return JSON.stringify(res);
 	}
 
+	it("a channel PEER never sees operator markdown NOTES (MEMORY.md), even on a matching query", async () => {
+		// Notes are operator-authored workspace files with NO per-peer scoping, so
+		// the notes lane is OWNER-ONLY — only the facts lane is origin-filtered.
+		writeMemory("MEMORY.md", "Operator note: the vault passphrase hint is bluestratosphere.");
+		const ownerView = await recallAs({ senderIsOwner: true }, "vault passphrase hint");
+		assert.match(ownerView, /bluestratosphere/, "owner sees their own notes");
+		const peerView = await recallAs(
+			{ senderIsOwner: false, channelContext: peerA, sessionKey: peerASessionKey },
+			"vault passphrase hint",
+		);
+		assert.doesNotMatch(peerView, /bluestratosphere/, "a peer must NEVER see operator notes (cross-origin disclosure)");
+	});
+
 	it("owner-only: owner writes are stored with createdBy: owner and recallable by owner", async () => {
 		await writeAs({ senderIsOwner: true }, "the operator prefers dark mode");
 		const factStore = new FactStore(workspace);
@@ -201,6 +214,31 @@ describe("write_memory + recall_memory — session-scoped origin tracking", () =
 		// Owner recall sees their own fact.
 		const ownerView = await recallAs({ senderIsOwner: true }, "dark mode");
 		assert.match(ownerView, /dark mode/);
+	});
+
+	it("recall surfaces each fact's memoryId in the rendered text so corrections can supersede it", async () => {
+		await writeAs({ senderIsOwner: true }, "the operator deploys on Fridays");
+		const id = new FactStore(workspace).list()[0]?.memoryId;
+		assert.ok(id, "fact written");
+		const view = await recallAs({ senderIsOwner: true }, "deploy");
+		// The fact line now carries the id (only in the rendered TEXT — `details` always had it),
+		// plus a hint to use it. Without this, the model can't target a fact in write_memory(supersedes).
+		assert.ok(view.includes(`id ${id} · preference`), "fact line carries the memoryId for superseding");
+		assert.match(view, /To correct one of these/, "recall hints how to supersede");
+	});
+
+	it("write_memory with a subjectKey auto-supersedes the prior slot value; recall surfaces the slot", async () => {
+		const wtool = makeWriteMemoryTool(new FactStore(workspace), { senderIsOwner: true });
+		await wtool.execute("c1", { content: "I deploy on Fridays", segment: "preference", subjectKey: "deploy_day" } as never);
+		await wtool.execute("c2", { content: "I deploy on Wednesdays", segment: "correction", subjectKey: "deploy_day" } as never);
+
+		const active = new FactStore(workspace).list({ origin: { kind: "owner" } }).filter((r) => r.subjectKey === "deploy_day");
+		assert.equal(active.length, 1, "only the current slot value stays active");
+		assert.match(active[0]!.content, /Wednesdays/, "the new value won; the stale one was archived");
+
+		const view = await recallAs({ senderIsOwner: true }, "deploy");
+		assert.match(view, /slot deploy_day/, "recall surfaces the attribute slot so the model can reuse it");
+		assert.match(view, /Wednesdays/);
 	});
 
 	it("peer write is stored with channel origin including sessionKey", async () => {

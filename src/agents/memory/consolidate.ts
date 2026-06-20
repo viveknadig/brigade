@@ -19,8 +19,18 @@ import * as path from "node:path";
 
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import { tryGetRuntimeContext } from "../../storage/runtime-context.js";
-import { makeIsolatedLlm, type MakeExtractionLlmArgs } from "./extract.js";
-import { FactStore, type MemoryRecord } from "./records.js";
+import { cosine } from "./embedder.js";
+import { balancedObjects, makeIsolatedLlm, type MakeExtractionLlmArgs } from "./extract.js";
+import {
+	compareRichness,
+	contentSimilarity,
+	DEDUP_SIMILARITY,
+	FactStore,
+	IDEMPOTENT_COSINE_BAR,
+	IDEMPOTENT_JACCARD_BAR,
+	originBucketKey,
+	type MemoryRecord,
+} from "./records.js";
 
 const log = createSubsystemLogger("memory/consolidate");
 
@@ -43,18 +53,29 @@ Return STRICT JSON only, no prose, no fences:
 {"archive":["<id>", ...]}
 Use an empty array if nothing should be archived.`;
 
-/** Parse the consolidation reply into the list of ids to archive. Never throws. */
+/**
+ * Parse the consolidation reply into the list of ids to archive. Never throws.
+ * Scans every top-level balanced `{...}` (string-aware) and uses the FIRST that
+ * carries an `archive` array — the same scanner the sibling extractor adopted
+ * (`balancedObjects`), mirroring how `parseExtractedFacts` picks the first object
+ * with a `facts` array. This replaces a greedy first-to-LAST `{...}` match that
+ * broke on prose-with-braces before the payload (e.g. a reasoning model emitting
+ * `My analysis: {…}. Result: {"archive":[…]}`) AND on a LEADING stray object —
+ * both spanned/shadowed the real payload, failed `JSON.parse`, and returned [].
+ */
 export function parseConsolidationArchive(text: string): string[] {
 	if (!text) return [];
-	const match = text.match(/\{[\s\S]*\}/);
-	if (!match) return [];
-	try {
-		const parsed = JSON.parse(match[0]) as { archive?: unknown };
-		if (!Array.isArray(parsed.archive)) return [];
+	for (const block of balancedObjects(text)) {
+		let parsed: { archive?: unknown };
+		try {
+			parsed = JSON.parse(block) as { archive?: unknown };
+		} catch {
+			continue;
+		}
+		if (!Array.isArray(parsed.archive)) continue;
 		return parsed.archive.filter((x): x is string => typeof x === "string" && x.length > 0);
-	} catch {
-		return [];
 	}
+	return [];
 }
 
 export type ConsolidationLlm = (factsBlock: string) => Promise<string>;
@@ -64,16 +85,9 @@ export interface ConsolidationResult {
 	archived: number;
 	considered: number;
 }
-
-/** Origin-isolation bucket key. Owner (and legacy/undefined-origin) facts share
- *  one bucket; each channel peer (channelId+conversationId+sessionKey) is its
- *  OWN bucket — so a consolidation LLM call never mixes origins. */
-function originBucketKey(r: MemoryRecord): string {
-	const o = (r as { createdBy?: { kind?: string; channelId?: string; conversationId?: string; sessionKey?: string } })
-		.createdBy;
-	if (!o || o.kind !== "channel") return "owner";
-	return `channel:${o.channelId ?? ""}:${o.conversationId ?? ""}:${o.sessionKey ?? ""}`;
-}
+// Origin-isolation bucket key is the CANONICAL one from records.ts (injective +
+// accountId-aware) — a local copy previously drifted (unescaped ':' join could
+// collide two distinct channel origins into one consolidation bucket).
 
 /**
  * Run one consolidation pass: read active facts, ask the LLM which to archive,
@@ -132,9 +146,77 @@ export async function runConsolidation(args: {
 			});
 			toArchive = [];
 		}
-		if (toArchive.length > 0) store.setLifecycle(toArchive, "archived");
-		archived += toArchive.length;
-		log.info("consolidation sweep (origin)", { considered: bucket.length, archived: toArchive.length });
+		// RICHNESS GUARD (Fix 2 + 3): the LLM names ids to archive but has NO notion of
+		// metadata richness — it can (and on real data DID) pick the subject-bearing
+		// `identity`/`preference` ORIGINAL over its reworded subject-less `knowledge`
+		// twin, archiving the rich record and keeping the churn copy (the vault graph
+		// then loses the hub-anchoring subjectKey). So for each archive the model
+		// requested, if a near-duplicate twin would REMAIN active that is POORER than
+		// the record being archived, redirect: keep the richer record, archive the
+		// poorer twin instead. Either way the surviving record first inherits the
+		// richer metadata of the one it replaces, so no subjectKey / segment is dropped.
+		{
+			const byId = new Map(bucket.map((f) => [f.memoryId, f]));
+			const archiveSet = new Set(toArchive);
+			const merges: Array<{ keep: string; drop: string }> = [];
+			// Pre-resolve, per requested drop, its near-duplicate twins in the bucket. A
+			// twin is a content near-duplicate (>= the strict dedup bar) OR a subject-
+			// anchored paraphrase: when EITHER record is subject-bearing (exactly the
+			// records extraction churns a subject-less copy beside), the loose idempotency
+			// bars apply on BOTH lanes — embedding cosine (over the stored vectors) OR
+			// content Jaccard — mirroring `FactStore.findEquivalentActive`, so a reworded
+			// twin with low lexical overlap ("peanut allergy" ~ "allergic to peanuts",
+			// Jaccard 0.2 but cosine ~0.5) is still recognised.
+			const isTwin = (x: MemoryRecord, y: MemoryRecord): boolean => {
+				const jac = contentSimilarity(x.content, y.content);
+				if (jac >= DEDUP_SIMILARITY) return true;
+				if (x.subjectKey === undefined && y.subjectKey === undefined) return false;
+				const cos =
+					x.embedding && y.embedding && x.embedding.length === y.embedding.length && x.embedding.length > 0
+						? cosine(x.embedding, y.embedding)
+						: 0;
+				return cos >= IDEMPOTENT_COSINE_BAR || jac >= IDEMPOTENT_JACCARD_BAR;
+			};
+			for (const id of [...toArchive]) {
+				const dropRec = byId.get(id);
+				if (!dropRec || !archiveSet.has(id)) continue;
+				// Active twins that would REMAIN (not currently in the archive set).
+				const remainingTwins = bucket.filter(
+					(r) => r.memoryId !== id && !archiveSet.has(r.memoryId) && isTwin(dropRec, r),
+				);
+				if (remainingTwins.length === 0) continue;
+				// The richest record across the dropRec + its remaining twins must survive.
+				const richestTwin = remainingTwins.reduce((best, r) => (compareRichness(r, best) > 0 ? r : best));
+				if (compareRichness(dropRec, richestTwin) > 0) {
+					// The model picked the wrong survivor: keep dropRec, archive the poorer twin.
+					archiveSet.delete(id);
+					archiveSet.add(richestTwin.memoryId);
+					merges.push({ keep: dropRec.memoryId, drop: richestTwin.memoryId });
+				} else {
+					// The kept twin is already at least as rich — fine; just preserve metadata.
+					merges.push({ keep: richestTwin.memoryId, drop: id });
+				}
+			}
+			// Inherit richer metadata into each survivor BEFORE archiving its duplicate.
+			for (const m of merges) {
+				if (!archiveSet.has(m.keep)) store.mergeMetadataInto(m.keep, m.drop);
+			}
+			toArchive = [...archiveSet];
+		}
+		// Archive via `store.evict` (not `setLifecycle`) so the removal lands in the
+		// append-only event log — matching the DETERMINISTIC sibling (dream.ts archives
+		// near-duplicates/decayed facts through invalidate/evict, both of which emit).
+		// `setLifecycle` flips lifecycle SILENTLY, so an LLM-driven consolidation archive
+		// would otherwise leave no provenance ("evicted" per id stamps at/memoryId/segment),
+		// making "why did this fact disappear from recall?" unanswerable for the one
+		// mutation driven by an attacker-influenceable reading. evict skips non-active ids
+		// (all here are active — the bucket comes from the active list) and returns the ids
+		// actually archived, so `archived` reflects the real count. (In convex mode, emit
+		// routes through `appendMemoryEvent` best-effort when the hook is present; degrades
+		// to no audit trail when absent — lifecycle flip always applies.)
+		const evicted = toArchive.length > 0 ? store.evict(toArchive, { now: Date.now() }) : [];
+		archived += evicted.length;
+		log.info("consolidation sweep (origin)", { considered: bucket.length, archived: evicted.length });
 	}
 	return { ran, archived, considered: active.length };
 }
@@ -147,6 +229,13 @@ function statePath(workspaceDir: string): string {
 
 // Convex-mode throttle cache. A miss reads "eligible" once; the stamp lands
 // both here and in the backend so subsequent ticks throttle normally.
+// KNOWN LIMITATION (convex multi-agent, tracked): this stamp AND the backend SPI
+// (getConsolidateLastRunAt / markConsolidateRunAt) are NOT keyed per workspace, so with
+// ≥2 convex agents one agent's run throttles the others (non-primary agents under-
+// consolidate). The complete fix threads a workspaceId through the SPI (mirroring the
+// per-session extract cursor) + the convex schema. Filesystem mode is already
+// per-workspace (the state file is under activeWorkspaceDir), so this only bites
+// convex + multi-agent — deferred over a deep SPI/schema change at low blast radius.
 let convexLastRunAt: number | undefined;
 
 /** Test-only. */

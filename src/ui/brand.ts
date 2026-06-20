@@ -221,7 +221,7 @@ const PRE_RENDERED_FRAMES: string[][] = VIDEO_FRAMES.map(({ chars, rgb }) => {
 // the ASCII video doesn't shift right on the tagline row.
 function visibleWidth(s: string): number {
 	// Strip ANSI escapes first.
-	const stripped = s.replace(/\[[0-9;]*m/g, "");
+	const stripped = s.replace(/\x1b\[[0-9;]*m/g, "");
 	// Count visual cells: fullwidth / wide characters take 2 cells, the rest 1.
 	// We approximate "wide" via the common East Asian Width / Halfwidth-Fullwidth
 	// ranges that toFullwidth produces, plus CJK ideographs and the
@@ -323,6 +323,16 @@ function composeFrame(frameIdx: number, termCols?: number): string {
 	return lines.join("\n");
 }
 
+// Only ONE brand header is ever on screen at a time — each renderScreen()
+// rebuilds the whole screen. Track the live header's timer + resize listener at
+// module scope so a re-render tears down the PRIOR one. Without this, onboarding
+// (which calls renderBrandHeader once per step) accumulates an animation
+// interval AND a process.stdout "resize" listener on every step → a
+// MaxListenersExceededWarning plus several independent animation loops fighting
+// over the brand row.
+let liveHeaderTimer: NodeJS.Timeout | undefined;
+let liveHeaderOnResize: (() => void) | undefined;
+
 /**
  * Render the wordmark + video clip + tagline. By default spawns a setInterval
  * that drives the animation; the frame index wraps via modulo so the clip
@@ -338,15 +348,25 @@ export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): C
 	const animate = opts.animate ?? true;
 	const components: Component[] = [];
 
+	// Tear down the previous header's timer + resize listener before installing
+	// this one, so repeated renders can't accumulate either.
+	if (liveHeaderTimer) {
+		clearInterval(liveHeaderTimer);
+		liveHeaderTimer = undefined;
+	}
+	if (liveHeaderOnResize) {
+		process.stdout.removeListener("resize", liveHeaderOnResize);
+		liveHeaderOnResize = undefined;
+	}
+
 	// Pi-TUI's TUI exposes the underlying Terminal which has a `columns` getter
 	// (see node_modules/@mariozechner/pi-tui/dist/terminal.d.ts). Prefer that
 	// over process.stdout.columns since it's the value pi-tui itself uses for
 	// rendering, but pickLayout falls back if either is unavailable.
 	const getCols = (): number | undefined => tui.terminal?.columns ?? process.stdout.columns;
 
-	// Static-mode start frame is the LAST frame — the artist's intended resting
-	// pose (see header docstring "the last frame holds"). Animated mode starts
-	// at frame 0 and advances from there.
+	// Static mode (chat/connect) holds the LAST frame — the clip's resting pose.
+	// Animated mode starts at frame 0 and advances from there.
 	const initialFrameIdx = animate ? 0 : VIDEO_FRAME_COUNT - 1;
 
 	const padTop = new Text("\n\n", 0, 0);
@@ -431,6 +451,7 @@ export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): C
 		// quits, the process should be free to exit even if the timer hasn't yet
 		// reached the final frame.
 		timer.unref?.();
+		liveHeaderTimer = timer;
 	}
 
 	// Re-compose the brand block on terminal resize so the responsive layout
@@ -442,6 +463,7 @@ export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): C
 		safeRender(composeFrame(frameIdx, getCols()));
 	};
 	process.stdout.on("resize", onResize);
+	liveHeaderOnResize = onResize;
 
 	return components;
 }

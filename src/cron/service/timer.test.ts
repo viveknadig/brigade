@@ -492,7 +492,7 @@ describe("cron delivery — TUI awareness fires regardless of channel delivery (
 				name: "drink-water-reminder",
 				enabled: true,
 				agentId: "main",
-				sessionKey: "agent:main:whatsapp:direct:917702616808",
+				sessionKey: "agent:main:whatsapp:direct:15550100001",
 				schedule: { kind: "at", at: now + 10_000 },
 				sessionTarget: "isolated",
 				payload: { kind: "agentTurn", message: "remind me to drink water" },

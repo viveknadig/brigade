@@ -49,6 +49,7 @@ import { makeManageSkillTool } from "./manage-skill-tool.js";
 // happen inside the action body.
 import { makeOrgTool } from "./org-tool.js";
 import { loadConfig as _loadConfigForOrgGate } from "../../core/config.js";
+import { makeManageMemoryTool } from "./manage-memory-tool.js";
 import { makeReadMemoryTool, makeRecallMemoryTool, makeWriteMemoryTool } from "./memory-tools.js";
 import { makeSendMediaTool } from "./send-media-tool.js";
 import { makeSendMessageTool } from "./send-message-tool.js";
@@ -219,6 +220,11 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// capability. The per-call gate inside the tool stamps the right
 		// MemoryRecordOrigin so subsequent recalls can filter to caller-own.
 		makeWriteMemoryTool(capability, memoryScope),
+		// manage_memory — owner-only Phase-3 maintenance + governance: run a dream
+		// reflection on demand, crypto-shred a fact (+ cascade), inspect provenance,
+		// export, or apply retention. The live operator surface for Tideline's
+		// dream/governance behaviours (otherwise library-only).
+		makeManageMemoryTool(opts.workspaceDir, { agentId: opts.agentId }),
 		// agents_list — read-only enumeration of agents the caller can target.
 		// Mirrors the reference codebase's posture: the model can SEE the agent
 		// catalog without any privilege check.
@@ -334,7 +340,16 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 	// passes the candidate tool array through it. The two spawn tools share
 	// the same depth gate — if the model can't spawn one child, it can't
 	// spawn five either.
-	if (opts.subagentContext) {
+	//
+	// OWNER GATE (security): a sub-agent currently runs with OWNER privileges
+	// (subagent-runner hardcodes senderIsOwner:true and does not thread the parent's
+	// channel origin), so a NON-owner channel peer turn must not be offered spawn at
+	// all — else a peer could induce the model to delegate, and the owner-privileged
+	// child would read the operator's private memory + author trusted owner facts
+	// (cross-origin isolation + write-gate bypass). Owner turns (true) and trusted
+	// internal pathways (undefined) keep spawn. (A confined peer→sub-agent that
+	// inherits the peer's origin is a future enhancement; until then, deny.)
+	if (opts.subagentContext && opts.senderIsOwner !== false) {
 		const spawnAgentTool = makeSpawnAgentTool({
 			parentSessionKey: opts.subagentContext.parentSessionKey,
 			parentAgentId: opts.agentId,

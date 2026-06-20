@@ -250,7 +250,7 @@ function createPerplexitySearchProvider(): WebSearchProvider {
 								authorization: `Bearer ${apiKey}`,
 								// Telemetry hints — Perplexity uses these to bucket
 								// usage for OpenRouter-routed flows + ranking.
-								"http-referer": "https://github.com/Bhasvanth-Dev9380/brigade",
+								"http-referer": "https://github.com/spinabot/brigade",
 								"x-title": "Brigade",
 							},
 							body: JSON.stringify(body),
@@ -337,7 +337,7 @@ async function runSonarChat(params: {
 			headers: {
 				"content-type": "application/json",
 				authorization: `Bearer ${apiKey}`,
-				"http-referer": "https://github.com/Bhasvanth-Dev9380/brigade",
+				"http-referer": "https://github.com/spinabot/brigade",
 				"x-title": "Brigade",
 			},
 			body: JSON.stringify(body),

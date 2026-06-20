@@ -28,7 +28,7 @@
  *     soft failure, 2 = hard error) AND honour `--json` for machine-
  *     readable output. The shape mirrors other Brigade CLI commands.
  *
- * No openclaw / clawd / hermes / boop / paperclip / nanoclaw
+ * No external agent-codebase
  * identifiers are referenced from this file.
  */
 

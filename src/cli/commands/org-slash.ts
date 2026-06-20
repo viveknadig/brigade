@@ -12,7 +12,7 @@
  * client-side against the same Pride template using the `graph` field
  * returned in the snapshot.
  *
- * NO openclaw / clawd / hermes / boop / paperclip / nanoclaw identifiers.
+ * NO external agent-codebase identifiers.
  */
 
 import type { OrgGraph } from "../../agents/org/types.js";

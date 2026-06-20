@@ -16,7 +16,7 @@
  * Each test scopes its own BRIGADE_STATE_DIR so config writes are
  * isolated and the suite never touches the real ~/.brigade directory.
  *
- * No openclaw / clawd / hermes / boop / paperclip / nanoclaw identifiers
+ * No external agent-codebase identifiers
  * appear in this file.
  */
 

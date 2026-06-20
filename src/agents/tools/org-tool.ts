@@ -42,7 +42,7 @@
  *       - `set` refuses when the targeted agent does not exist
  *         (points the model at `manage_agent` to create it first).
  *
- * No openclaw / clawd / hermes / boop / paperclip / nanoclaw
+ * No external agent-codebase
  * identifiers are referenced from this file.
  */
 

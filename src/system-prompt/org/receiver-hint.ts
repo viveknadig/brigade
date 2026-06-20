@@ -25,7 +25,7 @@
  *     so they're cheap, but bloating the model with redundant context
  *     is still a regression.
  *
- * No openclaw / clawd / hermes / boop / paperclip / nanoclaw identifiers
+ * No external agent-codebase identifiers
  * are referenced from this file.
  */
 

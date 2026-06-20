@@ -8,7 +8,7 @@
  * `editor.onSubmit` handler does for `/org` (call gateway snapshot,
  * branch on parsed shape, render via the Pride template).
  *
- * NO openclaw / clawd / hermes / boop / paperclip / nanoclaw identifiers.
+ * NO external agent-codebase identifiers.
  */
 
 import { strict as assert } from "node:assert";

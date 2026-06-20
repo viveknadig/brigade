@@ -32,7 +32,7 @@
 // `brigade encrypt rotate --to <new-hex>` (calls re-seal across all
 // sensitive columns; lands as a follow-up).
 
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -47,12 +47,40 @@ const TAG_LEN = 16;
 const KEY_ENV_PRIMARY = "BRIGADE_ENCRYPTION_KEY";
 const KEY_ENV_OLD = "BRIGADE_ENCRYPTION_KEY_OLD";
 
+/** Fixed app salt for HKDF subkey derivation (domain separation, not secret). */
+const HKDF_SALT = Buffer.from("brigade-memory-hkdf-v1", "utf8");
+/** Cache derived subkeys (keyed by masterFingerprint‖context) — HKDF is cheap
+ *  but runs on every seal/open, and origins repeat. Cleared on key-cache reset. */
+const subkeyCache = new Map<string, Buffer>();
+
+/**
+ * Derive a per-CONTEXT 32-byte subkey from a master via HKDF-SHA256. The basis
+ * for per-origin crypto-isolation: each origin seals with ITS OWN subkey, so a
+ * cross-origin read needs the right `context` — not just the master. Multi-tenant
+ * ready: when each tenant has its own master/root, swapping the root in here
+ * keeps origins crypto-separated ACROSS tenants for free (a tenant can't derive
+ * another tenant's subkeys without that tenant's root).
+ */
+export function deriveSubkey(master: Buffer, context: string): Buffer {
+	const fp = createHash("sha256").update(master).digest("hex"); // FULL fingerprint: a 32-bit prefix could collide across many tenant roots (keys the cache only; subkey is fp-independent)
+	const cacheKey = `${fp}|${context}`;
+	const hit = subkeyCache.get(cacheKey);
+	if (hit) return hit;
+	const sub = Buffer.from(hkdfSync("sha256", master, HKDF_SALT, Buffer.from(context, "utf8"), 32));
+	subkeyCache.set(cacheKey, sub);
+	return sub;
+}
+
 function parseHexKey(name: string, raw: string | undefined): Buffer | undefined {
 	if (!raw || raw.trim().length === 0) return undefined;
 	const hex = raw.trim();
 	if (!/^[0-9a-f]{64}$/i.test(hex)) {
+		const detail =
+			hex.length === 64
+				? `Got 64 chars but it contains non-hex characters.`
+				: `Got ${hex.length} chars.`;
 		throw new Error(
-			`${name} must be a 64-char hex string (32 bytes). Got ${hex.length} chars. ` +
+			`${name} must be a 64-char hex string (32 bytes). ${detail} ` +
 				`Generate one with: node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"`,
 		);
 	}
@@ -198,6 +226,7 @@ export function __resetEncryptionKeyCacheForTests(): void {
 	cachedFileKey = undefined;
 	cachedSource = "none";
 	cacheStamp = "";
+	subkeyCache.clear();
 }
 
 /** Encrypt arbitrary bytes. When no key is configured, returns the bytes
@@ -206,14 +235,17 @@ export function __resetEncryptionKeyCacheForTests(): void {
 export function seal(
 	plaintext: Uint8Array | ArrayBuffer | Buffer | string,
 	aad?: string,
+	keyContext?: string,
 ): ArrayBuffer {
-	const key = getKeys().primary;
+	const master = getKeys().primary;
 	const buf = toBuffer(plaintext);
-	if (!key) {
+	if (!master) {
 		// Return the raw plaintext (no magic header) — `open` will see no
 		// magic byte and pass through.
 		return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
 	}
+	// Per-origin (or per-tenant) crypto-isolation: seal with the context subkey.
+	const key = keyContext ? deriveSubkey(master, keyContext) : master;
 	const nonce = randomBytes(NONCE_LEN);
 	const cipher = createCipheriv("aes-256-gcm", key, nonce);
 	if (aad) cipher.setAAD(Buffer.from(aad, "utf8"));
@@ -232,18 +264,18 @@ export function seal(
 export function open(
 	payload: Uint8Array | ArrayBuffer | Buffer | undefined | null,
 	aad?: string,
+	keyContext?: string,
 ): Buffer {
 	if (!payload) return Buffer.alloc(0);
 	const buf = toBuffer(payload);
-	if (buf.length < HEADER_LEN || buf[0] !== MAGIC) {
-		// Not a sealed payload — treat as plaintext bytes.
+	if (buf.length < HEADER_LEN + NONCE_LEN + TAG_LEN || buf[0] !== MAGIC || buf[1] !== VERSION) {
+		// Not a sealed payload — treat as plaintext bytes. Gate on magic AND version
+		// AND a full minimum envelope: plaintext that merely STARTS with 0x42 ('B',
+		// e.g. "Brigade…") must pass through unchanged, not be misread as a short or
+		// wrong-version sealed blob and throw into the read path. This is the no-key
+		// passthrough contract — turning a key on later must never have corrupted a
+		// pre-existing plaintext value that happened to begin with 'B'.
 		return buf;
-	}
-	const version = buf[1];
-	if (version !== VERSION) {
-		throw new Error(
-			`brigade encryption: unknown sealed-payload version ${version} (expected ${VERSION})`,
-		);
 	}
 	const { primary, old: oldKey } = getKeys();
 	if (!primary) {
@@ -267,11 +299,22 @@ export function open(
 		}
 	};
 
-	const primaryResult = tryDecrypt(primary);
-	if (primaryResult !== undefined) return primaryResult;
+	// Candidate keys, in order. The context SUBKEY first (current per-origin
+	// seals), then the RAW master (legacy rows sealed before HKDF was added —
+	// organic migration: they re-seal with the subkey on their next write), then
+	// the same pair for the rotated-out OLD key. A row sealed for origin A can't
+	// be opened with origin B's context (its subkey won't decrypt + the master
+	// won't either, since A used a subkey) — cross-origin isolation.
+	const candidates: Buffer[] = [];
+	if (keyContext) candidates.push(deriveSubkey(primary, keyContext));
+	candidates.push(primary);
 	if (oldKey) {
-		const oldResult = tryDecrypt(oldKey);
-		if (oldResult !== undefined) return oldResult;
+		if (keyContext) candidates.push(deriveSubkey(oldKey, keyContext));
+		candidates.push(oldKey);
+	}
+	for (const key of candidates) {
+		const r = tryDecrypt(key);
+		if (r !== undefined) return r;
 	}
 	throw new Error(
 		`brigade encryption: failed to decrypt sealed payload — wrong key or corrupted data`,
@@ -284,17 +327,18 @@ export function open(
 
 /** Encrypt a UTF-8 string. Returns the sealed ArrayBuffer ready to send
  *  into a Convex `v.bytes()` column. */
-export function sealString(text: string, aad?: string): ArrayBuffer {
-	return seal(Buffer.from(text, "utf8"), aad);
+export function sealString(text: string, aad?: string, keyContext?: string): ArrayBuffer {
+	return seal(Buffer.from(text, "utf8"), aad, keyContext);
 }
 
 /** Decrypt a sealed-or-plain ArrayBuffer back into a UTF-8 string. */
 export function openToString(
 	payload: ArrayBuffer | Uint8Array | undefined | null,
 	aad?: string,
+	keyContext?: string,
 ): string {
 	if (!payload) return "";
-	return open(payload, aad).toString("utf8");
+	return open(payload, aad, keyContext).toString("utf8");
 }
 
 /** Encrypt a JSON-serialisable value. */

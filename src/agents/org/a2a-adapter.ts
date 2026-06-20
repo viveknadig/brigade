@@ -22,7 +22,7 @@
  *   - Self-targets are always allowed (mirrors the legacy policy's
  *     `requesterAgentId === targetAgentId` short-circuit).
  *
- * No openclaw / clawd / hermes / boop / paperclip / nanoclaw
+ * No external agent-codebase
  * identifiers are referenced from this file.
  */
 

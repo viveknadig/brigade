@@ -106,7 +106,7 @@ describe("useConvexAuthState (against real Baileys)", () => {
 		const keyBytes = new Uint8Array([1, 2, 3, 4]);
 		await auth.state.keys.set({
 			"pre-key": { "1": { private: keyBytes, public: keyBytes } },
-			session: { "917702616808.0": { fake: "session-blob" } },
+			session: { "15550100001.0": { fake: "session-blob" } },
 		});
 
 		const got = await auth.state.keys.get("pre-key", ["1", "999"]);
@@ -115,7 +115,7 @@ describe("useConvexAuthState (against real Baileys)", () => {
 
 		await auth.flush();
 		assert.ok(fake.keys.has("pre-key:1"));
-		assert.ok(fake.keys.has("session:917702616808.0"));
+		assert.ok(fake.keys.has("session:15550100001.0"));
 
 		// Delete via null — reference removeData parity.
 		await auth.state.keys.set({ "pre-key": { "1": null } });

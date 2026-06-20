@@ -26,7 +26,7 @@
  * full operator scope set (localhost-only); Phase 2 multi-user will
  * narrow this without any code change here.
  *
- * Brand-scrub: no openclaw / clawd / hermes / boop / paperclip / nanoclaw
+ * Brand-scrub: no external agent-codebase
  * identifiers referenced in this file.
  */
 

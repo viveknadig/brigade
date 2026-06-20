@@ -37,7 +37,7 @@
  *     `decodeDeliveryKindContextKey` on `event.contextKey`. No other
  *     wiring needed.
  *
- * No openclaw / clawd / hermes / boop / paperclip / nanoclaw identifiers
+ * No external agent-codebase identifiers
  * are referenced from this file.
  */
 

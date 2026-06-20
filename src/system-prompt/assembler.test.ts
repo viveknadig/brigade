@@ -849,13 +849,13 @@ describe("assembleSystemPrompt — ## Messaging linked self-accounts", () => {
 			toolDescriptions: [],
 			channels: {
 				started: ["whatsapp"],
-				linked: [{ channelId: "whatsapp", selfId: "917702616808" }],
+				linked: [{ channelId: "whatsapp", selfId: "15550100001" }],
 			},
 		});
 		assert.match(out.text, /## Messaging/);
-		assert.match(out.text, /whatsapp is linked to the operator's own account: `917702616808`/);
+		assert.match(out.text, /whatsapp is linked to the operator's own account: `15550100001`/);
 		assert.match(out.text, /never ask the operator for their number/);
-		assert.match(out.text, /send_message\(\{channel: "whatsapp", to: "917702616808", text\}\)/);
+		assert.match(out.text, /send_message\(\{channel: "whatsapp", to: "15550100001", text\}\)/);
 	});
 
 	it("omits the linked line when no adapter reported a selfId", () => {
@@ -877,12 +877,12 @@ describe("assembleSystemPrompt — ## Messaging linked self-accounts", () => {
 			channels: {
 				started: ["whatsapp", "telegram"],
 				linked: [
-					{ channelId: "whatsapp", selfId: "917702616808" },
+					{ channelId: "whatsapp", selfId: "15550100001" },
 					{ channelId: "telegram", selfId: "operator_tg" },
 				],
 			},
 		});
-		assert.match(out.text, /whatsapp is linked to the operator's own account: `917702616808`/);
+		assert.match(out.text, /whatsapp is linked to the operator's own account: `15550100001`/);
 		assert.match(out.text, /telegram is linked to the operator's own account: `operator_tg`/);
 	});
 });

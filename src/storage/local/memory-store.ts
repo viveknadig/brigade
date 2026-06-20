@@ -11,7 +11,9 @@
 //   ✓ setExtractCursor                     — inline tmp+rename (writer is private upstream)
 //   ✓ getConsolidateLastRunAt              — read consolidate-state.json inline
 //   ✓ markConsolidateRunAt                 — wrap consolidate.ts:markConsolidationRun
-//   ✗ findSimilar                          — vector recall ships in PR19
+//   ✗ findSimilar                          — stub; embed-on-write ships in
+//                                            both modes, so real hybrid recall
+//                                            lives in FactStore.searchHybrid
 //   ✗ decay                                — needs a sweep helper upstream
 //   ✗ subscribe                            — no-op (filesystem mode reads on demand)
 //
@@ -64,6 +66,10 @@ function activeMemoryStore(): FileMemoryStore {
 }
 
 export class LocalMemoryStore implements MemoryStore {
+	// `_stateDir` is retained for parity with the other local stores, but path
+	// resolution here intentionally flows through the global `resolveStateDir()`
+	// (via `activeWorkspaceDir()` → `resolveAgentWorkspaceDir`) so memory ops
+	// land in the same workspace the rest of the runtime reads from.
 	constructor(private readonly _stateDir: string) {}
 
 	async listFacts(filter: ListFilter): Promise<MemoryRecord[]> {
@@ -80,7 +86,7 @@ export class LocalMemoryStore implements MemoryStore {
 		query: string,
 		opts: { limit?: number; markAccessed?: boolean; origin?: RecordOriginFilter },
 	): Promise<Array<MemoryRecord & { score: number }>> {
-		const result = activeFactStore().search(query, {
+		const result = activeFactStore().recall(query, {
 			...(opts.limit !== undefined ? { limit: opts.limit } : {}),
 			...(opts.markAccessed !== undefined ? { markAccessed: opts.markAccessed } : {}),
 			...(opts.origin !== undefined ? { origin: opts.origin as InternalRecordOriginFilter } : {}),
@@ -106,11 +112,14 @@ export class LocalMemoryStore implements MemoryStore {
 		_scope: Scope,
 		_k?: number,
 	): Promise<Array<MemoryRecord & { score: number }>> {
-		// Vector recall lands in Phase 2 PR19 (memoryFacts.embedding + ANN).
-		// Filesystem mode has no embedding store today; throw rather than
-		// silently degrade to substring search (callers should use
-		// `searchFacts` for that).
-		throw new NotImplementedYet("memory.findSimilar (vector recall — Phase 2 PR19)");
+		// Intentionally a stub. Embed-on-write now ships in BOTH modes, so
+		// records carry `.embedding` and real vector/hybrid recall is available
+		// via `FactStore.searchHybrid` (BM25 ⊕ vector). This adapter method
+		// could become a thin wrapper over that for parity, but until a caller
+		// needs the typed-seam entry point we throw rather than silently degrade
+		// to substring search (callers wanting recall should use `searchFacts`
+		// or the FactStore hybrid lane directly).
+		throw new NotImplementedYet("memory.findSimilar (use FactStore.searchHybrid for vector/hybrid recall)");
 	}
 
 	async searchNotes(query: string, opts: unknown): Promise<unknown[]> {
@@ -127,6 +136,10 @@ export class LocalMemoryStore implements MemoryStore {
 	}
 
 	async getExtractCursor(sessionId: string): Promise<number> {
+		// Asymmetry with setExtractCursor is intentional: the getter flows
+		// through getCursor() (which branches on the runtime context), while the
+		// setter writes the cursor file inline because its writer is private
+		// upstream. Plain filesystem mode reads/writes the same local file.
 		return getCursor(activeWorkspaceDir(), sessionId);
 	}
 
