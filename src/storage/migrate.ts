@@ -43,7 +43,10 @@ import { createHash } from "node:crypto";
 import { resolveAgentWorkspaceDir } from "../config/paths.js";
 import { wipeLocalBrigadeState } from "./factory-reset.js";
 import { LocalBrigadeStore } from "./local/index.js";
-import { ConvexBrigadeStore } from "./convex/index.js";
+// ConvexBrigadeStore is imported LAZILY in buildStores() — its module chain
+// statically pulls in `convex/_generated`, which ships only in convex-mode dev
+// checkouts (not the npm package). A top-level import would crash every
+// `brigade store …` subcommand (even filesystem ones) just by loading this file.
 import { readSentinel, writeSentinelNow } from "./sentinel.js";
 
 import type { BrigadeStore, SkillRecord } from "./store.js";
@@ -141,6 +144,7 @@ function collectAgentIds(cfg: unknown): string[] {
 
 async function buildStores(opts: MigrateOptions): Promise<{ source: BrigadeStore; target: BrigadeStore }> {
 	const local: BrigadeStore = new LocalBrigadeStore({ stateDir: opts.stateDir });
+	const { ConvexBrigadeStore } = await import("./convex/index.js");
 	const convex: BrigadeStore = new ConvexBrigadeStore({
 		stateDir: opts.stateDir,
 		...(opts.convexUrl !== undefined ? { url: opts.convexUrl } : {}),
