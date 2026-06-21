@@ -54,6 +54,10 @@ const BOOT_OPTIONAL_PREFIXES = [
   "encrypt",
   "migrate",
   "backup",
+  // The `convex` command MANAGES the backend that convex mode depends on, so
+  // it must run even when that backend is down — booting the storage layer
+  // here would be circular (you can't reach a backend you're trying to start).
+  "convex",
 ];
 
 /** "gateway status"-style path for the action command (root name elided). */
@@ -1480,6 +1484,75 @@ export function buildProgram(): Command {
     .action(async (opts: { agent?: string }) => {
       const { runMemoryMcpServerCli } = await import("../commands/mcp-cmd.js");
       await exitAfterFlush(await runMemoryMcpServerCli({ ...(opts.agent ? { agentId: opts.agent } : {}) }));
+    });
+
+  /* ─────────────────────────────── convex ─────────────────────────────── */
+  // `brigade convex <dev|start|status|stop|push|codegen>` — drive the bundled
+  // self-hosted Convex backend that powers convex storage mode. The binaries +
+  // orchestrator scripts ship inside the package, so these work both in a repo
+  // checkout and from a global install (any cwd). `dev` runs in the foreground
+  // (Ctrl-C to stop); it does NOT start the chat TUI.
+  const convex = program
+    .command("convex")
+    .description("Run or manage the bundled self-hosted Convex backend (dev, status, push, …)");
+
+  convex
+    .command("dev")
+    .description("Download the backend if needed, then run it + the dashboard in the foreground")
+    .option("-h, --host <host>", "backend host (default: 127.0.0.1)")
+    .option("-p, --port <port>", "backend port (default: 3210)", (v) => parseInt(v, 10))
+    .action(async (opts: { host?: string; port?: number }) => {
+      const { runConvexCommand } = await import("../commands/convex-cmd.js");
+      await exitAfterFlush(await runConvexCommand({ action: "dev", host: opts.host, port: opts.port }));
+    });
+
+  convex
+    .command("start")
+    .description("Alias for `convex dev` — run the backend + dashboard in the foreground")
+    .option("-h, --host <host>", "backend host (default: 127.0.0.1)")
+    .option("-p, --port <port>", "backend port (default: 3210)", (v) => parseInt(v, 10))
+    .action(async (opts: { host?: string; port?: number }) => {
+      const { runConvexCommand } = await import("../commands/convex-cmd.js");
+      await exitAfterFlush(await runConvexCommand({ action: "start", host: opts.host, port: opts.port }));
+    });
+
+  convex
+    .command("status")
+    .description("Probe the backend and report whether it is running")
+    .option("-h, --host <host>", "backend host (default: 127.0.0.1)")
+    .option("-p, --port <port>", "backend port (default: 3210)", (v) => parseInt(v, 10))
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { host?: string; port?: number; json?: boolean }) => {
+      const { runConvexCommand } = await import("../commands/convex-cmd.js");
+      await exitAfterFlush(
+        await runConvexCommand({ action: "status", host: opts.host, port: opts.port, json: opts.json }),
+      );
+    });
+
+  convex
+    .command("stop")
+    .description("Explain how to stop the foreground backend (Ctrl-C)")
+    .option("-h, --host <host>", "backend host (default: 127.0.0.1)")
+    .option("-p, --port <port>", "backend port (default: 3210)", (v) => parseInt(v, 10))
+    .action(async (opts: { host?: string; port?: number }) => {
+      const { runConvexCommand } = await import("../commands/convex-cmd.js");
+      await exitAfterFlush(await runConvexCommand({ action: "stop", host: opts.host, port: opts.port }));
+    });
+
+  convex
+    .command("push")
+    .description("Deploy the bundled Convex functions to the running backend")
+    .action(async () => {
+      const { runConvexCommand } = await import("../commands/convex-cmd.js");
+      await exitAfterFlush(await runConvexCommand({ action: "push" }));
+    });
+
+  convex
+    .command("codegen")
+    .description("Regenerate the Convex client (convex/_generated) against the running backend")
+    .action(async () => {
+      const { runConvexCommand } = await import("../commands/convex-cmd.js");
+      await exitAfterFlush(await runConvexCommand({ action: "codegen" }));
     });
 
   return program;

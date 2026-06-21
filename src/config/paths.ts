@@ -199,6 +199,46 @@ export function resolveBundledSkillsDir(): string {
   return path.resolve(moduleDir, "..", "..", "skills");
 }
 
+// Package root — the directory that holds package.json, scripts/, convex/,
+// and (in an installed copy) bin/. This module sits at
+// `<root>/src/config/paths.ts` in dev and `<root>/dist/config/paths.js`
+// once compiled — both are two levels under the package root, so
+// `"..", ".."` resolves the root in either layout. Mirrors the same
+// `fileURLToPath(import.meta.url)` trick `resolveBundledSkillsDir` uses.
+export function resolvePackageRoot(): string {
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+}
+
+// Where the self-hosted Convex backend + dashboard binaries live. Three
+// layouts, in precedence order:
+//   1. BRIGADE_CONVEX_BIN_DIR override (tests / exotic installs).
+//   2. In-repo dev (a `.git` dir next to package.json) → `<root>/bin`, the
+//      historical `npm run convex:dev` location — unchanged for contributors.
+//   3. Global install (no `.git`) → `~/.brigade/convex/bin`, a durable
+//      per-user location outside the read-only package tree.
+export function resolveConvexBinDir(): string {
+  const override = process.env.BRIGADE_CONVEX_BIN_DIR?.trim();
+  if (override && override.length > 0) return path.resolve(override);
+  if (fs.existsSync(path.join(resolvePackageRoot(), ".git"))) {
+    return path.join(resolvePackageRoot(), "bin");
+  }
+  return path.join(resolveStateDir(), "convex", "bin");
+}
+
+// Where the Convex backend persists its state (sqlite db, file storage,
+// derived admin key, the generated .env.local). Same three-layout
+// precedence as the bin dir: env override, then in-repo `<root>/.convex-data`
+// for contributors, then `~/.brigade/convex/data` for a global install so a
+// single data dir is self-contained per user.
+export function resolveConvexDataDir(): string {
+  const override = process.env.BRIGADE_CONVEX_DATA_DIR?.trim();
+  if (override && override.length > 0) return path.resolve(override);
+  if (fs.existsSync(path.join(resolvePackageRoot(), ".git"))) {
+    return path.join(resolvePackageRoot(), ".convex-data");
+  }
+  return path.join(resolveStateDir(), "convex", "data");
+}
+
 export function resolveTasksDir(): string {
   return path.join(resolveStateDir(), "tasks");
 }
