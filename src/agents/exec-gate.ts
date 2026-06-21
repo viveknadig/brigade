@@ -58,7 +58,7 @@
  * subscribe and render the refusal as a log line.
  */
 
-import type { BeforeToolCallContext, BeforeToolCallResult } from "@mariozechner/pi-agent-core";
+import type { BeforeToolCallContext, BeforeToolCallResult } from "@earendil-works/pi-agent-core";
 
 import { BrigadeApprovalFileVersionError, decideApproval } from "../core/exec-approvals.js";
 import { emitAgentEvent } from "./agent-event-bus.js";

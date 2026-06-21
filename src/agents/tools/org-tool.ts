@@ -46,7 +46,7 @@
  * identifiers are referenced from this file.
  */
 
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import crypto from "node:crypto";
 import path from "node:path";
 import { Type } from "typebox";

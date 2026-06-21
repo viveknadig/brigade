@@ -26,8 +26,8 @@ import {
   ModelRegistry,
   SessionManager,
   createAgentSession,
-} from "@mariozechner/pi-coding-agent";
-import type { AgentSession } from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 
 import {
@@ -367,7 +367,7 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
     throw new Error(
       "Pi ModelRegistry.find is not a function — likely a Pi SDK version drift. " +
         "Brigade was built against the 0.70.x ModelRegistry surface. " +
-        "Pin `@mariozechner/pi-coding-agent` to a known-compatible version, or " +
+        "Pin `@earendil-works/pi-coding-agent` to a known-compatible version, or " +
         "update brigade's agent-loop to match the new Pi API.",
     );
   }

@@ -36,7 +36,7 @@ import {
 	truncateToWidth,
 	type TUI,
 	visibleWidth,
-} from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-tui";
 
 import { brand } from "../ui/theme.js";
 

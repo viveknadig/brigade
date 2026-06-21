@@ -36,7 +36,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
 
 import { loadConfig } from "../../core/config.js";

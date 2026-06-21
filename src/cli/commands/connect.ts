@@ -31,7 +31,7 @@ import {
 	type SlashCommand,
 	Text,
 	TUI,
-} from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-tui";
 
 import { BrigadeEditor } from "../../ui/editor.js";
 import { sanitizeTerminalInput } from "../../security/terminal-input-sanitizer.js";

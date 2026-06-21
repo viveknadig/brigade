@@ -6,7 +6,7 @@
  * delegates to the engine and returns a structured `jsonToolResult`.
  *
  * Pi AgentTool shape (best-effort match — Brigade pins to the version in
- * `node_modules/@mariozechner/pi-coding-agent`):
+ * `node_modules/@earendil-works/pi-coding-agent`):
  *
  *   {
  *     name: "sessions_spawn",

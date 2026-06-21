@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import type { SessionManager } from "@mariozechner/pi-coding-agent";
+import type { SessionManager } from "@earendil-works/pi-coding-agent";
 
 // Per-session marker that the bootstrap context (workspace persona files +
 // any first-turn guidance) has been delivered into the model's context.

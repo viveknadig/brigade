@@ -24,7 +24,7 @@
  * Outside the popup, Enter retains its normal "submit" semantics.
  */
 
-import { Editor } from "@mariozechner/pi-tui";
+import { Editor } from "@earendil-works/pi-tui";
 
 // Slash commands whose argument is OPTIONAL (or absent) — Enter should
 // submit immediately even when the autocomplete popup is showing. Kept

@@ -30,7 +30,7 @@
 // gateway shutdown. A hard kill mid-turn loses at most the in-flight tail;
 // transcripts are observability, not source of truth.
 
-import { SessionManager } from "@mariozechner/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import type { PiTranscriptRecord } from "../storage/store.js";

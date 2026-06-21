@@ -290,7 +290,7 @@ export async function compactWithSlotResolution(
 // Pure function. Caller wires it via transformContext.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 export interface SmartCompactionOptions {
   /**

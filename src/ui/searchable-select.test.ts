@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import type { SelectItem, SelectListTheme } from "@mariozechner/pi-tui";
+import type { SelectItem, SelectListTheme } from "@earendil-works/pi-tui";
 
 import { SearchableSelectList } from "./searchable-select.js";
 

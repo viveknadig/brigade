@@ -21,8 +21,8 @@
 
 import process from "node:process";
 
-import { Input, type SelectItem, SelectList, Text, TUI } from "@mariozechner/pi-tui";
-import { ProcessTerminal } from "@mariozechner/pi-tui";
+import { Input, type SelectItem, SelectList, Text, TUI } from "@earendil-works/pi-tui";
+import { ProcessTerminal } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 
 import { BrigadeExtensionRegistry } from "../../agents/extensions/registry.js";

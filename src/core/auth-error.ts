@@ -3,7 +3,7 @@
  * surfaces from Pi's auth-resolution path.
  *
  * Pi's own message hardcodes `/login` (a Pi slash command Brigade doesn't
- * have) and dumps raw `node_modules/@mariozechner/pi-coding-agent/docs/`
+ * have) and dumps raw `node_modules/@earendil-works/pi-coding-agent/docs/`
  * paths into the user's chat. Both are direct violations of Brigade's
  * B2B-grade copy rules — paying customers see the agent gesture at a
  * non-existent command and at internal package paths.

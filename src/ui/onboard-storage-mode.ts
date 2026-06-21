@@ -15,7 +15,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { CancellableLoader, Input, type SelectItem, SelectList, Text, type TUI } from "@mariozechner/pi-tui";
+import { CancellableLoader, Input, type SelectItem, SelectList, Text, type TUI } from "@earendil-works/pi-tui";
 
 import { renderBrandHeader } from "./brand.js";
 import { brand, selectListTheme } from "./theme.js";

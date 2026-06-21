@@ -25,7 +25,7 @@
 
 import { Type } from "typebox";
 
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { MemoryCapability } from "../extensions/types.js";
 import {
 	BrigadeMemoryPathError,

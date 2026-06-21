@@ -18,7 +18,7 @@
 import { appendFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
 
-import type { AgentSession, AgentSessionEvent } from "@mariozechner/pi-coding-agent";
+import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 
 import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import type { BrigadeStore } from "../storage/store.js";

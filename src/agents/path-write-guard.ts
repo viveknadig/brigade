@@ -38,7 +38,7 @@
 import os from "node:os";
 import path from "node:path";
 
-import type { BeforeToolCallContext, BeforeToolCallResult } from "@mariozechner/pi-agent-core";
+import type { BeforeToolCallContext, BeforeToolCallResult } from "@earendil-works/pi-agent-core";
 
 import {
 	resolveBundledSkillsDir,

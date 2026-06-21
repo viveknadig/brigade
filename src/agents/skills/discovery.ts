@@ -24,7 +24,7 @@
 
 import * as fs from "node:fs";
 
-import { formatSkillsForPrompt, loadSkillsFromDir, type Skill } from "@mariozechner/pi-coding-agent";
+import { formatSkillsForPrompt, loadSkillsFromDir, type Skill } from "@earendil-works/pi-coding-agent";
 
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import {

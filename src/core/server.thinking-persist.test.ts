@@ -23,7 +23,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { applySetThinkingMutation } from "./agent-runtime-persist.js";
 import { readPersistedThinkingLevel, pickInitialThinkingLevel } from "./model-caps.js";
-import type { Model } from "@mariozechner/pi-ai";
+import type { Model } from "@earendil-works/pi-ai";
 
 let stateDir: string;
 let prevStateDir: string | undefined;

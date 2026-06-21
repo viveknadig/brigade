@@ -29,7 +29,7 @@ import {
 	type SelectItem,
 	type SelectListLayoutOptions,
 	type SelectListTheme,
-} from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-tui";
 
 export interface SearchableSelectOptions extends SelectListLayoutOptions {
 	/**

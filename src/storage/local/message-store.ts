@@ -44,7 +44,7 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import * as fsAsync from "node:fs/promises";
 import path from "node:path";
 
-import { SessionManager } from "@mariozechner/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 import {
 	consumeSystemEventEntries,

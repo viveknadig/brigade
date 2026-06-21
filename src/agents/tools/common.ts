@@ -23,7 +23,7 @@
  * Pure functions; no module-level state.
  */
 
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 
 import { emitAgentEvent } from "../agent-event-bus.js";
 import type { AgentToolUpdateCallback, AnyBrigadeTool } from "./types.js";

@@ -8,7 +8,7 @@ import { buildProgram } from "./program/build-program.js";
 export async function runMain(argv: string[]): Promise<number> {
   const program = buildProgram();
   try {
-    await program.parseAsync(argv);
+    await program.parseAsync(rewriteColonSubcommands(argv));
     return 0;
   } catch (err) {
     return mapErrorToExitCode(err);
@@ -26,6 +26,21 @@ export async function runMain(argv: string[]): Promise<number> {
       // Never let a drain failure mask the real exit code.
     }
   }
+}
+
+/**
+ * Rewrite the `brigade convex:dev` colon form into the canonical
+ * `brigade convex dev` two-token form before Commander parses it. The
+ * npm-script habit (`npm run convex:dev`) leads operators to type the colon
+ * form at the `brigade` CLI too; without this they'd fall through to the
+ * default `tui` command and start the gateway. Only the known convex actions
+ * are rewritten, so no unrelated argument is touched. Returns a new array
+ * (never mutates the caller's argv).
+ */
+function rewriteColonSubcommands(argv: string[]): string[] {
+  const m = /^convex:(dev|start|status|stop|push|codegen)$/.exec(argv[2] ?? "");
+  if (!m) return argv;
+  return [...argv.slice(0, 2), "convex", m[1]!, ...argv.slice(3)];
 }
 
 function mapErrorToExitCode(err: unknown): number {

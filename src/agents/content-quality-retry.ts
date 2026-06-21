@@ -22,7 +22,7 @@
  * importing from Runtime A.
  */
 
-import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
 
 import { detectSlop } from "./quality/slop-detector.js";
 

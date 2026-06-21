@@ -20,8 +20,8 @@
 // a safe fallback), PLUS the streamFn-composed payload mutators and OpenRouter
 // attribution-header injection.
 
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { Api, Model, ThinkingLevel } from "@mariozechner/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { Api, Model, ThinkingLevel } from "@earendil-works/pi-ai";
 
 import { scrubAnthropicRefusalSentinel } from "./error-classifier.js";
 import { sanitizeMessages } from "./sanitize-surrogates.js";
@@ -380,7 +380,7 @@ export const PROVIDER_QUIRKS_PARKED = {
 // single file is the source of truth for provider-side mutations.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
 
 import { CACHE_BOUNDARY_MARKER } from "../system-prompt/cache-boundary.js";
 import { resolveOpenRouterAttributionHeaders } from "./provider-attribution.js";

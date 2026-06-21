@@ -26,7 +26,7 @@
 
 import { Type } from "typebox";
 
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 
 import { getActiveChannelManager } from "../channels/active-manager.js";
 import type { ChannelApprovalRoute } from "../channels/approval-router.js";

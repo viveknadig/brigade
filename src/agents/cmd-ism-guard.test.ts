@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import type { BeforeToolCallContext, BeforeToolCallResult } from "@mariozechner/pi-agent-core";
+import type { BeforeToolCallContext, BeforeToolCallResult } from "@earendil-works/pi-agent-core";
 
 import { detectDeviceRedirect, makeCmdIsmGuard } from "./cmd-ism-guard.js";
 

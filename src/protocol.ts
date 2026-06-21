@@ -19,7 +19,7 @@
  * Compatible with: any WebSocket client speaking this JSON shape.
  */
 
-import type { Model } from "@mariozechner/pi-ai";
+import type { Model } from "@earendil-works/pi-ai";
 import type {
 	CronAddParamsV2,
 	CronAddResultV2,

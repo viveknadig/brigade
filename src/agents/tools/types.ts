@@ -25,7 +25,7 @@
  * post-schema coercion / labelling that's nicer than catching AJV errors.
  */
 
-import type { AgentTool } from "@mariozechner/pi-agent-core";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 // Pi re-exports TypeBox under the package name `typebox` (not the upstream
 // `@sinclair/typebox`). Importing from the same source Pi uses guarantees
 // schema types line up and avoids version drift between Brigade tools and
@@ -35,7 +35,7 @@ import type { TSchema } from "typebox";
 export type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
-} from "@mariozechner/pi-agent-core";
+} from "@earendil-works/pi-agent-core";
 
 /**
  * Brigade-native extension of Pi's `AgentTool`. Adds two metadata fields

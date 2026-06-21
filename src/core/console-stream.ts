@@ -24,7 +24,7 @@ import process from "node:process";
 
 import chalk from "chalk";
 
-import type { AgentSessionEvent } from "@mariozechner/pi-coding-agent";
+import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { RequestMethod } from "../protocol.js";
 
 /* ─────────────────────────── public surface ─────────────────────────── */

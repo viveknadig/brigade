@@ -30,8 +30,8 @@
  * `Markdown`, so callsites can just swap the import line.
  */
 
-import { Markdown as PiMarkdown } from "@mariozechner/pi-tui";
-import type { DefaultTextStyle, MarkdownTheme } from "@mariozechner/pi-tui";
+import { Markdown as PiMarkdown } from "@earendil-works/pi-tui";
+import type { DefaultTextStyle, MarkdownTheme } from "@earendil-works/pi-tui";
 
 /**
  * Convert `_text_` italic markdown into `*text*` so Pi-TUI's parser renders

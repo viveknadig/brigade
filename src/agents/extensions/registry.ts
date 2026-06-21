@@ -13,7 +13,7 @@
  * Product registrations dedupe by id (last wins) so re-running modules is safe.
  */
 
-import type { ExtensionAPI, ExtensionFactory } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 
 import type { BrigadeConfig } from "../../config/io.js";
 import type { AnyBrigadeTool } from "../tools/types.js";

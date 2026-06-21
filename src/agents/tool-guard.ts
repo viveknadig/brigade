@@ -21,7 +21,7 @@
  * importing from Runtime A.
  */
 
-import type { BeforeToolCallContext, BeforeToolCallResult } from "@mariozechner/pi-agent-core";
+import type { BeforeToolCallContext, BeforeToolCallResult } from "@earendil-works/pi-agent-core";
 
 /**
  * Hook signature matches Pi's exact contract — strictly async, returns

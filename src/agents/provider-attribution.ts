@@ -24,7 +24,7 @@
 // Vertex, Bedrock, or OpenAI (which either don't read them or reject custom
 // headers).
 
-import type { Model } from "@mariozechner/pi-ai";
+import type { Model } from "@earendil-works/pi-ai";
 
 /** Brigade's canonical app identity reported to OpenRouter. */
 export const BRIGADE_OPENROUTER_REFERER = "https://brigade.spinabot.com";

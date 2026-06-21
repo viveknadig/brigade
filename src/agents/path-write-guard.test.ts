@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
-import type { BeforeToolCallContext, BeforeToolCallResult } from "@mariozechner/pi-agent-core";
+import type { BeforeToolCallContext, BeforeToolCallResult } from "@earendil-works/pi-agent-core";
 
 import { buildProtectedRoots, makePathWriteGuard } from "./path-write-guard.js";
 

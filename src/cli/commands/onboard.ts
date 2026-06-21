@@ -20,8 +20,8 @@
 import * as fsAsync from "node:fs/promises";
 import process from "node:process";
 
-import { AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
-import { ProcessTerminal, TUI } from "@mariozechner/pi-tui";
+import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { ProcessTerminal, TUI } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import type { Command } from "commander";
 

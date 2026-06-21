@@ -21,7 +21,7 @@
  * exact CLI output the operator would see.
  */
 
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
 
 import { jsonResult } from "./common.js";

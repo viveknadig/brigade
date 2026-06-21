@@ -32,7 +32,7 @@
  * philosophy as the path-write guard.
  */
 
-import type { BeforeToolCallResult } from "@mariozechner/pi-agent-core";
+import type { BeforeToolCallResult } from "@earendil-works/pi-agent-core";
 
 import type { BrigadeBeforeToolCallHook } from "./tool-guard.js";
 

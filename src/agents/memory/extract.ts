@@ -20,8 +20,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { createAgentSession, DefaultResourceLoader, SessionManager } from "@mariozechner/pi-coding-agent";
-import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
 
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import { pickInitialThinkingLevel } from "../../core/model-caps.js";

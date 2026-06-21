@@ -4,7 +4,7 @@
  * One canonical place so onboarding + chat feel like the same app.
  */
 
-import type { EditorTheme, MarkdownTheme, SelectListTheme } from "@mariozechner/pi-tui";
+import type { EditorTheme, MarkdownTheme, SelectListTheme } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { highlight, supportsLanguage } from "cli-highlight";
 

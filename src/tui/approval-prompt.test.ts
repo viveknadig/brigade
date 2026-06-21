@@ -24,7 +24,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { visibleWidth, type TUI } from "@mariozechner/pi-tui";
+import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
 
 import { ApprovalPrompt, type ApprovalRenderRequest } from "./approval-prompt.js";
 

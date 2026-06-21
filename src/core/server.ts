@@ -28,13 +28,13 @@ import { createServer, type IncomingMessage, type Server as HttpServer } from "n
 import { createServer as createTcpServer } from "node:net";
 import { pathToFileURL } from "node:url";
 
-import type { Model } from "@mariozechner/pi-ai";
+import type { Model } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
 	type AuthStorage,
 	ModelRegistry,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { WebSocketServer, type WebSocket } from "ws";
 
 import {
@@ -256,7 +256,7 @@ import { attachEventLogger, getTodayLogPath } from "./event-logger.js";
 import { pickInitialThinkingLevel, readPersistedThinkingLevel, remapThinkingLevel } from "./model-caps.js";
 import { Carrow } from "../agents/carrow.js";
 import { getBuildInfo } from "../version.js";
-import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { extractIdentityName, isIdentityNameUnset } from "./system-prompt.js";
 import { existsSync, readFileSync, watch as fsWatch } from "node:fs";
 import { join as joinPath } from "node:path";

@@ -27,7 +27,7 @@
 import cfontsPkg from "cfonts";
 const { render } = cfontsPkg;
 
-import { type Component, type TUI, Text } from "@mariozechner/pi-tui";
+import { type Component, type TUI, Text } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { VIDEO_COLS, VIDEO_FPS, VIDEO_FRAME_COUNT, VIDEO_FRAMES, VIDEO_ROWS } from "./brand-frames-cli.js";
 
@@ -154,7 +154,7 @@ export const ASCII_MIN_WIDTH = 56;
 type LayoutMode = "side" | "stack" | "ascii-only" | "empty";
 
 // Pick layout mode based on current terminal width. Pi-TUI's TUI exposes
-// `tui.terminal.columns` (see node_modules/@mariozechner/pi-tui/dist/terminal.d.ts);
+// `tui.terminal.columns` (see node_modules/@earendil-works/pi-tui/dist/terminal.d.ts);
 // we accept that as an optional override. Otherwise we fall back to
 // process.stdout.columns. If neither is available (non-TTY pipe etc.) we
 // assume the terminal is wide enough and keep the side-by-side layout —
@@ -360,7 +360,7 @@ export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): C
 	}
 
 	// Pi-TUI's TUI exposes the underlying Terminal which has a `columns` getter
-	// (see node_modules/@mariozechner/pi-tui/dist/terminal.d.ts). Prefer that
+	// (see node_modules/@earendil-works/pi-tui/dist/terminal.d.ts). Prefer that
 	// over process.stdout.columns since it's the value pi-tui itself uses for
 	// rendering, but pickLayout falls back if either is unavailable.
 	const getCols = (): number | undefined => tui.terminal?.columns ?? process.stdout.columns;
@@ -384,7 +384,7 @@ export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): C
 	tui.requestRender();
 
 	// --- Scrollback-friendly render scheduling ---------------------------------
-	// pi-tui's differential renderer (see node_modules/@mariozechner/pi-tui/dist/tui.js
+	// pi-tui's differential renderer (see node_modules/@earendil-works/pi-tui/dist/tui.js
 	// `doRender`, lines ~674-971) repaints animation frames by moving the
 	// hardware cursor up with `\x1b[{n}A`, clearing each row with `\x1b[2K`, and
 	// writing the new content. Windows Terminal (and other Conhost-derived
@@ -408,7 +408,7 @@ export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): C
 	//    are no-ops on terminals that don't honour them.
 	//
 	// References:
-	//   - pi-tui differential renderer: node_modules/@mariozechner/pi-tui/dist/tui.js:674-971
+	//   - pi-tui differential renderer: node_modules/@earendil-works/pi-tui/dist/tui.js:674-971
 	//   - Synchronized Output (DEC 2026): https://gitlab.com/gnachman/iterm2/-/wikis/synchronized-updates-spec
 	//   - Cursor save/restore (DECSC / DECRC, ANSI \x1b[s/\x1b[u): VT100 spec
 	const SYNC_BEGIN = "\x1b[?2026h\x1b[s"; // begin sync + save cursor

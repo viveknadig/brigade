@@ -23,9 +23,9 @@
  *   - NEXT-TURN (no active turn): swap now; the next message goes to the new model.
  */
 
-import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
-import type { AgentSession } from "@mariozechner/pi-coding-agent";
-import type { Model } from "@mariozechner/pi-ai";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { Model } from "@earendil-works/pi-ai";
 
 import { remapThinkingLevel } from "../core/model-caps.js";
 import { switchModelMidTurn } from "./mid-turn-switch.js";

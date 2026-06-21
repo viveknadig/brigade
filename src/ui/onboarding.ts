@@ -15,9 +15,9 @@
 
 import * as path from "node:path";
 
-import { getEnvApiKey, getModels, type KnownProvider, type Model } from "@mariozechner/pi-ai";
-import type { AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
-import { CancellableLoader, Input, type SelectItem, SelectList, Text, TUI } from "@mariozechner/pi-tui";
+import { getEnvApiKey, getModels, type KnownProvider, type Model } from "@earendil-works/pi-ai";
+import type { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { CancellableLoader, Input, type SelectItem, SelectList, Text, TUI } from "@earendil-works/pi-tui";
 
 import { upsertApiKeyProfile, upsertApiKeyRefProfile } from "../auth/profiles.js";
 import { DEFAULT_AGENT_ID, resolveAuthProfilesPath, resolveModelsPath } from "../config/paths.js";

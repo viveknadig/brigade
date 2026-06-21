@@ -22,7 +22,7 @@
  * Ported from `core/agent.ts:1319-1371` (Runtime A) — same logic.
  */
 
-import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
 
 /**
  * Detector for the family of "thinking not supported" error messages

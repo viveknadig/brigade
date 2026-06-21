@@ -12,7 +12,7 @@
  * skipped — only Primitive #1's run loop needs that). Duplicating the small
  * surface here keeps the agent-loop module untouched per the lift-scope rule.
  */
-import { AuthStorage } from "@mariozechner/pi-coding-agent";
+import { AuthStorage } from "@earendil-works/pi-coding-agent";
 
 import { DEFAULT_AGENT_ID } from "../config/paths.js";
 import { PROVIDERS } from "../providers/catalog.js";

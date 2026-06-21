@@ -16,7 +16,7 @@
  *   - `isIdentityNameUnset`            — placeholder-Name detector
  */
 
-import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
 
 import { applyPersonaOverrideToSession } from "../system-prompt/pi-injection.js";
 import { assembleSystemPrompt } from "../system-prompt/assembler.js";

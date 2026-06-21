@@ -14,8 +14,8 @@
  * encode it here, not scattered across agent.ts/tui.ts/onboarding.ts.
  */
 
-import type { Model } from "@mariozechner/pi-ai";
-import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
+import type { Model } from "@earendil-works/pi-ai";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 
 /**
  * Pick the SAFE initial `thinkingLevel` for this model.

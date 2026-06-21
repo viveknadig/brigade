@@ -19,9 +19,9 @@
  * Ported from `core/agent.ts:1373-1446` (Runtime A) — same logic.
  */
 
-import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
-import type { AgentSession } from "@mariozechner/pi-coding-agent";
-import type { Model } from "@mariozechner/pi-ai";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { Model } from "@earendil-works/pi-ai";
 
 const SAFETY_TIMEOUT_MS = 5_000;
 

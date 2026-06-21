@@ -28,7 +28,7 @@
  * subagent.
  */
 
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
 
 import { resolveDefaultAgentId } from "../agent-scope.js";

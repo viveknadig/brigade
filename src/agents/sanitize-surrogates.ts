@@ -18,7 +18,7 @@
  * Ported from `core/agent.ts:998-1031` (Runtime A).
  */
 
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 export function sanitizeSurrogates(text: string): string {
 	if (!text) return text;
