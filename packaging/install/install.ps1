@@ -17,8 +17,11 @@ $RuntimeDir   = Join-Path $env:LOCALAPPDATA 'Brigade\node'
 $FallbackNode = 'v22.18.0'
 $script:NodeFreshlyInstalled = $false
 
-function Info($m) { Write-Host "▸ $m" -ForegroundColor Yellow }
-function Fail($m) { Write-Host "✗ $m" -ForegroundColor Red; exit 1 }
+# ASCII-only output: when fetched via `irm <url> | iex`, PowerShell may decode
+# the script as Latin-1 (no charset header) and the console code page may not be
+# UTF-8, so non-ASCII glyphs render as mojibake (e.g. "â–¸"). Keep it plain.
+function Info($m) { Write-Host ">> $m" -ForegroundColor Yellow }
+function Fail($m) { Write-Host "ERROR: $m" -ForegroundColor Red; exit 1 }
 
 function Test-NodeOk {
   $node = Get-Command node -ErrorAction SilentlyContinue
@@ -69,7 +72,7 @@ function Install-Node {
 
 Info 'Brigade installer'
 if (Test-NodeOk) {
-  Info "Node $(node -v) detected — good."
+  Info "Node $(node -v) detected - good."
 } else {
   if (Get-Command node -ErrorAction SilentlyContinue) {
     Info "Node $(node -v) is too old (need $MinMajor.$MinMinor+)."
@@ -86,7 +89,7 @@ if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
 Info "Installing $Pkg ..."
 & npm i -g $Pkg
 
-Write-Host "`n✓ Brigade installed.  Run:  brigade onboard" -ForegroundColor Green
+Write-Host "`nOK: Brigade installed.  Run:  brigade onboard" -ForegroundColor Green
 if ($script:NodeFreshlyInstalled) {
-  Write-Host '   Node was just installed — open a new terminal first so it is on your PATH.'
+  Write-Host '   Node was just installed - open a new terminal first so it is on your PATH.'
 }
