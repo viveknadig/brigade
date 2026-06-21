@@ -7,7 +7,8 @@ discussions, or pull requests.**
 
 Report them privately through GitHub's
 [private vulnerability reporting](https://github.com/spinabot/brigade/security/advisories/new)
-("Report a vulnerability" under the repository's **Security** tab).
+("Report a vulnerability" under the repository's **Security** tab), or, if you can't use
+GitHub, email **[security@brigade-agent.ai](mailto:security@brigade-agent.ai)**.
 
 We aim to acknowledge reports within 5 business days and to provide a remediation
 timeline after triage. Please give us reasonable time to investigate and patch before
