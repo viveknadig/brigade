@@ -4,6 +4,9 @@
 # @spinabot/brigade globally via npm. Safe to re-run.
 #
 #   irm https://brigade.spinabot.com/install.ps1 | iex
+#
+# (Or directly from GitHub:)
+#   irm https://raw.githubusercontent.com/spinabot/brigade/main/packaging/install/install.ps1 | iex
 
 $ErrorActionPreference = 'Stop'
 

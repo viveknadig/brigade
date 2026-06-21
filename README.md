@@ -96,11 +96,15 @@ backend — all under one `~/.brigade/` directory you fully own.
 ```bash
 # macOS / Linux
 curl -fsSL https://brigade.spinabot.com/install.sh | sh
+# …or straight from GitHub:
+curl -fsSL https://raw.githubusercontent.com/spinabot/brigade/main/packaging/install/install.sh | sh
 ```
 
 ```powershell
 # Windows (PowerShell)
 irm https://brigade.spinabot.com/install.ps1 | iex
+# …or straight from GitHub:
+irm https://raw.githubusercontent.com/spinabot/brigade/main/packaging/install/install.ps1 | iex
 ```
 
 **Already on Node 22.12+?** Install straight from npm:

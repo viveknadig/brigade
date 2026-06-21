@@ -5,6 +5,9 @@
 # @spinabot/brigade globally via npm. Safe to re-run.
 #
 #   curl -fsSL https://brigade.spinabot.com/install.sh | sh
+#
+# (Or directly from GitHub:)
+#   curl -fsSL https://raw.githubusercontent.com/spinabot/brigade/main/packaging/install/install.sh | sh
 set -eu
 
 BRIGADE_PKG="@spinabot/brigade"
