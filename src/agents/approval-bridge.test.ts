@@ -57,9 +57,22 @@ describe("InMemoryApprovalBridge", () => {
 			timeoutMs: 30,
 			decisions: DECISIONS,
 		});
-		const decision = await pending;
-		assert.equal(decision.kind, "deny");
-		assert.equal(decision.timedOut, true);
+		// The production timeout timer is unref()'d (line ~155 of the bridge) so
+		// a pending approval never keeps the gateway process alive. But a test
+		// that AWAITS the timeout has nothing else holding the event loop open —
+		// on some Node versions (seen on 22.12) the test runner sees the loop
+		// drain before the 30ms timer fires and cancels the whole suite with
+		// "Promise resolution is still pending but the event loop has already
+		// resolved", cascading `cancelledByParent` to every sibling. A ref'd
+		// keep-alive timer holds the loop open until the timeout resolves us.
+		const keepAlive = setTimeout(() => {}, 5_000);
+		try {
+			const decision = await pending;
+			assert.equal(decision.kind, "deny");
+			assert.equal(decision.timedOut, true);
+		} finally {
+			clearTimeout(keepAlive);
+		}
 	});
 
 	it("resolveApproval returns false for unknown id (stale / double-click)", () => {
