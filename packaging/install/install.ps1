@@ -1,7 +1,10 @@
 # Brigade installer for Windows (PowerShell 5+).
 #
-# Installs Node.js (latest LTS) if it's missing or older than 22.12, then installs
-# @spinabot/brigade globally via npm. Safe to re-run.
+# 1. Ensures Node.js >= 22.12 (installs the latest LTS into %LOCALAPPDATA%\Brigade\node
+#    if yours is missing or too old).
+# 2. Installs @spinabot/brigade globally via npm.
+# 3. Puts npm's REAL global dir on your PATH (persisted for your user) so
+#    `brigade` works in every new terminal.
 #
 #   irm https://brigade.spinabot.com/install.ps1 | iex
 #
@@ -19,7 +22,7 @@ $script:NodeFreshlyInstalled = $false
 
 # ASCII-only output: when fetched via `irm <url> | iex`, PowerShell may decode
 # the script as Latin-1 (no charset header) and the console code page may not be
-# UTF-8, so non-ASCII glyphs render as mojibake (e.g. "â–¸"). Keep it plain.
+# UTF-8, so non-ASCII glyphs render as mojibake (e.g. box-drawing chars). Keep it plain.
 function Info($m) { Write-Host ">> $m" -ForegroundColor Yellow }
 function Fail($m) { Write-Host "ERROR: $m" -ForegroundColor Red; exit 1 }
 
@@ -61,15 +64,38 @@ function Install-Node {
   Rename-Item -Path (Join-Path $parent $name) -NewName (Split-Path $RuntimeDir -Leaf)
   Remove-Item $tmp -Force
 
-  # Add to the current session PATH and persist for the user.
+  # Make the just-installed Node the one used for the rest of this script.
   $env:Path = "$RuntimeDir;$env:Path"
-  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-  if ($userPath -notlike "*$RuntimeDir*") {
-    [Environment]::SetEnvironmentVariable('Path', "$RuntimeDir;$userPath", 'User')
-  }
   $script:NodeFreshlyInstalled = $true
+
+  # Verify completeness - the zip bundles npm; both must be runnable now.
+  if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Fail "Node install incomplete: no node.exe in $RuntimeDir." }
+  if (-not (Get-Command npm  -ErrorAction SilentlyContinue)) { Fail "Node install incomplete: no npm in $RuntimeDir." }
 }
 
+# Add a directory to PATH now AND persist it for the user (idempotent).
+function Add-ToPath($dir) {
+  if ([string]::IsNullOrWhiteSpace($dir)) { return }
+  $dir = $dir.TrimEnd('\')
+  if (($env:Path -split ';') -notcontains $dir) { $env:Path = "$dir;$env:Path" }
+  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  if (-not $userPath) { $userPath = '' }
+  if (($userPath -split ';') -notcontains $dir) {
+    $newUser = if ($userPath) { "$dir;$userPath" } else { $dir }
+    [Environment]::SetEnvironmentVariable('Path', $newUser, 'User')
+  }
+}
+
+# Where `npm i -g` actually drops .cmd shims - DERIVED from npm, never assumed.
+# On Windows the global shims live directly in the prefix dir (not prefix\bin).
+function Get-NpmGlobalDir {
+  $p = $null
+  try { $p = (& npm prefix -g 2>$null) } catch { $p = $null }
+  if (-not $p) { $p = $RuntimeDir }
+  return ($p | Out-String).Trim()
+}
+
+# --- main ---
 Info 'Brigade installer'
 if (Test-NodeOk) {
   Info "Node $(node -v) detected - good."
@@ -88,8 +114,24 @@ if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
 
 Info "Installing $Pkg ..."
 & npm i -g $Pkg
+if ($LASTEXITCODE -ne 0) {
+  # Fall back to a private, hermetic Node runtime if the existing Node's global
+  # install failed (e.g. a locked-down prefix) - then everything lives under
+  # %LOCALAPPDATA%\Brigade.
+  if (-not $script:NodeFreshlyInstalled) {
+    Info 'Global install failed with your existing Node. Installing a private Node runtime for Brigade and retrying ...'
+    Install-Node
+    & npm i -g $Pkg
+    if ($LASTEXITCODE -ne 0) { Fail "npm could not install $Pkg." }
+  } else {
+    Fail "npm could not install $Pkg."
+  }
+}
+
+# Put the real npm global dir on PATH (covers both the bundled and system Node).
+Add-ToPath (Get-NpmGlobalDir)
 
 Write-Host "`nOK: Brigade installed.  Run:  brigade onboard" -ForegroundColor Green
-if ($script:NodeFreshlyInstalled) {
-  Write-Host '   Node was just installed - open a new terminal first so it is on your PATH.'
+if (-not (Get-Command brigade -ErrorAction SilentlyContinue)) {
+  Write-Host '   Open a NEW terminal so brigade is on your PATH.'
 }

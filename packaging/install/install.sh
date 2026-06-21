@@ -1,8 +1,11 @@
 #!/bin/sh
 # Brigade installer for macOS / Linux.
 #
-# Installs Node.js (latest LTS) if it's missing or older than 22.12, then installs
-# @spinabot/brigade globally via npm. Safe to re-run.
+# 1. Ensures Node.js >= 22.12 (installs the latest LTS into ~/.brigade/runtime if
+#    yours is missing or too old).
+# 2. Installs @spinabot/brigade globally via npm.
+# 3. Puts npm's REAL global bin dir on your PATH and persists it to your shell rc
+#    (creating the rc if needed) so `brigade` works in every new terminal.
 #
 #   curl -fsSL https://brigade.spinabot.com/install.sh | sh
 #
@@ -15,7 +18,11 @@ MIN_MAJOR=22
 MIN_MINOR=12
 RUNTIME_DIR="${HOME}/.brigade/runtime"
 FALLBACK_NODE="v22.18.0"
+NODE_FRESHLY_INSTALLED=0
 
+# ASCII-only output: piped via `curl | sh` the bytes may be rendered under a
+# non-UTF-8 locale, turning Unicode glyphs into mojibake (e.g. box-drawing chars). Plain
+# ASCII renders correctly everywhere.
 info() { printf '\033[1;33m>>\033[0m %s\n' "$1"; }
 err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$1" >&2; }
 
@@ -63,41 +70,53 @@ install_node() {
   TARBALL="node-${NV}-${OS}-${ARCH}.tar.gz"
   URL="https://nodejs.org/dist/${NV}/${TARBALL}"
   info "Installing Node ${NV} (${OS}-${ARCH}) into ${RUNTIME_DIR} ..."
+  rm -rf "$RUNTIME_DIR"
   mkdir -p "$RUNTIME_DIR"
   TMP=$(mktemp -d)
   curl -fsSL "$URL" -o "${TMP}/${TARBALL}" || { err "Download failed: $URL"; rm -rf "$TMP"; exit 1; }
-  tar -xzf "${TMP}/${TARBALL}" -C "$RUNTIME_DIR" --strip-components=1
+  tar -xzf "${TMP}/${TARBALL}" -C "$RUNTIME_DIR" --strip-components=1 || { err "Extract failed: $URL"; rm -rf "$TMP"; exit 1; }
   rm -rf "$TMP"
+  # Make the just-installed Node the one used for the rest of this script.
   PATH="${RUNTIME_DIR}/bin:${PATH}"
   export PATH
-  persist_path
   NODE_FRESHLY_INSTALLED=1
+  # Verify completeness - the tarball bundles npm; both must be runnable now.
+  need node || { err "Node install incomplete: no 'node' in ${RUNTIME_DIR}/bin."; exit 1; }
+  need npm  || { err "Node install incomplete: no 'npm' in ${RUNTIME_DIR}/bin."; exit 1; }
 }
 
-persist_path() {
-  line="export PATH=\"${RUNTIME_DIR}/bin:\$PATH\""
+# Where `npm i -g` actually drops executables - DERIVED from npm, never assumed.
+# Correct for the bundled runtime, Homebrew, nvm, a system package, etc.
+npm_global_bin() {
+  p=$(npm prefix -g 2>/dev/null || true)
+  [ -n "${p:-}" ] || p="$RUNTIME_DIR"
+  printf '%s/bin' "$p"
+}
 
-  # Pick the rc file for the user's login shell and CREATE it if it's missing.
-  # A fresh macOS account commonly has NO ~/.zshrc yet — only updating files
-  # that already exist would silently persist nothing, leaving `brigade` absent
-  # from every new terminal (so the user re-runs the installer forever).
+# Add $1 to PATH now AND persist it to the user's shell rc (creating the rc for
+# the login shell if it doesn't exist - a fresh macOS account often has no
+# ~/.zshrc, so "only update what exists" would persist nothing).
+ensure_on_path() {
+  dir="$1"
+  [ -n "$dir" ] || return 0
+  case ":${PATH}:" in
+    *":${dir}:"*) ;;
+    *) PATH="${dir}:${PATH}"; export PATH ;;
+  esac
+  line="export PATH=\"${dir}:\$PATH\""
   case "${SHELL:-}" in
     *zsh)  primary="$HOME/.zshrc" ;;
     *bash) primary="$HOME/.bashrc" ;;
     *)     primary="$HOME/.profile" ;;
   esac
-
-  # Always write the primary (creating it via >>); also update any other shell
-  # rc that already exists, so PATH is live whichever terminal opens next.
   for rc in "$primary" "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
     [ "$rc" = "$primary" ] || [ -e "$rc" ] || continue
-    grep -qF "${RUNTIME_DIR}/bin" "$rc" 2>/dev/null && continue
-    printf '\n# Brigade Node runtime\n%s\n' "$line" >> "$rc"
+    grep -qF "$dir" "$rc" 2>/dev/null && continue
+    printf '\n# Brigade (Node global bin)\n%s\n' "$line" >> "$rc"
   done
 }
 
 main() {
-  NODE_FRESHLY_INSTALLED=0
   info "Brigade installer"
   if node_ok; then
     info "Node $(node -v) detected - good."
@@ -109,12 +128,30 @@ main() {
     fi
     install_node
   fi
+
   need npm || { err "npm is not available even after installing Node. Please report this."; exit 1; }
+
   info "Installing ${BRIGADE_PKG} ..."
-  npm i -g "$BRIGADE_PKG"
+  if ! npm i -g "$BRIGADE_PKG"; then
+    # Most common cause on a system Node: the global prefix isn't writable
+    # (would need sudo). Fall back to a private, hermetic Node runtime instead
+    # of asking for root - then everything lives under ~/.brigade.
+    if [ "$NODE_FRESHLY_INSTALLED" -eq 0 ]; then
+      info "Global install failed with your existing Node (often a permissions issue)."
+      info "Installing a private Node runtime for Brigade and retrying ..."
+      install_node
+      npm i -g "$BRIGADE_PKG"
+    else
+      err "npm could not install ${BRIGADE_PKG}. See the error above."
+      exit 1
+    fi
+  fi
+
+  ensure_on_path "$(npm_global_bin)"
+
   printf '\n\033[1;32mOK: Brigade installed.\033[0m  Run:  \033[1mbrigade onboard\033[0m\n'
-  if [ "$NODE_FRESHLY_INSTALLED" -eq 1 ]; then
-    printf '   Node was just installed. Open a new terminal (or run: exec $SHELL) so it is on your PATH.\n'
+  if ! command -v brigade >/dev/null 2>&1; then
+    printf '   Open a new terminal (or run:  exec %s -l ) so brigade is on your PATH.\n' "${SHELL:-sh}"
   fi
 }
 
