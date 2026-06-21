@@ -17,12 +17,18 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const pinned = process.env.BRIGADE_STATE_DIR?.trim();
 const suiteDir = pinned || mkdtempSync(join(tmpdir(), "brigade-suite-statedir-"));
 
+// Keep the event loop alive for the whole run so tests that await unref()'d
+// production timers don't get cancelled when the runner thinks the loop has
+// drained (see scripts/test-keepalive.mjs). Cleared after all tests settle.
+const keepAlive = pathToFileURL(join(import.meta.dirname, "test-keepalive.mjs")).href;
+
 const extra = process.argv.slice(2);
-const res = spawnSync("npx", ["tsx", "--test", "src/**/*.test.ts", ...extra], {
+const res = spawnSync("npx", ["tsx", "--import", keepAlive, "--test", "src/**/*.test.ts", ...extra], {
   stdio: "inherit",
   shell: true, // resolves npx.cmd on Windows
   env: { ...process.env, BRIGADE_STATE_DIR: suiteDir },
