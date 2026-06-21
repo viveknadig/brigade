@@ -105,19 +105,33 @@ brigade
 
 ## Quick start
 
-First launch walks you through three steps:
+```bash
+# 1. Set up — pick a provider, paste an API key (or scan local Ollama), choose a model
+brigade onboard
 
-1. **Pick a provider** — Anthropic, OpenAI, Gemini, OpenRouter, Ollama, and more.
-2. **Connect it** — paste an API key, or scan your local Ollama.
-3. **Choose a default model.**
+# 2. Start the always-on gateway — your crew, channels, and cron jobs live here
+brigade gateway run
 
-That's it. Subsequent launches resume right where you left off.
+# 3. Chat with your crew
+brigade tui
+```
+
+The onboarding wizard walks you through three steps: **pick a provider** (Anthropic,
+OpenAI, Gemini, OpenRouter, Ollama, and more), **connect it** (paste an API key or scan
+your local Ollama), and **choose a default model**. Subsequent launches resume right
+where you left off.
+
+`brigade tui` (or just `brigade`) auto-starts the gateway if it isn't already running,
+so for a quick local session you can skip step 2. To keep the gateway alive across
+reboots, run `brigade gateway install` (installs a launchd / systemd / Task Scheduler
+service).
+
+Other handy entry points:
 
 ```bash
-brigade                 # chat TUI (default)
-brigade agent -m "summarize ~/today.md"   # one-shot turn
-brigade gateway run     # headless, always-on
-brigade doctor          # health-check your install
+brigade agent -m "summarize ~/today.md"   # one-shot turn, no TUI
+brigade connect                            # attach a client to a running gateway
+brigade doctor                             # health-check your install
 ```
 
 ---
@@ -199,9 +213,16 @@ into your main session, a full agent turn in an isolated session, or a shell scr
 Jobs survive restarts.
 
 ### 🔗 Connectors (Composio)
-An owner-only `composio` tool brings **1,000+ app connectors** (Gmail, Slack,
-GitHub, Notion, Calendar, Linear, …) with managed OAuth. Set a key once; discover,
-connect, and execute actions by slug.
+An owner-only `composio` tool brings **1,000+ app connectors** (Gmail, Slack, GitHub,
+Notion, Calendar, Linear, …) with managed OAuth. Set a key once, then just ask your
+crew in plain language: *"connect my Gmail"*, *"post to #team"*.
+
+**Getting the key:** Brigade uses the Composio **SDK**, so it needs a **PLATFORM** key
+(starts with `ak_`), *not* the "FOR YOU" consumer key (`ck_`) that Brigade rejects. At
+[dashboard.composio.dev](https://dashboard.composio.dev), set the top-left mode toggle
+to **PLATFORM**, open **Settings → API Keys**, and copy the `ak_…` key. Hand it to
+Brigade once (*"set my Composio key to `ak_…`"*) and it's verified and stored encrypted.
+Full guide: **[docs/composio.md](docs/composio.md)**.
 
 ### 🧩 MCP
 Run `brigade mcp` to expose your long-term memory to any MCP client (Claude Desktop,
