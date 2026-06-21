@@ -91,3 +91,24 @@ are abusive, off-topic, or disruptive.
   **hello@brigade-agent.ai**.
 - **Security issues** — do not open a public issue; see [SECURITY.md](SECURITY.md) or
   email **security@brigade-agent.ai**.
+
+## Maintainers
+
+Brigade is built and maintained by **Spinabot**.
+
+- Lead maintainer — [@Bhasvanth-Dev9380](https://github.com/Bhasvanth-Dev9380)
+
+We're selectively growing the maintainer team. If you're an experienced contributor
+who wants to help shape Brigade's direction — through code, docs, or community — we'd
+like to hear from you. Being a maintainer is a responsibility, not a title: we expect
+consistent involvement (triaging issues, reviewing PRs, and moving the project
+forward).
+
+Interested? Email **contributing@brigade-agent.ai** with:
+
+- Links to your PRs on Brigade (if you don't have any yet, that's the place to start).
+- Links to open-source projects you maintain or actively contribute to.
+- Your GitHub handle and a short intro: background, areas of interest, and how much
+  time you can realistically commit.
+
+We review applications carefully and add maintainers slowly and deliberately.
