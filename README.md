@@ -772,6 +772,10 @@ coding conventions, and the Conventional-Commits release flow. For security issu
 **[SECURITY.md](SECURITY.md)** — please report privately. Releases are automated with
 release-please; see **[docs/RELEASING.md](docs/RELEASING.md)**.
 
+Questions or ideas? Open a
+[discussion](https://github.com/spinabot/brigade/discussions) or email
+**hello@brigade-agent.ai** (security → **security@brigade-agent.ai**).
+
 ---
 
 ## License

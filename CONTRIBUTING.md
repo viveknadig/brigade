@@ -83,3 +83,11 @@ vulnerabilities, **do not open a public issue** — see [SECURITY.md](SECURITY.m
 Keep discussions respectful and on-topic. Assume good faith, help newcomers, and
 keep the project welcoming. Maintainers may moderate or remove contributions that
 are abusive, off-topic, or disruptive.
+
+## Contact
+
+- **Questions & ideas** — open a
+  [GitHub Discussion](https://github.com/spinabot/brigade/discussions) or email
+  **hello@brigade-agent.ai**.
+- **Security issues** — do not open a public issue; see [SECURITY.md](SECURITY.md) or
+  email **security@brigade-agent.ai**.
