@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.1](https://github.com/spinabot/brigade/compare/brigade-v1.0.0...brigade-v1.0.1) (2026-06-21)
+
+
+### Bug Fixes
+
+* harden installer Node setup and PATH placement (macOS + Windows) ([05b5f1c](https://github.com/spinabot/brigade/commit/05b5f1cc3b6d00f9d719df485c60441b9aa710d6))
+* installer persists PATH on fresh macOS and emits ASCII-only output ([3b32aad](https://github.com/spinabot/brigade/commit/3b32aad3b054f8ac402203e807e23e1c396e69a1))
+* lazy-load convex storage so filesystem onboarding does not crash ([4d8e1ca](https://github.com/spinabot/brigade/commit/4d8e1caa2c5fdec78c1365a9af0df54ac34ab468))
+
 ## [1.0.0](https://github.com/spinabot/brigade/compare/brigade-v0.1.2...brigade-v1.0.0) (2026-06-21)
 
 
