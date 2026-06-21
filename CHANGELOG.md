@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.0](https://github.com/spinabot/brigade/compare/brigade-v1.0.2...brigade-v1.1.0) (2026-06-21)
+
+
+### Features
+
+* **convex:** brigade convex command to run the bundled self-hosted backend ([6f331df](https://github.com/spinabot/brigade/commit/6f331dfa7c32313a2d38473309e1c2c541bd816e))
+
+
+### Bug Fixes
+
+* **install:** always show how to use brigade in the current shell ([1337148](https://github.com/spinabot/brigade/commit/1337148418bbe9c8602530b72aef68618a934002))
+* **install:** install + verify Node and put it on PATH before installing brigade ([aac7dc6](https://github.com/spinabot/brigade/commit/aac7dc60366f249ce728328127edf0fd4dc5bad3))
+
 ## [1.0.2](https://github.com/spinabot/brigade/compare/brigade-v1.0.1...brigade-v1.0.2) (2026-06-21)
 
 
