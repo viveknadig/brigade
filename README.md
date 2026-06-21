@@ -768,8 +768,7 @@ Full contributor guide, repo layout, and conventions live in **[AGENTS.md](AGENT
 ## Contributing
 
 Contributions are welcome! Read **[CONTRIBUTING.md](CONTRIBUTING.md)** for dev setup,
-coding conventions, and the Conventional-Commits release flow, and
-**[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)**. For security issues, see
+coding conventions, and the Conventional-Commits release flow. For security issues, see
 **[SECURITY.md](SECURITY.md)** — please report privately. Releases are automated with
 release-please; see **[docs/RELEASING.md](docs/RELEASING.md)**.
 

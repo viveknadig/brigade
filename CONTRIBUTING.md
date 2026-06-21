@@ -78,7 +78,8 @@ Use a clear, imperative subject line, e.g. `feat(cron): support IANA tz in add`.
 Open an issue using the templates in the issue tracker. For security
 vulnerabilities, **do not open a public issue** — see [SECURITY.md](SECURITY.md).
 
-## Code of Conduct
+## Be excellent to each other
 
-This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md). By
-participating you agree to uphold it.
+Keep discussions respectful and on-topic. Assume good faith, help newcomers, and
+keep the project welcoming. Maintainers may moderate or remove contributions that
+are abusive, off-topic, or disruptive.
