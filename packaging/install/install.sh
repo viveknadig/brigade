@@ -7,7 +7,7 @@
 #   curl -fsSL https://brigade.spinabot.com/install.sh | sh
 #
 # (Or directly from GitHub:)
-#   curl -fsSL https://raw.githubusercontent.com/spinabot/brigade/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/spinabot/brigade/main/packaging/install/install.sh | sh
 set -eu
 
 BRIGADE_PKG="@spinabot/brigade"

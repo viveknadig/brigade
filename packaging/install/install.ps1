@@ -6,7 +6,7 @@
 #   irm https://brigade.spinabot.com/install.ps1 | iex
 #
 # (Or directly from GitHub:)
-#   irm https://raw.githubusercontent.com/spinabot/brigade/main/scripts/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/spinabot/brigade/main/packaging/install/install.ps1 | iex
 
 $ErrorActionPreference = 'Stop'
 
