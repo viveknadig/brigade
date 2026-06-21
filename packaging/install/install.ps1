@@ -112,6 +112,13 @@ if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
   Fail 'npm is not available even after installing Node. Please report this.'
 }
 
+# Node must be PROPER and on PATH BEFORE we touch Brigade: prove it runs, then
+# persist its global dir. Only then install @spinabot/brigade.
+& node -v *> $null; if ($LASTEXITCODE -ne 0) { Fail 'node is on PATH but will not run. Aborting before Brigade install.' }
+& npm  -v *> $null; if ($LASTEXITCODE -ne 0) { Fail 'npm is on PATH but will not run. Aborting before Brigade install.' }
+Info "Node ready: $(node -v) (npm $(npm -v))"
+Add-ToPath (Get-NpmGlobalDir)
+
 Info "Installing $Pkg ..."
 & npm i -g $Pkg
 if ($LASTEXITCODE -ne 0) {
@@ -121,6 +128,7 @@ if ($LASTEXITCODE -ne 0) {
   if (-not $script:NodeFreshlyInstalled) {
     Info 'Global install failed with your existing Node. Installing a private Node runtime for Brigade and retrying ...'
     Install-Node
+    Add-ToPath (Get-NpmGlobalDir)
     & npm i -g $Pkg
     if ($LASTEXITCODE -ne 0) { Fail "npm could not install $Pkg." }
   } else {
@@ -128,7 +136,8 @@ if ($LASTEXITCODE -ne 0) {
   }
 }
 
-# Put the real npm global dir on PATH (covers both the bundled and system Node).
+# Re-affirm PATH after install (covers the fallback to the bundled Node and
+# confirms the brigade bin dir is persisted).
 Add-ToPath (Get-NpmGlobalDir)
 
 Write-Host "`nOK: Brigade installed.  Run:  brigade onboard" -ForegroundColor Green

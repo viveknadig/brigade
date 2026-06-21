@@ -79,10 +79,15 @@ install_node() {
   # Make the just-installed Node the one used for the rest of this script.
   PATH="${RUNTIME_DIR}/bin:${PATH}"
   export PATH
+  # Drop any cached command lookups so the freshly-installed node/npm are seen
+  # (some shells cache a negative lookup from before the install).
+  hash -r 2>/dev/null || true
   NODE_FRESHLY_INSTALLED=1
-  # Verify completeness - the tarball bundles npm; both must be runnable now.
-  need node || { err "Node install incomplete: no 'node' in ${RUNTIME_DIR}/bin."; exit 1; }
-  need npm  || { err "Node install incomplete: no 'npm' in ${RUNTIME_DIR}/bin."; exit 1; }
+  # Verify completeness by running the binaries directly (not just `command -v`),
+  # so a partial extract or arch mismatch fails HERE with a clear message rather
+  # than later inside npm.
+  "${RUNTIME_DIR}/bin/node" -v >/dev/null 2>&1 || { err "Node install incomplete or wrong arch: ${RUNTIME_DIR}/bin/node won't run."; exit 1; }
+  "${RUNTIME_DIR}/bin/npm" -v >/dev/null 2>&1 || { err "Node install incomplete: ${RUNTIME_DIR}/bin/npm won't run."; exit 1; }
 }
 
 # Where `npm i -g` actually drops executables - DERIVED from npm, never assumed.
@@ -131,6 +136,13 @@ main() {
 
   need npm || { err "npm is not available even after installing Node. Please report this."; exit 1; }
 
+  # Node must be PROPER and on PATH BEFORE we touch Brigade: prove it runs, then
+  # persist its global bin to the shell rc. Only then install @spinabot/brigade.
+  node -v >/dev/null 2>&1 || { err "node is on PATH but won't run. Aborting before Brigade install."; exit 1; }
+  npm  -v >/dev/null 2>&1 || { err "npm is on PATH but won't run. Aborting before Brigade install."; exit 1; }
+  info "Node ready: $(node -v) (npm $(npm -v)) at $(command -v node)"
+  ensure_on_path "$(npm_global_bin)"
+
   info "Installing ${BRIGADE_PKG} ..."
   if ! npm i -g "$BRIGADE_PKG"; then
     # Most common cause on a system Node: the global prefix isn't writable
@@ -140,6 +152,7 @@ main() {
       info "Global install failed with your existing Node (often a permissions issue)."
       info "Installing a private Node runtime for Brigade and retrying ..."
       install_node
+      ensure_on_path "$(npm_global_bin)"
       npm i -g "$BRIGADE_PKG"
     else
       err "npm could not install ${BRIGADE_PKG}. See the error above."
@@ -147,6 +160,8 @@ main() {
     fi
   fi
 
+  # Re-affirm PATH after install (covers the fallback that switched to the
+  # bundled Node, and confirms the brigade bin dir is persisted).
   ensure_on_path "$(npm_global_bin)"
 
   printf '\n\033[1;32mOK: Brigade installed.\033[0m  Run:  \033[1mbrigade onboard\033[0m\n'
