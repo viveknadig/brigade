@@ -40,9 +40,15 @@ jobs:
       - uses: googleapis/release-please-action@v4
         id: release
         with:
-          # Default GITHUB_TOKEN is fine. Swap for a PAT (secrets.RELEASE_PLEASE_TOKEN)
-          # if you want the Release PR to trigger the CI workflow.
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # This enterprise DISABLES write permissions for the Actions GITHUB_TOKEN
+          # ("Write permissions for workflows are disabled by the enterprise"), so
+          # the bot cannot open the Release PR. A PAT (RELEASE_PLEASE_TOKEN) acts as
+          # a real user and is NOT subject to that restriction — set it as a repo
+          # secret and release-please will open + label the Release PR automatically
+          # (it also makes the Release PR trigger CI). Falls back to GITHUB_TOKEN
+          # (PR creation will fail, but the rest of the workflow still runs) when
+          # the PAT secret is absent.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
 
   publish-npm:
     needs: release-please
