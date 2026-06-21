@@ -91,11 +91,25 @@ backend — all under one `~/.brigade/` directory you fully own.
 
 ## Install
 
+**Fastest — handles Node for you** (installs Node 22.12+ if you don't have it, then Brigade):
+
+```bash
+# macOS / Linux
+curl -fsSL https://brigade.spinabot.com/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://brigade.spinabot.com/install.ps1 | iex
+```
+
+**Already on Node 22.12+?** Install straight from npm:
+
 ```bash
 npm i -g @spinabot/brigade
 ```
 
-Requires **Node.js 22.12 or newer** (`node --version`). Then launch onboarding:
+Then launch onboarding:
 
 ```bash
 brigade

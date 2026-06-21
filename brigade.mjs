@@ -155,9 +155,9 @@ function buildMissingEntryError() {
     lines.push("This install looks like an unbuilt source tree or GitHub source archive.");
     lines.push("Build locally: `npm install && npm run build`,");
     lines.push("or for development: `npm run dev <args>` (uses the smart dev runner).");
-    lines.push("For releases, install from npm: `npm install -g brigade`.");
+    lines.push("For releases, install from npm: `npm install -g @spinabot/brigade`.");
   } else {
-    lines.push("Reinstall brigade: `npm install -g brigade`.");
+    lines.push("Reinstall brigade: `npm install -g @spinabot/brigade`.");
   }
   return lines.join("\n");
 }
