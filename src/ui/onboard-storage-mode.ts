@@ -56,7 +56,7 @@ export async function pickStorageMode(
 ): Promise<StorageModeResult> {
 	if (opts.preselected) return opts.preselected;
 
-	renderScreen(tui, "Step 0 of 5 · Storage mode");
+	renderScreen(tui, "Step 1 of 5 · Storage mode");
 	tui.addChild(
 		new Text(
 			`  ${brand.dim("Where should Brigade keep its state?")}`,
@@ -75,7 +75,7 @@ export async function pickStorageMode(
 		{
 			value: "convex",
 			label: "Convex",
-			description: "Relational + reactive + vector search · local backend or cloud",
+			description: "Cloud-backed storage with search and sync · local or hosted",
 		},
 	];
 
@@ -105,8 +105,8 @@ export async function pickStorageMode(
 			fs.existsSync(path.join(stateDir, "sessions"));
 		if (!hasPriorState) return { mode };
 
-		renderScreen(tui, "Step 0 of 5 · Found an existing Brigade");
-		tui.addChild(new Text(`  ${brand.dim(`Local Brigade data found at ${stateDir}`)}`, 0, 0));
+		renderScreen(tui, "Step 1 of 5 · Found an existing Brigade");
+		tui.addChild(new Text(`  ${brand.dim("Local Brigade data found on this computer")}`, 0, 0));
 		tui.addChild(new Text("", 0, 0));
 		const items: SelectItem[] = [
 			{
@@ -178,8 +178,8 @@ async function maybePromptClearLocalForConvex(tui: TUI, stateDir: string): Promi
 		fs.existsSync(path.join(stateDir, "sessions"));
 	if (!hasPriorState) return false;
 
-	renderScreen(tui, "Step 0 of 5 · Found data from a previous setup");
-	tui.addChild(new Text(`  ${brand.dim(`Local data found at ${stateDir}`)}`, 0, 0));
+	renderScreen(tui, "Step 1 of 5 · Found data from a previous setup");
+	tui.addChild(new Text(`  ${brand.dim("Local data found on this computer")}`, 0, 0));
 	tui.addChild(
 		new Text(
 			`  ${brand.dim("Convex keeps everything in the backend, so this local copy won't be used.")}`,
@@ -228,7 +228,7 @@ async function pickConvexBackend(tui: TUI): Promise<string> {
 	let lastError: string | null = null;
 
 	while (true) {
-		renderScreen(tui, "Step 0 of 5 · Convex backend");
+		renderScreen(tui, "Step 1 of 5 · Convex backend");
 		if (lastError) {
 			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
 			tui.addChild(new Text(brand.dim("  Press Enter to retry, or Esc to switch to filesystem."), 0, 0));
@@ -239,7 +239,7 @@ async function pickConvexBackend(tui: TUI): Promise<string> {
 			{
 				value: "local",
 				label: "Local",
-				description: "127.0.0.1:3210 · use `npm run convex:dev` in another terminal",
+				description: "Local backend · start it before continuing",
 			},
 			{
 				value: "existing",
@@ -270,7 +270,7 @@ async function pickConvexBackend(tui: TUI): Promise<string> {
 		const defaultUrl = kind === "local" ? "http://127.0.0.1:3210" : "";
 
 		// URL prompt.
-		renderScreen(tui, "Step 0 of 5 · Convex URL");
+		renderScreen(tui, "Step 1 of 5 · Convex URL");
 		if (kind === "local") {
 			tui.addChild(
 				new Text(
@@ -392,7 +392,10 @@ async function probeConvexBackend(url: string): Promise<ProbeResult> {
 		const res = await fetch(endpoint, { signal: controller.signal });
 		clearTimeout(t);
 		if (!res.ok) {
-			return { ok: false, reason: `HTTP ${res.status} from ${endpoint}` };
+			return {
+				ok: false,
+				reason: "That backend responded but didn't look like a Brigade backend. Double-check the URL.",
+			};
 		}
 		const text = (await res.text()).trim();
 		return { ok: true, reason: "ok", instanceName: text || undefined };
@@ -400,7 +403,7 @@ async function probeConvexBackend(url: string): Promise<ProbeResult> {
 		const msg = (err as Error)?.name === "AbortError" ? "timed out after 5s" : (err as Error).message;
 		const localHint =
 			cleaned.includes("127.0.0.1") || cleaned.includes("localhost")
-				? "  · is `npm run convex:dev` running in another terminal?"
+				? "  · make sure your local backend is running before continuing."
 				: "";
 		return { ok: false, reason: `Couldn't reach ${cleaned}: ${msg}${localHint}` };
 	}
@@ -420,7 +423,7 @@ async function probeConvexBackend(url: string): Promise<ProbeResult> {
 async function ensureEncryptionKeyStep(tui: TUI): Promise<void> {
 	const source = encryptionKeySource();
 	if (source === "env") {
-		renderScreen(tui, "Step 0 of 5 · Encryption");
+		renderScreen(tui, "Step 1 of 5 · Encryption");
 		tui.addChild(
 			new Text(`  ${brand.amber("✓")} Encryption key found in your environment — using it.`, 0, 0),
 		);
@@ -429,7 +432,7 @@ async function ensureEncryptionKeyStep(tui: TUI): Promise<void> {
 		return;
 	}
 	if (source === "file") {
-		renderScreen(tui, "Step 0 of 5 · Encryption");
+		renderScreen(tui, "Step 1 of 5 · Encryption");
 		tui.addChild(
 			new Text(`  ${brand.amber("✓")} Encryption key found on this computer — using it.`, 0, 0),
 		);
@@ -447,7 +450,7 @@ async function ensureEncryptionKeyStep(tui: TUI): Promise<void> {
 /** Full-screen "save this key" moment. Resolves when the user confirms;
  *  throws "back" on Esc. */
 async function showRecoveryKeyScreen(tui: TUI, hex: string, intro: string): Promise<void> {
-	renderScreen(tui, "Step 0 of 5 · Your encryption key");
+	renderScreen(tui, "Step 1 of 5 · Your encryption key");
 	tui.addChild(new Text(`  ${brand.dim(intro)}`, 0, 0));
 	tui.addChild(new Text("", 0, 0));
 	tui.addChild(new Text(`  ${brand.white(hex)}`, 0, 0));
@@ -510,7 +513,7 @@ async function detectExistingInstanceStep(tui: TUI, url: string): Promise<"proce
 	if (state === "fresh") return "proceed";
 
 	if (state === "restorable") {
-		renderScreen(tui, "Step 0 of 5 · Found an existing Brigade");
+		renderScreen(tui, "Step 1 of 5 · Found an existing Brigade");
 		tui.addChild(new Text(`  ${brand.dim(describeSummary(summary))}`, 0, 0));
 		tui.addChild(new Text("", 0, 0));
 		const items: SelectItem[] = [
@@ -547,7 +550,7 @@ async function detectExistingInstanceStep(tui: TUI, url: string): Promise<"proce
 	}
 
 	// key-mismatch — the backend's data was sealed with a different key.
-	renderScreen(tui, "Step 0 of 5 · This backend is locked with a different key");
+	renderScreen(tui, "Step 1 of 5 · This backend is locked with a different key");
 	tui.addChild(new Text(`  ${brand.dim(describeSummary(summary))}`, 0, 0));
 	tui.addChild(new Text("", 0, 0));
 	tui.addChild(
@@ -564,13 +567,13 @@ async function detectExistingInstanceStep(tui: TUI, url: string): Promise<"proce
 		tui.addChild(new Text("", 0, 0));
 		tui.addChild(
 			new Text(
-				`  ${brand.dim("(Your key currently comes from the BRIGADE_ENCRYPTION_KEY environment")}`,
+				`  ${brand.dim("(Your key currently comes from your environment configuration —")}`,
 				0,
 				0,
 			),
 		);
 		tui.addChild(
-			new Text(`  ${brand.dim("variable — update that variable instead of entering a key here.)")}`, 0, 0),
+			new Text(`  ${brand.dim("update it there instead of entering a key here.)")}`, 0, 0),
 		);
 	}
 	tui.addChild(new Text("", 0, 0));
@@ -624,7 +627,7 @@ async function detectExistingInstanceStep(tui: TUI, url: string): Promise<"proce
 async function promptForRecoveryKey(tui: TUI, expectedFingerprint: string): Promise<boolean> {
 	let lastError: string | null = null;
 	while (true) {
-		renderScreen(tui, "Step 0 of 5 · Enter your recovery key");
+		renderScreen(tui, "Step 1 of 5 · Enter your recovery key");
 		if (lastError) {
 			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
 			tui.addChild(new Text("", 0, 0));
@@ -665,7 +668,7 @@ async function confirmAndErase(
 	url: string,
 	summary: ConvexInstanceSummary,
 ): Promise<boolean> {
-	renderScreen(tui, "Step 0 of 5 · Erase this Brigade?");
+	renderScreen(tui, "Step 1 of 5 · Erase this Brigade?");
 	tui.addChild(new Text(`  ${brand.error("This permanently deletes:")} ${describeSummary(summary)}`, 0, 0));
 	tui.addChild(new Text(`  ${brand.dim("There is no undo.")}`, 0, 0));
 	tui.addChild(new Text("", 0, 0));
@@ -692,7 +695,7 @@ async function confirmAndErase(
 	}
 	if (choice !== "yes") return false;
 
-	renderScreen(tui, "Step 0 of 5 · Erasing…");
+	renderScreen(tui, "Step 1 of 5 · Erasing…");
 	const loader = new CancellableLoader(
 		tui,
 		(s) => brand.amber(s),

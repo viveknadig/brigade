@@ -160,6 +160,15 @@ export function buildProgram(): Command {
     });
 
   program
+    .command("login [provider]")
+    .description("Log in to a subscription provider (Claude Pro/Max, ChatGPT, Copilot) — browser OAuth")
+    .action(async (provider: string | undefined) => {
+      const { runLoginCommand } = await import("../commands/login.js");
+      const code = await runLoginCommand(provider ? { provider } : {});
+      await exitAfterFlush(code);
+    });
+
+  program
     .command("agent")
     .description("Drive a single turn through the agent pipeline")
     .allowUnknownOption()

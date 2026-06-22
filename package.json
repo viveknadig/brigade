@@ -2,7 +2,7 @@
   "name": "@spinabot/brigade",
   "version": "1.2.2",
   "description": "Brigade — your personal AI crew",
-  "homepage": "https://brigade-agent.ai",
+  "homepage": "https://brigade.spinabot.com",
   "author": "Spinabot <hello@brigade-agent.ai>",
   "license": "MIT",
   "repository": {
@@ -36,6 +36,9 @@
     "scripts/install-convex.mjs",
     "scripts/convex-dev.mjs",
     "scripts/convex-push.mjs",
+    "scripts/brand-oauth-page.mjs",
+    "scripts/assets/brigade-logo.webp",
+    "scripts/assets/brigade-favicon.ico",
     "dist/**/*",
     "templates/**/*",
     "skills/**/*",
@@ -48,6 +51,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "postbuild": "node scripts/build-done.mjs",
+    "postinstall": "node scripts/brand-oauth-page.mjs",
     "build:watch": "tsc -p tsconfig.build.json --watch",
     "clean": "node -e \"import('node:fs').then(fs => fs.rmSync('dist', { recursive: true, force: true }))\"",
     "prepack": "npm run build",

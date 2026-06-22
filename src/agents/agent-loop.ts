@@ -1993,6 +1993,15 @@ export function readAuthProfilesAsCredentialMap(
         type?: string;
         key?: string;
         keyRef?: string | { source?: string; provider?: string; id?: string };
+        // oauth / token profiles (subscription login). access/refresh/token may
+        // be literal or a secret-ref, mirroring the key/keyRef pair.
+        access?: string;
+        accessRef?: string | { source?: string; provider?: string; id?: string };
+        refresh?: string;
+        refreshRef?: string | { source?: string; provider?: string; id?: string };
+        expires?: number;
+        token?: string;
+        tokenRef?: string | { source?: string; provider?: string; id?: string };
         alias?: string;
       }
     >;
@@ -2024,7 +2033,19 @@ export function readAuthProfilesAsCredentialMap(
     { profileId: string; provider: string; resolvedKey: string }[]
   >();
   for (const [profileId, profile] of Object.entries(parsed.profiles ?? {})) {
-    if (!profile?.provider || profile.type !== "api_key") continue;
+    if (!profile?.provider) continue;
+    // Subscription credentials (OAuth login / setup-token). Pi's AuthStorage
+    // handles {type:"oauth"} natively (auto-refresh) and detects an
+    // `sk-ant-oat…` value to switch to Bearer auth — so pass these straight
+    // through. Single credential per provider (no cooldown pool); first wins
+    // and it takes precedence over a stored api key.
+    if (profile.type === "oauth" || profile.type === "token") {
+      if (out[profile.provider] !== undefined) continue;
+      const cred = subscriptionProfileToCredential(profile);
+      if (cred) out[profile.provider] = cred;
+      continue;
+    }
+    if (profile.type !== "api_key") continue;
     const resolvedKey = resolveCredentialSecret(
       profile.key,
       profile.keyRef,
@@ -2037,6 +2058,7 @@ export function readAuthProfilesAsCredentialMap(
   }
 
   for (const [provider, list] of byProvider) {
+    if (out[provider] !== undefined) continue; // a subscription credential won
     if (cooldownFilter && provider === cooldownFilter.provider) {
       const ordered = orderProfilesForSelection({
         state: cooldownFilter.cooldownState,
@@ -2060,16 +2082,23 @@ export function readAuthProfilesAsCredentialMap(
     }
   }
 
-  // C5: env-fallback. If no profile-stored key surfaced for a known provider
-  // but the user has e.g. `ANTHROPIC_API_KEY` exported in their shell, return
-  // that key so a fresh agent with no auth-profiles.json entry still boots
-  // instead of failing with a 401. Mirrors core/auth-bridge.ts:91-97.
+  // C5: env-fallback. If no profile-stored credential surfaced for a known
+  // provider but the user has e.g. `ANTHROPIC_API_KEY` (or the OAuth-token
+  // fallback `ANTHROPIC_OAUTH_TOKEN`) exported, surface it so a fresh agent
+  // with no auth-profiles.json entry still boots instead of failing with a
+  // 401. An OAuth token flows through as an api-key entry — Pi detects the
+  // `sk-ant-oat…` shape and switches to Bearer auth itself.
   for (const provider of PROVIDERS) {
-    if (!provider.envVar || provider.noAuth) continue;
+    if (provider.noAuth) continue;
     if (out[provider.id] !== undefined) continue;
-    const apiKey = process.env[provider.envVar];
-    if (!apiKey) continue;
-    out[provider.id] = { type: "api_key", key: apiKey };
+    const envNames = [provider.envVar, ...(provider.envVarFallbacks ?? [])];
+    for (const name of envNames) {
+      if (!name) continue;
+      const value = process.env[name];
+      if (!value) continue;
+      out[provider.id] = { type: "api_key", key: value };
+      break;
+    }
   }
 
   return { credentials: out, selectedProfileId };
@@ -2091,6 +2120,52 @@ function resolveCredentialSecret(
   if (typeof keyRef === "string") return expandEnvRef(keyRef, provider);
   if (keyRef.source === "env" && keyRef.id) return process.env[keyRef.id] ?? "";
   return "";
+}
+
+// Map an OAuth-login / setup-token profile to a Pi credential. OAuth →
+// {type:"oauth", access, refresh, expires} (Pi auto-refreshes); token →
+// {type:"api_key", key} so Pi's value-based `sk-ant-oat` Bearer detection
+// fires. Returns null when no secret resolves.
+function subscriptionProfileToCredential(profile: {
+  provider?: string;
+  type?: string;
+  access?: string;
+  accessRef?: string | { source?: string; provider?: string; id?: string };
+  refresh?: string;
+  refreshRef?: string | { source?: string; provider?: string; id?: string };
+  expires?: number;
+  token?: string;
+  tokenRef?: string | { source?: string; provider?: string; id?: string };
+  metadata?: Record<string, unknown>;
+}): Record<string, unknown> | null {
+  const provider = profile.provider ?? "";
+  if (profile.type === "oauth") {
+    const access = resolveCredentialSecret(profile.access, profile.accessRef, provider);
+    if (!access) return null;
+    const refresh = resolveCredentialSecret(profile.refresh, profile.refreshRef, provider);
+    // A durable oauth profile CAN lack `expires` (the Claude/Codex CLI-login
+    // path). Coerce a missing/garbage value to 0 so Pi treats the access token
+    // as expired and refreshes via the refresh token immediately. Spread
+    // `metadata` FIRST so the known oauth fields always win — it carries the
+    // extras (Copilot enterprise refresh + availableModelIds) Pi needs.
+    const expires =
+      typeof profile.expires === "number" && Number.isFinite(profile.expires)
+        ? profile.expires
+        : 0;
+    return {
+      ...(profile.metadata && typeof profile.metadata === "object" ? profile.metadata : {}),
+      type: "oauth",
+      access,
+      refresh: refresh || undefined,
+      expires,
+    };
+  }
+  if (profile.type === "token") {
+    const token = resolveCredentialSecret(profile.token, profile.tokenRef, provider);
+    if (!token) return null;
+    return { type: "api_key", key: token };
+  }
+  return null;
 }
 
 const ENV_REF_PATTERN = /^\$\{([A-Z_][A-Z0-9_]*)\}$/;

@@ -74,7 +74,7 @@ const ManageProviderParams = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				'Model id for set-agent-model, e.g. "gpt-4o" or "claude-opus-4-7". Bare id (the provider field carries the provider).',
+				'Model id for set-agent-model, e.g. "gpt-4o" or "claude-sonnet-4-6". Bare id (the provider field carries the provider). Tier by org rank: junior roles on a fast/cheap model (e.g. "claude-haiku-4-5"), leadership on the strongest (e.g. "claude-opus-4-8").',
 			minLength: 1,
 			maxLength: 128,
 		}),
@@ -122,6 +122,7 @@ export function makeManageProviderTool(
 			"WHEN THE OPERATOR HANDS YOU AN API KEY: call save-key IMMEDIATELY. NEVER write a key to a .env file, workspace file, memory, brigade.json, or shell command, and NEVER repeat the key back in chat — this tool's credential store (restricted permissions, encrypted in convex mode) is the ONLY correct destination.",
 			'save-key: {action:"save-key", provider:"openai", key:"sk-…"} — stores it for the default agent (pass agentId to target another agent\'s store).',
 			'set-agent-model: {action:"set-agent-model", agentId:"marketing-lead", provider:"openai", model:"gpt-4o"} — updates the agent\'s config atomically AND copies the provider key into that agent\'s own credential store when only the default agent has it. The gateway hot-reloads the model — applies from the agent\'s next turn, no restart.',
+			'Tier agents by org rank: e.g. {action:"set-agent-model", agentId:"intern", provider:"anthropic", model:"claude-haiku-4-5"} for a junior role, {action:"set-agent-model", agentId:"eng-lead", provider:"anthropic", model:"claude-opus-4-8"} for leadership.',
 			"list: which providers have stored keys (masked tails only — full keys are never readable through this tool).",
 		].join(" "),
 		parameters: ManageProviderParams,

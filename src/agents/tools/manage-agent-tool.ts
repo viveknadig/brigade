@@ -57,7 +57,7 @@ const ManageAgentParams = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				"Model id. Defaults to cfg.agents.defaults.model.primary. Only used when action=add.",
+				"Model id this agent runs on. Defaults to cfg.agents.defaults.model.primary. Only used when action=add. Tier by org rank: junior roles on a fast/cheap model, leadership on the strongest — e.g. interns → \"claude-haiku-4-5\", mid-level → \"claude-sonnet-4-6\", executives/top-of-org → \"claude-opus-4-8\" (pair with provider:\"anthropic\").",
 		}),
 	),
 	// `set-identity` params
@@ -115,6 +115,7 @@ export function makeManageAgentTool(): BrigadeTool<typeof ManageAgentParams, Man
 			"Owner-only LLM-driven agent CRUD. Wraps the same code as `brigade agents add/delete/set-identity`.",
 			"Use this when the user asks you to create, delete, or rename a peer agent.",
 			"action=add creates a new agent with its workspace (all 7 persona files seeded) + brigade.json entry, atomically with rollback on failure.",
+			"Give each new position a model tier by rank — pass provider+model on add (cheaper models for junior roles, top models for leadership): e.g. interns → claude-haiku-4-5, mid-level → claude-sonnet-4-6, executives/top-of-org → claude-opus-4-8 (provider:\"anthropic\").",
 			"action=delete soft-deletes — the workspace moves to `.brigade-trash/<id>-<timestamp>/` so the user can recover.",
 			"action=set-identity updates display name/emoji/theme/avatar without touching workspace files.",
 			"Returns {action, id, exitCode, stdout, stderr, ok}. Relay the CLI output back to the user.",

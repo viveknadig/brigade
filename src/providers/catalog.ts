@@ -15,6 +15,15 @@
 export interface ProviderInfo {
 	/** Pi-AI provider id (KnownProvider) — or a custom id we register at runtime (e.g. "ollama"). */
 	id: string;
+	/**
+	 * Real Pi provider id this picker entry resolves to for credential storage +
+	 * model routing, when it differs from `id`. Lets ONE Pi provider surface as
+	 * TWO picker choices with different auth models — e.g. "Anthropic" (API key,
+	 * id "anthropic") and "Claude Code" (subscription, id "claude-code") both
+	 * store their credential under, and route their models through, Pi's
+	 * `anthropic` provider. Defaults to `id` when unset.
+	 */
+	providerId?: string;
 	/** Display name shown in the picker. */
 	name: string;
 	/** One-line tagline for the picker description column. */
@@ -55,19 +64,51 @@ export interface ProviderInfo {
 	 * instead of using a built-in catalog.
 	 */
 	custom?: boolean;
+	/** Subscription / OAuth-login support — onboarding offers a browser login instead of an API key. */
+	subscription?: { oauthProviderId: string; label: string };
+	/**
+	 * Reuse a vendor CLI's already-stored login on this machine. When set,
+	 * onboarding reads the named CLI's credential file and offers a one-keystroke
+	 * "reuse this login" path (no browser, no key) before the subscription / key
+	 * flow.
+	 */
+	cliLogin?: { read: "claude" | "codex"; label: string };
+	/**
+	 * Pi API shape for a custom (catalog-defined) provider. Determines how Pi
+	 * frames requests against `baseUrl` — `anthropic-messages` for an
+	 * Anthropic-compatible endpoint, `openai-completions` for an OpenAI-compatible
+	 * one. Paired with `custom: true` + `baseUrl` + `models`.
+	 */
+	api?: "openai-completions" | "anthropic-messages";
+	/** Catalog model ids registered into models.json for a custom provider. */
+	models?: string[];
 }
 
 export const PROVIDERS: ProviderInfo[] = [
 	{
 		id: "anthropic",
 		name: "Anthropic",
-		description: "Claude — best for tool use & long context",
+		description: "Claude models via an Anthropic API key",
 		keyUrl: "https://console.anthropic.com/settings/keys",
 		envVar: "ANTHROPIC_API_KEY",
-		// Anthropic's CLI tools also export `ANTHROPIC_OAUTH_TOKEN` (claude-cli
-		// subscription auth). Treat it as a valid fallback so users on the
-		// CLI subscription path get the env-detect badge + auto-select.
+		// `ANTHROPIC_OAUTH_TOKEN` (exported by the Claude CLI subscription auth)
+		// stays a valid fallback so the runtime credential pipeline still resolves
+		// it. The subscription PATH itself lives on the "claude-code" entry below —
+		// this entry is the pay-per-token API-key route.
 		envVarFallbacks: ["ANTHROPIC_OAUTH_TOKEN"],
+	},
+	{
+		// Same Pi provider as "anthropic" (so models route + the credential stores
+		// under `anthropic`), surfaced as a distinct SUBSCRIPTION choice: log in
+		// with Claude Pro / Max, or reuse an existing Claude Code login — no key.
+		id: "claude-code",
+		providerId: "anthropic",
+		name: "Claude Code",
+		description: "Use your Claude Pro / Max subscription — no API key",
+		keyUrl: "https://claude.ai",
+		envVar: "",
+		subscription: { oauthProviderId: "anthropic", label: "Log in with Claude Pro / Max" },
+		cliLogin: { read: "claude", label: "Use your existing Claude Code login" },
 	},
 	{
 		id: "openai",
@@ -126,6 +167,78 @@ export const PROVIDERS: ProviderInfo[] = [
 		envVar: "MISTRAL_API_KEY",
 	},
 	{
+		id: "openai-codex",
+		name: "ChatGPT (Codex)",
+		description: "Use your ChatGPT Plus/Pro subscription",
+		keyUrl: "https://chatgpt.com",
+		envVar: "",
+		subscription: { oauthProviderId: "openai-codex", label: "Log in with ChatGPT Plus / Pro" },
+		cliLogin: { read: "codex", label: "Use your existing Codex login" },
+	},
+	{
+		id: "github-copilot",
+		name: "GitHub Copilot",
+		description: "Use your Copilot subscription ($10/mo, multi-model)",
+		keyUrl: "https://github.com/settings/copilot",
+		envVar: "",
+		subscription: { oauthProviderId: "github-copilot", label: "Log in with GitHub Copilot" },
+	},
+	{
+		id: "glm",
+		name: "GLM (Z.ai)",
+		description: "Use your Z.ai GLM coding-plan key",
+		keyUrl: "https://z.ai/manage-apikey/apikey-list",
+		envVar: "",
+		custom: true,
+		api: "anthropic-messages",
+		baseUrl: "https://api.z.ai/api/anthropic",
+		models: ["glm-5.2", "glm-4.7", "glm-4.5-air"],
+	},
+	{
+		id: "kimi",
+		name: "Kimi (Moonshot)",
+		description: "Use your Moonshot / Kimi key",
+		keyUrl: "https://platform.moonshot.ai/console/api-keys",
+		envVar: "",
+		custom: true,
+		api: "anthropic-messages",
+		baseUrl: "https://api.moonshot.ai/anthropic",
+		models: ["kimi-k2.7-code", "kimi-k2.6"],
+	},
+	{
+		id: "qwen",
+		name: "Qwen (DashScope)",
+		description: "Use your Alibaba DashScope key",
+		keyUrl: "https://bailian.console.alibabacloud.com",
+		envVar: "",
+		custom: true,
+		api: "anthropic-messages",
+		baseUrl: "https://dashscope-intl.aliyuncs.com/apps/anthropic",
+		models: ["qwen3-coder-plus", "qwen3-coder-next"],
+	},
+	{
+		id: "minimax-sub",
+		name: "MiniMax (coding plan)",
+		description: "Use your MiniMax key",
+		keyUrl: "https://platform.minimax.io",
+		envVar: "",
+		custom: true,
+		api: "anthropic-messages",
+		baseUrl: "https://api.minimax.io/anthropic",
+		models: ["MiniMax-M2.7", "MiniMax-M3"],
+	},
+	{
+		id: "deepseek-sub",
+		name: "DeepSeek (coding plan)",
+		description: "Use your DeepSeek key",
+		keyUrl: "https://platform.deepseek.com/api_keys",
+		envVar: "",
+		custom: true,
+		api: "anthropic-messages",
+		baseUrl: "https://api.deepseek.com/anthropic",
+		models: ["deepseek-v4-flash", "deepseek-v4-pro"],
+	},
+	{
 		id: "ollama",
 		name: "Ollama (local)",
 		description: "Run models locally — no API key, fully private",
@@ -138,7 +251,7 @@ export const PROVIDERS: ProviderInfo[] = [
 	{
 		id: "custom",
 		name: "Custom (OpenAI-compatible)",
-		description: "Together, Fireworks, vLLM, LM Studio, any /v1/chat/completions endpoint",
+		description: "Together, Fireworks, vLLM, LM Studio — any OpenAI-compatible endpoint",
 		keyUrl: "—",
 		envVar: "",
 		custom: true,

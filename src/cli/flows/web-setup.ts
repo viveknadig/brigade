@@ -8,7 +8,7 @@
  * called out in screenshot #2.
  *
  * Two entry points:
- *   - `runWebSetupStep(tui, …)` — called by `runOnboarding` as Step 4 of 4.
+ *   - `runWebSetupStep(tui, …)` — called by `runOnboarding` as Step 5 of 5.
  *   - `runWebSetupStandalone()` — used by `brigade onboard web`; spins up
  *     its own TUI, runs the step, tears down.
  *
@@ -45,7 +45,7 @@ export interface RunWebSetupOptions {
 	secretInputMode?: "plaintext" | "ref";
 	/**
 	 * The header label rendered above the picker. Default
-	 * "Step 4 of 4 · Web search" when called from the main wizard;
+	 * "Step 5 of 5 · Web search" when called from the main wizard;
 	 * "Web search" when called standalone.
 	 */
 	stepLabel?: string;
@@ -59,7 +59,7 @@ export async function runWebSetupStep(
 	tui: TUI,
 	opts: RunWebSetupOptions = {},
 ): Promise<WebSetupResult> {
-	const stepLabel = opts.stepLabel ?? "Step 4 of 4 · Web search";
+	const stepLabel = opts.stepLabel ?? "Step 5 of 5 · Web search";
 
 	const rows = await classifyProviders();
 	if (rows.length === 0) {

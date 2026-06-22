@@ -28,6 +28,18 @@ interface ReadProfile {
   // `source: "env"` here — file/exec backends require an async resolver and
   // are out of scope for the bridge's synchronous build.
   keyRef?: { source?: string; provider?: string; id?: string } | string;
+  // oauth / token profiles (subscription login).
+  access?: string;
+  accessRef?: { source?: string; provider?: string; id?: string } | string;
+  refresh?: string;
+  refreshRef?: { source?: string; provider?: string; id?: string } | string;
+  expires?: number;
+  token?: string;
+  tokenRef?: { source?: string; provider?: string; id?: string } | string;
+  // Free-form provider metadata (scopes, account id, availableModelIds, …).
+  // Must reach Pi for the oauth path — Copilot enterprise refresh +
+  // availableModelIds ride here.
+  metadata?: Record<string, unknown>;
 }
 
 interface ReadProfilesFile {
@@ -75,43 +87,92 @@ function readBrigadeCredentials(agentId: string): Record<string, unknown> {
     // Fall through to env-backed bootstrap.
   }
   for (const profile of Object.values(parsed.profiles ?? {})) {
-    if (!profile?.provider || profile.type !== "api_key") continue;
-    const resolvedKey = resolveProfileKey(profile);
-    if (!resolvedKey) continue;
-    // First-wins per provider — matches Primitive #1's no-cooldown path.
-    if (out[profile.provider] === undefined) {
-      out[profile.provider] = { type: "api_key", key: resolvedKey };
+    if (!profile?.provider) continue;
+    if (out[profile.provider] !== undefined) continue; // first-wins per provider
+    // Subscription credentials (OAuth login / setup-token) pass straight
+    // through — Pi's AuthStorage handles {type:"oauth"} (auto-refresh) and
+    // detects an `sk-ant-oat…` token to switch to Bearer auth.
+    if (profile.type === "oauth" || profile.type === "token") {
+      const cred = subscriptionProfileToCredential(profile);
+      if (cred) out[profile.provider] = cred;
+      continue;
     }
+    if (profile.type !== "api_key") continue;
+    const resolvedKey = resolveProfileKey(profile);
+    if (resolvedKey) out[profile.provider] = { type: "api_key", key: resolvedKey };
   }
-  // Env-backed bootstrap. If a user has ANTHROPIC_API_KEY (etc) exported
-  // in their shell but never ran `brigade onboard`, Pi's registry would
-  // hide the provider unless we surface that key here. Profile-stored keys
-  // take precedence — env is only consulted when a provider has no profile
-  // entry.
+  // Env-backed bootstrap. If a user has ANTHROPIC_API_KEY (or the OAuth-token
+  // fallback ANTHROPIC_OAUTH_TOKEN) exported but never ran `brigade onboard`,
+  // surface it so Pi's registry exposes the provider. Profile-stored creds
+  // take precedence — env is only consulted when a provider has no profile.
   for (const provider of PROVIDERS) {
-    if (!provider.envVar || provider.noAuth) continue;
+    if (provider.noAuth) continue;
     if (out[provider.id] !== undefined) continue;
-    const apiKey = process.env[provider.envVar];
-    if (!apiKey) continue;
-    out[provider.id] = { type: "api_key", key: apiKey };
+    const envNames = [provider.envVar, ...(provider.envVarFallbacks ?? [])];
+    for (const name of envNames) {
+      if (!name) continue;
+      const value = process.env[name];
+      if (!value) continue;
+      out[provider.id] = { type: "api_key", key: value };
+      break;
+    }
   }
   return out;
 }
 
-function resolveProfileKey(profile: ReadProfile): string {
-  if (profile.key && profile.key.length > 0) return profile.key;
-  const ref = profile.keyRef;
+// Resolve a literal-or-ref secret value (key / access / refresh / token).
+// String refs are the legacy `${ENV_VAR}` form; object refs (BrigadeSecretRef)
+// resolve only env source synchronously — file/exec backends are out of scope
+// for the bridge's sync build.
+function resolveRefValue(
+  value: string | undefined,
+  ref: { source?: string; provider?: string; id?: string } | string | undefined,
+): string {
+  if (value && value.length > 0) return value;
   if (!ref) return "";
-  // String form (legacy): `${ENV_VAR}` literal. Matches the regex agent-loop
-  // uses for the same shape.
   if (typeof ref === "string") {
     const m = /^\$\{([A-Z_][A-Z0-9_]*)\}$/.exec(ref);
     if (m && m[1]) return process.env[m[1]] ?? "";
     return ref;
   }
-  // BrigadeSecretRef object form: only env-source is resolvable synchronously.
-  if (ref.source === "env" && ref.id) {
-    return process.env[ref.id] ?? "";
-  }
+  if (ref.source === "env" && ref.id) return process.env[ref.id] ?? "";
   return "";
+}
+
+function resolveProfileKey(profile: ReadProfile): string {
+  return resolveRefValue(profile.key, profile.keyRef);
+}
+
+// Map an OAuth-login / setup-token profile to a Pi credential. OAuth →
+// {type:"oauth", access, refresh, expires} (Pi auto-refreshes); token →
+// {type:"api_key", key} so Pi's value-based `sk-ant-oat` Bearer detection
+// fires. Returns null when no secret resolves.
+function subscriptionProfileToCredential(profile: ReadProfile): Record<string, unknown> | null {
+  if (profile.type === "oauth") {
+    const access = resolveRefValue(profile.access, profile.accessRef);
+    if (!access) return null;
+    const refresh = resolveRefValue(profile.refresh, profile.refreshRef);
+    // A durable oauth profile CAN lack `expires` (the Claude/Codex CLI-login
+    // path). Coerce a missing/garbage value to 0 so Pi treats the access token
+    // as expired and refreshes via the refresh token immediately. Spread
+    // `metadata` FIRST so the known oauth fields always win — it carries the
+    // extras (Copilot enterprise refresh + availableModelIds) Pi needs.
+    const expires =
+      typeof profile.expires === "number" && Number.isFinite(profile.expires)
+        ? profile.expires
+        : 0;
+    return {
+      ...(profile.metadata && typeof profile.metadata === "object" ? profile.metadata : {}),
+      type: "oauth",
+      access,
+      refresh: refresh || undefined,
+      expires,
+    };
+  }
+  if (profile.type === "token") {
+    const token = resolveRefValue(profile.token, profile.tokenRef);
+    if (!token) return null;
+    return { type: "api_key", key: token };
+  }
+  return null;
 }

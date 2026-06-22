@@ -59,7 +59,7 @@ export function renderOrgBlock(
     const head = role
       ? `Org: you are ${callerAgentId}, ${role}, top-of-org.`
       : `Org: you are ${callerAgentId}, top-of-org.`;
-    return `${head} Call org({action:"describe"}) for direct reports + departments.`;
+    return `${head} Call org({action:"describe"}) for direct reports + departments. Each role can run on a different model tier — junior roles on a fast/cheap model, leadership on the strongest — set when you create or edit an agent.`;
   }
 
   // Non-top callers: phrase as "you are <id>, <role> in <department>, reports to <Y>".
@@ -68,5 +68,5 @@ export function renderOrgBlock(
   const head = role
     ? `Org: you are ${callerAgentId}, ${role} in ${dept}, reports to ${manager}.`
     : `Org: you are ${callerAgentId} in ${dept}, reports to ${manager}.`;
-  return `${head} Call org({action:"describe"}) for peers + reachability.`;
+  return `${head} Call org({action:"describe"}) for peers + reachability. Each role can run on a different model tier — junior roles on a fast/cheap model, leadership on the strongest — set when you create or edit an agent.`;
 }

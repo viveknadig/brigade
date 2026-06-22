@@ -128,14 +128,22 @@ describe("catalog — env-key detection works for every cloud provider", () => {
 		assert.deepEqual(ids, [
 			"anthropic",
 			"cerebras",
+			"claude-code",
 			"custom",
 			"deepseek",
+			"deepseek-sub",
+			"github-copilot",
+			"glm",
 			"google",
 			"groq",
+			"kimi",
+			"minimax-sub",
 			"mistral",
 			"ollama",
 			"openai",
+			"openai-codex",
 			"openrouter",
+			"qwen",
 			"xai",
 		]);
 	});

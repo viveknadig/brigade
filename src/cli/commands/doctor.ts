@@ -245,7 +245,7 @@ function checkConfiguredProvider(config: Awaited<ReturnType<typeof loadConfig>> 
 			return {
 				name: "default provider",
 				status: "ok",
-				message: `${provider}/${modelId} (env-backed key from ${info.envVar})`,
+				message: `${provider}/${modelId} (using a key from your environment)`,
 			};
 		}
 	}
@@ -261,6 +261,25 @@ function checkConfiguredProvider(config: Awaited<ReturnType<typeof loadConfig>> 
 			(p) => p?.provider === provider,
 		);
 		if (profile) {
+			// Subscription-login (OAuth) profiles carry an `access` token, not a
+			// `key`. Without this branch a healthy `brigade login` deployment would
+			// fall through to the "no API key found" warning below and trip
+			// `brigade doctor --strict`.
+			if (profile.type === "oauth" && typeof profile.access === "string" && profile.access.length > 0) {
+				return {
+					name: "default provider",
+					status: "ok",
+					message: `${provider}/${modelId} (subscription login)`,
+				};
+			}
+			// Setup-token profiles (e.g. Anthropic's token flow) carry a `token`.
+			if (profile.type === "token" && typeof profile.token === "string" && profile.token.length > 0) {
+				return {
+					name: "default provider",
+					status: "ok",
+					message: `${provider}/${modelId} (token)`,
+				};
+			}
 			if (typeof profile.key === "string" && profile.key.length > 0) {
 				return { name: "default provider", status: "ok", message: `${provider}/${modelId}` };
 			}
@@ -274,14 +293,14 @@ function checkConfiguredProvider(config: Awaited<ReturnType<typeof loadConfig>> 
 					return {
 						name: "default provider",
 						status: "ok",
-						message: `${provider}/${modelId} (keyRef → ${ref.id})`,
+						message: `${provider}/${modelId} (the saved credential points at an environment value)`,
 					};
 				}
 				return {
 					name: "default provider",
 					status: "warn",
-					message: `${provider}/${modelId} — profile pins keyRef → ${ref.id}, but the env var is unset`,
-					hint: `export ${ref.id}=... in your shell, or run \`brigade onboard\` to switch the credential shape.`,
+					message: `${provider}/${modelId} — the saved credential points at an environment value that isn't set`,
+					hint: "set that value in your environment, or run `brigade onboard` to switch the credential shape.",
 				};
 			}
 			if (typeof ref === "string") {
@@ -291,7 +310,7 @@ function checkConfiguredProvider(config: Awaited<ReturnType<typeof loadConfig>> 
 					return {
 						name: "default provider",
 						status: "ok",
-						message: `${provider}/${modelId} (keyRef → ${m[1]})`,
+						message: `${provider}/${modelId} (the saved credential points at an environment value)`,
 					};
 				}
 			}
@@ -303,7 +322,7 @@ function checkConfiguredProvider(config: Awaited<ReturnType<typeof loadConfig>> 
 		name: "default provider",
 		status: "warn",
 		message: `${provider}/${modelId} but no API key found`,
-		hint: info.envVar ? `export ${info.envVar}=... or run \`brigade onboard\`` : "run `brigade onboard`",
+		hint: info.envVar ? "set a key in your environment, or run `brigade onboard`" : "run `brigade onboard`",
 	};
 }
 

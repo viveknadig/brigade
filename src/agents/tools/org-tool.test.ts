@@ -679,6 +679,66 @@ describe("org tool — set action", () => {
     assert.equal(out.ok, false);
     assert.match(out.error ?? "", /nothing to update/);
   });
+
+  it("tiers a position's model: writes cfg.agents.<id>.provider + model.primary", async () => {
+    writeCfg(ORG_CFG);
+    const out = (await runOrg("main", {
+      action: "set",
+      agentId: "marketing",
+      provider: "anthropic",
+      model: "claude-haiku-4-5",
+    })) as { ok: boolean; provider?: unknown; model?: unknown };
+    assert.equal(out.ok, true);
+    assert.equal(out.provider, "anthropic");
+    assert.deepEqual(out.model, { primary: "claude-haiku-4-5" });
+    const cfg = readCfg() as {
+      agents?: {
+        marketing?: { provider?: string; model?: { primary?: string }; org?: Record<string, unknown> };
+      };
+    };
+    assert.equal(cfg.agents?.marketing?.provider, "anthropic");
+    assert.equal(cfg.agents?.marketing?.model?.primary, "claude-haiku-4-5");
+    // Pre-existing org block is preserved (model-tier write is additive).
+    assert.equal(cfg.agents?.marketing?.org?.department, "marketing");
+  });
+
+  it("writes model tier ALONGSIDE org-block edits in one atomic set", async () => {
+    writeCfg(ORG_CFG);
+    const out = (await runOrg("main", {
+      action: "set",
+      agentId: "marketing",
+      role: "VP Marketing",
+      provider: "anthropic",
+      model: "claude-opus-4-8",
+    })) as { ok: boolean; org?: Record<string, unknown> };
+    assert.equal(out.ok, true);
+    assert.equal(out.org?.role, "VP Marketing");
+    const cfg = readCfg() as {
+      agents?: { marketing?: { provider?: string; model?: { primary?: string }; org?: Record<string, unknown> } };
+    };
+    assert.equal(cfg.agents?.marketing?.provider, "anthropic");
+    assert.equal(cfg.agents?.marketing?.model?.primary, "claude-opus-4-8");
+    assert.equal(cfg.agents?.marketing?.org?.role, "VP Marketing");
+  });
+
+  it("refuses the model-tier write for a non-owner sender (owner-only gate)", async () => {
+    writeCfg(ORG_CFG);
+    const tool = makeOrgTool({ requesterAgentId: "main", senderIsOwner: false });
+    const r = await tool.execute("test-call-id", {
+      action: "set",
+      agentId: "marketing",
+      provider: "anthropic",
+      model: "claude-opus-4-8",
+    } as never);
+    const out = parseResult(
+      r as { content?: Array<{ type: string; text: string }> },
+    ) as { ok: boolean; error?: string };
+    assert.equal(out.ok, false);
+    assert.match(out.error ?? "", /owner-only/);
+    // The config must NOT have been mutated by the refused call.
+    const cfg = readCfg() as { agents?: { marketing?: { provider?: string } } };
+    assert.equal(cfg.agents?.marketing?.provider, undefined);
+  });
 });
 
 /* ─────────────────────── explain ─────────────────────── */

@@ -13,15 +13,29 @@
  * language is consistent across the app.
  */
 
+import { spawn } from "node:child_process";
 import * as path from "node:path";
 
 import { getEnvApiKey, getModels, type KnownProvider, type Model } from "@earendil-works/pi-ai";
+// `getOAuthProvider` lives ONLY on the "./oauth" subpath export — the package's
+// main "." entry (base + register-builtins) does NOT re-export the OAuth
+// registry, so importing it from "@earendil-works/pi-ai" resolves to undefined.
+// The package.json "exports" map exposes "./oauth", so this is the supported
+// path (verified against node_modules @ pi-ai 0.79.9).
+import { getOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import type { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { CancellableLoader, Input, type SelectItem, SelectList, Text, TUI } from "@earendil-works/pi-tui";
 
-import { upsertApiKeyProfile, upsertApiKeyRefProfile } from "../auth/profiles.js";
+import {
+	upsertApiKeyProfile,
+	upsertApiKeyRefProfile,
+	upsertOAuthProfile,
+	upsertTokenProfile,
+} from "../auth/profiles.js";
 import { DEFAULT_AGENT_ID, resolveAuthProfilesPath, resolveModelsPath } from "../config/paths.js";
 import { BRIGADE_DIR, saveConfig } from "../core/config.js";
+import { readClaudeCliLogin, readCodexCliLogin } from "../integrations/cli-login.js";
+import { writeCustomProviderToModelsJson } from "../integrations/custom-provider.js";
 import { discoverOllamaModels, writeOllamaToModelsJson } from "../integrations/ollama.js";
 import {
 	findProvider,
@@ -35,7 +49,11 @@ import { renderBrandHeader } from "./brand.js";
 import { brand, selectListTheme } from "./theme.js";
 import { pickStorageMode, type StorageModeResult } from "./onboard-storage-mode.js";
 import { SearchableSelectList } from "./searchable-select.js";
-import { listOpenRouterModels } from "../integrations/provider-discovery.js";
+import {
+	getCachedSubscriptionModels,
+	listOpenRouterModels,
+	prefetchSubscriptionModels,
+} from "../integrations/provider-discovery.js";
 
 export interface OnboardingResult {
 	provider: string;
@@ -48,6 +66,24 @@ export interface OnboardingResult {
 /* ────────────────────────────── public API ────────────────────────────── */
 
 /**
+ * Strip terminal paste artifacts (bracketed-paste markers + stray control chars)
+ * from a typed/pasted value before use. `String.trim()` does NOT remove the
+ * `ESC[200~ … ESC[201~` wrapper some terminals add to a paste, so a valid key
+ * arrives as `<ESC>[200~sk-…` and fails validation. Keys / URLs / model ids are
+ * printable, so dropping control chars is safe.
+ */
+function sanitizePastedValue(value: string): string {
+	const esc = String.fromCharCode(27); // ESC (0x1b) from a code point — no control byte in source
+	const unwrapped = value.split(`${esc}[200~`).join("").split(`${esc}[201~`).join("");
+	let cleaned = "";
+	for (const ch of unwrapped) {
+		const code = ch.codePointAt(0) ?? 0;
+		if (code >= 0x20 && code !== 0x7f) cleaned += ch; // drop C0 control chars + DEL
+	}
+	return cleaned.trim();
+}
+
+/**
  * Resolve the model list for a provider. Pi's static `getModels()` only knows
  * built-in catalogs (Anthropic, OpenAI, Google, etc.); custom providers we
  * register at runtime via models.json (Ollama) are exposed through
@@ -57,6 +93,32 @@ export interface OnboardingResult {
  */
 async function getProviderModels(modelRegistry: ModelRegistry, providerId: string): Promise<Array<Model<any>>> {
 	const staticModels: Array<Model<any>> = (() => {
+		// Subscription providers (e.g. GitHub Copilot) are filtered to the
+		// account's enabled models by the registry's `modifyModels` after login —
+		// prefer the refreshed registry so the picker shows exactly what the plan
+		// allows. Falls through to the static catalog when the registry is empty
+		// (e.g. pre-login).
+		if (findProvider(providerId)?.subscription || findProvider(providerId)?.custom) {
+			// Live fetch (warmed at login by `prefetchSubscriptionModels`) is
+			// authoritative for the SET of models the account can use. Join the
+			// static catalog by id for richer metadata (cost, context window) where
+			// Pi knows the model; live-only ids pass through as the loose live shape.
+			const live = getCachedSubscriptionModels(providerId);
+			if (live && live.length > 0) {
+				let catalog: Array<Model<any>> = [];
+				try {
+					catalog = getModels(providerId as KnownProvider) as Array<Model<any>>;
+				} catch {
+					/* unknown provider — no catalog to join against */
+				}
+				const byId = new Map(catalog.map((m) => [m.id, m]));
+				return live.map((lm) => byId.get(lm.id) ?? (lm as unknown as Model<any>));
+			}
+			const fromRegistry = modelRegistry
+				.getAll()
+				.filter((m) => m.provider === providerId) as Array<Model<any>>;
+			if (fromRegistry.length > 0) return fromRegistry;
+		}
 		try {
 			const fromCatalog = getModels(providerId as KnownProvider) as Array<Model<any>>;
 			if (fromCatalog && fromCatalog.length > 0) return fromCatalog;
@@ -178,7 +240,7 @@ export async function runOnboarding(
 
 	while (true) {
 		if (step === "provider") {
-			renderScreen(tui, "Step 1 of 5 · Pick a provider");
+			renderScreen(tui, "Step 2 of 5 · Pick a provider");
 			provider = await pickProvider(tui); // throws "onboarding-cancelled" on Esc
 			step = "key";
 			continue;
@@ -192,6 +254,57 @@ export async function runOnboarding(
 			if (providerInfo?.local && providerInfo.id === "ollama") {
 				const result = await ensureLocalOllama(tui, modelRegistry, providerInfo.baseUrl ?? "http://localhost:11434");
 				if (result === "back") {
+					step = "provider";
+					continue;
+				}
+				step = "model";
+				continue;
+			}
+
+			// CLI-login reuse — if the provider can adopt an already-logged-in
+			// vendor CLI's token on this machine (Claude Code, Codex), offer the
+			// one-keystroke "reuse this login" path FIRST. "other" means no CLI
+			// login present (or the user opted for a key / fresh login), so we
+			// fall through to the subscription / key path below.
+			if (providerInfo?.cliLogin) {
+				const r = await ensureCliLogin(tui, authStorage, providerInfo);
+				if (r === "ok") {
+					modelRegistry.refresh();
+					step = "model";
+					continue;
+				}
+				if (r === "back") {
+					step = "provider";
+					continue;
+				}
+				// r === "other" → fall through to the subscription/key path below
+			}
+
+			// Subscription providers (Claude Pro/Max, ChatGPT Plus/Pro, GitHub
+			// Copilot) log in through a browser OAuth flow instead of pasting an
+			// API key. The credential lands under the catalog `id` (which equals
+			// the oauthProviderId for these), so Pi routes their models to the
+			// right provider.
+			// Codex + Copilot model menus come from Pi's bundled catalog
+			// automatically; Copilot is further filtered to the account's enabled
+			// models via the `availableModelIds` persisted on login.
+			if (providerInfo?.subscription) {
+				const result = await ensureSubscriptionLogin(tui, authStorage, providerInfo);
+				if (result === "back") {
+					step = "provider";
+					continue;
+				}
+				modelRegistry.refresh();
+				step = "model";
+				continue;
+			}
+
+			// Custom (catalog-defined) providers — a key + a known
+			// Anthropic-compatible endpoint (GLM, Kimi, Qwen, MiniMax, DeepSeek).
+			// Paste the key, register the endpoint + models into models.json, done.
+			if (providerInfo?.custom && providerInfo.baseUrl) {
+				const r = await ensureCustomProvider(tui, authStorage, modelRegistry, providerInfo);
+				if (r === "back") {
 					step = "provider";
 					continue;
 				}
@@ -213,8 +326,8 @@ export async function runOnboarding(
 		}
 
 		// step === "model"
-		renderScreen(tui, "Step 3 of 5 · Default model");
-		const result = await pickModel(tui, modelRegistry, provider);
+		renderScreen(tui, "Step 4 of 5 · Default model");
+		const result = await pickModel(tui, modelRegistry, findProvider(provider)?.providerId ?? provider);
 		if (result === "back") {
 			step = "provider"; // go all the way back so they can change provider too
 			continue;
@@ -227,14 +340,18 @@ export async function runOnboarding(
 	// agent's identity is left for the agent itself to discover via
 	// BOOTSTRAP.md on first turn. Workspace scaffolding still happens at
 	// agent boot via `buildAgent → seedDefaultPrompts`.
-	await saveConfig({ defaultProvider: provider, defaultModelId: modelId });
+	// A picker entry may resolve to a different Pi provider for routing — e.g.
+	// "Claude Code" (subscription) stores under and routes through "anthropic".
+	// Persist the REAL provider id so the runtime resolves the model + credential.
+	const effectiveProvider = findProvider(provider)?.providerId ?? provider;
+	await saveConfig({ defaultProvider: effectiveProvider, defaultModelId: modelId });
 
-	// Step 4 of 5 — web-search backend. Same Pi-TUI components, same brand
+	// Step 5 of 5 — web-search backend. Same Pi-TUI components, same brand
 	// header. Re-runnable via `brigade onboard web`.
 	try {
 		const { runWebSetupStep } = await import("../cli/flows/web-setup.js");
 		await runWebSetupStep(tui, {
-			stepLabel: "Step 4 of 5 · Web search",
+			stepLabel: "Step 5 of 5 · Web search",
 			secretInputMode: opts.secretInputMode,
 		});
 	} catch {
@@ -247,7 +364,7 @@ export async function runOnboarding(
 	await delay(900);
 	clear(tui);
 
-	return { provider, modelId, storage };
+	return { provider: effectiveProvider, modelId, storage };
 }
 
 /* ────────────────────────── screen scaffolding ────────────────────────── */
@@ -268,36 +385,81 @@ function renderScreen(tui: TUI, subheader: string): void {
 /* ────────────────────────────── steps ─────────────────────────────────── */
 
 async function pickProvider(tui: TUI): Promise<string> {
-	// Re-order providers so any with a credential the user already has —
-	// either an env var Pi can read, OR a noAuth provider like Ollama —
-	// floats to the top. Without this, PROVIDERS[0] = anthropic always wins
-	// the highlight, and a user with only OPENROUTER_API_KEY exported picks
-	// anthropic by reflex (then fails when they send a message).
-	const detected: SelectItem[] = [];
-	const undetected: SelectItem[] = [];
+	// Build the picker LOGIN-FIRST. The ranking surfaces, in order:
+	//   0. Already connected — a vendor CLI login already on this machine
+	//      (Claude Code / Codex) the user can reuse with no browser, no key.
+	//   1. Already connected — a key already in the user's environment.
+	//   2. Log in with a subscription (browser approval) — Claude Pro/Max,
+	//      ChatGPT Plus/Pro, GitHub Copilot.
+	//   3. Use a coding-plan subscription key — GLM, Kimi, Qwen, MiniMax, DeepSeek.
+	//   4. Standard API-key providers.
+	//   5. Local (Ollama) and 6. bring-your-own endpoint.
+	// A type-to-filter box sits on top so the full list (18+) is searchable and
+	// nothing — including Anthropic at the top — ever hides below the fold.
+	const ranked: Array<{ rank: number; item: SelectItem }> = [];
 	for (const p of PROVIDERS) {
-		// `readProviderEnvKey` checks `envVar` AND any `envVarFallbacks` —
-		// Anthropic users with `ANTHROPIC_OAUTH_TOKEN` set get the detected
-		// badge alongside the standard `ANTHROPIC_API_KEY` path.
+		// A login the matching vendor CLI already minted on this machine?
+		let cliReady = false;
+		if (p.cliLogin) {
+			const cred = p.cliLogin.read === "claude" ? readClaudeCliLogin() : readCodexCliLogin();
+			cliReady = cred !== null;
+		}
 		const hasEnvKey = !!readProviderEnvKey(p);
-		const noAuth = p.noAuth === true;
-		const item: SelectItem = {
-			value: p.id,
-			label: p.name,
-			description:
-				hasEnvKey
-					? `${p.description} · detected ${p.envVar ?? "env var"}`
-					: noAuth
-						? `${p.description} · no auth required`
-						: p.description,
-		};
-		(hasEnvKey || noAuth ? detected : undetected).push(item);
-	}
-	const items = [...detected, ...undetected];
+		const isSubscription = !!p.subscription;
+		const isCodingPlan = !!(p.custom && p.baseUrl);
+		const isLocal = p.local === true || p.noAuth === true;
+		const isBYO = p.custom === true && !p.baseUrl;
 
-	const list = new SelectList(items, Math.min(items.length, 9), selectListTheme, {
+		let rank: number;
+		let badge: string;
+		// A subscription provider stays "log in" (browser-first, multi-account) even
+		// when a CLI login is on disk — reuse is offered as a secondary option inside
+		// the flow. Only a pure CLI-login provider gets the rank-0 "reuse" treatment.
+		if (cliReady && !isSubscription) {
+			rank = 0;
+			badge = "logged in — reuse, no key";
+		} else if (hasEnvKey) {
+			rank = 1;
+			badge = "detected — ready to use";
+		} else if (isSubscription) {
+			rank = 2;
+			badge = "log in with your subscription";
+		} else if (isCodingPlan) {
+			rank = 3;
+			badge = "use your coding-plan key";
+		} else if (isLocal) {
+			rank = 5;
+			badge = "runs locally — no key";
+		} else if (isBYO) {
+			rank = 6;
+			badge = "bring your own endpoint";
+		} else {
+			rank = 4;
+			badge = ""; // standard API-key provider — its description says enough
+		}
+
+		ranked.push({
+			rank,
+			item: {
+				value: p.id,
+				label: p.name,
+				description: badge ? `${p.description} · ${badge}` : p.description,
+			},
+		});
+	}
+	// Stable sort (V8) keeps catalog order within a rank.
+	ranked.sort((a, b) => a.rank - b.rank);
+	const items = ranked.map((r) => r.item);
+
+	const list = new SearchableSelectList(items, 12, selectListTheme, {
 		minPrimaryColumnWidth: 18,
-		maxPrimaryColumnWidth: 22,
+		maxPrimaryColumnWidth: 24,
+		formatHeader: (q, matchCount, total) =>
+			brand.dim(
+				q.length > 0
+					? `  search: ${q}▌  (${matchCount}/${total} match${matchCount === 1 ? "" : "es"})`
+					: `  ${total} providers · type to filter · ↑↓ move · Enter select · Esc back`,
+			),
 	});
 	tui.addChild(list);
 	tui.setFocus(list);
@@ -371,10 +533,10 @@ export async function ensureApiKey(
 		// OPENROUTER_API_KEY, sk-o…52b5)?`. Single line, default = Yes.
 		// No explanatory paragraphs.
 		const envVar = provider.envVar ?? "the env var";
-		renderScreen(tui, `Step 2 of 5 · ${provider.name}`);
+		renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
 		tui.addChild(
 			new Text(
-				`  ${brand.amber("?")} Use existing ${envVar} (env: ${envVar}, ${formatApiKeyPreview(envKey)})?`,
+				`  ${brand.amber("?")} We found a saved ${provider.name} key on this computer (${formatApiKeyPreview(envKey)}). Use it?`,
 				0,
 				0,
 			),
@@ -412,7 +574,7 @@ export async function ensureApiKey(
 			// and let them paste their own. The typed-key loop below treats
 			// `lastError === null` as a clean first iteration, so no stale
 			// error text leaks in.
-			renderScreen(tui, `Step 2 of 5 · ${provider.name}`);
+			renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
 			// Fall through to typed-key loop without `lastError` set.
 			// (Variable declared just below the env block.)
 			return await promptTypedKey(tui, authStorage, provider, providerId, null);
@@ -421,7 +583,7 @@ export async function ensureApiKey(
 		// User confirmed — verify the env key actually works before accepting.
 		tui.addChild(
 			new Text(
-				`  ${brand.dim(`Verifying ${envVar} with ${provider.name}…`)}`,
+				`  ${brand.dim(`Checking your ${provider.name} key…`)}`,
 				0,
 				0,
 			),
@@ -484,7 +646,7 @@ export async function ensureApiKey(
 				});
 				authStorage.set(providerId, { type: "api_key", key: envKey });
 			}
-			const pinShape = mode === "ref" ? "your environment (kept as a reference)" : "your environment";
+			const pinShape = mode === "ref" ? "the key already on this computer" : "your saved key";
 			tui.addChild(
 				new Text(
 					`  ${brand.amber("✓")} ${provider.name} is already connected (using ${brand.white(pinShape)}).`,
@@ -501,7 +663,7 @@ export async function ensureApiKey(
 		// skip — drop into the typed-key path with the failure seeded so the
 		// user immediately sees WHY their env key didn't work and can paste a
 		// fresh one.
-		const staleReason = `The ${provider.envVar ?? "env var"} for ${provider.name} doesn't work: ${envCheck.reason}`;
+		const staleReason = `That saved ${provider.name} key didn't work: ${envCheck.reason}`;
 		return await promptTypedKey(tui, authStorage, provider, providerId, staleReason);
 	}
 
@@ -532,7 +694,7 @@ async function promptTypedKey(
 	let lastError: string | null = seedError;
 
 	while (true) {
-		renderScreen(tui, `Step 2 of 5 · ${provider.name}`);
+		renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
 
 		if (lastError) {
 			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
@@ -553,7 +715,7 @@ async function promptTypedKey(
 		let key: string;
 		try {
 			key = await new Promise<string>((resolve, reject) => {
-				input.onSubmit = (value: string) => resolve(value.trim());
+				input.onSubmit = (value: string) => resolve(sanitizePastedValue(value));
 				input.onEscape = () => reject(new Error("back"));
 			});
 		} catch {
@@ -669,7 +831,7 @@ async function ensureLocalOllama(
 	let lastError: string | null = null;
 
 	while (true) {
-		renderScreen(tui, "Step 2 of 5 · Connect Ollama");
+		renderScreen(tui, "Step 3 of 5 · Connect Ollama");
 
 		if (lastError) {
 			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
@@ -734,6 +896,436 @@ async function ensureLocalOllama(
 	}
 }
 
+/**
+ * Subscription-login variant of `ensureApiKey`. For providers that carry a
+ * `subscription` descriptor (Anthropic, OpenAI Codex, GitHub Copilot) we run
+ * Pi's OAuth login flow instead of asking for an API key:
+ *   1. Confirm with the user (Enter to start the browser flow, Esc to go back).
+ *   2. Drive `oauthProvider.login(...)` — Pi does NOT open the browser, so our
+ *      `onAuth` callback does (best-effort, per-platform).
+ *   3. On success, persist the returned credential to BOTH credential stores
+ *      (auth-profiles.json via `upsertOAuthProfile` + auth.json via
+ *      `authStorage.set`) so the wizard process and every future boot can use it.
+ *
+ * Modeled on `ensureLocalOllama`: a retry `while(true)` loop with a `lastError`
+ * line and Esc → "back". Any thrown error (including the user aborting the
+ * flow) is caught and surfaced inline so the user can retry or pick a different
+ * provider.
+ */
+export async function ensureSubscriptionLogin(
+	tui: TUI,
+	authStorage: AuthStorage,
+	provider: ProviderInfo,
+): Promise<"ok" | "back"> {
+	const sub = provider.subscription!;
+	const oauthProvider = getOAuthProvider(sub.oauthProviderId);
+	if (!oauthProvider) {
+		// Pi build doesn't know this provider — fail cleanly back to the picker
+		// rather than crashing the wizard.
+		renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
+		tui.addChild(
+			new Text(`  ${brand.error("✗")} ${brand.error(`${provider.name} sign-in isn't supported yet.`)}`, 0, 0),
+		);
+		tui.addChild(new Text(brand.dim("  Taking you back to choose another provider…"), 0, 0));
+		tui.requestRender();
+		await delay(900);
+		return "back";
+	}
+
+	let lastError: string | null = null;
+
+	while (true) {
+		renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
+
+		if (lastError) {
+			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
+			tui.addChild(new Text(brand.dim("  Press Enter to try again, or Esc to choose a different provider."), 0, 0));
+			tui.addChild(new Text("", 0, 0));
+		}
+
+		tui.addChild(new Text(`  ${brand.white(sub.label)}`, 0, 0));
+		tui.addChild(new Text(brand.dim("  We'll open your browser to sign in. Approve it there — we'll wait."), 0, 0));
+		tui.addChild(new Text(brand.dim("  Enter to start  ·  Esc to go back"), 0, 0));
+
+		// Confirm-gate (mirrors ensureLocalOllama) so the user can Esc out BEFORE
+		// the browser opens. Just hits Enter to proceed, or Esc to rewind.
+		const confirm = new Input();
+		tui.addChild(confirm);
+		tui.setFocus(confirm);
+		tui.requestRender();
+
+		try {
+			await new Promise<void>((resolve, reject) => {
+				confirm.onSubmit = () => resolve();
+				confirm.onEscape = () => reject(new Error("back"));
+			});
+		} catch {
+			return "back";
+		}
+		tui.removeChild(confirm);
+
+		// Drive the OAuth flow. `controller` lets the callbacks (and an Esc) abort
+		// the in-flight login; Pi honors `signal` across its loopback wait.
+		const controller = new AbortController();
+		let creds;
+		try {
+			creds = await oauthProvider.login({
+				// Pi does NOT open the browser — we do. onAuth is fire-and-forget
+				// (void), so don't await here; just kick the browser + show the URL
+				// and a waiting spinner.
+				onAuth: (info) => {
+					tui.addChild(new Text(`  ${brand.amber("→")} Opening your browser to sign in…`, 0, 0));
+					openSubscriptionBrowser(info.url);
+					tui.addChild(new Text("", 0, 0));
+					tui.addChild(new Text("  " + brand.amber(info.url), 0, 0));
+					tui.addChild(
+						new Text(brand.dim("  If your browser didn't open, copy the link above. Paste the code here if asked."), 0, 0),
+					);
+					if (info.instructions) tui.addChild(new Text(brand.dim("  " + info.instructions), 0, 0));
+					// Wire Escape to abort the in-flight login. The loader only
+					// receives key input (handleInput) while it holds focus, so set
+					// focus AND point onAbort at the login controller.
+					const waitLoaderAuth = new CancellableLoader(tui, (s) => brand.amber(s), (s) => brand.dim(s), "Waiting for you to authorize…");
+					waitLoaderAuth.onAbort = () => controller.abort();
+					tui.addChild(waitLoaderAuth);
+					tui.setFocus(waitLoaderAuth);
+					tui.requestRender();
+				},
+				// Loopback-callback providers (anthropic, openai-codex) also let the
+				// user paste the redirect URL / code by hand — this races the local
+				// callback server internally. Resolve from an Input; Esc rejects to
+				// abort the whole login.
+				onManualCodeInput: () =>
+					new Promise<string>((resolve, reject) => {
+						tui.addChild(new Text("", 0, 0));
+						tui.addChild(new Text(brand.dim("  Paste the code or redirect URL, then press Enter  ·  Esc to cancel"), 0, 0));
+						const input = new Input();
+						tui.addChild(input);
+						tui.setFocus(input);
+						tui.requestRender();
+						input.onSubmit = (value: string) => resolve(sanitizePastedValue(value));
+						input.onEscape = () => reject(new Error("cancelled"));
+					}),
+				// Device-code providers (github-copilot): show the verification URL +
+				// user code, plus a waiting spinner while Pi polls for completion.
+				onDeviceCode: (info) => {
+					openSubscriptionBrowser(info.verificationUri);
+					tui.addChild(new Text("", 0, 0));
+					tui.addChild(
+						new Text(`  Go to ${brand.amber(info.verificationUri)} and enter code: ${brand.amber(info.userCode)}`, 0, 0),
+					);
+					tui.addChild(new Text(brand.dim("  If your browser didn't open, copy the link above."), 0, 0));
+					// Wire Escape to abort the in-flight login (device-code path). The
+					// loader only receives key input while focused, so set focus AND
+					// point onAbort at the login controller.
+					const waitLoaderDevice = new CancellableLoader(tui, (s) => brand.amber(s), (s) => brand.dim(s), "Waiting for you to authorize…");
+					waitLoaderDevice.onAbort = () => controller.abort();
+					tui.addChild(waitLoaderDevice);
+					tui.setFocus(waitLoaderDevice);
+					tui.requestRender();
+				},
+				// Free-form prompt (rare). Render the message + an Input; honor
+				// allowEmpty so a blank submit is accepted when the provider allows it.
+				onPrompt: (p) =>
+					new Promise<string>((resolve, reject) => {
+						tui.addChild(new Text("", 0, 0));
+						tui.addChild(new Text(`  ${p.message}`, 0, 0));
+						const input = new Input();
+						tui.addChild(input);
+						tui.setFocus(input);
+						tui.requestRender();
+						input.onSubmit = (value: string) => {
+							const v = value.trim();
+							if (!v && !p.allowEmpty) return; // keep waiting for a value
+							resolve(v);
+						};
+						input.onEscape = () => reject(new Error("cancelled"));
+					}),
+				// Best-effort progress line.
+				onProgress: (msg) => {
+					tui.addChild(new Text(brand.dim("  " + msg), 0, 0));
+					tui.requestRender();
+				},
+				// REQUIRED for openai-codex: it calls onSelect FIRST (browser vs
+				// device-code) and throws if absent. Render a SelectList; resolve the
+				// chosen id, or undefined on cancel.
+				onSelect: (p) =>
+					new Promise<string | undefined>((resolve) => {
+						tui.addChild(new Text("", 0, 0));
+						tui.addChild(new Text(`  ${p.message}`, 0, 0));
+						const list = new SelectList(
+							p.options.map((o) => ({ value: o.id, label: o.label })),
+							Math.min(p.options.length, 6),
+							selectListTheme,
+							{ minPrimaryColumnWidth: 12, maxPrimaryColumnWidth: 28 },
+						);
+						tui.addChild(list);
+						tui.setFocus(list);
+						tui.requestRender();
+						list.onSelect = (item) => resolve(item.value);
+						list.onCancel = () => resolve(undefined);
+					}),
+				signal: controller.signal,
+			});
+		} catch (err) {
+			controller.abort();
+			const reason = err instanceof Error ? err.message : String(err);
+			// "cancelled" / "back" are user-initiated aborts — surface a soft line
+			// and let them retry; anything else is a real failure. NEVER render
+			// the raw Pi reason (it can leak a URL / status / internal detail) —
+			// map it to a friendly, generic line. The soft-cancel branch also
+			// matches Pi's "Login cancelled" wording so a user abort reads clean.
+			const softCancel =
+				/^login cancelled$/i.test(reason) || reason === "cancelled" || reason === "back";
+			lastError = softCancel
+				? "Login cancelled. Start again, or pick a different provider."
+				: "We couldn't finish signing you in. Check your connection and try again.";
+			continue;
+		}
+
+		// Persist to BOTH stores (NOT authStorage.login, which would only write
+		// auth.json): auth-profiles.json is the canonical credential store the
+		// agent boots from; auth.json is Pi's in-process mirror so the model
+		// picker that runs next can use the token immediately.
+		// Resolve to the real Pi provider for storage — e.g. the "claude-code"
+		// entry stores its OAuth credential under "anthropic".
+		const providerId = provider.providerId ?? provider.id;
+		// Preserve provider-specific extras the login returned — notably GitHub
+		// Copilot's `availableModelIds` (the exact models THIS account's plan
+		// enabled), which Pi's `modifyModels` uses to filter the model menu. Hand
+		// the whole credential to Pi's in-memory store and stash the extras in the
+		// profile metadata so they survive a reboot.
+		const { access, refresh, expires, ...extras } = creds;
+		upsertOAuthProfile(DEFAULT_AGENT_ID, {
+			provider: providerId,
+			access,
+			refresh,
+			expires,
+			metadata: Object.keys(extras).length > 0 ? extras : undefined,
+		});
+		authStorage.set(providerId, { type: "oauth", ...creds });
+		authStorage.reload();
+
+		// Warm the live model cache with THIS account's current models so the
+		// model picker (next step) shows exactly what the subscription enables,
+		// not just Pi's bundled snapshot. Best-effort — `prefetchSubscriptionModels`
+		// swallows its own errors, and the picker falls back to the catalog if the
+		// cache is empty (codex, or an unauthorized/failed fetch).
+		try {
+			await prefetchSubscriptionModels(providerId, creds.access);
+		} catch {
+			/* best-effort — picker falls back to the catalog */
+		}
+
+		tui.addChild(new Text("", 0, 0));
+		tui.addChild(new Text(`  ${brand.amber("✓")} ${provider.name} connected.`, 0, 0));
+		tui.requestRender();
+		await delay(600);
+		return "ok";
+	}
+}
+
+/**
+ * Connect a subscription provider that ALSO has a vendor CLI login on disk
+ * (Claude Code / Codex). When such a login exists we present a choice that LEADS
+ * with browser sign-in — the right default when several people each use their own
+ * account — and offers reusing this machine's existing login as the convenience
+ * second option.
+ *
+ * Returns:
+ *   - "ok"    → reused the on-disk CLI login and persisted it
+ *   - "back"  → user pressed Esc; caller rewinds to the provider picker
+ *   - "other" → no CLI login present, OR the user chose browser sign-in; caller
+ *               falls through to the subscription (browser OAuth) / key path
+ */
+async function ensureCliLogin(
+	tui: TUI,
+	authStorage: AuthStorage,
+	provider: ProviderInfo,
+): Promise<"ok" | "back" | "other"> {
+	const cred = provider.cliLogin!.read === "claude" ? readClaudeCliLogin() : readCodexCliLogin();
+	if (!cred) return "other"; // no CLI login present on this machine
+
+	// A login is already on this machine — but LEAD with browser sign-in: it works
+	// for ANY account, which is what you want when different people each use their
+	// own subscription. Reuse is the second, convenience option.
+	renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
+	tui.addChild(new Text(`  ${brand.amber(`How do you want to connect ${provider.name}?`)}`, 0, 0));
+	tui.addChild(new Text("", 0, 0));
+
+	const choiceList = new SelectList(
+		[
+			{ value: "login", label: "Log in with your account", description: "Opens your browser — works for any account" },
+			{ value: "reuse", label: "Reuse this machine's login", description: "The account already signed in here" },
+		],
+		2,
+		selectListTheme,
+		{ minPrimaryColumnWidth: 26, maxPrimaryColumnWidth: 32 },
+	);
+	tui.addChild(choiceList);
+	tui.setFocus(choiceList);
+	tui.requestRender();
+
+	let choice: "reuse" | "other";
+	try {
+		const picked = await new Promise<string>((resolve, reject) => {
+			choiceList.onSelect = (item) => resolve(item.value);
+			choiceList.onCancel = () => reject(new Error("back"));
+		});
+		choice = picked === "reuse" ? "reuse" : "other";
+	} catch {
+		return "back";
+	}
+
+	// Browser sign-in → caller runs the subscription (OAuth) login next.
+	if (choice === "other") return "other";
+
+	// Reuse path — persist to BOTH stores (auth-profiles.json is canonical; the
+	// authStorage mirror lets the wizard's model picker use the credential now).
+	if (cred.type === "oauth") {
+		upsertOAuthProfile(DEFAULT_AGENT_ID, {
+			provider: cred.provider,
+			access: cred.access,
+			refresh: cred.refresh,
+			expires: cred.expires,
+		});
+		authStorage.set(cred.provider, {
+			type: "oauth",
+			access: cred.access,
+			refresh: cred.refresh,
+			// Pi's in-memory oauth shape requires a numeric `expires`. When the CLI
+			// file carried no expiry, seed 0 so Pi treats the access token as
+			// expired and refreshes via the refresh token on first use. The durable
+			// profile (above) keeps the real value (possibly undefined).
+			expires: cred.expires ?? 0,
+		});
+	} else {
+		// Durable store keeps the type:"token" shape (upsertTokenProfile). Mirror
+		// it into Pi's in-memory store as type:"oauth" for shape-consistency with
+		// the refresh-capable path — a Claude credential with an access token but
+		// no refresh token. expires:0 makes Pi treat the access token as expired
+		// and refresh on first use when a refresh token later exists.
+		upsertTokenProfile(DEFAULT_AGENT_ID, { provider: cred.provider, token: cred.token });
+		// Pi's in-memory OAuthCredential requires a `refresh` string; this CLI
+		// credential carries no refresh token, so seed "".
+		authStorage.set(cred.provider, { type: "oauth", access: cred.token, refresh: "", expires: cred.expires ?? 0 });
+	}
+	authStorage.reload();
+
+	// Warm the live model cache (best-effort — picker falls back to the catalog).
+	try {
+		await prefetchSubscriptionModels(cred.provider, cred.type === "oauth" ? cred.access : cred.token);
+	} catch {
+		/* best-effort */
+	}
+
+	tui.addChild(new Text("", 0, 0));
+	tui.addChild(new Text(`  ${brand.amber("✓")} ${provider.name} connected (using your existing login).`, 0, 0));
+	tui.requestRender();
+	await delay(600);
+	return "ok";
+}
+
+/**
+ * Custom (catalog-defined) provider entry. For providers that carry a key + a
+ * known Anthropic-compatible endpoint (GLM, Kimi, Qwen, MiniMax, DeepSeek): ask
+ * for the key, persist it, register the endpoint + catalog models into
+ * models.json, then refresh the registry so the model picker sees them.
+ *
+ * Returns:
+ *   - "ok"   → key saved, provider registered
+ *   - "back" → user pressed Esc; caller rewinds to the provider picker
+ */
+async function ensureCustomProvider(
+	tui: TUI,
+	authStorage: AuthStorage,
+	modelRegistry: ModelRegistry,
+	provider: ProviderInfo,
+): Promise<"ok" | "back"> {
+	let lastError: string | null = null;
+	while (true) {
+		renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
+
+		if (lastError) {
+			tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(lastError)}`, 0, 0));
+			tui.addChild(new Text(brand.dim("  Press Enter to try again, or Esc to choose a different provider."), 0, 0));
+			tui.addChild(new Text("", 0, 0));
+		}
+
+		tui.addChild(new Text(`  Paste your ${provider.name} key.`, 0, 0));
+		tui.addChild(new Text(brand.dim(`  Get one at ${provider.keyUrl}`), 0, 0));
+		tui.addChild(new Text(brand.dim("  Enter to continue  ·  Esc to go back"), 0, 0));
+		tui.addChild(new Text("", 0, 0));
+
+		const input = new Input();
+		tui.addChild(input);
+		tui.setFocus(input);
+		tui.requestRender();
+
+		let key: string;
+		try {
+			key = await new Promise<string>((resolve, reject) => {
+				input.onSubmit = (value: string) => resolve(sanitizePastedValue(value));
+				input.onEscape = () => reject(new Error("back"));
+			});
+		} catch {
+			return "back";
+		}
+
+		// Empty submit — show a one-line hint instead of silently re-rendering.
+		if (!key) {
+			lastError = "Please enter an API key.";
+			continue;
+		}
+
+		// Cheap LOCAL format check (length / whitespace / known prefix). Custom
+		// endpoints vary, so we do NOT online-validate here — but an obviously
+		// malformed key is rejected with feedback rather than persisted.
+		const localCheck = validateApiKey(provider.id, key);
+		if (!localCheck.ok) {
+			lastError = localCheck.reason;
+			continue;
+		}
+
+		upsertApiKeyProfile(DEFAULT_AGENT_ID, { provider: provider.id, key });
+		authStorage.set(provider.id, { type: "api_key", key });
+		authStorage.reload();
+		await writeCustomProviderToModelsJson(resolveModelsPath(DEFAULT_AGENT_ID), {
+			id: provider.id,
+			baseUrl: provider.baseUrl!,
+			api: provider.api!,
+			apiKey: key,
+			models: provider.models ?? [],
+		});
+		modelRegistry.refresh();
+
+		tui.addChild(new Text(`  ${brand.amber("✓")} ${provider.name} connected.`, 0, 0));
+		tui.requestRender();
+		await delay(500);
+		return "ok";
+	}
+}
+
+/**
+ * Best-effort open the system browser at `url`. Detached + unref'd so the child
+ * never keeps the wizard process alive, and every error is swallowed — a failed
+ * launch just means the user copies the URL we printed above. NOT exported;
+ * only the subscription-login flow uses it.
+ */
+function openSubscriptionBrowser(url: string): void {
+	try {
+		const child =
+			process.platform === "win32"
+				? spawn("rundll32", ["url.dll,FileProtocolHandler", url], { detached: true, stdio: "ignore" })
+				: process.platform === "darwin"
+					? spawn("open", [url], { detached: true, stdio: "ignore" })
+					: spawn("xdg-open", [url], { detached: true, stdio: "ignore" });
+		child.unref();
+	} catch {
+		// Couldn't launch a browser — the URL is already on screen for manual use.
+	}
+}
+
 async function pickModel(tui: TUI, modelRegistry: ModelRegistry, providerId: string): Promise<"back" | { modelId: string }> {
 	const models = await getProviderModels(modelRegistry, providerId);
 
@@ -745,7 +1337,7 @@ async function pickModel(tui: TUI, modelRegistry: ModelRegistry, providerId: str
 		tui.requestRender();
 		try {
 			const id = await new Promise<string>((resolve, reject) => {
-				input.onSubmit = (value: string) => resolve(value.trim());
+				input.onSubmit = (value: string) => resolve(sanitizePastedValue(value));
 				input.onEscape = () => reject(new Error("back"));
 			});
 			return { modelId: id };

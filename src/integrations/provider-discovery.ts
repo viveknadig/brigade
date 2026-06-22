@@ -15,6 +15,8 @@
  * OpenAI-compatible HTTP endpoints.
  */
 
+import { getModels, type KnownProvider } from "@earendil-works/pi-ai";
+
 const TIMEOUT_MS = 5000;
 
 export interface DiscoveredModelMeta {
@@ -200,5 +202,163 @@ export async function listOpenRouterModels(): Promise<LiveCloudModel[]> {
 		return out;
 	} catch {
 		return openRouterListCache?.models ?? [];
+	}
+}
+
+/* ──────────────────────── subscription live catalogs ──────────────────────── */
+
+/**
+ * Live model catalogs for OAuth subscription providers (GitHub Copilot,
+ * Anthropic Claude Pro/Max). Same shape + degrade-to-cache contract as
+ * `listOpenRouterModels`, but keyed by providerId because there are several
+ * subscription providers (OpenRouter is a singleton). The onboarding picker
+ * reads the cache after login via `getCachedSubscriptionModels` and joins the
+ * static Pi catalog by id for richer metadata.
+ */
+const SUBSCRIPTION_MODELS_TTL_MS = 5 * 60_000;
+const subscriptionModelsCache = new Map<string, { at: number; models: LiveCloudModel[] }>();
+
+/** Last-fetched live models for a subscription provider, or `undefined` if never fetched. */
+export function getCachedSubscriptionModels(providerId: string): LiveCloudModel[] | undefined {
+	const e = subscriptionModelsCache.get(providerId);
+	return e ? e.models : undefined;
+}
+
+/**
+ * GitHub Copilot's per-account model catalog. The token embeds the proxy host
+ * (`proxy-ep=…`) which `getGitHubCopilotBaseUrl` rewrites to the api host; we GET
+ * `${baseUrl}/models` with Copilot's required editor headers (a plain
+ * Authorization isn't enough — the endpoint 400s without the editor/integration
+ * headers). Keeps only models the account can actually pick (model_picker_enabled,
+ * policy not disabled, tool_calls not explicitly off). Never throws — returns the
+ * last good cache or `[]` so the caller falls back to Pi's bundled catalog.
+ */
+export async function fetchGitHubCopilotModels(copilotToken: string): Promise<LiveCloudModel[]> {
+	const now = Date.now();
+	const cached = subscriptionModelsCache.get("github-copilot");
+	if (cached && now - cached.at < SUBSCRIPTION_MODELS_TTL_MS) {
+		return cached.models;
+	}
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+	try {
+		const { getGitHubCopilotBaseUrl } = await import("@earendil-works/pi-ai/oauth");
+		const baseUrl = getGitHubCopilotBaseUrl(copilotToken);
+		const res = await fetch(`${baseUrl}/models`, {
+			signal: controller.signal,
+			headers: {
+				Accept: "application/json",
+				Authorization: `Bearer ${copilotToken}`,
+				"User-Agent": "GitHubCopilotChat/0.35.0",
+				"Editor-Version": "vscode/1.107.0",
+				"Editor-Plugin-Version": "copilot-chat/0.35.0",
+				"Copilot-Integration-Id": "vscode-chat",
+				"X-GitHub-Api-Version": "2026-06-01",
+			},
+		});
+		if (!res.ok) return cached?.models ?? [];
+		const body = (await res.json()) as { data?: unknown } | null;
+		const list = body?.data;
+		if (!Array.isArray(list)) return cached?.models ?? [];
+		const out: LiveCloudModel[] = [];
+		for (const raw of list) {
+			const item = raw as Record<string, unknown>;
+			const id = typeof item.id === "string" ? item.id : undefined;
+			if (!id) continue;
+			// Selectability gate (mirrors Pi's own `isSelectableCopilotModel`): only
+			// surface models the account is allowed to pick. Every access is guarded —
+			// the response is untyped.
+			const policy = item.policy as { state?: unknown } | undefined;
+			const capabilities = item.capabilities as
+				| { supports?: { tool_calls?: unknown; vision?: unknown }; limits?: { max_context_window_tokens?: unknown } }
+				| undefined;
+			const supports = capabilities?.supports;
+			if (item.model_picker_enabled !== true) continue;
+			if (policy?.state === "disabled") continue;
+			if (supports?.tool_calls === false) continue;
+			const maxCtx = capabilities?.limits?.max_context_window_tokens;
+			const contextWindow = typeof maxCtx === "number" && maxCtx > 0 ? maxCtx : undefined;
+			const name = typeof item.name === "string" && item.name.length > 0 ? item.name : id;
+			const input = supports?.vision ? ["text", "image"] : ["text"];
+			out.push({
+				provider: "github-copilot",
+				id,
+				name,
+				...(contextWindow !== undefined ? { contextWindow } : {}),
+				// Copilot's list doesn't flag reasoning here — leave false; the static
+				// catalog join in onboarding fills the richer fields when Pi knows it.
+				reasoning: false,
+				input,
+			});
+		}
+		subscriptionModelsCache.set("github-copilot", { at: now, models: out });
+		return out;
+	} catch {
+		return cached?.models ?? [];
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/**
+ * Models a Claude Pro/Max SUBSCRIPTION can use. There is NO live per-account
+ * models endpoint for a subscription OAuth token: Anthropic scopes that token to
+ * inference only, so `GET /v1/models` returns 401/403 (verified). Instead we
+ * surface Pi's bundled Anthropic catalog — it IS the current Claude model family
+ * and updates as Pi ships new models — so the picker is always populated and
+ * current with ZERO network round-trip (no guaranteed-fail request, no timeout)
+ * on every sign-in. (GitHub Copilot DOES expose a live per-account list, so that
+ * path stays a real fetch; Anthropic subscriptions simply don't have one.)
+ */
+export function fetchAnthropicSubscriptionModels(): LiveCloudModel[] {
+	const now = Date.now();
+	const cached = subscriptionModelsCache.get("anthropic");
+	if (cached && now - cached.at < SUBSCRIPTION_MODELS_TTL_MS) {
+		return cached.models;
+	}
+	let out: LiveCloudModel[] = [];
+	try {
+		const catalog = getModels("anthropic" as KnownProvider) as Array<{
+			id: string;
+			name?: string;
+			reasoning?: boolean;
+			input?: string[];
+			contextWindow?: number;
+		}>;
+		out = catalog.map((m) => ({
+			provider: "anthropic",
+			id: m.id,
+			name: m.name ?? m.id,
+			contextWindow: m.contextWindow,
+			reasoning: m.reasoning ?? false,
+			input: m.input ?? ["text"],
+		}));
+	} catch {
+		out = [];
+	}
+	subscriptionModelsCache.set("anthropic", { at: now, models: out });
+	return out;
+}
+
+/**
+ * Warm the live cache for a subscription provider right after OAuth login so the
+ * model picker has the account's CURRENT models ready. Best-effort: any failure is
+ * swallowed (login must never block on this). `codex` has no live list endpoint —
+ * it falls through to Pi's bundled catalog, so this is a no-op for it.
+ */
+export async function prefetchSubscriptionModels(providerId: string, oauthAccessToken: string): Promise<void> {
+	try {
+		if (providerId === "github-copilot") {
+			await fetchGitHubCopilotModels(oauthAccessToken);
+			return;
+		}
+		if (providerId === "anthropic") {
+			// No network — populates the cache from Pi's current Anthropic catalog.
+			fetchAnthropicSubscriptionModels();
+			return;
+		}
+		// Other subscription providers (codex) have no live endpoint — no-op.
+	} catch {
+		// Best-effort warm-up — never blocks login; picker falls back to the catalog.
 	}
 }

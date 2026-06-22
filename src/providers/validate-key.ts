@@ -52,17 +52,31 @@ function buildRequest(providerId: string, apiKey: string): { url: string; init: 
 				url: "http://localhost:11434/api/tags",
 				init: { method: "GET" },
 			};
-		case "anthropic":
+		case "anthropic": {
+			// OAuth / setup-token credentials (sk-ant-oat…) authenticate via a
+			// Bearer header + the OAuth beta gate — sending them as `x-api-key`
+			// returns a spurious 401. Normal console keys (sk-ant-api…) keep the
+			// x-api-key path. Both validate against the same /v1/models endpoint.
+			const isOAuth = apiKey.includes("sk-ant-oat");
 			return {
 				url: "https://api.anthropic.com/v1/models?limit=1",
 				init: {
 					method: "GET",
-					headers: {
-						"x-api-key": apiKey,
-						"anthropic-version": "2023-06-01",
-					},
+					headers: isOAuth
+						? {
+								Authorization: `Bearer ${apiKey}`,
+								"anthropic-version": "2023-06-01",
+								"anthropic-beta": "oauth-2025-04-20",
+								"user-agent": "claude-cli/2.1.75",
+								"x-app": "cli",
+							}
+						: {
+								"x-api-key": apiKey,
+								"anthropic-version": "2023-06-01",
+							},
 				},
 			};
+		}
 		case "openai":
 			return {
 				url: "https://api.openai.com/v1/models",
@@ -178,7 +192,7 @@ export async function validateApiKeyOnline(providerId: string, apiKey: string): 
 		// Anything else (404, 400, …) — surface the status and refuse.
 		return {
 			ok: false,
-			reason: `${providerName} couldn't be reached (status ${response.status}). The key may be incorrect.`,
+			reason: `${providerName} couldn't be reached. The key may be incorrect.`,
 		};
 	} catch (err) {
 		const providerName = providerDisplayName(providerId);

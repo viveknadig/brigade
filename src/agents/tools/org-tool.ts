@@ -52,6 +52,7 @@ import path from "node:path";
 import { Type } from "typebox";
 
 import { loadConfig } from "../../core/config.js";
+import { applyAgentConfig } from "../../cli/commands/agents-config.js";
 import type { ChannelApprovalRoute } from "../channels/approval-router.js";
 import {
   getOrgTemplate,
@@ -163,6 +164,20 @@ const OrgParams = Type.Object({
   ),
   bio: Type.Optional(
     Type.String({ description: "set: short bio surfaced in org-aware prompts." }),
+  ),
+  provider: Type.Optional(
+    Type.String({
+      description:
+        'set: provider id to run this position on (e.g. "anthropic"). Pair with `model` to tier a role by rank.',
+      minLength: 1,
+    }),
+  ),
+  model: Type.Optional(
+    Type.String({
+      description:
+        'set: model id this position runs on — tier by rank (junior roles on a fast/cheap model, leadership on the strongest). e.g. interns → "claude-haiku-4-5", mid-level → "claude-sonnet-4-6", executives/top-of-org → "claude-opus-4-8". Pair with `provider:"anthropic"`.',
+      minLength: 1,
+    }),
   ),
   // explain
   from: Type.Optional(
@@ -300,6 +315,10 @@ export interface OrgSetResult {
   ok: boolean;
   agentId?: string;
   org?: unknown;
+  /** Echoed back when a model tier was assigned on this `set`. */
+  provider?: unknown;
+  /** Echoed back when a model tier was assigned on this `set`. */
+  model?: unknown;
   error?: string;
 }
 
@@ -348,6 +367,15 @@ export interface MakeOrgToolOptions {
    * turns leave this undefined and keep the default `format:"list"`.
    */
   channelContext?: ChannelApprovalRoute;
+  /**
+   * Whether the calling sender is the workspace owner. Defaults to true
+   * (TUI / CLI / direct-RPC turns). Gates the model-tier mutation on
+   * `set`: assigning a position's provider/model is an owner-only act
+   * (a channel peer must never re-point an agent's brain). Mirrors the
+   * per-call `senderIsOwner` gate used by `message_action` /
+   * `connect_channel` — a structured refusal, not a vanished param.
+   */
+  senderIsOwner?: boolean;
 }
 
 interface OrgToolParams {
@@ -368,6 +396,8 @@ interface OrgToolParams {
   reportsTo?: string | null;
   role?: string;
   bio?: string;
+  provider?: string;
+  model?: string;
   from?: string;
   to?: string;
   task?: string;
@@ -386,11 +416,12 @@ export function makeOrgTool(
   const requesterAgentId = normalizeAgentId(
     opts.requesterAgentId ?? DEFAULT_AGENT_ID,
   );
+  const senderIsOwner = opts.senderIsOwner !== false;
   return {
     name: "org",
     label: "Org",
     description:
-      "Virtual-office surface. Single tool, many actions: `describe` (your position + reachable peers), `show` (the Pride hierarchy chart — 🦁 The Pride · Higher Office / Departments / Team, flattened to 3 tiers; `format:'list'` default = tight LLM-friendly chart, `'tree'` = vertical branch tree, `'columns'` = horizontal org-chart with boxes, `'image'` = render to PNG/SVG on disk and return `imagePath` for the channel's send-media tool — call with `format:'image'` when a chat user asks to *see* the org), `delegate` (cross-dept hand-off), `init` (bootstrap cfg.org from a template), `set` (update an existing agent's org block), `explain` (why this edge exists or doesn't), `plan` (reserved). Only surfaced when an org config is present.",
+      "Virtual-office surface. Single tool, many actions: `describe` (your position + reachable peers), `show` (the Pride hierarchy chart — 🦁 The Pride · Higher Office / Departments / Team, flattened to 3 tiers; `format:'list'` default = tight LLM-friendly chart, `'tree'` = vertical branch tree, `'columns'` = horizontal org-chart with boxes, `'image'` = render to PNG/SVG on disk and return `imagePath` for the channel's send-media tool — call with `format:'image'` when a chat user asks to *see* the org), `delegate` (cross-dept hand-off), `init` (bootstrap cfg.org from a template), `set` (update an existing agent's org block), `explain` (why this edge exists or doesn't), `plan` (reserved). Give each position a model tier (cheaper models for junior roles, top models for leadership): pass `provider:\"anthropic\"` + `model` on `set` — e.g. interns → `claude-haiku-4-5`, mid-level → `claude-sonnet-4-6`, executives/top-of-org → `claude-opus-4-8`. Only surfaced when an org config is present.",
     parameters: OrgParams,
     execute: async (
       _toolCallId: string,
@@ -407,7 +438,7 @@ export function makeOrgTool(
         case "init":
           return executeInit(params);
         case "set":
-          return executeSet(params);
+          return executeSet(params, senderIsOwner);
         case "explain":
           return executeExplain(params);
         case "plan":
@@ -986,6 +1017,7 @@ function filterTemplateAgents(
 
 async function executeSet(
   params: OrgToolParams,
+  senderIsOwner: boolean,
 ): Promise<AgentToolResult<OrgToolResult>> {
   const agentId = (params.agentId ?? "").trim();
   if (!agentId) {
@@ -1021,12 +1053,30 @@ async function executeSet(
     params.department === undefined &&
     params.reportsTo === undefined &&
     params.role === undefined &&
-    params.bio === undefined
+    params.bio === undefined &&
+    params.provider === undefined &&
+    params.model === undefined
   ) {
     return jsonResult({
       ok: false,
       error:
-        "org.set: nothing to update — pass at least one of department / reportsTo / role / bio",
+        "org.set: nothing to update — pass at least one of department / reportsTo / role / bio / provider / model",
+    } satisfies OrgSetResult) as AgentToolResult<OrgToolResult>;
+  }
+
+  // Owner-only model-tier gate. Re-pointing a position's brain
+  // (provider/model) is an owner-only act — a channel peer must never
+  // change which model an agent runs on. Per-call refusal (not a
+  // registration-time ownerOnly) so the message is actionable; mirrors
+  // message_action / connect_channel. Cosmetic org-block edits
+  // (department/reportsTo/role/bio) are unaffected.
+  const wantsModelTier =
+    params.provider !== undefined || params.model !== undefined;
+  if (wantsModelTier && !senderIsOwner) {
+    return jsonResult({
+      ok: false,
+      error:
+        "org.set: assigning a position's provider/model (model tier) is owner-only — a channel peer cannot re-point an agent's brain. Ask the operator to do this from the TUI.",
     } satisfies OrgSetResult) as AgentToolResult<OrgToolResult>;
   }
 
@@ -1055,10 +1105,16 @@ async function executeSet(
     params.role !== undefined ? params.role.trim() || undefined : undefined;
   const normBio =
     params.bio !== undefined ? params.bio.trim() || undefined : undefined;
+  const normProvider =
+    params.provider !== undefined
+      ? params.provider.trim() || undefined
+      : undefined;
+  const normModel =
+    params.model !== undefined ? params.model.trim() || undefined : undefined;
 
   try {
     const next = await mutateConfigAtomic((current: BrigadeConfig) => {
-      const merged: BrigadeConfig = { ...current };
+      let merged: BrigadeConfig = { ...current };
       const agents = { ...((merged.agents ?? {}) as Record<string, unknown>) };
       const target = { ...((agents[agentId] ?? {}) as Record<string, unknown>) };
       const prevOrg =
@@ -1071,6 +1127,18 @@ async function executeSet(
       target.org = nextOrg;
       agents[agentId] = target;
       merged.agents = agents as never;
+      // Model-tier write: reuse the canonical agent-config upsert so the
+      // shape (cfg.agents.<id>.provider + cfg.agents.<id>.model.primary)
+      // matches manage_agent / manage_provider exactly. Runs inside the
+      // same atomic mutation as the org-block edit, so the gateway hot-
+      // reloads both together on the next turn.
+      if (normProvider !== undefined || normModel !== undefined) {
+        merged = applyAgentConfig(merged, {
+          agentId,
+          ...(normProvider !== undefined ? { provider: normProvider } : {}),
+          ...(normModel !== undefined ? { model: normModel } : {}),
+        });
+      }
       return merged;
     });
     const writtenAgent = (next.agents as Record<string, unknown> | undefined)?.[
@@ -1080,6 +1148,12 @@ async function executeSet(
       ok: true,
       agentId,
       org: writtenAgent?.org,
+      ...(writtenAgent?.provider !== undefined
+        ? { provider: writtenAgent.provider }
+        : {}),
+      ...(writtenAgent?.model !== undefined
+        ? { model: writtenAgent.model }
+        : {}),
     } satisfies OrgSetResult) as AgentToolResult<OrgToolResult>;
   } catch (err) {
     return jsonResult({

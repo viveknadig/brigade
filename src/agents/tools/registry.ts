@@ -333,6 +333,9 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 					...(opts.sessionContext?.key !== undefined
 						? { agentSessionKey: opts.sessionContext.key }
 						: {}),
+					...(opts.senderIsOwner !== undefined
+						? { senderIsOwner: opts.senderIsOwner }
+						: {}),
 					...(opts.channelContext !== undefined
 						? {
 								channelContext: {

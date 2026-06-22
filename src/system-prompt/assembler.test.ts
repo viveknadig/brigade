@@ -715,7 +715,7 @@ describe("assembleSystemPrompt — org anchor (cfg.org defined → anchor appear
 			orgGraph: FIXTURE_ORG,
 		});
 		// The single-line anchor appears.
-		assert.match(out.text, /^Org: you are default, Chief of Staff, top-of-org\. Call org\(\{action:"describe"\}\) for direct reports \+ departments\.$/m);
+		assert.match(out.text, /^Org: you are default, Chief of Staff, top-of-org\. Call org\(\{action:"describe"\}\) for direct reports \+ departments\./m);
 		// And only once — defensive against an accidental double-render.
 		const occurrences = out.text.split(/^Org: you are /m).length - 1;
 		assert.equal(occurrences, 1, "anchor must render exactly once");

@@ -90,7 +90,7 @@ describe("renderOrgBlock — top-of-org caller (main)", () => {
     const out = renderOrgBlock(FIXTURE, "main");
     assert.equal(
       out,
-      `Org: you are main, Chief of Staff, top-of-org. Call org({action:"describe"}) for direct reports + departments.`,
+      `Org: you are main, Chief of Staff, top-of-org. Call org({action:"describe"}) for direct reports + departments. Each role can run on a different model tier — junior roles on a fast/cheap model, leadership on the strongest — set when you create or edit an agent.`,
     );
   });
 
@@ -120,7 +120,7 @@ describe("renderOrgBlock — non-top caller (department head + leaf)", () => {
     const out = renderOrgBlock(FIXTURE, "logistics");
     assert.equal(
       out,
-      `Org: you are logistics, Head of Logistics in logistics, reports to main. Call org({action:"describe"}) for peers + reachability.`,
+      `Org: you are logistics, Head of Logistics in logistics, reports to main. Call org({action:"describe"}) for peers + reachability. Each role can run on a different model tier — junior roles on a fast/cheap model, leadership on the strongest — set when you create or edit an agent.`,
     );
   });
 
@@ -128,7 +128,7 @@ describe("renderOrgBlock — non-top caller (department head + leaf)", () => {
     const out = renderOrgBlock(FIXTURE, "inventory");
     assert.equal(
       out,
-      `Org: you are inventory, Inventory Lead in logistics, reports to logistics. Call org({action:"describe"}) for peers + reachability.`,
+      `Org: you are inventory, Inventory Lead in logistics, reports to logistics. Call org({action:"describe"}) for peers + reachability. Each role can run on a different model tier — junior roles on a fast/cheap model, leadership on the strongest — set when you create or edit an agent.`,
     );
   });
 
@@ -161,7 +161,7 @@ describe("renderOrgBlock — role omission graceful", () => {
     const out = renderOrgBlock(noRole, "helper");
     assert.equal(
       out,
-      `Org: you are helper in office, reports to main. Call org({action:"describe"}) for peers + reachability.`,
+      `Org: you are helper in office, reports to main. Call org({action:"describe"}) for peers + reachability. Each role can run on a different model tier — junior roles on a fast/cheap model, leadership on the strongest — set when you create or edit an agent.`,
     );
     assert.doesNotMatch(out, /undefined/i);
     assert.doesNotMatch(out, /null/);
@@ -180,7 +180,7 @@ describe("renderOrgBlock — role omission graceful", () => {
     const out = renderOrgBlock(noRole, "main");
     assert.equal(
       out,
-      `Org: you are main, top-of-org. Call org({action:"describe"}) for direct reports + departments.`,
+      `Org: you are main, top-of-org. Call org({action:"describe"}) for direct reports + departments. Each role can run on a different model tier — junior roles on a fast/cheap model, leadership on the strongest — set when you create or edit an agent.`,
     );
     assert.doesNotMatch(out, /undefined/i);
     assert.doesNotMatch(out, /null/);
@@ -199,11 +199,11 @@ describe("renderOrgBlock — role omission graceful", () => {
     };
     assert.equal(
       renderOrgBlock(blankRole, "main"),
-      `Org: you are main, top-of-org. Call org({action:"describe"}) for direct reports + departments.`,
+      `Org: you are main, top-of-org. Call org({action:"describe"}) for direct reports + departments. Each role can run on a different model tier — junior roles on a fast/cheap model, leadership on the strongest — set when you create or edit an agent.`,
     );
     assert.equal(
       renderOrgBlock(blankRole, "helper"),
-      `Org: you are helper in office, reports to main. Call org({action:"describe"}) for peers + reachability.`,
+      `Org: you are helper in office, reports to main. Call org({action:"describe"}) for peers + reachability. Each role can run on a different model tier — junior roles on a fast/cheap model, leadership on the strongest — set when you create or edit an agent.`,
     );
   });
 });
