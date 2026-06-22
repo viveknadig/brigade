@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/spinabot/brigade/compare/brigade-v1.2.2...brigade-v1.3.0) (2026-06-22)
+
+
+### Features
+
+* **onboard:** subscription login, agnostic picker, org model-tiering, branded sign-in ([4c24e7e](https://github.com/spinabot/brigade/commit/4c24e7e552ef5e56643de0585d9409c5444e1eaa))
+
 ## [1.2.2](https://github.com/spinabot/brigade/compare/brigade-v1.2.1...brigade-v1.2.2) (2026-06-21)
 
 
