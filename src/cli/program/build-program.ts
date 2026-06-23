@@ -110,6 +110,12 @@ export function buildProgram(): Command {
   // Commander killing the process directly with exit(1).
   program.exitOverride();
 
+  // On a parse error (unknown option, bad arg) point the user at help instead
+  // of leaving them with a bare error. Unknown COMMANDS are handled separately:
+  // because `tui` is the default command, an unknown word becomes its [agent]
+  // positional — the tui action validates it and prints full help (see below).
+  program.showHelpAfterError("(run 'brigade --help' to see all commands)");
+
   // Storage boot — fires for every action in the command tree (Commander
   // propagates program-level hooks to subcommands). Help/version never reach
   // an action, so they stay storage-free. The import is dynamic to keep the
@@ -199,6 +205,31 @@ export function buildProgram(): Command {
     .option("-p, --port <port>", "gateway port (default: 7777)", (v) => parseInt(v, 10))
     .option("--agent <id>", "bind the TUI to this agent at startup (skips the /agent step)")
     .action(async (agentArg: string | undefined, opts: { envDetect?: boolean; host?: string; port?: number; agent?: string }) => {
+      // FOOTGUN GUARD. `tui` is the DEFAULT command, so a mistyped or unknown
+      // command (`brigade upgarde`, `brigade foo`) doesn't error — Commander
+      // routes the unknown word here as the positional [agent]. Without this
+      // check it would silently START THE GATEWAY bound to a bogus agent. So:
+      // a BARE positional that isn't a real agent id is treated as an unknown
+      // command — print help and exit, never launch. (The explicit `--agent`
+      // flag is deliberate intent and is left to resolve downstream.)
+      if (agentArg && !opts.agent) {
+        const known = new Set<string>();
+        try {
+          const { loadConfig } = await import("../../core/config.js");
+          const { listAgentEntries } = await import("../commands/agents-config.js");
+          const { DEFAULT_AGENT_ID } = await import("../../agents/routing/session-key.js");
+          known.add(DEFAULT_AGENT_ID);
+          for (const a of listAgentEntries(loadConfig())) known.add(a.id);
+        } catch {
+          known.add("main"); // config unreadable → only the default agent is known
+        }
+        if (!known.has(agentArg)) {
+          process.stderr.write(`error: unknown command '${agentArg}'\n\n`);
+          program.outputHelp();
+          await exitAfterFlush(1);
+          return;
+        }
+      }
       const { runChatCommand } = await import("../commands/chat.js");
       // Flag wins over positional when both are given; otherwise the
       // positional (npm path) supplies the binding.
@@ -423,6 +454,23 @@ export function buildProgram(): Command {
       await exitAfterFlush(
         await runDoctorCommand({ host: opts.host, port: opts.port, json: opts.json, strict: opts.strict }),
       );
+    });
+
+  /* ─────────────────────────────── update ─────────────────────────────── */
+
+  program
+    .command("update", { isDefault: false })
+    .aliases(["upgrade"])
+    .description(
+      "Update Brigade to the latest published version (npm).\n" +
+        "  Examples:\n" +
+        "    brigade update          # upgrade to the latest release\n" +
+        "    brigade update --check  # just report if a newer version exists",
+    )
+    .option("--check", "report current vs latest without installing", false)
+    .action(async (opts: { check?: boolean }) => {
+      const { runUpdateCommand } = await import("../commands/update.js");
+      await exitAfterFlush(await runUpdateCommand({ check: opts.check }));
     });
 
   /* ─────────────────────────────── config ─────────────────────────────── */
