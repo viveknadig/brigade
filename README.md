@@ -18,6 +18,12 @@
 </p>
 
 <p align="center">
+  🔑 <strong>No API key? No problem.</strong> Sign in with your <strong>Claude</strong>, <strong>ChatGPT</strong>, or
+  <strong>Copilot</strong> subscription — or, if you're already signed into the <strong>Claude Code</strong> or
+  <strong>Codex</strong> CLI, reuse that login (no browser, no re-auth).
+</p>
+
+<p align="center">
   <a href="https://github.com/spinabot/brigade/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/spinabot/brigade/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI" alt="CI status"></a>
   <a href="https://www.npmjs.com/package/@spinabot/brigade"><img src="https://img.shields.io/npm/v/@spinabot/brigade?style=for-the-badge&logo=npm&logoColor=white&color=CB3837" alt="npm version"></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/node/v/@spinabot/brigade?style=for-the-badge&logo=nodedotjs&logoColor=white&color=5FA04E&label=node" alt="node engine"></a>
@@ -145,7 +151,8 @@ brigade tui
 
 The onboarding wizard walks you through **five steps**: **(0) storage mode**
 (filesystem or self-hosted Convex), **(1) pick a provider** (Anthropic, OpenAI, Gemini,
-OpenRouter, Ollama, and more), **(2) connect it** (paste an API key, validated live, or
+OpenRouter, Ollama, and more), **(2) connect it** (paste an API key, **sign in with a
+Claude/ChatGPT/Copilot subscription**, reuse your Claude Code or Codex CLI login, or
 connect local Ollama), **(3) choose a default model**, and **(4) web search** (pick a
 search backend; keyless options work out of the box). Subsequent launches resume right
 where you left off.
@@ -605,6 +612,18 @@ Cerebras, xAI, DeepSeek, Mistral, **Ollama** (local), and **Custom**
 OpenAI-compatible endpoints (Together, Fireworks, vLLM, LM Studio, on-prem gateways
 — anything that speaks `/v1/chat/completions`). Connect several at once, switch with
 `/model`, and Brigade keeps your context across the switch.
+
+**Sign in with a subscription — no API key.** Don't want to manage keys, consoles,
+and billing? Use the subscription you already pay for. Two ways, both keyless:
+
+- **Browser sign-in** — `brigade login` signs in to **Claude Pro/Max**, **ChatGPT
+  Plus/Pro**, or **GitHub Copilot** over OAuth (also offered inside `brigade onboard`).
+- **Reuse a CLI login** — already signed into the **Claude Code** or **Codex** CLI on
+  this machine? `brigade onboard` offers *"Reuse this machine's login"* — one keystroke,
+  no browser, no re-auth.
+
+Keys still work if you prefer them; either way the credential is sealed on your own
+machine (auto-refreshed when the provider supports it).
 
 **Web search** is pluggable and auto-selected by what you've configured: Tavily,
 Brave, Exa, Perplexity, Firecrawl, SearXNG (keyed) and DuckDuckGo, Wikipedia, Hacker
