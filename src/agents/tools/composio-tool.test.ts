@@ -138,6 +138,8 @@ describe("composio tool", () => {
 		assert.equal(payload.ok, true);
 		assert.equal(payload.redirectUrl, "https://connect.composio.dev/link/lk_x");
 		assert.equal(payload.connectionId, "ca_linked");
+		// The link is handed over as a clickable markdown link, not a bare URL.
+		assert.match(payload.message, /\[Authorize Gmail\]\(https:\/\/connect\.composio\.dev\/link\/lk_x\)/);
 	});
 
 	it("connect surfaces an actionable message for BYO apps (no managed auth → create 400s)", async () => {

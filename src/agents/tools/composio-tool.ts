@@ -15,6 +15,8 @@
  *   action="status"   [connectionId]         → instant connection state / list connections
  *   action="search"   query="send an email"  → find the right tool slug(s)
  *   action="execute"  tool="GMAIL_SEND_EMAIL" arguments={…} → run it
+ *   action="disconnect" [connectionId|app|all=true] → remove connected account(s)
+ *   action="refresh"  connectionId            → re-mint a connection's credentials
  *
  * The key resolves from ANYWHERE: the sealed credential profile first, then
  * config `tools.composio.apiKey`, then the `COMPOSIO_API_KEY` env. The tool is
@@ -93,6 +95,11 @@ interface ComposioLike {
 		/** Composio-MANAGED OAuth connect — the live path (authorize()/initiate() were
 		 *  retired for managed auth); returns a redirect URL for the operator to click. */
 		link(userId: string, authConfigId: string, options?: Record<string, unknown>): Promise<ComposioConnectionRequest>;
+		/** Remove a connected account by id. Uses the SDK's current (v3) endpoint —
+		 *  no manual API/version juggling. */
+		delete(id: string): Promise<unknown>;
+		/** Refresh a connected account's stored credentials (re-mint OAuth tokens etc.). */
+		refresh(id: string, options?: Record<string, unknown>): Promise<unknown>;
 	};
 }
 
@@ -105,10 +112,12 @@ const ComposioParams = Type.Object({
 			Type.Literal("status"),
 			Type.Literal("search"),
 			Type.Literal("execute"),
+			Type.Literal("disconnect"),
+			Type.Literal("refresh"),
 		],
 		{
 			description:
-				"set-key: seal the operator's Composio API key. apps: discover which apps are connectable (live catalog; optionally filter with query). connect: start an OAuth link to connect an app. status: check a pending connection (instant) or list connected apps. search: find the right tool slug for a task. execute: run a tool.",
+				"set-key: seal the operator's Composio API key. apps: discover which apps are connectable (live catalog; optionally filter with query). connect: start an OAuth link to connect an app. status: check a pending connection (instant) or list connected apps with their ids. search: find the right tool slug for a task. execute: run a tool. disconnect: remove connected account(s) — one by connectionId, all of an app by app, or every one with all:true. refresh: re-mint a connected account's credentials by connectionId.",
 		},
 	),
 	key: Type.Optional(
@@ -131,8 +140,14 @@ const ComposioParams = Type.Object({
 	connectionId: Type.Optional(
 		Type.String({
 			description:
-				"A connection id from a prior connect. For status: checks whether it's active yet. For execute: targets that specific connected account (only needed if the same app is connected more than once).",
+				"A connection id (e.g. \"ca_…\"). For status: checks whether it's active yet. For execute: targets that specific connected account (only needed if the same app is connected more than once). For disconnect/refresh: the single account to remove/refresh. List ids with action:\"status\".",
 			maxLength: 128,
+		}),
+	),
+	all: Type.Optional(
+		Type.Boolean({
+			description:
+				"disconnect: set true to remove EVERY connected account for the operator. Explicit opt-in — required for the bulk delete when neither connectionId nor app is given.",
 		}),
 	),
 });
@@ -415,8 +430,9 @@ export function makeComposioTool(opts?: {
 		description: [
 			"Connect to and act on 1,000+ external apps (Gmail, Slack, GitHub, Notion, … and any app Composio adds later) via Composio.",
 			'FIRST the operator must provide a Composio API key: action="set-key" with key="<their key>" — it is sealed (encrypted at rest), never echoed, and verified with Composio when set. IMPORTANT when telling the operator where to get the key: dashboard.composio.dev → switch the top-left toggle to PLATFORM (NOT "FOR YOU") → Settings → API Keys; a PLATFORM key starts with "ak_". A "FOR YOU" key (starts with "ck_") is for desktop AI clients and will be rejected. If a connect/search/execute reports "not configured" or "key rejected", ask the operator for a current PLATFORM key and set-key it.',
-			'To discover what is connectable: action="apps" (optionally query="<substring>") → live catalog of app slugs (nothing hardcoded). Then action="connect" with app="<slug>" → returns an OAuth link; give it to the operator to click, then action="status" with the returned connectionId (instant — does NOT block).',
+			'To discover what is connectable: action="apps" (optionally query="<substring>") → live catalog of app slugs (nothing hardcoded). Then action="connect" with app="<slug>" → returns an OAuth link; give it to the operator to click, then action="status" with the returned connectionId (instant — does NOT block). ALWAYS hand connect/authorize links to the operator as a clickable markdown link — [Authorize <App>](<url>) — exactly as the tool returns it, never as a bare URL.',
 			'action="search" with query="<what you want to do>" (optionally app="<slug>") → returns candidate tool slugs. action="execute" with tool="<SLUG>" and arguments={…} → runs it.',
+			'To MANAGE existing connections: action="status" lists connected accounts with their ids; action="disconnect" removes them (connectionId="ca_…" for one, app="gmail" for all of an app, or all=true for every one); action="refresh" with connectionId re-mints a connection\'s credentials. These go through the Composio SDK — do NOT curl the API by hand.',
 			"Prefer apps→connect and search→execute over guessing slugs. Owner-only; call only on the operator's request.",
 		].join(" "),
 		parameters: ComposioParams,
@@ -528,9 +544,13 @@ export function makeComposioTool(opts?: {
 						if (sessionKey && req.id) {
 							watchComposioConnection({ composio, connectionId: req.id, app, sessionKey, agentId });
 						}
+						// Hand the link to the operator as a clickable markdown link (NOT a
+						// bare URL) so chat + TUI render it like the OAuth flow does. Keep the
+						// `[Authorize <app>](<url>)` shape verbatim when relaying to the user.
+						const appTitle = app.charAt(0).toUpperCase() + app.slice(1);
 						return ok(
 							req.redirectUrl
-								? `Send the operator this link to connect ${app}: ${req.redirectUrl}${
+								? `Give the operator this link to connect ${app}: [Authorize ${appTitle}](${req.redirectUrl})${
 										watching
 											? " — once they click it and authorize, I'll confirm automatically (no need to tell me)."
 											: ` — after they click it, run composio({action:"status", connectionId:"${req.id}"}) to confirm it went active.`
@@ -590,6 +610,58 @@ export function makeComposioTool(opts?: {
 							data: capData(res.data),
 							message: res.successful ? `Executed ${slug}.` : `Tool ${slug} failed: ${res.error ?? "unknown error"}.`,
 						} satisfies ComposioResult) as AgentToolResult<ComposioResult>;
+					}
+					case "disconnect": {
+						// Remove connected account(s). Resolve the target set first: a single
+						// id, every account of one app, or all of them (explicit opt-in). The
+						// SDK's delete() hits Composio's current (v3) endpoint, so the crew
+						// never has to hand-roll the API or guess versions.
+						const cid = (args.connectionId ?? "").trim();
+						const app = (args.app ?? "").trim().toLowerCase();
+						let targets: Array<{ id: string; toolkit?: string; status?: string }>;
+						if (cid) {
+							targets = [{ id: cid }];
+						} else if (app) {
+							targets = projectAccounts(await composio.connectedAccounts.list({ userIds: [userId] })).filter(
+								(a) => (a.toolkit ?? "").toLowerCase() === app,
+							);
+							if (targets.length === 0)
+								return fail(`No connected accounts for "${app}". Run action:"status" to see what's connected.`);
+						} else if (args.all === true) {
+							targets = projectAccounts(await composio.connectedAccounts.list({ userIds: [userId] }));
+							if (targets.length === 0) return ok("No connected accounts to remove.", { data: { deleted: [], count: 0 } });
+						} else {
+							return fail(
+								'disconnect needs a target: connectionId:"ca_…" (one), app:"gmail" (all of that app), or all:true (every connected account). List them with action:"status".',
+							);
+						}
+						const deleted: string[] = [];
+						const failed: Array<{ id: string; error: string }> = [];
+						for (const t of targets) {
+							try {
+								await composio.connectedAccounts.delete(t.id);
+								deleted.push(t.id);
+							} catch (err) {
+								failed.push({ id: t.id, error: err instanceof Error ? err.message : String(err) });
+							}
+						}
+						const scope = cid ? `connection ${cid}` : app ? `all "${app}" connection(s)` : "all connected accounts";
+						return jsonResult({
+							action: "disconnect",
+							ok: failed.length === 0,
+							message:
+								failed.length === 0
+									? `Disconnected ${deleted.length} account(s) (${scope}).`
+									: `Disconnected ${deleted.length}/${targets.length} (${scope}); ${failed.length} failed.`,
+							data: { deleted, failed, count: deleted.length },
+						} satisfies ComposioResult) as AgentToolResult<ComposioResult>;
+					}
+					case "refresh": {
+						const cid = (args.connectionId ?? "").trim();
+						if (!cid)
+							return fail('refresh needs a connectionId (the account to refresh, e.g. "ca_…"). List ids with action:"status".');
+						await composio.connectedAccounts.refresh(cid);
+						return ok(`Refreshed credentials for connection ${cid}.`, { connectionId: cid });
 					}
 					default:
 						return fail(`Unknown action "${String(args.action)}".`);
