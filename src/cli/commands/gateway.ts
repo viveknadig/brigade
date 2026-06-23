@@ -226,6 +226,12 @@ async function sendShutdownRpc(args: { host?: string; port?: number; timeoutMs: 
 			settled = true;
 			try {
 				ws.removeAllListeners();
+				// Closing a socket that hasn't finished connecting makes `ws` emit an
+				// 'error' ("WebSocket was closed before the connection was
+				// established"). We just removed our listeners, so absorb it with a
+				// no-op sink — otherwise Node turns it into an unhandled 'error' and
+				// crashes the CLI (same class as the probeGateway teardown crash).
+				ws.on("error", () => {});
 				ws.close();
 			} catch {
 				/* ignore */
