@@ -544,6 +544,46 @@ describe("connectTelegram outbound", () => {
 		await conn.close();
 	});
 
+	it("sendText with replyToMessageId sets reply_parameters.message_id", async () => {
+		const bot = makeFakeBot();
+		const runner = makeFakeRunner();
+		const conn = await connectTelegram({
+			token: "tkn",
+			log: noopLog,
+			onMessage: () => {},
+			botFactory: () => bot,
+			runnerFactory: () => runner,
+			sleepImpl: instantSleep,
+		});
+		await conn.sendText("555", "hi", { replyToMessageId: "77" });
+		assert.equal(bot.sent.length, 1);
+		const rp = bot.sent[0]?.opts?.reply_parameters as
+			| { message_id?: number; allow_sending_without_reply?: boolean }
+			| undefined;
+		assert.equal(rp?.message_id, 77, "quotes the target message id (numeric)");
+		assert.equal(rp?.allow_sending_without_reply, true, "still sends if the quoted message vanished");
+		runner.finish();
+		await conn.close();
+	});
+
+	it("sendText WITHOUT replyToMessageId sets no reply_parameters (back-compat)", async () => {
+		const bot = makeFakeBot();
+		const runner = makeFakeRunner();
+		const conn = await connectTelegram({
+			token: "tkn",
+			log: noopLog,
+			onMessage: () => {},
+			botFactory: () => bot,
+			runnerFactory: () => runner,
+			sleepImpl: instantSleep,
+		});
+		await conn.sendText("555", "hi");
+		assert.equal(bot.sent.length, 1);
+		assert.equal(bot.sent[0]?.opts?.reply_parameters, undefined, "no quote when omitted");
+		runner.finish();
+		await conn.close();
+	});
+
 	it("sendText rejects after a 401 marked the token invalid", async () => {
 		const bot = makeFakeBot();
 		bot.api.getMe = async () => {

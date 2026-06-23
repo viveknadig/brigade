@@ -232,6 +232,76 @@ describe("inbound-pipeline: /agent <id> interception writes binding + suppresses
 	});
 });
 
+describe("inbound-pipeline: native replyToId on the answer send", () => {
+	it("the dispatched answer quotes the inbound (opts.replyToId === msg.messageId)", async () => {
+		writeConfig({ agents: { main: {} }, channels: { fake: { dmPolicy: "open" } } });
+		const fake = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [fake.adapter],
+			config: loadConfig(),
+			agentId: "main",
+			runTurn: async () => ({ reply: "here is my answer" }),
+		});
+		await fake.ctx().onInbound({
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			messageId: "INBOUND-42",
+			text: "what's up?",
+		});
+		// One reply send carrying the answer, quoting the inbound message id.
+		const answer = fake.sentWithOpts.find((s) => s.text === "here is my answer");
+		assert.ok(answer, "the agent's answer was sent");
+		assert.equal(answer?.opts?.replyToId, "INBOUND-42", "answer natively quotes the inbound");
+		await mgr.stop();
+	});
+
+	it("back-compat: an inbound with NO messageId yields an answer send with no replyToId", async () => {
+		writeConfig({ agents: { main: {} }, channels: { fake: { dmPolicy: "open" } } });
+		const fake = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [fake.adapter],
+			config: loadConfig(),
+			agentId: "main",
+			runTurn: async () => ({ reply: "no-id answer" }),
+		});
+		await fake.ctx().onInbound({
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			// no messageId
+			text: "ping",
+		});
+		const answer = fake.sentWithOpts.find((s) => s.text === "no-id answer");
+		assert.ok(answer, "the agent's answer was sent");
+		assert.equal(answer?.opts?.replyToId, undefined, "no quote when the inbound has no id");
+		await mgr.stop();
+	});
+
+	it("a slash-command reply is NOT quoted (only genuine reply-to-inbound sends set replyToId)", async () => {
+		writeConfig({ agents: { main: {}, ops: {} }, channels: { fake: { dmPolicy: "open" } } });
+		const fake = makeFakeChannel();
+		const mgr = await startChannels({
+			adapters: [fake.adapter],
+			config: loadConfig(),
+			agentId: "main",
+			runTurn: async () => ({ reply: "should not happen" }),
+		});
+		await fake.ctx().onInbound({
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			messageId: "INBOUND-7",
+			text: "/agent ops",
+		});
+		// The slash handler's confirmation send must NOT carry a reply quote.
+		const cmdReply = fake.sentWithOpts.find((s) => /Pinned/.test(s.text));
+		assert.ok(cmdReply, "slash command produced a reply");
+		assert.equal(cmdReply?.opts?.replyToId, undefined, "command replies are not quoted");
+		await mgr.stop();
+	});
+});
+
 describe("inbound-pipeline: recorded owner on a separate-bot channel (secure model)", () => {
 	const BOT_ID = "bot999"; // adapter.selfId() — the bot, NOT the operator
 	const OWNER = "operator123";

@@ -207,6 +207,125 @@ describe("composio tool", () => {
 		const p2 = r2.details as { data: { apps: Array<{ slug: string }> } };
 		assert.deepEqual(p2.data.apps.map((a) => a.slug), ["brandnewapp"]);
 	});
+
+	it("disconnect by connectionId deletes exactly that account via the SDK", async () => {
+		const agentId = "composio-disc-one";
+		const deletes: string[] = [];
+		const t = makeComposioTool({
+			agentId,
+			clientFactory: async () =>
+				fakeComposio({
+					connectedAccounts: {
+						list: async () => ({ items: [] }),
+						delete: async (id: string) => {
+							deletes.push(id);
+							return { success: true };
+						},
+					},
+				}),
+		});
+		await t.execute("k", { action: "set-key", key: "csk_ok" } as never);
+		const r = await t.execute("d", { action: "disconnect", connectionId: "ca_one" } as never);
+		const payload = r.details as { ok: boolean; data: { deleted: string[]; count: number } };
+		assert.equal(payload.ok, true);
+		assert.deepEqual(deletes, ["ca_one"]);
+		assert.equal(payload.data.count, 1);
+	});
+
+	it("disconnect all=true deletes every connected account", async () => {
+		const agentId = "composio-disc-all";
+		const deletes: string[] = [];
+		const accounts = {
+			items: [
+				{ id: "ca_a", toolkit: { slug: "gmail" }, status: "ACTIVE" },
+				{ id: "ca_b", toolkit: { slug: "github" }, status: "ACTIVE" },
+				{ id: "ca_c", toolkit: { slug: "youtube" }, status: "ACTIVE" },
+			],
+		};
+		const t = makeComposioTool({
+			agentId,
+			clientFactory: async () =>
+				fakeComposio({
+					connectedAccounts: {
+						list: async () => accounts,
+						delete: async (id: string) => {
+							deletes.push(id);
+							return { success: true };
+						},
+					},
+				}),
+		});
+		await t.execute("k", { action: "set-key", key: "csk_ok" } as never);
+		const r = await t.execute("d", { action: "disconnect", all: true } as never);
+		const payload = r.details as { ok: boolean; data: { count: number } };
+		assert.equal(payload.ok, true);
+		assert.deepEqual(deletes.sort(), ["ca_a", "ca_b", "ca_c"]);
+		assert.equal(payload.data.count, 3);
+	});
+
+	it("disconnect by app deletes only that app's accounts", async () => {
+		const agentId = "composio-disc-app";
+		const deletes: string[] = [];
+		const accounts = {
+			items: [
+				{ id: "ca_gmail1", toolkit: { slug: "gmail" } },
+				{ id: "ca_gmail2", toolkit: { slug: "gmail" } },
+				{ id: "ca_gh", toolkit: { slug: "github" } },
+			],
+		};
+		const t = makeComposioTool({
+			agentId,
+			clientFactory: async () =>
+				fakeComposio({
+					connectedAccounts: {
+						list: async () => accounts,
+						delete: async (id: string) => {
+							deletes.push(id);
+							return { success: true };
+						},
+					},
+				}),
+		});
+		await t.execute("k", { action: "set-key", key: "csk_ok" } as never);
+		const r = await t.execute("d", { action: "disconnect", app: "gmail" } as never);
+		const payload = r.details as { ok: boolean; data: { count: number } };
+		assert.equal(payload.ok, true);
+		assert.deepEqual(deletes.sort(), ["ca_gmail1", "ca_gmail2"]);
+		assert.equal(payload.data.count, 2);
+	});
+
+	it("disconnect with no target refuses (won't nuke everything by accident)", async () => {
+		const agentId = "composio-disc-guard";
+		const t = makeComposioTool({ agentId, clientFactory: async () => fakeComposio() });
+		await t.execute("k", { action: "set-key", key: "csk_ok" } as never);
+		const r = await t.execute("d", { action: "disconnect" } as never);
+		const payload = r.details as { ok: boolean; message: string };
+		assert.equal(payload.ok, false);
+		assert.match(payload.message, /connectionId|app|all/i);
+	});
+
+	it("refresh re-mints a connection's credentials by id", async () => {
+		const agentId = "composio-refresh";
+		const refreshed: string[] = [];
+		const t = makeComposioTool({
+			agentId,
+			clientFactory: async () =>
+				fakeComposio({
+					connectedAccounts: {
+						list: async () => ({ items: [] }),
+						refresh: async (id: string) => {
+							refreshed.push(id);
+							return { id, status: "ACTIVE" };
+						},
+					},
+				}),
+		});
+		await t.execute("k", { action: "set-key", key: "csk_ok" } as never);
+		const r = await t.execute("r", { action: "refresh", connectionId: "ca_x" } as never);
+		const payload = r.details as { ok: boolean };
+		assert.equal(payload.ok, true);
+		assert.deepEqual(refreshed, ["ca_x"]);
+	});
 });
 
 describe("composio projections (pure — no network)", () => {

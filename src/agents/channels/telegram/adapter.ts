@@ -297,31 +297,40 @@ export function createTelegramAdapter(opts: CreateTelegramAdapterOptions = {}): 
 				throw new Error("Telegram token is invalid — run `brigade channels add --channel telegram` with a new token, then retry.");
 			}
 			const threadId = opts?.threadId;
+			// Native reply target (Telegram `reply_parameters.message_id`). Applied
+			// to the FIRST chunk only — quoting every chunk of a long reply would
+			// render a chain of quoted messages. Omitted → unquoted send (unchanged).
+			const replyToMessageId = opts?.replyToId;
 			// Chunk on the RAW markdown so fences/paragraphs aren't shredded, then
 			// convert each chunk to Telegram HTML and send. A chunk whose HTML is
 			// empty (syntax-only) or that Telegram rejects with a parse error is
 			// re-sent as plain text.
 			const chunks = chunkText(text, { limit: TELEGRAM_TEXT_LIMIT });
+			let first = true;
 			for (const chunk of chunks) {
+				// Only the first chunk carries the reply quote.
+				const replyOpt = first && replyToMessageId ? { replyToMessageId } : {};
 				const html = markdownToTelegramHtml(chunk);
 				if (telegramHtmlIsEmpty(html)) {
 					// Nothing renderable — send the raw chunk as plain text (if it has any).
 					if (chunk.trim().length > 0) {
-						await connection.sendText(conversationId, chunk, { threadId });
+						await connection.sendText(conversationId, chunk, { threadId, ...replyOpt });
+						first = false;
 					}
 					continue;
 				}
 				try {
-					await connection.sendText(conversationId, html, { html: true, threadId });
+					await connection.sendText(conversationId, html, { html: true, threadId, ...replyOpt });
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
 					if (PARSE_ERROR_RE.test(msg) && chunk.trim().length > 0) {
 						// HTML failed to parse — fall back to the plain chunk.
-						await connection.sendText(conversationId, chunk, { threadId });
+						await connection.sendText(conversationId, chunk, { threadId, ...replyOpt });
 					} else {
 						throw err;
 					}
 				}
+				first = false;
 			}
 		},
 

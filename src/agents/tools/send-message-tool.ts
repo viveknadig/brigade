@@ -97,6 +97,14 @@ const SendMessageParams = Type.Object({
 				"unset for the default account.",
 		}),
 	),
+	replyToId: Type.Optional(
+		Type.String({
+			description:
+				"Optional: native reply target — the channel-native id of a message " +
+				"to QUOTE (WhatsApp quote, Telegram reply). Channels without native " +
+				"reply linkage ignore it. Leave unset for an ordinary (unquoted) send.",
+		}),
+	),
 });
 
 type SendMessageDetails = {
@@ -172,6 +180,7 @@ export function makeSendMessageTool(
 			const toRaw = readStringParam(params, "to");
 			const threadIdParam = readStringParam(params, "threadId");
 			const accountId = readStringParam(params, "accountId");
+			const replyToId = readStringParam(params, "replyToId");
 			// Per-call non-owner gate. A channel-routed peer may only
 			// reply-to-their-own-chat: BOTH `channel` and `to` either
 			// (a) unset (auto-fill from channelContext below), OR
@@ -299,9 +308,11 @@ export function makeSendMessageTool(
 					if (typeof mods.accountId === "string") resolvedAccountId = mods.accountId;
 				}
 			}
-			const opts2: { threadId?: string; accountId?: string } = {};
+			const opts2: { threadId?: string; accountId?: string; replyToId?: string } = {};
 			if (threadId) opts2.threadId = threadId;
 			if (resolvedAccountId) opts2.accountId = resolvedAccountId;
+			// Native reply target — additive; channels without reply linkage ignore it.
+			if (replyToId) opts2.replyToId = replyToId;
 			try {
 				await adapter.sendText(to, text, Object.keys(opts2).length > 0 ? opts2 : undefined);
 			} catch (err) {

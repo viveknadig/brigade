@@ -264,6 +264,10 @@ export {
 	/** Turn a loose `to` into a concrete outbound target via the channel's messaging adapter (or
 	 *  return the raw `to` unchanged when none is registered). Never throws. */
 	resolveOutboundTarget,
+	/** Canonicalise an INCOMING peer id to a stable conversation/session identity via the channel's
+	 *  messaging adapter (the inverse of `resolveOutboundTarget`); returns the raw peer id unchanged
+	 *  when the channel doesn't opt in. Never throws. */
+	resolveInboundConversation,
 	/** Heuristic: does a `to` read like a human contact NAME (vs an already-concrete id)? */
 	looksLikeContactName,
 } from "./channel-messaging-registry.js";

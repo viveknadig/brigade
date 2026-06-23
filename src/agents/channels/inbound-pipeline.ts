@@ -56,6 +56,7 @@ import { resolveAgentRoute } from "../routing/resolve-route.js";
 import { normalizeAccountId } from "../routing/account-id.js";
 import { resolveThreadSessionKeys } from "../routing/session-key.js";
 import { resolveLinkedPeerIdFromConfig } from "../identity-links.js";
+import { resolveInboundConversation } from "./channel-messaging-registry.js";
 import { sanitizeReplyForChannel } from "./reply-sanitizer.js";
 import { classifyErrorReason, isBrigadeRetryError } from "../error-classifier.js";
 import { isRetryExhaustedError } from "../retry-policy.js";
@@ -442,7 +443,7 @@ async function safeSendText(
 	adapter: ChannelAdapter,
 	conversationId: string,
 	text: string,
-	opts: { threadId?: string; accountId?: string } | undefined,
+	opts: { threadId?: string; accountId?: string; replyToId?: string } | undefined,
 ): Promise<void> {
 	try {
 		await adapter.sendText(conversationId, text, opts);
@@ -455,11 +456,24 @@ async function safeSendText(
 	}
 }
 
-/** Build the opts object the adapter expects, omitting undefined keys. */
-function buildSendOpts(threadId?: string, accountId?: string): { threadId?: string; accountId?: string } | undefined {
-	const out: { threadId?: string; accountId?: string } = {};
+/**
+ * Build the opts object the adapter expects, omitting undefined keys.
+ *
+ * `replyToId` is OPTIONAL and additive: pass the inbound message's id ONLY at a
+ * genuine reply-to-inbound send site so the adapter quotes the message it
+ * answers (WhatsApp quote / Telegram `reply_parameters`). Omit it everywhere
+ * else — a build with no `replyToId` produces a byte-identical opts object to
+ * before this field existed, so non-reply sends are unchanged.
+ */
+function buildSendOpts(
+	threadId?: string,
+	accountId?: string,
+	replyToId?: string,
+): { threadId?: string; accountId?: string; replyToId?: string } | undefined {
+	const out: { threadId?: string; accountId?: string; replyToId?: string } = {};
 	if (threadId) out.threadId = threadId;
 	if (accountId) out.accountId = accountId;
+	if (replyToId) out.replyToId = replyToId;
 	return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -622,7 +636,9 @@ export async function runChannelInboundPipeline(
 					channelLabel: adapter.label,
 					idLabel: adapter.pairing?.idLabel,
 				}),
-				buildSendOpts(msg.threadId, msg.accountId),
+				// Genuine reply-to-inbound: quote the message that triggered the
+				// challenge so the requester sees what they're being asked to verify.
+				buildSendOpts(msg.threadId, msg.accountId, msg.messageId),
 			);
 			if (msg.messageId && adapter.markRead) {
 				try {
@@ -838,12 +854,19 @@ export async function runChannelInboundPipeline(
 		const rawAccountId = msg.accountId?.trim() || msg.conversationId;
 		const normalizedAccountId = normalizeAccountId(rawAccountId);
 		const peerKind = isGroup ? "group" : "direct";
+		// INBOUND conversation resolution (the inverse of the outbound
+		// `resolveOutboundTarget`): canonicalise the incoming peer id via the
+		// channel's registered `messaging` adapter so a name-addressed inbound
+		// collapses onto the SAME conversation/session outbound resolves to. When
+		// the channel doesn't opt in, this returns `msg.from` unchanged, so the
+		// config-link resolve + routing below are byte-identical to before.
+		const inboundPeerId = resolveInboundConversation({ channelId: adapter.id, peerId: msg.from });
 		const canonicalPeerId =
 			resolveLinkedPeerIdFromConfig({
 				config: cfg,
 				channel: adapter.id,
-				peerId: msg.from,
-			}) ?? msg.from;
+				peerId: inboundPeerId,
+			}) ?? inboundPeerId;
 		const route = resolveAgentRoute({
 			cfg,
 			channel: adapter.id,
@@ -927,7 +950,8 @@ export async function runChannelInboundPipeline(
 				}
 			}
 		}
-		// Immediate dispatch.
+		// Immediate dispatch. Pass the inbound's id as the reply target so the
+		// agent's answer NATIVELY quotes the message it answers.
 		await dispatchTurn(ctx, {
 			text,
 			sessionKey,
@@ -935,6 +959,7 @@ export async function runChannelInboundPipeline(
 			conversationId: msg.conversationId,
 			...(msg.threadId !== undefined ? { threadId: msg.threadId } : {}),
 			...(msg.accountId !== undefined ? { accountId: msg.accountId } : {}),
+			...(msg.messageId !== undefined ? { replyToId: msg.messageId } : {}),
 			senderIsOwner,
 			channelApprovalRoute,
 		});
@@ -963,6 +988,13 @@ export async function runChannelInboundPipeline(
 			conversationId: string;
 			threadId?: string;
 			accountId?: string;
+			/**
+			 * Channel-native id of the inbound message this turn answers. When
+			 * present it is threaded into every reply send below (stream open,
+			 * reasoning, final answer) so the reply NATIVELY quotes the message it
+			 * answers. Undefined → no quote (byte-identical to before).
+			 */
+			replyToId?: string;
 			senderIsOwner?: boolean;
 			channelApprovalRoute?: ChannelApprovalRoute;
 		},
@@ -1000,7 +1032,7 @@ export async function runChannelInboundPipeline(
 			try {
 				replyStream = c.adapter.beginReplyStream(
 					a.conversationId,
-					buildSendOpts(a.threadId, a.accountId),
+					buildSendOpts(a.threadId, a.accountId, a.replyToId),
 				);
 			} catch {
 				replyStream = null;
@@ -1068,7 +1100,7 @@ export async function runChannelInboundPipeline(
 					await c.adapter.deliverReasoning(
 						a.conversationId,
 						result.reply ?? "",
-						buildSendOpts(a.threadId, a.accountId),
+						buildSendOpts(a.threadId, a.accountId, a.replyToId),
 					);
 				} catch (err) {
 					log.warn("deliverReasoning failed (non-fatal)", {
@@ -1140,7 +1172,7 @@ export async function runChannelInboundPipeline(
 			const sent = await c.adapter.sendText(
 				a.conversationId,
 				reply,
-				buildSendOpts(a.threadId, a.accountId),
+				buildSendOpts(a.threadId, a.accountId, a.replyToId),
 			);
 			recordLastSentMessage({
 				agentId: a.agentId,
@@ -1180,6 +1212,9 @@ export async function runChannelInboundPipeline(
 		const conversationId = slot.baseMsg.conversationId;
 		const threadId = slot.baseMsg.threadId;
 		const accountId = slot.baseMsg.accountId;
+		// Coalesced turn: quote the FIRST message of the debounce window (the one
+		// that opened the slot) as the reply target.
+		const replyToId = slot.baseMsg.messageId;
 		// Plugin hook: `before_dispatch` (CLAIMING) — debounced path. Same hook
 		// as the immediate path above; a claim here skips the coalesced dispatch.
 		{
@@ -1212,6 +1247,7 @@ export async function runChannelInboundPipeline(
 				conversationId,
 				...(threadId !== undefined ? { threadId } : {}),
 				...(accountId !== undefined ? { accountId } : {}),
+				...(replyToId !== undefined ? { replyToId } : {}),
 				senderIsOwner: slot.senderIsOwner,
 				channelApprovalRoute: slot.channelApprovalRoute,
 			});

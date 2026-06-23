@@ -304,6 +304,16 @@ export interface OutboundSendOptions {
 	threadId?: string;
 	/** Which channel account to send from on multi-account adapters (e.g. Slack with two workspaces, WhatsApp with two linked numbers); `undefined` falls back to the adapter's default account. */
 	accountId?: string;
+	/**
+	 * Native reply-to-a-specific-message id. When set, the channel sends the
+	 * outbound as a NATIVE quoted/threaded reply pointing at this message
+	 * (WhatsApp quote via `contextInfo.stanzaId`, Telegram
+	 * `reply_parameters.message_id`). This is the channel-native id of the
+	 * message being answered (e.g. the inbound's `messageId`). Channels without
+	 * native reply linkage silently ignore it. CRITICAL back-compat: a send with
+	 * NO `replyToId` behaves EXACTLY as before — the quote is purely additive.
+	 */
+	replyToId?: string;
 }
 
 /**

@@ -15,7 +15,7 @@ const enabledCfg = (botToken = "123456:AAExampleTokenValueABCDEFGHIJKLMNOP"): Br
 
 /** Recorded calls to the fake connection's action methods (for parity assertions). */
 interface FakeConnCalls {
-	sentText: Array<{ chatId: string; text: string; html?: boolean; threadId?: string }>;
+	sentText: Array<{ chatId: string; text: string; html?: boolean; threadId?: string; replyToMessageId?: string }>;
 	sentInteractive: Array<{ chatId: string; text: string; replyMarkup: unknown; threadId?: string }>;
 	polls: Array<{ chatId: string; question: string; options: string[] }>;
 	edits: Array<{ chatId: string; messageId: string; text: string; html?: boolean }>;
@@ -69,7 +69,13 @@ function makeFakeConnectImpl(opts: { sendTextImpl?: FakeConnHandle["conn"]["send
 			sendText:
 				opts.sendTextImpl ??
 				(async (chatId, text, o) => {
-					calls.sentText.push({ chatId, text, html: o?.html, threadId: o?.threadId });
+					calls.sentText.push({
+						chatId,
+						text,
+						html: o?.html,
+						threadId: o?.threadId,
+						replyToMessageId: o?.replyToMessageId,
+					});
 					return { messageId: calls.sentText.length };
 				}),
 			sendInteractive: async (chatId, text, replyMarkup, o) => {
@@ -390,6 +396,36 @@ describe("Telegram adapter sendText chunk → HTML → send", () => {
 		await a.start(makeStartCtx());
 		handle()!.tokenInvalid = true;
 		await assert.rejects(() => a.sendText("555", "hi"), /token is invalid/i);
+	});
+
+	it("maps opts.replyToId → reply target on the FIRST chunk only", async () => {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createTelegramAdapter({ connectImpl });
+		a.isConfigured(enabledCfg(), {});
+		await a.start(makeStartCtx());
+		// Two ~3000-char paragraphs → ≥2 chunks; only the first quotes the target.
+		const para = "x".repeat(3000);
+		await a.sendText("555", `${para}\n\n${para}`, { replyToId: "77" });
+		const sent = handle()!.sentText;
+		assert.ok(sent.length >= 2, `expected ≥2 chunks, got ${sent.length}`);
+		assert.equal(sent[0]?.replyToMessageId, "77", "first chunk quotes the reply target");
+		for (let i = 1; i < sent.length; i++) {
+			assert.equal(sent[i]?.replyToMessageId, undefined, `chunk ${i} must NOT re-quote`);
+		}
+	});
+
+	it("back-compat: a send with NO replyToId sets no reply target", async () => {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createTelegramAdapter({ connectImpl });
+		a.isConfigured(enabledCfg(), {});
+		await a.start(makeStartCtx());
+		await a.sendText("555", "hello **world**");
+		const sent = handle()!.sentText;
+		assert.equal(sent.length, 1);
+		assert.equal(sent[0]?.replyToMessageId, undefined, "no quote when replyToId absent");
+		// Behaviour otherwise unchanged.
+		assert.equal(sent[0]?.text, "hello <b>world</b>");
+		assert.equal(sent[0]?.html, true);
 	});
 });
 

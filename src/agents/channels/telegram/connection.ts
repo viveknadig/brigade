@@ -409,6 +409,14 @@ export interface TelegramSendTextOpts {
 	html?: boolean;
 	/** Forum-topic thread id. */
 	threadId?: string;
+	/**
+	 * Native reply target — the Telegram `message_id` this send should quote.
+	 * Mapped to `reply_parameters: { message_id, allow_sending_without_reply }`
+	 * so the message renders as a native reply. Best-effort: a vanished target
+	 * still delivers (Telegram drops the quote rather than erroring) because
+	 * `allow_sending_without_reply` is set. Omitted → an ordinary, unquoted send.
+	 */
+	replyToMessageId?: string;
 }
 
 export interface TelegramSendMediaOpts {
@@ -1119,6 +1127,14 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 		const params: Record<string, unknown> = {};
 		if (opts?.html) params.parse_mode = "HTML";
 		if (opts?.threadId) params.message_thread_id = Number(opts.threadId);
+		// Native reply: quote the target message. `allow_sending_without_reply`
+		// keeps the send succeeding even if the quoted message was deleted.
+		if (opts?.replyToMessageId) {
+			const replyId = Number(opts.replyToMessageId);
+			if (Number.isFinite(replyId)) {
+				params.reply_parameters = { message_id: replyId, allow_sending_without_reply: true };
+			}
+		}
 		try {
 			const res = await b.api.sendMessage(chatId, text, params);
 			return { messageId: res.message_id };

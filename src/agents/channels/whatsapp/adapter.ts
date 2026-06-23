@@ -28,7 +28,7 @@ import {
 	resolveWhatsAppAccountAuthDir,
 	whatsappChannelEnabled,
 } from "./account-config.js";
-import { connectWhatsApp, toWhatsAppJid, type WhatsAppConnection } from "./connection.js";
+import { connectWhatsApp, toWhatsAppJid, type ConnectWhatsAppArgs, type WhatsAppConnection } from "./connection.js";
 
 const CHANNEL_ID = "whatsapp";
 
@@ -41,6 +41,13 @@ export interface CreateWhatsAppAdapterOptions {
 	accountId?: string;
 	/** Override the on-disk auth directory. When omitted, derived from `accountId`. */
 	authDir?: string;
+	/**
+	 * TEST SEAM: override how the connection is built. Production leaves this
+	 * undefined and `connectWhatsApp` lazy-loads Baileys. Tests inject a fake to
+	 * drive `sendText`/quote behaviour without a live socket. Mirrors the
+	 * Telegram adapter's `connectImpl`.
+	 */
+	connectImpl?: (args: ConnectWhatsAppArgs) => Promise<WhatsAppConnection>;
 }
 
 /** Render a QR to the terminal (lazy-imports qrcode-terminal). */
@@ -64,6 +71,8 @@ export function createWhatsAppAdapter(opts: CreateWhatsAppAdapterOptions = {}): 
 	const accountId = opts.accountId?.trim() || DEFAULT_ACCOUNT_ID;
 	/** Auth directory override (multi-account plugin path), else derived per-account in start(). */
 	const authDirOverride = opts.authDir?.trim();
+	/** Connection factory — production `connectWhatsApp`; tests inject a fake. */
+	const connectImpl = opts.connectImpl ?? connectWhatsApp;
 	let connection: WhatsAppConnection | null = null;
 	// Health state captured from the connection's lifecycle callbacks. The
 	// adapter is otherwise stateless about session liveness — Baileys owns
@@ -111,7 +120,7 @@ export function createWhatsAppAdapter(opts: CreateWhatsAppAdapterOptions = {}): 
 			// the strict-zero guard. Skip; pass accountId so the convex auth
 			// tables key per-account (multi-account safe).
 			if (tryGetRuntimeContext()?.mode !== "convex") ensureDir(authDir);
-			connection = await connectWhatsApp({
+			connection = await connectImpl({
 				authDir,
 				accountId,
 				verbose: false,
@@ -252,9 +261,14 @@ export function createWhatsAppAdapter(opts: CreateWhatsAppAdapterOptions = {}): 
 			}
 			// WhatsApp has no thread routing — `opts.threadId` is accepted for
 			// signature compatibility with threaded channels (Slack/Discord)
-			// and silently ignored here.
-			void opts;
-			await connection.sendText(jid, text);
+			// and silently ignored here. `opts.replyToId`, when present, becomes a
+			// NATIVE quoted reply (minimal Baileys `contextInfo` linkage); absent →
+			// an ordinary send, byte-identical to before.
+			await connection.sendText(
+				jid,
+				text,
+				opts?.replyToId ? { replyToId: opts.replyToId } : undefined,
+			);
 		},
 		// Pairing customization — WhatsApp ids are international phone numbers,
 		// so the challenge card uses the "Your number: +X" line. No

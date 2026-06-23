@@ -125,6 +125,23 @@ export interface ConnectWhatsAppArgs {
 	onLinkProgress?: (status: string) => void;
 }
 
+/** Optional per-send hints for {@link WhatsAppConnection.sendText}. */
+export interface WaSendTextOpts {
+	/**
+	 * Native reply target — the WhatsApp `msg.key.id` (stanza id) this send
+	 * should quote. Mapped to the minimal Baileys `contextInfo` reply linkage
+	 * (`stanzaId` + `participant`). The participant defaults to the conversation
+	 * jid (the DM peer) when not supplied. Omitted → ordinary send, no quote.
+	 */
+	replyToId?: string;
+	/**
+	 * The author jid of the quoted message (Baileys `contextInfo.participant`).
+	 * Only meaningful alongside `replyToId`. In a group this is the speaker's
+	 * jid; in a DM it is the peer (defaults to the conversation jid).
+	 */
+	replyToParticipant?: string;
+}
+
 export interface WhatsAppConnection {
 	/** The live Baileys socket (rebuilt internally across reconnects). */
 	current(): WASocket | null;
@@ -146,8 +163,14 @@ export interface WhatsAppConnection {
 	 * it proves conversational traffic is flowing, not just metadata.
 	 */
 	lastActivityAt(): number;
-	/** Send a text message to a chat JID. */
-	sendText(conversationId: string, text: string): Promise<void>;
+	/**
+	 * Send a text message to a chat JID. Optional `opts.replyToId` makes the
+	 * message a NATIVE quoted reply to that message id via the minimal Baileys
+	 * `contextInfo` linkage (`stanzaId` + `participant`); omitted → an ordinary
+	 * send (byte-identical to before). Degrades gracefully — when no full quoted
+	 * message object is reachable, only the minimal reply linkage is set.
+	 */
+	sendText(conversationId: string, text: string, opts?: WaSendTextOpts): Promise<void>;
 	/** Send a media attachment (image / video / audio / voice / document / sticker). */
 	sendMedia(
 		conversationId: string,
@@ -1631,16 +1654,24 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 		throw lastErr ?? new Error(`WhatsApp ${kind} failed after retries`);
 	}
 
-	/** Send a single text chunk with retry. Records the outbound id for echo-dedupe. */
+	/**
+	 * Send a single text chunk with retry. Records the outbound id for echo-dedupe.
+	 * An optional `contextInfo` makes the chunk a native quoted reply (minimal
+	 * `stanzaId`/`participant` linkage); omitted → an ordinary text send.
+	 */
 	async function sendOneChunkWithRetry(
 		conversationId: string,
 		chunk: string,
 		log: (msg: string, meta?: Record<string, unknown>) => void,
+		contextInfo?: Record<string, unknown>,
 	): Promise<void> {
+		const content: Record<string, unknown> = contextInfo
+			? { text: chunk, contextInfo }
+			: { text: chunk };
 		const result = await sendWithRetry(
 			"send",
 			async (live) =>
-				(await live.sendMessage(conversationId, { text: chunk })) as
+				(await live.sendMessage(conversationId, content as never)) as
 					| { key?: { id?: string } }
 					| undefined,
 			log,
@@ -1658,7 +1689,7 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 		connectedAt: () => connectedAtMs,
 		lastInboundAt: () => lastInboundAt,
 		lastActivityAt: () => lastActivityAt,
-		async sendText(conversationId: string, text: string): Promise<void> {
+		async sendText(conversationId: string, text: string, opts?: WaSendTextOpts): Promise<void> {
 			// Convert agent-style markdown (**bold**, headings, tables, [links])
 			// into WhatsApp's sparse formatting (*bold*, • bullets, "label (url)")
 			// before splitting. Otherwise raw `**` / `|` / `###` leak into chat.
@@ -1667,6 +1698,19 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 			// aware). Each chunk goes through its own retry loop so a transient
 			// reconnect mid-reply doesn't lose the rest of the message.
 			const chunks = chunkText(wa);
+			// Native quoted reply (FIRST chunk only). We have just the id, not the
+			// full quoted WAMessage, so set the MINIMAL Baileys `contextInfo`
+			// linkage: the stanza id + the author jid (participant). For a DM the
+			// participant is the peer (the conversation jid); a group reply passes
+			// the speaker jid via `replyToParticipant`. Degrades gracefully — when
+			// `replyToId` is absent the content is a plain `{ text }` (unchanged).
+			const replyToId = opts?.replyToId?.trim();
+			const replyContextInfo: Record<string, unknown> | undefined = replyToId
+				? {
+						stanzaId: replyToId,
+						participant: opts?.replyToParticipant?.trim() || conversationId,
+					}
+				: undefined;
 			// Show "composing…" once at the start of a multi-chunk reply so the
 			// recipient sees "typing…" while the LLM was thinking AND while we're
 			// sending. Best-effort — failure here never breaks the send.
@@ -1676,7 +1720,13 @@ export async function connectWhatsApp(args: ConnectWhatsAppArgs): Promise<WhatsA
 				/* presence is cosmetic */
 			}
 			for (let i = 0; i < chunks.length; i++) {
-				await sendOneChunkWithRetry(conversationId, chunks[i] as string, args.log);
+				// Only the first chunk carries the quote linkage.
+				await sendOneChunkWithRetry(
+					conversationId,
+					chunks[i] as string,
+					args.log,
+					i === 0 ? replyContextInfo : undefined,
+				);
 				if (i < chunks.length - 1) await delay(150);
 			}
 			// Reset presence so the bot doesn't show as "typing forever".

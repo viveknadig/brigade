@@ -204,3 +204,46 @@ export async function resolveOutboundTarget(params: {
 		return { to, usedAdapter: false, resolvedByName: false };
 	}
 }
+
+/* -------------------------------------------------------------------------
+ * Default inbound-conversation resolution (the inverse of resolveOutboundTarget)
+ * --------------------------------------------------------------------- */
+
+/**
+ * Canonicalise an INCOMING peer id to a stable conversation/session identity
+ * using the channel's registered `messaging` adapter when it ships the optional
+ * `resolveInboundConversation` hook (the inverse of the outbound `targetResolver`).
+ * The inbound pipeline calls this just before the 8-tier route resolver so a
+ * name-addressed inbound collapses onto the SAME conversation/session the
+ * outbound side targets.
+ *
+ * Contract — mirrors {@link resolveOutboundTarget}, conservative by construction:
+ *   1. No messaging adapter registered, OR it has no `resolveInboundConversation`
+ *      → return the raw `peerId` UNCHANGED.
+ *   2. The hook returns `null`/empty, OR throws → return the raw `peerId`.
+ *   3. Otherwise → return the canonicalised id.
+ *
+ * NEVER throws. When the result equals the raw `peerId` (the default for any
+ * channel that doesn't opt in), downstream routing is byte-identical to today.
+ */
+export function resolveInboundConversation(params: {
+	channelId: string;
+	peerId: string;
+}): string {
+	const { channelId, peerId } = params;
+	const adapter = getChannelMessagingAdapter(channelId);
+	// (1) No adapter / no inbound hook → raw peer id, byte-for-byte.
+	if (!adapter || typeof adapter.resolveInboundConversation !== "function") {
+		return peerId;
+	}
+	try {
+		const resolved = adapter.resolveInboundConversation(peerId);
+		// (2) null / empty → keep the raw peer id (no behaviour change).
+		if (resolved == null || resolved === "") return peerId;
+		// (3) canonicalised id.
+		return resolved;
+	} catch {
+		// A misbehaving adapter must never break inbound routing — degrade.
+		return peerId;
+	}
+}

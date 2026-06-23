@@ -16,6 +16,7 @@ import {
 	looksLikeContactName,
 	registerChannelMessagingAdapter,
 	resetChannelMessagingRegistryForTests,
+	resolveInboundConversation,
 	resolveOutboundTarget,
 	syncChannelMessagingAdaptersFromPlugins,
 } from "./channel-messaging-registry.js";
@@ -240,5 +241,78 @@ describe("resolveOutboundTarget — fault tolerance", () => {
 		const res = await resolveOutboundTarget({ channelId: "telegram", to: "keepme" });
 		// normalize emptied it → fall back to the (parsed/raw) target, not "".
 		assert.equal(res.to, "keepme");
+	});
+});
+
+describe("resolveInboundConversation — back-compat (no adapter / no hook)", () => {
+	it("returns the raw peer id when no messaging adapter is registered", () => {
+		assert.equal(
+			resolveInboundConversation({ channelId: "whatsapp", peerId: "15551234567" }),
+			"15551234567",
+		);
+	});
+
+	it("returns the raw peer id when the adapter omits resolveInboundConversation", () => {
+		// fakeMessaging() ships only parse + normalize — no inbound hook.
+		registerChannelMessagingAdapter("telegram", fakeMessaging());
+		assert.equal(
+			resolveInboundConversation({ channelId: "telegram", peerId: "@alex" }),
+			"@alex",
+		);
+	});
+});
+
+describe("resolveInboundConversation — adapter resolution", () => {
+	it("canonicalises an incoming peer id via the channel's inbound hook", () => {
+		registerChannelMessagingAdapter(
+			"telegram",
+			fakeMessaging({
+				// Collapse an @username onto the numeric chat id the outbound side uses.
+				resolveInboundConversation: (peerId) => (peerId === "@alex" ? "123456" : null),
+			}),
+		);
+		assert.equal(
+			resolveInboundConversation({ channelId: "telegram", peerId: "@alex" }),
+			"123456",
+		);
+	});
+
+	it("keeps the raw peer id when the hook returns null (no canonical form)", () => {
+		registerChannelMessagingAdapter(
+			"telegram",
+			fakeMessaging({ resolveInboundConversation: () => null }),
+		);
+		assert.equal(
+			resolveInboundConversation({ channelId: "telegram", peerId: "stranger" }),
+			"stranger",
+		);
+	});
+
+	it("keeps the raw peer id when the hook returns an empty string", () => {
+		registerChannelMessagingAdapter(
+			"telegram",
+			fakeMessaging({ resolveInboundConversation: () => "" }),
+		);
+		assert.equal(
+			resolveInboundConversation({ channelId: "telegram", peerId: "keepme" }),
+			"keepme",
+		);
+	});
+});
+
+describe("resolveInboundConversation — never throws", () => {
+	it("degrades to the raw peer id when the hook throws", () => {
+		registerChannelMessagingAdapter(
+			"telegram",
+			fakeMessaging({
+				resolveInboundConversation: () => {
+					throw new Error("boom");
+				},
+			}),
+		);
+		assert.equal(
+			resolveInboundConversation({ channelId: "telegram", peerId: "raw-peer" }),
+			"raw-peer",
+		);
 	});
 });

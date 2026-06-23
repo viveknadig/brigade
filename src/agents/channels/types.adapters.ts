@@ -526,9 +526,12 @@ export type ChannelApprovalCapability = {
  *      directory OMITS this method, and the caller falls back to the raw id —
  *      so back-compat is preserved by construction.
  *
- * ⚠️ OUTBOUND ONLY. The INBOUND counterpart (resolving an incoming peer id back
- * to a stable conversation/session identity) lives in the inbound pipeline and
- * is intentionally NOT part of this adapter.
+ * MOSTLY OUTBOUND. The one INBOUND hook is the OPTIONAL
+ * `resolveInboundConversation` (the inverse of `targetResolver`): it
+ * canonicalises an INCOMING peer id back to a stable conversation/session
+ * identity so a name-addressed inbound collapses onto the SAME session the
+ * outbound side targets. A channel that omits it (the default) leaves inbound
+ * routing byte-identical to before.
  *
  * Every method except `parseExplicitTarget` + `normalizeTarget` is optional;
  * the whole adapter is optional on `ChannelPlugin` (channels opt in). A channel
@@ -593,4 +596,21 @@ export type ChannelMessagingAdapter = {
 	 * when omitted.
 	 */
 	formatTargetDisplay?: (target: string) => string;
+
+	/**
+	 * OPTIONAL INBOUND hook — the inverse of {@link targetResolver}. Canonicalise
+	 * an INCOMING peer id (the `from` an adapter put on an `InboundMessage`) to a
+	 * STABLE conversation/session identity, so a peer that can be addressed by
+	 * more than one handle (a name, a privacy alias, an @username vs a numeric id)
+	 * collapses onto the SAME conversation the OUTBOUND side resolves to. The
+	 * inbound pipeline calls this right before the route resolver.
+	 *
+	 * Return the canonical id, or `null`/the raw `peerId` when there's nothing to
+	 * canonicalise — in BOTH of those cases the pipeline keeps the raw peer id, so
+	 * a channel that omits this method (or returns the input) leaves routing
+	 * byte-identical to today. MUST be cheap + side-effect-free (it runs on every
+	 * inbound) and MUST NOT throw — the registry wrapper guards it, but keep it
+	 * total anyway.
+	 */
+	resolveInboundConversation?: (peerId: string) => string | null;
 };
