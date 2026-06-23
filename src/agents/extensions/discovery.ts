@@ -2,13 +2,20 @@
  * User-module discovery.
  *
  * Out-of-tree modules dropped into `~/.brigade/extensions/` are discovered and
- * dynamic-imported here, alongside the bundled ones. A candidate is either a
- * top-level `*.js`/`*.mjs` file or a folder containing `index.js`/`index.mjs`.
- * Each must `export default` a `BrigadeModule` (or an array of them); anything
- * else is skipped with a warning — a bad user module never aborts boot.
+ * imported here, alongside the bundled ones. A candidate is either a top-level
+ * `*.js`/`*.mjs`/`*.ts`/`*.mts` file or a folder containing
+ * `index.{js,mjs,ts,mts}`. Each must `export default` a `BrigadeModule` (or an
+ * array of them); anything else is skipped with a warning — a bad user module
+ * never aborts boot. `.d.ts` declaration files are NOT candidates.
  *
- * Authors import the stable `@brigade/extension-sdk` surface (defineModule + the
- * capability contracts), so a user module never reaches into Brigade internals.
+ * TypeScript-authored modules load directly: imports go through a Jiti instance
+ * that transpiles `.ts`/`.mts` on import, so authors don't need a build step.
+ *
+ * Authors import the stable `brigade/extension-sdk` / `brigade/channel-sdk`
+ * surface (defineModule + the capability contracts), so a user module never
+ * reaches into Brigade internals. Those specifiers are alias-resolved to
+ * Brigade's own built SDK entry points by the Jiti instance (see `sdk-alias.ts`),
+ * so the author does NOT install Brigade into the extensions folder.
  *
  * POSIX safety gates (non-Windows only): world-writable files are rejected
  * (mode & 0o002), suspicious ownership (uid != current uid AND != root) is
@@ -19,9 +26,9 @@
 
 import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
+import { createExtensionSdkJiti, type ExtensionSdkJiti } from "./sdk-alias.js";
 import type { BrigadeModule, BrigadeModuleManifest } from "./types.js";
 
 const log = createSubsystemLogger("extensions/discovery");
@@ -31,9 +38,24 @@ const log = createSubsystemLogger("extensions/discovery");
 // logged + skipped (the import keeps running detached but we move on).
 const IMPORT_TIMEOUT_MS = 5_000;
 
-function importWithTimeout(href: string): Promise<unknown> {
+// Single Jiti instance shared across every candidate (per process). It carries
+// the SDK alias (`brigade/extension-sdk` / `brigade/channel-sdk` → Brigade's own
+// built entries) and the TypeScript transpile config. Created lazily so the cost
+// is only paid when at least one user module is actually imported.
+let sharedJiti: ExtensionSdkJiti | null = null;
+function getExtensionJiti(): ExtensionSdkJiti {
+	sharedJiti ??= createExtensionSdkJiti(import.meta.url);
+	return sharedJiti;
+}
+
+/**
+ * Import a candidate through the shared Jiti instance (applies the SDK alias +
+ * TS transpile), racing against `IMPORT_TIMEOUT_MS`. Jiti takes an absolute file
+ * path (not a `file://` URL), and resolves `.ts`/`.mts`/`.js` itself.
+ */
+function importWithTimeout(absPath: string): Promise<unknown> {
 	return Promise.race([
-		import(href),
+		getExtensionJiti().import(absPath),
 		new Promise((_, reject) => {
 			const t = setTimeout(() => reject(new Error(`import timed out after ${IMPORT_TIMEOUT_MS}ms`)), IMPORT_TIMEOUT_MS);
 			t.unref?.();
@@ -77,9 +99,29 @@ function isManifest(value: unknown): value is BrigadeModuleManifest {
 	return !!value && typeof value === "object" && typeof (value as BrigadeModuleManifest).id === "string";
 }
 
-/** Resolve the import entry for a directory candidate (index.js / index.mjs). */
+// Accepted top-level / index entry extensions. `.d.ts` is excluded explicitly
+// in `isCandidateFile` — it is a declaration file, never an importable module.
+const ENTRY_EXTENSIONS = [".js", ".mjs", ".ts", ".mts"] as const;
+
+// Directory index basenames, in PRECEDENCE order. When a folder ships more than
+// one (e.g. both a precompiled `index.js` and a source `index.ts`), the FIRST
+// match here wins — compiled (`.js`/`.mjs`) is preferred over source
+// (`.ts`/`.mts`) so a built artifact takes precedence over its own source, and
+// the runtime stays deterministic regardless of readdir order.
+const DIR_INDEX_BASENAMES = ["index.js", "index.mjs", "index.ts", "index.mts"] as const;
+
+/** Is `name` an importable top-level entry file? Accepts the entry extensions
+ *  but rejects `.d.ts` declaration files. */
+function isCandidateFile(name: string): boolean {
+	if (name.endsWith(".d.ts")) return false;
+	return ENTRY_EXTENSIONS.some((ext) => name.endsWith(ext));
+}
+
+/** Resolve the import entry for a directory candidate
+ *  (index.{js,mjs,ts,mts}). Picks the first present per DIR_INDEX_BASENAMES
+ *  precedence (compiled before source). */
 function dirEntry(dir: string): string | null {
-	for (const name of ["index.js", "index.mjs"]) {
+	for (const name of DIR_INDEX_BASENAMES) {
 		const candidate = path.join(dir, name);
 		try {
 			if (statSync(candidate).isFile()) return candidate;
@@ -169,7 +211,7 @@ function candidateEntries(extensionsDir: string): string[] {
 		} catch {
 			continue;
 		}
-		if (st.isFile() && (name.endsWith(".js") || name.endsWith(".mjs"))) {
+		if (st.isFile() && isCandidateFile(name)) {
 			entries.push(full);
 		} else if (st.isDirectory()) {
 			const entry = dirEntry(full);
@@ -223,9 +265,12 @@ export function extensionsRootExists(extensionsDir: string): boolean {
 	return existsSync(extensionsDir);
 }
 
-/** Drop the discovery cache so the next `discoverUserModules` re-scans (reload). */
+/** Drop the discovery cache so the next `discoverUserModules` re-scans (reload).
+ *  Also drops the shared Jiti instance so a reloaded module is re-transpiled
+ *  fresh rather than served from Jiti's own module cache. */
 export function clearDiscoveryCache(): void {
 	discoveryCache.clear();
+	sharedJiti = null;
 }
 
 /**
@@ -253,7 +298,7 @@ export async function discoverUserModules(extensionsDir: string): Promise<Discov
 			continue;
 		}
 		try {
-			const imported = (await importWithTimeout(pathToFileURL(source).href)) as {
+			const imported = (await importWithTimeout(source)) as {
 				default?: unknown;
 				module?: unknown;
 				manifest?: unknown;

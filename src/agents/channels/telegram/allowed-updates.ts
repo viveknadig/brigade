@@ -32,27 +32,38 @@ export type TelegramAllowedUpdate =
 	| "message"
 	| "callback_query"
 	| "message_reaction"
-	| "edited_message";
+	| "edited_message"
+	| "channel_post";
 
 /** Options gating the conditional update kinds. */
 export interface ResolveTelegramAllowedUpdatesOptions {
-	/** Subscribe `message_reaction` (inbound reaction events). Default false. */
+	/**
+	 * Subscribe `message_reaction` (inbound reaction events). Default TRUE — the
+	 * connection now routes reactions through the pipeline. Pass `false` to opt
+	 * out (`message_reaction` is the one kind Telegram does NOT deliver under a
+	 * default/empty `allowed_updates`, so it must be requested explicitly).
+	 */
 	reactions?: boolean;
-	/** Subscribe `edited_message` (inbound message edits). Default false. */
+	/** Subscribe `edited_message` (inbound message edits). Default TRUE. */
 	editedMessages?: boolean;
+	/** Subscribe `channel_post` (posts in channels the bot administers). Default TRUE. */
+	channelPosts?: boolean;
 }
 
 /**
  * Resolve the `allowed_updates` list Brigade's Telegram poller/webhook should
- * request. `message` + `callback_query` are always present; reactions / edited
- * messages are added only when explicitly enabled. Deduped + stable order.
+ * request. `message` + `callback_query` are always present; `message_reaction`,
+ * `edited_message`, and `channel_post` are now requested by DEFAULT (the
+ * connection routes all three) and can be opted out individually. Deduped +
+ * stable order.
  */
 export function resolveTelegramAllowedUpdates(
 	opts: ResolveTelegramAllowedUpdatesOptions = {},
 ): TelegramAllowedUpdate[] {
 	const out: TelegramAllowedUpdate[] = ["message", "callback_query"];
-	if (opts.reactions) out.push("message_reaction");
-	if (opts.editedMessages) out.push("edited_message");
+	if (opts.reactions !== false) out.push("message_reaction");
+	if (opts.editedMessages !== false) out.push("edited_message");
+	if (opts.channelPosts !== false) out.push("channel_post");
 	// De-dupe defensively (the base list is already unique, but a future caller
 	// could pass overlapping flags) while preserving first-seen order.
 	const seen = new Set<TelegramAllowedUpdate>();

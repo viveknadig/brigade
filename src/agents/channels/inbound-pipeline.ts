@@ -38,6 +38,7 @@ import {
 } from "./access-control/index.js";
 import { isAbortTrigger } from "./abort-triggers.js";
 import { buildAgentSwitchCommands } from "./agent-switch-command.js";
+import { decodeGeneralCallbackData, isGeneralCallbackData } from "./general-callback.js";
 import {
 	type ChannelApprovalRoute,
 	tryConsumeChannelApprovalCallback,
@@ -211,6 +212,15 @@ export type RunChannelTurnFn = (args: {
 	signal?: AbortSignal;
 	senderIsOwner?: boolean;
 	channelApprovalRoute?: ChannelApprovalRoute;
+	/**
+	 * OPTIONAL live-streaming delta sink. When the pipeline wants progressive
+	 * delivery (the adapter advertises `beginReplyStream` AND the channel is
+	 * configured to stream), it passes this; the gateway forwards the
+	 * accumulating answer text on each model update. Undefined → final-only
+	 * delivery (unchanged). The final reply is ALWAYS still returned, so the
+	 * non-streaming fallback stays authoritative.
+	 */
+	onReplyDelta?: (accumulatedText: string) => void;
 }) => Promise<ChannelTurnResult>;
 
 /** Pending debounce slot — accumulated text waiting to dispatch. */
@@ -551,9 +561,29 @@ export async function runChannelInboundPipeline(
 				);
 				return;
 			}
-			// A callback that matched no pending approval (stale / foreign
-			// button) is dropped silently, there is nothing to dispatch.
-			return;
+			// GENERAL (agent-attached) button: not an approval. Decode the
+			// app-defined token and route it through the pipeline as a synthetic
+			// turn so the agent that attached the button can react to the tap.
+			// We rewrite `msg.text` and FALL THROUGH to the normal routing +
+			// dispatch path below (instead of returning).
+			if (isGeneralCallbackData(msg.callbackQuery.data)) {
+				const token = decodeGeneralCallbackData(msg.callbackQuery.data);
+				if (token) {
+					// Synthetic inbound text the agent sees for the tap. Kept short +
+					// explicit so the agent can branch on the token it set.
+					msg.text = `[button] ${token}`;
+					// Clear the callbackQuery so the downstream path treats this as a
+					// normal text turn (and doesn't re-enter this block).
+					msg.callbackQuery = undefined;
+					// fall through ↓
+				} else {
+					return;
+				}
+			} else {
+				// A callback that matched no pending approval (stale / foreign
+				// button) is dropped silently, there is nothing to dispatch.
+				return;
+			}
 		}
 		// ── Sender ADMITTED — only now pay for media. ──────────────────────
 		// Deferred downloads (msg.resolveMedia) run here, after the access
@@ -806,6 +836,34 @@ export async function runChannelInboundPipeline(
 				/* cosmetic */
 			}
 		}
+		// Live-streaming: if the adapter advertises `beginReplyStream` AND it
+		// returns a stream (the adapter gates on its own config), open it and
+		// feed the gateway's accumulating answer text into it as tokens arrive.
+		// The stream is best-effort UX — the FINAL reply below is still sent
+		// authoritatively (or skipped when the stream already delivered it).
+		let replyStream: ReturnType<NonNullable<ChannelAdapter["beginReplyStream"]>> = null;
+		if (typeof c.adapter.beginReplyStream === "function") {
+			try {
+				replyStream = c.adapter.beginReplyStream(
+					a.conversationId,
+					buildSendOpts(a.threadId, a.accountId),
+				);
+			} catch {
+				replyStream = null;
+			}
+		}
+		// Only forward deltas when a stream is actually open; the sink sanitizes
+		// upstream, but a closed/aborted stream must drop late deltas.
+		const onReplyDelta = replyStream
+			? (text: string) => {
+					if (controller.signal.aborted) return;
+					try {
+						replyStream?.update(text);
+					} catch {
+						/* stream hiccup never breaks the turn */
+					}
+				}
+			: undefined;
 		let result: ChannelTurnResult;
 		try {
 			result = await c.runTurn({
@@ -817,8 +875,10 @@ export async function runChannelInboundPipeline(
 				...(a.channelApprovalRoute !== undefined
 					? { channelApprovalRoute: a.channelApprovalRoute }
 					: {}),
+				...(onReplyDelta ? { onReplyDelta } : {}),
 			});
 		} catch (err) {
+			replyStream?.stop();
 			if (c.inflight.get(ilKey) === controller) c.inflight.delete(ilKey);
 			if (c.adapter.setComposing) {
 				try {
@@ -837,9 +897,64 @@ export async function runChannelInboundPipeline(
 				/* cosmetic */
 			}
 		}
-		if (controller.signal.aborted) return;
+		if (controller.signal.aborted) {
+			replyStream?.stop();
+			return;
+		}
 		const reply = sanitizeReplyForChannel(result.reply?.trim() ?? "");
 		if (reply) {
+			// Reasoning lane (OPTIONAL, default OFF): when the adapter opts in, hand
+			// it the RAW reply so it can deliver a `<think>` trace as a separate
+			// prefixed message BEFORE the answer. The adapter gates on its own
+			// config; a no-op adapter (or disabled config) sends nothing. Runs for
+			// BOTH streaming + non-streaming paths so reasoning always precedes the
+			// answer. Best-effort — never blocks the answer below.
+			if (typeof c.adapter.deliverReasoning === "function") {
+				try {
+					await c.adapter.deliverReasoning(
+						a.conversationId,
+						result.reply ?? "",
+						buildSendOpts(a.threadId, a.accountId),
+					);
+				} catch (err) {
+					log.warn("deliverReasoning failed (non-fatal)", {
+						channel: c.adapter.id,
+						conversationId: a.conversationId,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+			}
+			// STREAMING path: when a live stream is open, FINALIZE it with the
+			// complete reply (it edits the in-progress message to the full text +
+			// rolls overflow into new messages). This replaces the single
+			// `sendText` below — the stream is now authoritative for delivery.
+			if (replyStream) {
+				try {
+					const sent = await replyStream.finalize(reply);
+					recordLastSentMessage({
+						agentId: a.agentId,
+						channelId: c.adapter.id,
+						conversationId: a.conversationId,
+						messageId: sent && typeof sent === "object" ? sent.messageId : undefined,
+						...(a.threadId !== undefined ? { threadId: a.threadId } : {}),
+						...(a.accountId !== undefined ? { accountId: a.accountId } : {}),
+					});
+					return;
+				} catch (err) {
+					// Stream finalize failed — fall through to the non-streaming
+					// sendText so the recipient still gets the complete reply.
+					log.warn("reply stream finalize failed; falling back to sendText", {
+						channel: c.adapter.id,
+						conversationId: a.conversationId,
+						error: err instanceof Error ? err.message : String(err),
+					});
+					try {
+						replyStream.stop();
+					} catch {
+						/* best-effort */
+					}
+				}
+			}
 			// Capture the sent id (additive `{ messageId }` return) so the agent
 			// can later reference "my last message" via `message_action` without
 			// having to track ids itself. Channels that return void simply leave
@@ -857,6 +972,10 @@ export async function runChannelInboundPipeline(
 				...(a.threadId !== undefined ? { threadId: a.threadId } : {}),
 				...(a.accountId !== undefined ? { accountId: a.accountId } : {}),
 			});
+		} else {
+			// No reply text but a stream may have been opened (and possibly already
+			// sent a placeholder) — stop it so it doesn't leak.
+			replyStream?.stop();
 		}
 	}
 

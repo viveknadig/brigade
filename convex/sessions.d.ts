@@ -9,9 +9,9 @@ export declare const getEntry: import("convex/server").RegisteredQuery<"public",
     authProfile?: string | undefined;
     thinkingLevel?: string | undefined;
     subagent?: {
+        label?: string | undefined;
         parentRunId?: string | undefined;
         spawnedWorkspaceDir?: string | undefined;
-        label?: string | undefined;
         cleanup?: "delete" | "keep" | undefined;
         spawnDepth: number;
         spawnedBy: string;
@@ -35,9 +35,9 @@ export declare const listEntries: import("convex/server").RegisteredQuery<"publi
     authProfile?: string | undefined;
     thinkingLevel?: string | undefined;
     subagent?: {
+        label?: string | undefined;
         parentRunId?: string | undefined;
         spawnedWorkspaceDir?: string | undefined;
-        label?: string | undefined;
         cleanup?: "delete" | "keep" | undefined;
         spawnDepth: number;
         spawnedBy: string;
@@ -58,9 +58,9 @@ export declare const upsertEntry: import("convex/server").RegisteredMutation<"pu
     authProfile?: string | undefined;
     thinkingLevel?: string | undefined;
     subagent?: {
+        label?: string | undefined;
         parentRunId?: string | undefined;
         spawnedWorkspaceDir?: string | undefined;
-        label?: string | undefined;
         cleanup?: "delete" | "keep" | undefined;
         spawnDepth: number;
         spawnedBy: string;
@@ -78,9 +78,9 @@ export declare const upsertEntry: import("convex/server").RegisteredMutation<"pu
     authProfile?: string | undefined;
     thinkingLevel?: string | undefined;
     subagent?: {
+        label?: string | undefined;
         parentRunId?: string | undefined;
         spawnedWorkspaceDir?: string | undefined;
-        label?: string | undefined;
         cleanup?: "delete" | "keep" | undefined;
         spawnDepth: number;
         spawnedBy: string;

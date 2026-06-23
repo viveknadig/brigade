@@ -37,13 +37,17 @@
 import {
 	createDedupeCache,
 	nextBackoffDelay,
+	type InboundForwardContext,
 	type InboundMediaAttachment,
 	type InboundReplyContext,
 	type OutboundMedia,
 } from "../sdk.js";
+import { maskProxyUrl } from "./account-config.js";
 import { resolveTelegramAllowedUpdates } from "./allowed-updates.js";
+import { buildSocksDispatcher, isSocksProxyScheme } from "./socks-dispatcher.js";
 import {
 	buildTelegramSenderName,
+	extractTelegramForwardContext,
 	extractTelegramMentions,
 	extractTelegramReplyContext,
 	extractTelegramText,
@@ -129,6 +133,16 @@ export interface TgInboundMessage {
 	 * approval-callback path.
 	 */
 	callbackQuery?: { data: string; callbackId: string };
+	/** True when this inbound is an `edited_message` (text carries the NEW text). */
+	edited?: boolean;
+	/** Forwarded-message provenance, when this message was forwarded from elsewhere. */
+	forwarded?: InboundForwardContext;
+	/**
+	 * Inbound reaction context — present ONLY when this inbound is a
+	 * `message_reaction` update (not a typed message). `emojis` are the newly-
+	 * ADDED reaction emoji(s); `targetMessageId` is the message they landed on.
+	 */
+	reaction?: { emojis: string[]; targetMessageId: string };
 	/** Raw grammY message (for adapters that need more). */
 	raw: Message;
 }
@@ -171,6 +185,8 @@ export interface TelegramBotLike {
 		unpinChatMessage?(chatId: string | number, opts?: Record<string, unknown>): Promise<boolean>;
 		/** Rename a forum topic (thread auto-labeling). */
 		editForumTopic?(chatId: string | number, messageThreadId: number, opts?: Record<string, unknown>): Promise<boolean>;
+		/** Create a forum topic; returns the new topic's `message_thread_id`. */
+		createForumTopic?(chatId: string | number, name: string, opts?: Record<string, unknown>): Promise<{ message_thread_id: number; name?: string }>;
 		/** Register the bot's `/` command menu (native command surface). */
 		setMyCommands?(commands: Array<{ command: string; description: string }>, opts?: Record<string, unknown>): Promise<boolean>;
 		config?: { use(transformer: unknown): void };
@@ -185,6 +201,15 @@ export interface TelegramBotLike {
 	on(
 		filter: "callback_query",
 		handler: (ctx: { update: Update; callbackQuery?: TelegramCallbackQuery; answerCallbackQuery: (opts?: Record<string, unknown>) => Promise<unknown> }) => unknown,
+	): void;
+	/** An `edited_message` update (the edit carries the new text). */
+	on(filter: "edited_message", handler: (ctx: { update: Update; editedMessage?: Message }) => unknown): void;
+	/** A `channel_post` update (a post in a channel the bot is admin of). */
+	on(filter: "channel_post", handler: (ctx: { update: Update; channelPost?: Message }) => unknown): void;
+	/** A `message_reaction` update (someone added/removed an emoji reaction). */
+	on(
+		filter: "message_reaction",
+		handler: (ctx: { update: Update; messageReaction?: TelegramMessageReaction }) => unknown,
 	): void;
 	/** Stop the bot (grammY). */
 	stop(): Promise<void> | void;
@@ -208,6 +233,19 @@ export interface TelegramCallbackQuery {
 	message?: Message;
 }
 
+/** A Telegram `message_reaction` update payload (the subset Brigade reads). */
+export interface TelegramMessageReaction {
+	chat: { id: number | string; type?: string; title?: string; is_forum?: boolean };
+	message_id: number;
+	user?: { id?: number; is_bot?: boolean; username?: string; first_name?: string; last_name?: string };
+	actor_chat?: { id?: number; title?: string; username?: string };
+	date?: number;
+	/** Reactions present BEFORE this update — used to diff the newly-added ones. */
+	old_reaction: Array<{ type: string; emoji?: string }>;
+	/** Reactions present AFTER this update. */
+	new_reaction: Array<{ type: string; emoji?: string }>;
+}
+
 /** A grammY-runner-like handle (what `run(bot)` returns). */
 interface RunnerLike {
 	isRunning(): boolean;
@@ -220,6 +258,16 @@ export interface ConnectTelegramArgs {
 	token: string;
 	/** Account namespace stamped on inbounds (single-account v1 → "default"). */
 	accountId?: string;
+	/**
+	 * Optional proxy URL all Telegram API calls (incl. `getMe` + `getUpdates`)
+	 * route through. Use it on networks where `api.telegram.org` is blocked.
+	 * Form: `http(s)://[user:pass@]host:port` for an HTTP CONNECT proxy, or
+	 * `socks5://[user:pass@]host:port` (also `socks://` / `socks4://` /
+	 * `socks5h://`) for a SOCKS proxy. When omitted/empty the connection is DIRECT
+	 * (unchanged default). HTTP(S) proxies use an `undici` ProxyAgent; SOCKS
+	 * proxies use a SOCKS-aware `undici` Agent (see `socks-dispatcher.ts`).
+	 */
+	proxyUrl?: string;
 	/** Called once `getMe` succeeds and polling starts. */
 	onConnected?: () => void;
 	/** Called when the token is rejected (401) — terminal, re-token required. */
@@ -234,6 +282,13 @@ export interface ConnectTelegramArgs {
 	 * omitted, callback updates are still acked + de-duplicated but not routed.
 	 */
 	onCallbackQuery?: (msg: TgInboundMessage) => void;
+	/**
+	 * Called for every inbound `message_reaction` (someone added an emoji
+	 * reaction). The normalized inbound carries `reaction: { emojis,
+	 * targetMessageId }` and no text. Optional — when omitted, reaction updates
+	 * are de-duplicated but not routed.
+	 */
+	onReaction?: (msg: TgInboundMessage) => void;
 	/**
 	 * The `allowed_updates` list to request from `getUpdates`. Defaults to the
 	 * minimal `["message", "callback_query"]` set (see `allowed-updates.ts`).
@@ -308,6 +363,12 @@ export interface TelegramConnection {
 	unpinMessage(chatId: string, messageId?: string): Promise<void>;
 	/** Rename a forum topic (thread auto-labeling). Best-effort. */
 	editForumTopic(chatId: string, threadId: string, name: string): Promise<void>;
+	/**
+	 * Create a forum topic in a supergroup. Returns the new topic's thread id (as
+	 * a string) so the caller can immediately send into it. Throws when the bot
+	 * build / chat doesn't support forum topics or the name is invalid.
+	 */
+	createForumTopic(chatId: string, name: string, opts?: TelegramCreateForumTopicOpts): Promise<{ threadId: string; name: string }>;
 	/** Ack an inline-button press (`answerCallbackQuery`). Best-effort. */
 	answerCallback(callbackId: string, text?: string): Promise<void>;
 	/**
@@ -353,6 +414,14 @@ export interface TelegramSendTextOpts {
 export interface TelegramSendMediaOpts {
 	/** Forum-topic thread id. */
 	threadId?: string;
+}
+
+/** Optional `createForumTopic` knobs (icon color / custom emoji). */
+export interface TelegramCreateForumTopicOpts {
+	/** RGB color of the topic icon (one of Telegram's allowed palette ints). */
+	iconColor?: number;
+	/** Custom-emoji id for the topic icon. */
+	iconCustomEmojiId?: string;
 }
 
 /* ───────────────────────── error classification ───────────────────────── */
@@ -411,6 +480,50 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 		args.log(redactedMsg, redactedMeta);
 	};
 
+	// ── resolve proxy (optional) ──
+	// A configured proxy reroutes EVERY Telegram API call (getMe / getUpdates /
+	// sends) through an http(s) proxy — the fix for networks where
+	// `api.telegram.org` is blocked. We attach an `undici` ProxyAgent as grammY's
+	// fetch dispatcher; grammY uses Node's global `fetch` (undici) under the hood,
+	// so `client.baseFetchConfig.dispatcher` is the clean, dep-free seam. No proxy
+	// → the dispatcher stays undefined and the Bot is built exactly as before.
+	const proxyUrl = (args.proxyUrl ?? "").trim();
+	let proxyDispatcher: unknown;
+	if (proxyUrl) {
+		const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(proxyUrl)?.[1]?.toLowerCase();
+		if (isSocksProxyScheme(scheme)) {
+			// undici's ProxyAgent only speaks HTTP CONNECT — it cannot tunnel SOCKS.
+			// Build a plain undici `Agent` whose `connect` hook opens the socket
+			// through the SOCKS proxy (via the `socks` package) and upgrades it to
+			// TLS for the https `api.telegram.org` origin. grammY honours the
+			// resulting dispatcher exactly like the HTTP(S) ProxyAgent.
+			try {
+				proxyDispatcher = await buildSocksDispatcher(proxyUrl);
+				safeLog("telegram routing through SOCKS proxy", { account: accountId, proxy: maskProxyUrl(proxyUrl) });
+			} catch (err) {
+				// A malformed proxy URL / missing module must not wedge the channel.
+				safeLog("telegram SOCKS proxy setup failed — connecting directly", {
+					account: accountId,
+					proxy: maskProxyUrl(proxyUrl),
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		} else {
+			try {
+				const { ProxyAgent } = await import("undici");
+				proxyDispatcher = new ProxyAgent(proxyUrl);
+				safeLog("telegram routing through proxy", { account: accountId, proxy: maskProxyUrl(proxyUrl) });
+			} catch (err) {
+				// A malformed proxy URL must not wedge the channel — log + go direct.
+				safeLog("telegram proxy setup failed — connecting directly", {
+					account: accountId,
+					proxy: maskProxyUrl(proxyUrl),
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
+	}
+
 	// ── lazy-load grammY + runner + throttler (production path only) ──
 	let buildBot: (token: string) => TelegramBotLike;
 	let buildRunner: (bot: TelegramBotLike) => RunnerLike;
@@ -422,7 +535,17 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 		const { run } = await import("@grammyjs/runner");
 		const { apiThrottler } = await import("@grammyjs/transformer-throttler");
 		buildBot = (token: string) => {
-			const bot = new grammy.Bot(token) as unknown as TelegramBotLike;
+			// When a proxy dispatcher is present, hand it to grammY's fetch config so
+			// every API call tunnels through the proxy; otherwise build the Bot with
+			// no client options (byte-identical to the pre-proxy path). grammY uses
+			// Node's global `fetch` (undici), which honours `dispatcher` at runtime —
+			// the property just isn't in grammY's `baseFetchConfig` type, hence the cast.
+			const clientOpts = proxyDispatcher
+				? ({ client: { baseFetchConfig: { dispatcher: proxyDispatcher } } } as Record<string, unknown>)
+				: undefined;
+			const bot = (clientOpts
+				? new grammy.Bot(token, clientOpts as never)
+				: new grammy.Bot(token)) as unknown as TelegramBotLike;
 			// Rate-limit the outbound API so a chatty agent never trips Telegram's
 			// flood limits — installed on the api config as a transformer.
 			bot.api.config?.use(apiThrottler());
@@ -465,13 +588,14 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 	const updateDedupe = createDedupeCache({ maxEntries: 10_000, ttlMs: 60 * 60 * 1_000 });
 
 	/** Normalize one grammY message into the deferred-media inbound shape. */
-	const normalize = (message: Message): TgInboundMessage => {
+	const normalize = (message: Message, opts?: { edited?: boolean }): TgInboundMessage => {
 		const chatId = String(message.chat.id);
 		const text = extractTelegramText(message);
 		const chatType = telegramChatType(message);
 		const threadId = telegramThreadId(message);
 		const mentions = extractTelegramMentions(message, selfUsername ?? undefined, selfId ?? undefined);
 		const replyTo = extractTelegramReplyContext(message);
+		const forwarded = extractTelegramForwardContext(message);
 		const fromName = buildTelegramSenderName(message);
 		const fromId = typeof message.from?.id === "number" ? String(message.from.id) : chatId;
 		const tsSec = typeof message.date === "number" ? message.date : 0;
@@ -510,6 +634,8 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 			threadId,
 			mentions: mentions.length > 0 ? mentions : undefined,
 			replyTo,
+			...(forwarded ? { forwarded } : {}),
+			...(opts?.edited ? { edited: true } : {}),
 			resolveMedia,
 			raw: message,
 		};
@@ -527,6 +653,107 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 			args.onMessage(normalize(message));
 		} catch (err) {
 			safeLog("telegram inbound handler error", { error: err instanceof Error ? err.message : String(err) });
+		}
+	};
+
+	/**
+	 * Handle an `edited_message` update. Telegram redelivers the WHOLE message
+	 * with its new text under `edited_message`; we route it through the SAME
+	 * `onMessage` path the original used, flagged `edited: true` (and carrying the
+	 * edited message's own id) so the agent can see the correction. Deduped on the
+	 * update_id like every other update.
+	 */
+	const onEdited = (ctx: { update: Update; editedMessage?: Message }): void => {
+		try {
+			const updateId = ctx.update?.update_id;
+			if (typeof updateId === "number" && !updateDedupe.claim(String(updateId))) return;
+			const message = ctx.editedMessage ?? (ctx.update as { edited_message?: Message }).edited_message;
+			if (!message) return;
+			if (typeof message.from?.id === "number" && selfId && String(message.from.id) === selfId) return;
+			args.onMessage(normalize(message, { edited: true }));
+		} catch (err) {
+			safeLog("telegram edited handler error", { error: err instanceof Error ? err.message : String(err) });
+		}
+	};
+
+	/**
+	 * Handle a `channel_post` update — a post in a Telegram channel the bot is an
+	 * admin of. A channel post has no `from` user; we route it through `onMessage`
+	 * treating the chat as a group (channels behave like broadcast groups) so the
+	 * access gate + routing handle it uniformly. Bot-authored echoes are skipped.
+	 */
+	const onChannelPost = (ctx: { update: Update; channelPost?: Message }): void => {
+		try {
+			const updateId = ctx.update?.update_id;
+			if (typeof updateId === "number" && !updateDedupe.claim(String(updateId))) return;
+			const post = ctx.channelPost ?? (ctx.update as { channel_post?: Message }).channel_post;
+			if (!post) return;
+			// Channel posts carry `sender_chat` (the channel) rather than a `from`
+			// user. Normalize the post directly; `telegramChatType` maps the channel
+			// chat to "group" already via the supergroup branch only when the type is
+			// group/supergroup, so force the group kind on the normalized inbound.
+			const normalized = normalize(post);
+			normalized.chatType = "group";
+			args.onMessage(normalized);
+		} catch (err) {
+			safeLog("telegram channel_post handler error", { error: err instanceof Error ? err.message : String(err) });
+		}
+	};
+
+	/**
+	 * Normalize a `message_reaction` update into the inbound shape. Surfaces only
+	 * the NEWLY-ADDED emoji(s) (diffing `old_reaction` → `new_reaction`), the
+	 * actor, and the target message id. Reactions carry no `text`; the adapter
+	 * synthesises a short note so the pipeline can route it. Returns null when the
+	 * update removed reactions (nothing added) or was authored by a bot.
+	 */
+	const normalizeReaction = (r: TelegramMessageReaction): TgInboundMessage | null => {
+		if (r.user?.is_bot) return null;
+		const chatId = String(r.chat.id);
+		const oldEmojis = new Set(
+			(r.old_reaction ?? []).filter((x) => x.type === "emoji" && x.emoji).map((x) => x.emoji as string),
+		);
+		const added = (r.new_reaction ?? [])
+			.filter((x) => x.type === "emoji" && x.emoji)
+			.map((x) => x.emoji as string)
+			.filter((e) => !oldEmojis.has(e));
+		if (added.length === 0) return null; // a reaction REMOVAL — nothing to route
+		const fromId = typeof r.user?.id === "number" ? String(r.user.id) : chatId;
+		const fromName = r.user
+			? [r.user.first_name, r.user.last_name].filter(Boolean).join(" ").trim() ||
+				(r.user.username ? `@${r.user.username}` : undefined)
+			: undefined;
+		const chatType: "direct" | "group" =
+			r.chat.type === "group" || r.chat.type === "supergroup" ? "group" : "direct";
+		return {
+			conversationId: chatId,
+			from: fromId,
+			...(fromName ? { fromName } : {}),
+			text: "",
+			chatType,
+			reaction: { emojis: added, targetMessageId: String(r.message_id) },
+			raw: r as unknown as Message,
+		};
+	};
+
+	/**
+	 * Handle a `message_reaction` update. The connection normalizes it (newly-
+	 * added emoji(s) + actor + target) and routes it through `onReaction` (the
+	 * adapter feeds it into the SAME inbound pipeline as a synthesised note).
+	 * No-op when the channel didn't wire `onReaction`.
+	 */
+	const onReaction = (ctx: { update: Update; messageReaction?: TelegramMessageReaction }): void => {
+		try {
+			const updateId = ctx.update?.update_id;
+			if (typeof updateId === "number" && !updateDedupe.claim(String(updateId))) return;
+			const r =
+				ctx.messageReaction ?? (ctx.update as { message_reaction?: TelegramMessageReaction }).message_reaction;
+			if (!r) return;
+			const normalized = normalizeReaction(r);
+			if (!normalized) return;
+			args.onReaction?.(normalized);
+		} catch (err) {
+			safeLog("telegram reaction handler error", { error: err instanceof Error ? err.message : String(err) });
 		}
 	};
 
@@ -595,6 +822,13 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 		// per-update `answerCallbackQuery` helper on the ctx; the handler acks via
 		// it then routes the normalized callback inbound.
 		b.on("callback_query", (ctx) => void onCallbackQuery(ctx));
+		// Parity updates — edited messages, channel posts, and inbound reactions.
+		// All route through the same inbound surfaces (edits + posts → onMessage,
+		// reactions → onReaction). grammY only delivers these when they're in the
+		// requested `allowed_updates` list (see allowed-updates.ts).
+		b.on("edited_message", onEdited);
+		b.on("channel_post", onChannelPost);
+		b.on("message_reaction", onReaction);
 		bot = b;
 
 		// getMe first — both proves the token (401 surfaces here) and caches the
@@ -641,6 +875,21 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 		const message = (update as { message?: Message }).message;
 		if (message) {
 			onUpdate({ update, message });
+			return;
+		}
+		const editedMessage = (update as { edited_message?: Message }).edited_message;
+		if (editedMessage) {
+			onEdited({ update, editedMessage });
+			return;
+		}
+		const channelPost = (update as { channel_post?: Message }).channel_post;
+		if (channelPost) {
+			onChannelPost({ update, channelPost });
+			return;
+		}
+		const messageReaction = (update as { message_reaction?: TelegramMessageReaction }).message_reaction;
+		if (messageReaction) {
+			onReaction({ update, messageReaction });
 			return;
 		}
 		const callbackQuery = (update as { callback_query?: TelegramCallbackQuery }).callback_query;
@@ -1033,6 +1282,20 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 		}
 	};
 
+	const createForumTopic: TelegramConnection["createForumTopic"] = async (chatId, name, opts) => {
+		const b = requireLive();
+		if (!b.api.createForumTopic) throw new Error("Telegram: this bot build cannot create forum topics.");
+		const trimmed = (name ?? "").trim();
+		if (!trimmed) throw new Error("Telegram: a forum topic name is required.");
+		// Telegram caps a forum topic name at 128 chars.
+		if (trimmed.length > 128) throw new Error("Telegram: forum topic name must be 128 characters or fewer.");
+		const extra: Record<string, unknown> = {};
+		if (typeof opts?.iconColor === "number") extra.icon_color = opts.iconColor;
+		if (opts?.iconCustomEmojiId?.trim()) extra.icon_custom_emoji_id = opts.iconCustomEmojiId.trim();
+		const res = await b.api.createForumTopic(chatId, trimmed, Object.keys(extra).length > 0 ? extra : undefined);
+		return { threadId: String(res.message_thread_id), name: res.name ?? trimmed };
+	};
+
 	const answerCallback: TelegramConnection["answerCallback"] = async (callbackId, text) => {
 		const b = bot;
 		if (!b || tokenInvalid || !b.api.answerCallbackQuery) return; // best-effort
@@ -1118,6 +1381,7 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 		pinMessage,
 		unpinMessage,
 		editForumTopic,
+		createForumTopic,
 		answerCallback,
 		getIdentity,
 		setCommandMenu,

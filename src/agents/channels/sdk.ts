@@ -178,6 +178,8 @@ export type {
 	InboundMediaAttachment,
 	/** Quoted-reply context an inbound carries when it replies to a prior message. */
 	InboundReplyContext,
+	/** Forwarded-message provenance attached to a forwarded inbound. */
+	InboundForwardContext,
 	/** What the manager passes to `adapter.start(ctx)` — onInbound, log, signal, pairing hooks. */
 	ChannelStartContext,
 	/** Synchronous health verdict an adapter exposes via `health()`. */
@@ -196,6 +198,8 @@ export type {
 	OutboundMedia,
 	/** Per-send options (threadId, accountId) for `adapter.sendText(...)`. */
 	OutboundSendOptions,
+	/** A live reply-stream handle returned by `adapter.beginReplyStream(...)`. */
+	ChannelReplyStream,
 	/** The module shape `defineModule` returns / consumes. */
 	BrigadeModule,
 } from "../extensions/types.js";

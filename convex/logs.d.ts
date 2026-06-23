@@ -94,13 +94,13 @@ export declare const appendSubsystemRecord: import("convex/server").RegisteredMu
     fields?: any;
     message: string;
     time: string;
-    level: "error" | "trace" | "debug" | "info" | "warn" | "fatal";
+    level: "trace" | "debug" | "info" | "warn" | "error" | "fatal";
     subsystem: string;
     day: string;
     ownerId: string;
 }, Promise<void>>;
 export declare const readSubsystemRecords: import("convex/server").RegisteredQuery<"public", {
-    level?: "error" | "trace" | "debug" | "info" | "warn" | "fatal" | undefined;
+    level?: "trace" | "debug" | "info" | "warn" | "error" | "fatal" | undefined;
     subsystem?: string | undefined;
     limit?: number | undefined;
     day?: string | undefined;

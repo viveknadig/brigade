@@ -7,8 +7,10 @@ import { after, before, describe, it } from "node:test";
 import type { BrigadeConfig } from "../../../config/io.js";
 import {
 	listTelegramAccountIds,
+	maskProxyUrl,
 	resolveTelegramAccount,
 	resolveTelegramBotToken,
+	resolveTelegramProxyUrl,
 	telegramChannelEnabled,
 } from "./account-config.js";
 
@@ -118,5 +120,74 @@ describe("resolveTelegramAccount", () => {
 	it("reports disabled when an account entry sets enabled:false", () => {
 		const c = cfg({ enabled: true, accounts: [{ id: "ops", enabled: false, botToken: "x:y" }] });
 		assert.equal(resolveTelegramAccount(c, "ops", {}).enabled, false);
+	});
+
+	it("resolves the proxy url onto the resolved account", () => {
+		const c = cfg({ enabled: true, proxy: "http://proxy.local:8080" });
+		assert.equal(resolveTelegramAccount(c, "default", {}).proxyUrl, "http://proxy.local:8080");
+	});
+});
+
+describe("resolveTelegramProxyUrl", () => {
+	it("returns '' when no proxy is configured anywhere (direct connection)", () => {
+		assert.equal(resolveTelegramProxyUrl(cfg({ enabled: true }), "default", {}), "");
+	});
+
+	it("uses the top-level channels.telegram.proxy", () => {
+		const c = cfg({ enabled: true, proxy: "http://top.proxy:3128" });
+		assert.equal(resolveTelegramProxyUrl(c, "default", {}), "http://top.proxy:3128");
+	});
+
+	it("resolves a ${VAR} ref against env (like botToken)", () => {
+		const c = cfg({ enabled: true, proxy: "${TG_PROXY}" });
+		assert.equal(resolveTelegramProxyUrl(c, "default", { TG_PROXY: "http://ref.proxy:8080" } as NodeJS.ProcessEnv), "http://ref.proxy:8080");
+	});
+
+	it("per-account proxy overrides the top-level proxy", () => {
+		const c = cfg({
+			enabled: true,
+			proxy: "http://top.proxy:3128",
+			accounts: [{ id: "ops", botToken: "o:t", proxy: "http://ops.proxy:9000" }],
+		});
+		assert.equal(resolveTelegramProxyUrl(c, "ops", {}), "http://ops.proxy:9000");
+		// An account WITHOUT its own proxy inherits the top-level one.
+		const c2 = cfg({ enabled: true, proxy: "http://top.proxy:3128", accounts: [{ id: "ops2", botToken: "o:t" }] });
+		assert.equal(resolveTelegramProxyUrl(c2, "ops2", {}), "http://top.proxy:3128");
+	});
+
+	it("env fallback precedence: https_proxy > HTTPS_PROXY > all_proxy > ALL_PROXY", () => {
+		const base = cfg({ enabled: true });
+		assert.equal(resolveTelegramProxyUrl(base, "default", { ALL_PROXY: "http://all-up:1" } as NodeJS.ProcessEnv), "http://all-up:1");
+		assert.equal(
+			resolveTelegramProxyUrl(base, "default", { ALL_PROXY: "http://all-up:1", all_proxy: "http://all-lo:2" } as NodeJS.ProcessEnv),
+			"http://all-lo:2",
+		);
+		assert.equal(
+			resolveTelegramProxyUrl(base, "default", { all_proxy: "http://all-lo:2", HTTPS_PROXY: "http://https-up:3" } as NodeJS.ProcessEnv),
+			"http://https-up:3",
+		);
+		assert.equal(
+			resolveTelegramProxyUrl(base, "default", { HTTPS_PROXY: "http://https-up:3", https_proxy: "http://https-lo:4" } as NodeJS.ProcessEnv),
+			"http://https-lo:4",
+		);
+	});
+
+	it("config proxy outranks the env fallback", () => {
+		const c = cfg({ enabled: true, proxy: "http://cfg.proxy:8080" });
+		assert.equal(resolveTelegramProxyUrl(c, "default", { HTTPS_PROXY: "http://env.proxy:3128" } as NodeJS.ProcessEnv), "http://cfg.proxy:8080");
+	});
+});
+
+describe("maskProxyUrl", () => {
+	it("reduces to scheme://host:port and DROPS credentials", () => {
+		assert.equal(maskProxyUrl("http://user:pass@proxy.local:8080/path?q=1"), "http://proxy.local:8080");
+		assert.equal(maskProxyUrl("https://proxy.local:3128"), "https://proxy.local:3128");
+	});
+
+	it("returns '' for empty input and masks a malformed url to its scheme", () => {
+		assert.equal(maskProxyUrl(""), "");
+		assert.equal(maskProxyUrl("   "), "");
+		assert.equal(maskProxyUrl("socks5://not a url with spaces"), "socks5://<masked>");
+		assert.equal(maskProxyUrl("garbage"), "<masked>");
 	});
 });

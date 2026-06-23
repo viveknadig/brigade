@@ -217,6 +217,160 @@ describe("discoverUserModules — manifest extraction + origin", () => {
 	});
 });
 
+describe("discoverUserModules — TypeScript + SDK alias loading", () => {
+	it("loads a .ts user module that imports defineModule from brigade/channel-sdk", async () => {
+		clearDiscoveryCache();
+		const dir = mkdtempSync(join(tmpdir(), "brigade-disc-ts-channel-"));
+		try {
+			// Authored in TypeScript, with type annotations, importing the channel
+			// SDK by specifier — proves (a) TS transpiles on import and (b) the
+			// `brigade/channel-sdk` alias resolves to Brigade's own SDK entry
+			// WITHOUT Brigade installed into the extensions dir.
+			writeFileSync(
+				join(dir, "ts-channel.ts"),
+				`import { defineModule } from "brigade/channel-sdk";
+				const id: string = "ts-channel";
+				export default defineModule({ id, register(_b): void {} });`,
+			);
+			const found = await discoverUserModules(dir);
+			assert.equal(found.length, 1, "expected exactly one discovered TS module");
+			const d = found[0];
+			assert.ok(d, "expected one discovered module");
+			assert.equal(d.module.id, "ts-channel");
+			assert.equal(typeof d.module.register, "function");
+			assert.equal(d.origin, "user");
+		} finally {
+			clearDiscoveryCache();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("loads a .ts user module that imports defineModule from brigade/extension-sdk", async () => {
+		clearDiscoveryCache();
+		const dir = mkdtempSync(join(tmpdir(), "brigade-disc-ts-ext-"));
+		try {
+			writeFileSync(
+				join(dir, "ts-ext.ts"),
+				`import { defineModule } from "brigade/extension-sdk";
+				export default defineModule({ id: "ts-ext", register(_b) {} });`,
+			);
+			const found = await discoverUserModules(dir);
+			assert.equal(found.length, 1);
+			assert.equal(found[0]?.module.id, "ts-ext");
+		} finally {
+			clearDiscoveryCache();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("loads an .mts user module via the channel SDK alias", async () => {
+		clearDiscoveryCache();
+		const dir = mkdtempSync(join(tmpdir(), "brigade-disc-mts-"));
+		try {
+			writeFileSync(
+				join(dir, "m.mts"),
+				`import { defineModule } from "brigade/channel-sdk";
+				export default defineModule({ id: "mts-mod", register(_b) {} });`,
+			);
+			const found = await discoverUserModules(dir);
+			assert.equal(found.length, 1);
+			assert.equal(found[0]?.module.id, "mts-mod");
+		} finally {
+			clearDiscoveryCache();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("still loads a precompiled .js user module (existing path unchanged)", async () => {
+		clearDiscoveryCache();
+		const dir = mkdtempSync(join(tmpdir(), "brigade-disc-js-still-"));
+		try {
+			writeFileSync(join(dir, "plain.js"), `export default { id: "plain-js", register() {} };`);
+			const found = await discoverUserModules(dir);
+			assert.equal(found.length, 1);
+			assert.equal(found[0]?.module.id, "plain-js");
+		} finally {
+			clearDiscoveryCache();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("ignores .d.ts declaration files (never imported as a module)", async () => {
+		clearDiscoveryCache();
+		const dir = mkdtempSync(join(tmpdir(), "brigade-disc-dts-"));
+		try {
+			// A stray .d.ts must NOT be treated as a candidate, while a sibling
+			// real module loads normally.
+			writeFileSync(join(dir, "types.d.ts"), `export declare const x: number;`);
+			writeFileSync(join(dir, "real.ts"), `export default { id: "real-ts", register() {} };`);
+			const found = await discoverUserModules(dir);
+			const ids = found.map((d) => d.module.id).sort();
+			assert.deepEqual(ids, ["real-ts"], "the .d.ts must be ignored");
+		} finally {
+			clearDiscoveryCache();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("prefers a compiled index.js over a source index.ts in the same folder", async () => {
+		clearDiscoveryCache();
+		const dir = mkdtempSync(join(tmpdir(), "brigade-disc-dir-prec-"));
+		try {
+			const modDir = join(dir, "mymod");
+			mkdirSync(modDir);
+			// Both present: compiled wins per DIR_INDEX_BASENAMES precedence.
+			writeFileSync(join(modDir, "index.js"), `export default { id: "from-js", register() {} };`);
+			writeFileSync(join(modDir, "index.ts"), `export default { id: "from-ts", register() {} };`);
+			const found = await discoverUserModules(dir);
+			assert.equal(found.length, 1);
+			assert.equal(found[0]?.module.id, "from-js", "compiled index.js must take precedence");
+		} finally {
+			clearDiscoveryCache();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("loads a TS-only directory module via index.ts", async () => {
+		clearDiscoveryCache();
+		const dir = mkdtempSync(join(tmpdir(), "brigade-disc-dir-ts-"));
+		try {
+			const modDir = join(dir, "tsmod");
+			mkdirSync(modDir);
+			writeFileSync(
+				join(modDir, "index.ts"),
+				`import { defineModule } from "brigade/extension-sdk";
+				export default defineModule({ id: "dir-ts", register(_b) {} });`,
+			);
+			const found = await discoverUserModules(dir);
+			assert.equal(found.length, 1);
+			assert.equal(found[0]?.module.id, "dir-ts");
+		} finally {
+			clearDiscoveryCache();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("times out (and skips) a TS module whose top-level init hangs", async () => {
+		clearDiscoveryCache();
+		const dir = mkdtempSync(join(tmpdir(), "brigade-disc-ts-hang-"));
+		try {
+			// A safe sibling loads; the hanging one is skipped without aborting.
+			writeFileSync(join(dir, "ok.ts"), `export default { id: "ok-ts", register() {} };`);
+			writeFileSync(
+				join(dir, "hang.ts"),
+				`await new Promise<void>(() => {}); export default { id: "never", register() {} };`,
+			);
+			const found = await discoverUserModules(dir);
+			const ids = found.map((d) => d.module.id);
+			assert.ok(ids.includes("ok-ts"), "the safe TS module must still load");
+			assert.ok(!ids.includes("never"), "the hanging TS module must be skipped");
+		} finally {
+			clearDiscoveryCache();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 // Keep a reference to mkdirSync so the import isn't flagged as unused (some
 // host environments tree-shake unused fs imports; we use it transitively via
 // mkdtempSync but ts-node might still complain).

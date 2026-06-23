@@ -4,22 +4,22 @@ export declare const get: import("convex/server").RegisteredQuery<"public", {
 }, Promise<{
     _id: import("convex/values").GenericId<"subagentRuns">;
     _creationTime: number;
+    label?: string | undefined;
     model?: string | undefined;
     workspaceDir?: string | undefined;
-    label?: string | undefined;
     controllerSessionKey?: string | undefined;
     requesterOrigin?: ArrayBuffer | undefined;
     runTimeoutSeconds?: number | undefined;
-    spawnMode?: "session" | "run" | undefined;
+    spawnMode?: "run" | "session" | undefined;
     startedAt?: number | undefined;
     sessionStartedAt?: number | undefined;
     accumulatedRuntimeMs?: number | undefined;
     endedAt?: number | undefined;
     outcome?: {
-        text?: ArrayBuffer | undefined;
         error?: string | undefined;
         reason?: string | undefined;
-        status: "error" | "timeout" | "ok" | "abort";
+        text?: ArrayBuffer | undefined;
+        status: "timeout" | "error" | "ok" | "abort";
     } | undefined;
     archiveAtMs?: number | undefined;
     cleanupCompletedAt?: number | undefined;
@@ -54,22 +54,22 @@ export declare const getByChildSessionKey: import("convex/server").RegisteredQue
 }, Promise<{
     _id: import("convex/values").GenericId<"subagentRuns">;
     _creationTime: number;
+    label?: string | undefined;
     model?: string | undefined;
     workspaceDir?: string | undefined;
-    label?: string | undefined;
     controllerSessionKey?: string | undefined;
     requesterOrigin?: ArrayBuffer | undefined;
     runTimeoutSeconds?: number | undefined;
-    spawnMode?: "session" | "run" | undefined;
+    spawnMode?: "run" | "session" | undefined;
     startedAt?: number | undefined;
     sessionStartedAt?: number | undefined;
     accumulatedRuntimeMs?: number | undefined;
     endedAt?: number | undefined;
     outcome?: {
-        text?: ArrayBuffer | undefined;
         error?: string | undefined;
         reason?: string | undefined;
-        status: "error" | "timeout" | "ok" | "abort";
+        text?: ArrayBuffer | undefined;
+        status: "timeout" | "error" | "ok" | "abort";
     } | undefined;
     archiveAtMs?: number | undefined;
     cleanupCompletedAt?: number | undefined;
@@ -104,22 +104,22 @@ export declare const listByRequester: import("convex/server").RegisteredQuery<"p
 }, Promise<{
     _id: import("convex/values").GenericId<"subagentRuns">;
     _creationTime: number;
+    label?: string | undefined;
     model?: string | undefined;
     workspaceDir?: string | undefined;
-    label?: string | undefined;
     controllerSessionKey?: string | undefined;
     requesterOrigin?: ArrayBuffer | undefined;
     runTimeoutSeconds?: number | undefined;
-    spawnMode?: "session" | "run" | undefined;
+    spawnMode?: "run" | "session" | undefined;
     startedAt?: number | undefined;
     sessionStartedAt?: number | undefined;
     accumulatedRuntimeMs?: number | undefined;
     endedAt?: number | undefined;
     outcome?: {
-        text?: ArrayBuffer | undefined;
         error?: string | undefined;
         reason?: string | undefined;
-        status: "error" | "timeout" | "ok" | "abort";
+        text?: ArrayBuffer | undefined;
+        status: "timeout" | "error" | "ok" | "abort";
     } | undefined;
     archiveAtMs?: number | undefined;
     cleanupCompletedAt?: number | undefined;
@@ -163,22 +163,22 @@ export declare const markCompleted: import("convex/server").RegisteredMutation<"
 }, Promise<{
     _id: import("convex/values").GenericId<"subagentRuns">;
     _creationTime: number;
+    label?: string | undefined;
     model?: string | undefined;
     workspaceDir?: string | undefined;
-    label?: string | undefined;
     controllerSessionKey?: string | undefined;
     requesterOrigin?: ArrayBuffer | undefined;
     runTimeoutSeconds?: number | undefined;
-    spawnMode?: "session" | "run" | undefined;
+    spawnMode?: "run" | "session" | undefined;
     startedAt?: number | undefined;
     sessionStartedAt?: number | undefined;
     accumulatedRuntimeMs?: number | undefined;
     endedAt?: number | undefined;
     outcome?: {
-        text?: ArrayBuffer | undefined;
         error?: string | undefined;
         reason?: string | undefined;
-        status: "error" | "timeout" | "ok" | "abort";
+        text?: ArrayBuffer | undefined;
+        status: "timeout" | "error" | "ok" | "abort";
     } | undefined;
     archiveAtMs?: number | undefined;
     cleanupCompletedAt?: number | undefined;

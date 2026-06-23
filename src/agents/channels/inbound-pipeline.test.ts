@@ -401,3 +401,179 @@ describe("inbound-pipeline: /agent persists across gateway restart", () => {
 		assert.equal(route.matchedBy, "binding.peer");
 	});
 });
+
+describe("inbound-pipeline: live reply streaming", () => {
+	it("FINALIZES the stream and SKIPS the plain sendText when a stream is open", async () => {
+		const deltas: string[] = [];
+		let finalized: string | undefined;
+		let plainSends = 0;
+		const fake = makeFakeChannel({
+			async sendText() {
+				plainSends += 1;
+			},
+			beginReplyStream() {
+				return {
+					update: (t: string) => deltas.push(t),
+					async finalize(t: string) {
+						finalized = t;
+						return { messageId: "777" };
+					},
+					stop: () => {},
+				};
+			},
+		});
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async (args) => {
+				// Simulate the gateway forwarding accumulating deltas.
+				args.onReplyDelta?.("Hel");
+				args.onReplyDelta?.("Hello");
+				return { reply: "Hello world" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "hi",
+		});
+		assert.deepEqual(deltas, ["Hel", "Hello"], "deltas forwarded to the stream");
+		assert.equal(finalized, "Hello world", "stream finalized with the full reply");
+		assert.equal(plainSends, 0, "the plain sendText is SKIPPED when streaming delivered");
+	});
+
+	it("falls back to sendText when the adapter does NOT stream (final-only)", async () => {
+		let plainSends = 0;
+		let deltaSeen = false;
+		const fake = makeFakeChannel({
+			async sendText() {
+				plainSends += 1;
+			},
+		});
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async (args) => {
+				deltaSeen = args.onReplyDelta !== undefined;
+				return { reply: "final only" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "hi",
+		});
+		assert.equal(deltaSeen, false, "no onReplyDelta is passed when the adapter can't stream");
+		assert.equal(plainSends, 1, "final reply delivered via the normal sendText path");
+	});
+
+	it("falls back to sendText when stream.finalize THROWS", async () => {
+		let plainSends = 0;
+		const fake = makeFakeChannel({
+			async sendText() {
+				plainSends += 1;
+			},
+			beginReplyStream() {
+				return {
+					update: () => {},
+					async finalize() {
+						throw new Error("edit failed");
+					},
+					stop: () => {},
+				};
+			},
+		});
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => ({ reply: "recovered reply" }),
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "hi",
+		});
+		assert.equal(plainSends, 1, "a failed stream finalize falls back to the plain send");
+	});
+});
+
+describe("inbound-pipeline: reasoning lane + general button callbacks", () => {
+	it("calls deliverReasoning with the RAW reply before the answer", async () => {
+		const reasoningCalls: string[] = [];
+		const fake = makeFakeChannel({
+			async deliverReasoning(_conversationId, rawReply) {
+				reasoningCalls.push(rawReply);
+			},
+		});
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => ({ reply: "<think>plan</think>The answer." }),
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "hi",
+		});
+		assert.equal(reasoningCalls.length, 1);
+		assert.match(reasoningCalls[0] ?? "", /<think>plan<\/think>/, "raw reply (with reasoning) handed to the adapter");
+	});
+
+	it("routes a GENERAL button callback through the pipeline as a turn", async () => {
+		let turnText: string | undefined;
+		const fake = makeFakeChannel();
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async (args) => {
+				turnText = args.text;
+				return { reply: "ack" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "",
+			callbackQuery: { data: "g:buy", callbackId: "cb1" },
+		});
+		assert.match(turnText ?? "", /buy/, "the button token reaches the agent as a turn");
+	});
+
+	it("DROPS a non-approval, non-general callback (no turn)", async () => {
+		let turns = 0;
+		const fake = makeFakeChannel();
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => {
+				turns += 1;
+				return { reply: "x" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "",
+			callbackQuery: { data: "stale-approval-payload", callbackId: "cb2" },
+		});
+		assert.equal(turns, 0, "an unrecognized callback is dropped silently");
+	});
+});

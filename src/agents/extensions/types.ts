@@ -205,8 +205,52 @@ export interface InboundMessage {
 	 * ordinary message — channels without inline buttons never set it.
 	 */
 	callbackQuery?: { data: string; callbackId: string };
+	/**
+	 * Set when this inbound is an EDIT of a previously-sent message (Telegram
+	 * `edited_message`, Discord message update, …) rather than a fresh message.
+	 * `messageId` then carries the id of the message that was edited and `text`
+	 * the NEW text. Channels without edit events never set it. The agent sees the
+	 * edit folded into the turn so it can react to a corrected instruction.
+	 */
+	edited?: boolean;
+	/**
+	 * Forwarded-message provenance — present ONLY when this inbound was forwarded
+	 * from elsewhere (Telegram `forward_origin` / `forward_from` /
+	 * `forward_from_chat`). Lets the agent see "this was forwarded from X" rather
+	 * than treating it as the sender's own words. `undefined` for original
+	 * messages and for channels without forward metadata.
+	 */
+	forwarded?: InboundForwardContext;
+	/**
+	 * Inbound reaction context — present ONLY when this inbound is a reaction
+	 * event (Telegram `message_reaction`) rather than a message. `emojis` are the
+	 * newly-ADDED reaction emoji(s); `targetMessageId` is the message the
+	 * reaction was placed on. Carries no `text` of its own — the adapter
+	 * synthesises a short note so the central pipeline can route it. `undefined`
+	 * for every ordinary message. Channels without reaction events never set it.
+	 */
+	reaction?: { emojis: string[]; targetMessageId: string };
 	/** Raw provider payload (for adapters that need more). */
 	raw?: unknown;
+}
+
+/**
+ * Forwarded-message provenance attached to a forwarded inbound. Every field is
+ * best-effort — Telegram only ever populates the ones the origin exposed (a
+ * forward from a privacy-restricted user carries just `senderName`, a channel
+ * forward carries `chatTitle` + `chatId`, etc.).
+ */
+export interface InboundForwardContext {
+	/** Display name of the original author (user or hidden-sender label). */
+	senderName?: string;
+	/** Channel-native id of the original author, when the origin exposed it. */
+	from?: string;
+	/** Id of the chat/channel the message was originally posted in, when present. */
+	chatId?: string;
+	/** Title of the chat/channel the message was originally posted in, when present. */
+	chatTitle?: string;
+	/** When the message was originally sent (epoch ms), when the origin exposed it. */
+	date?: number;
 }
 
 /** Context handed to a channel adapter when the gateway starts it. */
@@ -510,6 +554,55 @@ export interface ChannelAdapter {
 		accountId?: string;
 		signal?: AbortSignal;
 	}): Promise<ChannelMessageActionResult>;
+	/**
+	 * Optional: open a LIVE reply stream for a conversation. When present AND the
+	 * channel is configured to stream, the pipeline calls this at turn start,
+	 * pushes the accumulating answer text via `update(text)` as the model emits
+	 * tokens, and calls `finalize(text)` once the turn settles. The adapter
+	 * implements the channel-native progressive delivery (Telegram: post a
+	 * placeholder then `editMessageText`, rolling to a new message at the 4096-
+	 * char limit). Adapters that don't support streaming omit this slot and the
+	 * pipeline falls back to a single `sendText` of the final reply.
+	 *
+	 * Contract: `update` is best-effort + throttled by the adapter; `finalize`
+	 * delivers the complete reply and MUST leave the conversation showing the
+	 * full text (so it is safe for the pipeline to skip the final `sendText`
+	 * when streaming succeeded). `stop` aborts without a final flush.
+	 */
+	beginReplyStream?(
+		conversationId: string,
+		opts?: OutboundSendOptions,
+	): ChannelReplyStream | null;
+	/**
+	 * Optional: deliver the model's REASONING trace as a separate message BEFORE
+	 * the answer. Called by the pipeline with the RAW reply (reasoning not yet
+	 * stripped) when the channel opts into reasoning surfacing. The default
+	 * behavior — reasoning stripped, never delivered — is preserved by adapters
+	 * that omit this slot OR return without sending (e.g. when their own config
+	 * gate is off). The pipeline still sanitizes + sends the answer separately
+	 * afterward, so the answer message is byte-identical whether or not this
+	 * fires. Best-effort: a throw here is logged and never blocks the answer.
+	 */
+	deliverReasoning?(
+		conversationId: string,
+		rawReply: string,
+		opts?: OutboundSendOptions,
+	): Promise<void>;
+}
+
+/**
+ * A live reply stream handle returned by `ChannelAdapter.beginReplyStream`. The
+ * pipeline drives it: `update` with the accumulating answer text, `finalize`
+ * with the complete reply at turn end, or `stop` to abort. `messageId()`
+ * surfaces the last delivered message id (for the agent's "my last message").
+ */
+export interface ChannelReplyStream {
+	/** Record the latest accumulated answer text (throttled by the adapter). */
+	update(accumulatedText: string): void;
+	/** Flush the final reply and close the stream. Returns the last message id. */
+	finalize(finalText: string): Promise<{ messageId?: string } | void>;
+	/** Abort without a final flush (turn aborted). */
+	stop(): void;
 }
 
 /** Context for a channel command handler (a `/cmd` typed in a channel chat). */

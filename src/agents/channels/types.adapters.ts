@@ -334,7 +334,21 @@ export type ChannelMessageAction =
 	| { kind: "edit"; messageId: string; text: string }
 	| { kind: "delete"; messageId: string }
 	| { kind: "pin"; messageId: string }
-	| { kind: "unpin"; messageId: string };
+	| { kind: "unpin"; messageId: string }
+	/**
+	 * Create a forum topic (Telegram supergroups). `name` is the topic title;
+	 * the optional icon fields style it. The result's `messageId` carries the new
+	 * topic's thread id so the agent can send into it.
+	 */
+	| { kind: "topic-create"; name: string; iconColor?: number; iconCustomEmojiId?: string }
+	/**
+	 * Send a NEW message carrying a general inline keyboard. `text` is the message
+	 * body; `buttons` is a grid of `{ text, data }` specs. A press posts the
+	 * button's `data` back through the inbound pipeline as a turn (namespaced so
+	 * it never collides with approval callbacks). The result's `messageId` is the
+	 * sent message's id. Channels without inline buttons report it unsupported.
+	 */
+	| { kind: "buttons"; text: string; buttons: Array<Array<{ text: string; data: string }>>; threadId?: string };
 
 export type ChannelMessageActionResult = {
 	ok: boolean;

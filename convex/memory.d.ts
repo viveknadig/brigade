@@ -21,7 +21,7 @@ export declare const listFacts: import("convex/server").RegisteredQuery<"public"
     confidence?: number | undefined;
     sourcePointers?: string[] | undefined;
     embedding?: number[] | undefined;
-    modality?: "text" | "image" | "video" | "audio" | "document" | undefined;
+    modality?: "text" | "audio" | "image" | "video" | "document" | undefined;
     mediaPointer?: string | undefined;
     subjectKey?: string | undefined;
     createdByKind?: "owner" | "channel" | undefined;
@@ -58,7 +58,7 @@ export declare const writeFact: import("convex/server").RegisteredMutation<"publ
     confidence?: number | undefined;
     sourcePointers?: string[] | undefined;
     embedding?: number[] | undefined;
-    modality?: "text" | "image" | "video" | "audio" | "document" | undefined;
+    modality?: "text" | "audio" | "image" | "video" | "document" | undefined;
     mediaPointer?: string | undefined;
     subjectKey?: string | undefined;
     createdByKind?: "owner" | "channel" | undefined;
@@ -92,7 +92,7 @@ export declare const writeFact: import("convex/server").RegisteredMutation<"publ
     confidence?: number | undefined;
     sourcePointers?: string[] | undefined;
     embedding?: number[] | undefined;
-    modality?: "text" | "image" | "video" | "audio" | "document" | undefined;
+    modality?: "text" | "audio" | "image" | "video" | "document" | undefined;
     mediaPointer?: string | undefined;
     subjectKey?: string | undefined;
     createdByKind?: "owner" | "channel" | undefined;
@@ -137,7 +137,7 @@ export declare const listAllFacts: import("convex/server").RegisteredQuery<"publ
     confidence?: number | undefined;
     sourcePointers?: string[] | undefined;
     embedding?: number[] | undefined;
-    modality?: "text" | "image" | "video" | "audio" | "document" | undefined;
+    modality?: "text" | "audio" | "image" | "video" | "document" | undefined;
     mediaPointer?: string | undefined;
     subjectKey?: string | undefined;
     createdByKind?: "owner" | "channel" | undefined;
@@ -177,7 +177,7 @@ export declare const upsertFactRecord: import("convex/server").RegisteredMutatio
     confidence?: number | undefined;
     sourcePointers?: string[] | undefined;
     embedding?: number[] | undefined;
-    modality?: "text" | "image" | "video" | "audio" | "document" | undefined;
+    modality?: "text" | "audio" | "image" | "video" | "document" | undefined;
     mediaPointer?: string | undefined;
     subjectKey?: string | undefined;
     createdByKind?: "owner" | "channel" | undefined;
@@ -287,7 +287,7 @@ export declare const searchContent: import("convex/server").RegisteredQuery<"pub
     confidence?: number | undefined;
     sourcePointers?: string[] | undefined;
     embedding?: number[] | undefined;
-    modality?: "text" | "image" | "video" | "audio" | "document" | undefined;
+    modality?: "text" | "audio" | "image" | "video" | "document" | undefined;
     mediaPointer?: string | undefined;
     subjectKey?: string | undefined;
     createdByKind?: "owner" | "channel" | undefined;
@@ -331,7 +331,7 @@ export declare const findSimilar: import("convex/server").RegisteredQuery<"publi
     confidence?: number | undefined;
     sourcePointers?: string[] | undefined;
     embedding?: number[] | undefined;
-    modality?: "text" | "image" | "video" | "audio" | "document" | undefined;
+    modality?: "text" | "audio" | "image" | "video" | "document" | undefined;
     mediaPointer?: string | undefined;
     subjectKey?: string | undefined;
     createdByKind?: "owner" | "channel" | undefined;

@@ -5,8 +5,8 @@ export declare const read: import("convex/server").RegisteredQuery<"public", {
     _creationTime: number;
     auth?: any;
     channels?: any;
-    session?: any;
     defaults?: any;
+    session?: any;
     agents?: any;
     gateway?: any;
     skills?: any;
@@ -29,8 +29,8 @@ export declare const read: import("convex/server").RegisteredQuery<"public", {
 export declare const write: import("convex/server").RegisteredMutation<"public", {
     auth?: any;
     channels?: any;
-    session?: any;
     defaults?: any;
+    session?: any;
     agents?: any;
     gateway?: any;
     skills?: any;

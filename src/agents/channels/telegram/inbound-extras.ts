@@ -14,7 +14,7 @@
 
 import type { Message } from "@grammyjs/types";
 
-import type { InboundReplyContext } from "../sdk.js";
+import type { InboundForwardContext, InboundReplyContext } from "../sdk.js";
 
 /** Telegram message entity (mention / link / etc.). */
 type TelegramTextEntity = NonNullable<Message["entities"]>[number];
@@ -192,6 +192,79 @@ export function extractTelegramReplyContext(msg: Message): InboundReplyContext |
 	const body = quotedText ? quotedText.slice(0, 280) : undefined; // bound LLM context
 	if (!messageId && !from && !body) return undefined;
 	return { messageId, from, body };
+}
+
+/* ───────────────────────── forwarded-message context ───────────────────────── */
+
+/**
+ * Forward provenance, when this message was forwarded from elsewhere. Reads the
+ * modern `forward_origin` envelope (Bot API 7.0+, a `MessageOrigin` union) and
+ * falls back to the legacy `forward_from` / `forward_from_chat` / `forward_date`
+ * fields so older payloads still surface a sender. Returns `undefined` for an
+ * original (non-forwarded) message. Ported from the reference
+ * `bot-handlers.runtime.ts` forward handling.
+ */
+export function extractTelegramForwardContext(msg: Message): InboundForwardContext | undefined {
+	const m = msg as Message & {
+		forward_origin?: {
+			type?: string;
+			date?: number;
+			sender_user?: { id?: number; first_name?: string; last_name?: string; username?: string };
+			sender_user_name?: string;
+			sender_chat?: { id?: number; title?: string; username?: string };
+			chat?: { id?: number; title?: string; username?: string };
+			author_signature?: string;
+		};
+		forward_from?: { id?: number; first_name?: string; last_name?: string; username?: string };
+		forward_from_chat?: { id?: number; title?: string; username?: string };
+		forward_sender_name?: string;
+		forward_date?: number;
+	};
+
+	const ctx: InboundForwardContext = {};
+
+	const origin = m.forward_origin;
+	if (origin) {
+		if (typeof origin.date === "number") ctx.date = origin.date * 1000;
+		// `user` origin → a concrete forwarding user.
+		const u = origin.sender_user;
+		if (u) {
+			const name = [u.first_name, u.last_name].filter(Boolean).join(" ").trim() || (u.username ? `@${u.username}` : "");
+			if (name) ctx.senderName = name;
+			if (typeof u.id === "number") ctx.from = String(u.id);
+		}
+		// `hidden_user` origin → only a display name (privacy-restricted forward).
+		if (!ctx.senderName && typeof origin.sender_user_name === "string" && origin.sender_user_name.trim()) {
+			ctx.senderName = origin.sender_user_name.trim();
+		}
+		// `chat` / `channel` origin → the originating chat/channel.
+		const originChat = origin.sender_chat ?? origin.chat;
+		if (originChat) {
+			if (typeof originChat.id === "number") ctx.chatId = String(originChat.id);
+			if (typeof originChat.title === "string" && originChat.title.trim()) ctx.chatTitle = originChat.title.trim();
+			if (!ctx.senderName && origin.author_signature) ctx.senderName = origin.author_signature;
+		}
+	} else {
+		// Legacy forward fields (pre-Bot-API-7.0).
+		if (typeof m.forward_date === "number") ctx.date = m.forward_date * 1000;
+		const u = m.forward_from;
+		if (u) {
+			const name = [u.first_name, u.last_name].filter(Boolean).join(" ").trim() || (u.username ? `@${u.username}` : "");
+			if (name) ctx.senderName = name;
+			if (typeof u.id === "number") ctx.from = String(u.id);
+		}
+		const chat = m.forward_from_chat;
+		if (chat) {
+			if (typeof chat.id === "number") ctx.chatId = String(chat.id);
+			if (typeof chat.title === "string" && chat.title.trim()) ctx.chatTitle = chat.title.trim();
+		}
+		if (!ctx.senderName && typeof m.forward_sender_name === "string" && m.forward_sender_name.trim()) {
+			ctx.senderName = m.forward_sender_name.trim();
+		}
+	}
+
+	// Nothing usable → not a forward (or an unrecognised origin shape).
+	return ctx.senderName || ctx.from || ctx.chatId || ctx.chatTitle || ctx.date ? ctx : undefined;
 }
 
 /* ───────────────────────── media detection (ported) ───────────────────────── */

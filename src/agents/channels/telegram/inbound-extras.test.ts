@@ -5,6 +5,7 @@ import type { Message } from "@grammyjs/types";
 
 import {
 	buildTelegramSenderName,
+	extractTelegramForwardContext,
 	extractTelegramMentions,
 	extractTelegramReplyContext,
 	extractTelegramText,
@@ -138,5 +139,66 @@ describe("buildTelegramSenderName", () => {
 	it("prefers First Last, falls back to @username", () => {
 		assert.equal(buildTelegramSenderName(msg({ from: { id: 1, is_bot: false, first_name: "Jane", last_name: "Doe" } })), "Jane Doe");
 		assert.equal(buildTelegramSenderName(msg({ from: { id: 1, is_bot: false, first_name: "", username: "jd" } as Message["from"] })), "@jd");
+	});
+});
+
+describe("extractTelegramForwardContext", () => {
+	it("returns undefined for a non-forwarded message", () => {
+		assert.equal(extractTelegramForwardContext(msg({ text: "hi" })), undefined);
+	});
+
+	it("reads a modern forward_origin user origin", () => {
+		const fwd = extractTelegramForwardContext(
+			msg({
+				forward_origin: {
+					type: "user",
+					date: 1_700_000_000,
+					sender_user: { id: 999, first_name: "Bob", username: "bob" },
+				},
+			} as Partial<Message>),
+		);
+		assert.equal(fwd?.senderName, "Bob");
+		assert.equal(fwd?.from, "999");
+		assert.equal(fwd?.date, 1_700_000_000 * 1000);
+	});
+
+	it("reads a hidden_user origin (display name only)", () => {
+		const fwd = extractTelegramForwardContext(
+			msg({
+				forward_origin: { type: "hidden_user", date: 1, sender_user_name: "Anon Person" },
+			} as Partial<Message>),
+		);
+		assert.equal(fwd?.senderName, "Anon Person");
+		assert.equal(fwd?.from, undefined);
+	});
+
+	it("reads a channel origin (chat title + id)", () => {
+		const fwd = extractTelegramForwardContext(
+			msg({
+				forward_origin: {
+					type: "channel",
+					date: 2,
+					chat: { id: -100777, title: "Announcements" },
+					author_signature: "Editor",
+				},
+			} as Partial<Message>),
+		);
+		assert.equal(fwd?.chatId, "-100777");
+		assert.equal(fwd?.chatTitle, "Announcements");
+		assert.equal(fwd?.senderName, "Editor");
+	});
+
+	it("falls back to legacy forward_from / forward_from_chat", () => {
+		const userFwd = extractTelegramForwardContext(
+			msg({ forward_date: 5, forward_from: { id: 12, first_name: "Old", last_name: "Style" } } as Partial<Message>),
+		);
+		assert.equal(userFwd?.senderName, "Old Style");
+		assert.equal(userFwd?.from, "12");
+
+		const chatFwd = extractTelegramForwardContext(
+			msg({ forward_date: 6, forward_from_chat: { id: -100888, title: "Legacy Channel" } } as Partial<Message>),
+		);
+		assert.equal(chatFwd?.chatId, "-100888");
+		assert.equal(chatFwd?.chatTitle, "Legacy Channel");
 	});
 });

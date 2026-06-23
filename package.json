@@ -27,6 +27,10 @@
       "types": "./dist/extension-sdk.d.ts",
       "import": "./dist/extension-sdk.js"
     },
+    "./channel-sdk": {
+      "types": "./dist/channel-sdk.d.ts",
+      "import": "./dist/channel-sdk.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -163,13 +167,13 @@
   },
   "dependencies": {
     "@composio/core": "^0.10.0",
-    "@grammyjs/runner": "^2.0.3",
-    "@grammyjs/transformer-throttler": "^1.2.1",
-    "@grammyjs/types": "^3.21.0",
     "@earendil-works/pi-agent-core": "0.79.9",
     "@earendil-works/pi-ai": "0.79.9",
     "@earendil-works/pi-coding-agent": "0.79.9",
     "@earendil-works/pi-tui": "0.79.9",
+    "@grammyjs/runner": "^2.0.3",
+    "@grammyjs/transformer-throttler": "^1.2.1",
+    "@grammyjs/types": "^3.21.0",
     "@mozilla/readability": "^0.6.0",
     "@whiskeysockets/baileys": "7.0.0-rc13",
     "cfonts": "^3.3.1",
@@ -179,6 +183,7 @@
     "convex": "^1.40.0",
     "croner": "^10.0.1",
     "grammy": "^1.42.0",
+    "jiti": "^2.6.1",
     "json5": "^2.2.3",
     "linkedom": "^0.18.12",
     "minimatch": "^10.2.5",
@@ -186,6 +191,7 @@
     "prompts": "^2.4.2",
     "proper-lockfile": "^4.1.2",
     "qrcode-terminal": "^0.12.0",
+    "socks-proxy-agent": "^10.1.0",
     "tar": "^7.5.15",
     "undici": "^7.25.0",
     "ws": "^8.21.0",

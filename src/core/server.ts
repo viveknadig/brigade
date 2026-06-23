@@ -61,13 +61,14 @@ import {
 // session is surfaced for the turn's lifetime via `onSessionReady` so the
 // gateway can steer / abort / switch-model mid-stream.
 import { applyAutoEnableA2AAtBoot } from "../agents/a2a-policy-canonicalize.js";
-import { runResilientTurn, type RunSingleTurnResult } from "../agents/agent-loop.js";
+import { flattenAssistantContent, runResilientTurn, type RunSingleTurnResult } from "../agents/agent-loop.js";
 import { BrigadeExtensionRegistry, BUNDLED_MODULES, clearDiscoveryCache, loadModules } from "../agents/extensions/index.js";
 import { setActiveRegistry } from "../agents/extensions/active-registry.js";
 import type { GatewayCaller, GatewayMethodHandler, HttpRoute, Service } from "../agents/extensions/index.js";
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_MS, readBodyWithLimit } from "./webhook-guards.js";
 import { extractFrameTags, shouldDeliverFrame } from "./ws-subscription-filter.js";
 import { setActiveChannelManager } from "../agents/channels/active-manager.js";
+import { sanitizeReplyForChannel } from "../agents/channels/reply-sanitizer.js";
 import { type ChannelManager, startChannels } from "../agents/channels/manager.js";
 import {
 	createChannelPluginManager,
@@ -2251,6 +2252,50 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		};
 	};
 
+	/**
+	 * OPTIONAL live-streaming delta forwarder. Subscribes to the SAME Pi session
+	 * `attachTurnSession` watches, but extracts only the accumulating assistant
+	 * ANSWER text from each `message_update` and forwards it to the channel's
+	 * `onReplyDelta` sink so the channel can progressively edit its message. The
+	 * `<think>` reasoning is stripped here with the same sanitizer the final
+	 * reply uses, so a stream never leaks reasoning into a channel preview.
+	 *
+	 * When `sink` is undefined (TUI / cron / sub-agent / RPC callers) this is a
+	 * no-op that returns an inert detach — those turns never stream.
+	 */
+	const attachReplyDeltaForwarder = (
+		session: AgentSession,
+		sink: ((accumulatedText: string) => void) | undefined,
+	): (() => void) => {
+		if (!sink) return () => {};
+		const detach = session.subscribe((piEvent: AgentSessionEvent) => {
+			if (piEvent.type !== "message_update" && piEvent.type !== "message_end") return;
+			const message = (piEvent as { message?: { role?: string; content?: unknown } }).message;
+			if (!message || message.role !== "assistant") return;
+			const raw = flattenAssistantContent(message.content);
+			if (!raw) return;
+			// Strip reasoning so the live preview shows only the answer-in-progress.
+			const answer = sanitizeReplyForChannel(raw);
+			if (answer) {
+				try {
+					sink(answer);
+				} catch {
+					/* a misbehaving sink must never break the turn */
+				}
+			}
+		});
+		let cleaned = false;
+		return () => {
+			if (cleaned) return;
+			cleaned = true;
+			try {
+				detach();
+			} catch {
+				/* session may already be torn down */
+			}
+		};
+	};
+
 	// Sub-agent pi-event forwarder (Primitive #6). The gateway's
 	// `attachTurnSession` only subscribes to the TOP-LEVEL Pi session — when
 	// a sub-agent runs (via `subagent-runner` recursing into `runSingleTurn`),
@@ -2459,6 +2504,17 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		 * the legacy WS broadcast path the connect-mode TUI watches).
 		 */
 		channelApprovalRoute?: import("../agents/channels/approval-router.js").ChannelApprovalRoute;
+		/**
+		 * OPTIONAL live-streaming delta sink. When a channel turn opts into
+		 * progressive delivery (e.g. Telegram `liveStream: true`), the channel
+		 * manager passes this callback; the gateway forwards the ACCUMULATED
+		 * assistant answer text on every Pi `message_update` so the channel can
+		 * edit its in-progress message. Always undefined for TUI / cron / sub-
+		 * agent / RPC callers, so their delivery is byte-unchanged. The final
+		 * reply is still returned in `RunSingleTurnResult.reply` (the channel's
+		 * final-only fallback path stays authoritative).
+		 */
+		onReplyDelta?: (accumulatedText: string) => void;
 	}): Promise<RunSingleTurnResult> => {
 		// Pick the lane:
 		//   - The BOOT operator's primary session (`agent:<bootAgentId>:main`)
@@ -2584,7 +2640,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 						// sibling turn's — `turnState` is a per-invocation local.
 						if (turnState.cleanup) turnState.cleanup();
 						turnState.activeSession = session;
-						turnState.cleanup = attachTurnSession(session, turnSessionKey, targetAgentId);
+						const detachStream = attachReplyDeltaForwarder(session, turn.onReplyDelta);
+						const detachTurn = attachTurnSession(session, turnSessionKey, targetAgentId);
+						turnState.cleanup = () => {
+							detachStream();
+							detachTurn();
+						};
 					},
 				});
 				// Queue a debounced, batched memory-extraction sweep over the settled

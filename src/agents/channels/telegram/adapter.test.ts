@@ -24,6 +24,7 @@ interface FakeConnCalls {
 	pins: Array<{ chatId: string; messageId: string }>;
 	unpins: Array<{ chatId: string; messageId?: string }>;
 	forumLabels: Array<{ chatId: string; threadId: string; name: string }>;
+	forumTopics: Array<{ chatId: string; name: string }>;
 	commandMenus: Array<Array<{ command: string; description: string }>>;
 	fedUpdates: unknown[];
 }
@@ -55,6 +56,7 @@ function makeFakeConnectImpl(opts: { sendTextImpl?: FakeConnHandle["conn"]["send
 			pins: [],
 			unpins: [],
 			forumLabels: [],
+			forumTopics: [],
 			commandMenus: [],
 			fedUpdates: [],
 		};
@@ -96,6 +98,10 @@ function makeFakeConnectImpl(opts: { sendTextImpl?: FakeConnHandle["conn"]["send
 			},
 			editForumTopic: async (chatId, threadId, name) => {
 				calls.forumLabels.push({ chatId, threadId, name });
+			},
+			createForumTopic: async (chatId, name) => {
+				calls.forumTopics.push({ chatId, name });
+				return { threadId: String(calls.forumTopics.length + 100), name };
 			},
 			answerCallback: async () => {},
 			getIdentity: async () => ({ id: 42, username: "brigadebot" }),
@@ -288,6 +294,51 @@ describe("Telegram adapter inbound wiring", () => {
 		assert.deepEqual(msg.mentions, ["42"]);
 		assert.equal(msg.resolveMedia, thunk, "deferred media thunk must pass through untouched");
 	});
+
+	it("routes an inbound reaction through onInbound with a synthesised note", async () => {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createTelegramAdapter({ connectImpl });
+		a.isConfigured(enabledCfg(), {});
+		const ctx = makeStartCtx();
+		await a.start(ctx);
+		handle()!.args.onReaction?.({
+			conversationId: "555",
+			from: "555",
+			fromName: "Alice",
+			text: "",
+			chatType: "direct",
+			reaction: { emojis: ["👍"], targetMessageId: "33" },
+			raw: {} as never,
+		});
+		await new Promise((r) => setTimeout(r, 0));
+		assert.equal(ctx.inbound.length, 1);
+		const msg = ctx.inbound[0]!;
+		assert.equal(msg.channel, "telegram");
+		assert.deepEqual(msg.reaction, { emojis: ["👍"], targetMessageId: "33" });
+		assert.match(msg.text, /Alice reacted 👍 to message 33/);
+	});
+
+	it("passes edited + forwarded provenance through onMessage → onInbound", async () => {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createTelegramAdapter({ connectImpl });
+		a.isConfigured(enabledCfg(), {});
+		const ctx = makeStartCtx();
+		await a.start(ctx);
+		handle()!.args.onMessage({
+			conversationId: "555",
+			messageId: "9",
+			from: "555",
+			text: "edited + forwarded",
+			chatType: "direct",
+			edited: true,
+			forwarded: { senderName: "Bob", from: "999" },
+			raw: {} as never,
+		});
+		await new Promise((r) => setTimeout(r, 0));
+		const msg = ctx.inbound[0]!;
+		assert.equal(msg.edited, true);
+		assert.deepEqual(msg.forwarded, { senderName: "Bob", from: "999" });
+	});
 });
 
 describe("Telegram adapter sendText chunk → HTML → send", () => {
@@ -400,6 +451,17 @@ describe("Telegram adapter handleAction dispatch", () => {
 		await a.handleAction!({ conversationId: "555", action: { kind: "unpin", messageId: "5" } });
 		assert.deepEqual(handle().calls.pins, [{ chatId: "555", messageId: "5" }]);
 		assert.deepEqual(handle().calls.unpins, [{ chatId: "555", messageId: "5" }]);
+	});
+
+	it("topic-create → createForumTopic, returns the new thread id", async () => {
+		const { a, handle } = await started();
+		const r = await a.handleAction!({
+			conversationId: "-100999",
+			action: { kind: "topic-create", name: "Roadmap" },
+		});
+		assert.equal(r.ok, true);
+		assert.equal(r.messageId, "101", "new thread id surfaced as messageId");
+		assert.deepEqual(handle().calls.forumTopics, [{ chatId: "-100999", name: "Roadmap" }]);
 	});
 
 	it("returns ok:false when the connection method throws", async () => {
@@ -574,5 +636,117 @@ describe("telegramModule", () => {
 		const reg = new BrigadeExtensionRegistry();
 		telegramModule.register(reg.context({ ...META, config: enabledCfg() }));
 		assert.equal(reg.httpRoutes.length, 0, "polling mode exposes no inbound HTTP surface");
+	});
+});
+
+describe("Telegram adapter live streaming (beginReplyStream)", () => {
+	const streamCfg = (extra: Record<string, unknown> = {}): BrigadeConfig =>
+		({
+			channels: { telegram: { enabled: true, botToken: "123456:AAExampleTokenValueABCDEFGHIJKLMNOP", liveStream: true, ...extra } },
+		}) as unknown as BrigadeConfig;
+
+	async function startedWith(cfg: BrigadeConfig) {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createTelegramAdapter({ connectImpl });
+		a.isConfigured(cfg, {});
+		await a.start(makeStartCtx());
+		return { a, handle: () => handle()! };
+	}
+
+	it("returns null when liveStream is NOT enabled (final-only fallback)", async () => {
+		const { a } = await startedWith(enabledCfg());
+		assert.equal(a.beginReplyStream?.("555"), null);
+	});
+
+	it("opens a stream when liveStream is enabled and edits in place", async () => {
+		const { a, handle } = await startedWith(streamCfg());
+		const stream = a.beginReplyStream?.("555");
+		assert.ok(stream, "stream should open when liveStream is true");
+		stream!.update("Hello");
+		// finalize delivers the full text via the connection's send/edit path.
+		const sent = await stream!.finalize("Hello world");
+		assert.ok(sent && typeof sent === "object" && sent.messageId, "finalize surfaces a message id");
+		// A send happened on the connection (placeholder or final).
+		assert.ok(handle().calls.sentText.length >= 1, "stream delivered via sendText");
+	});
+
+	it("returns null when the token is invalid", async () => {
+		const { a, handle } = await startedWith(streamCfg());
+		handle().tokenInvalid = true;
+		assert.equal(a.beginReplyStream?.("555"), null);
+	});
+});
+
+describe("Telegram adapter reasoning lane (deliverReasoning)", () => {
+	const reasoningCfg = (on: boolean): BrigadeConfig =>
+		({
+			channels: { telegram: { enabled: true, botToken: "123456:AAExampleTokenValueABCDEFGHIJKLMNOP", surfaceReasoning: on } },
+		}) as unknown as BrigadeConfig;
+
+	async function startedWith(cfg: BrigadeConfig) {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createTelegramAdapter({ connectImpl });
+		a.isConfigured(cfg, {});
+		await a.start(makeStartCtx());
+		return { a, handle: () => handle()! };
+	}
+
+	it("sends NOTHING when surfaceReasoning is off (default)", async () => {
+		const { a, handle } = await startedWith(reasoningCfg(false));
+		await a.deliverReasoning?.("555", "<think>plan</think>The answer.");
+		assert.equal(handle().calls.sentText.length, 0, "reasoning is not delivered by default");
+	});
+
+	it("sends a prefixed reasoning message when enabled and reasoning is present", async () => {
+		const { a, handle } = await startedWith(reasoningCfg(true));
+		await a.deliverReasoning?.("555", "<think>my plan</think>The answer.");
+		assert.equal(handle().calls.sentText.length, 1);
+		assert.match(handle().calls.sentText[0]?.text ?? "", /Reasoning/i);
+		assert.match(handle().calls.sentText[0]?.text ?? "", /my plan/);
+	});
+
+	it("sends nothing when enabled but the reply carried no reasoning", async () => {
+		const { a, handle } = await startedWith(reasoningCfg(true));
+		await a.deliverReasoning?.("555", "Just a plain answer.");
+		assert.equal(handle().calls.sentText.length, 0);
+	});
+});
+
+describe("Telegram adapter general inline buttons (handleAction buttons)", () => {
+	async function started() {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createTelegramAdapter({ connectImpl });
+		a.isConfigured(enabledCfg(), {});
+		await a.start(makeStartCtx());
+		return { a, handle: () => handle()! };
+	}
+
+	it("buttons → sendInteractive with a prefixed inline keyboard", async () => {
+		const { a, handle } = await started();
+		const r = await a.handleAction!({
+			conversationId: "555",
+			action: {
+				kind: "buttons",
+				text: "Pick one",
+				buttons: [[{ text: "Yes", data: "yes" }, { text: "No", data: "no" }]],
+			},
+		});
+		assert.equal(r.ok, true);
+		const interactive = handle().calls.sentInteractive;
+		assert.equal(interactive.length, 1);
+		const kb = interactive[0]?.replyMarkup as { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+		assert.equal(kb.inline_keyboard[0]?.[0]?.text, "Yes");
+		assert.equal(kb.inline_keyboard[0]?.[0]?.callback_data, "g:yes");
+		assert.equal(kb.inline_keyboard[0]?.[1]?.callback_data, "g:no");
+	});
+
+	it("buttons → ok:false when no usable button could be built", async () => {
+		const { a } = await started();
+		const r = await a.handleAction!({
+			conversationId: "555",
+			action: { kind: "buttons", text: "x", buttons: [[{ text: "", data: "" }]] },
+		});
+		assert.equal(r.ok, false);
+		assert.match(r.error ?? "", /no usable buttons/i);
 	});
 });

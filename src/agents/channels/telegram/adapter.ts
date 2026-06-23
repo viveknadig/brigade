@@ -31,6 +31,7 @@ import {
 	type ChannelHealth,
 	type ChannelMessageAction,
 	type ChannelMessageActionResult,
+	type ChannelReplyStream,
 	type ChannelStartContext,
 	type OutboundMedia,
 	type OutboundSendOptions,
@@ -39,11 +40,18 @@ import {
 import {
 	listTelegramAccountIds,
 	resolveTelegramBotToken,
+	resolveTelegramProxyUrl,
 	telegramChannelEnabled,
+	telegramLiveStreamEnabled,
+	telegramStreamThrottleMs,
+	telegramSurfaceReasoning,
 	telegramWebhookConfig,
 	TELEGRAM_CHANNEL_ID,
 	TELEGRAM_DEFAULT_ACCOUNT_ID,
 } from "./account-config.js";
+import { createDraftStream } from "./draft-stream.js";
+import { buildTelegramInlineKeyboard } from "./inline-keyboard.js";
+import { splitTelegramReasoning } from "./reasoning-lane.js";
 import { buildTelegramApprovalKeyboard, buildTelegramApprovalText } from "./approval-native.js";
 import { connectTelegram, type ConnectTelegramArgs, type TelegramBotIdentity, type TelegramConnection, type TelegramPollSpec } from "./connection.js";
 import { markdownToTelegramHtml, telegramHtmlIsEmpty } from "./format.js";
@@ -140,9 +148,15 @@ export function createTelegramAdapter(opts: CreateTelegramAdapterOptions = {}): 
 			// registers the webhook on connect; the gateway HTTP route feeds updates
 			// via `feedWebhookUpdate` (wired by the module when webhook is active).
 			const transport = telegramWebhookConfig(cfg, lastEnv);
+			// Optional proxy: per-account → top-level `channels.telegram.proxy` →
+			// `HTTPS_PROXY`/`ALL_PROXY` env. Empty → direct connection (the default).
+			// On a network where `api.telegram.org` is blocked, this routes every
+			// Telegram API call through a reachable http(s) proxy.
+			const proxyUrl = resolveTelegramProxyUrl(cfg, accountId, lastEnv);
 			connection = await connectImpl({
 				token,
 				accountId,
+				...(proxyUrl ? { proxyUrl } : {}),
 				...(opts.commandMenu && opts.commandMenu.length > 0 ? { commandMenu: opts.commandMenu } : {}),
 				...(opts.allowedUpdates && opts.allowedUpdates.length > 0 ? { allowedUpdates: opts.allowedUpdates } : {}),
 				...(transport.mode === "webhook"
@@ -189,9 +203,34 @@ export function createTelegramAdapter(opts: CreateTelegramAdapterOptions = {}): 
 						threadId: msg.threadId,
 						mentions: msg.mentions,
 						replyTo: msg.replyTo,
+						// Edit + forward provenance ride through so the central pipeline /
+						// agent see "this was an edit" / "this was forwarded from X".
+						...(msg.edited ? { edited: true } : {}),
+						...(msg.forwarded ? { forwarded: msg.forwarded } : {}),
 						// Deferred media thunk rides through untouched — the pipeline
 						// resolves it only after the access gate admits the sender.
 						resolveMedia: msg.resolveMedia,
+						raw: msg.raw,
+					});
+				},
+				// Inbound reaction (`message_reaction`) → synthesise a short note and
+				// route it through the SAME inbound pipeline as a normal message so
+				// the access gate + routing apply uniformly. The note carries the
+				// added emoji(s) + the target message id so the agent has context.
+				onReaction: (msg) => {
+					if (!msg.reaction) return;
+					const note = buildReactionNote(msg.reaction.emojis, msg.reaction.targetMessageId, msg.fromName);
+					void ctx.onInbound({
+						channel: TELEGRAM_CHANNEL_ID,
+						accountId,
+						conversationId: msg.conversationId,
+						from: msg.from,
+						...(msg.fromName !== undefined ? { fromName: msg.fromName } : {}),
+						text: note,
+						chatType: msg.chatType,
+						isGroup: msg.chatType === "group",
+						...(msg.threadId !== undefined ? { threadId: msg.threadId } : {}),
+						reaction: msg.reaction,
 						raw: msg.raw,
 					});
 				},
@@ -286,12 +325,94 @@ export function createTelegramAdapter(opts: CreateTelegramAdapterOptions = {}): 
 			}
 		},
 
+		/**
+		 * Open a LIVE reply stream — the gateway feeds the accumulating answer text
+		 * via `update()`, this edits one Telegram message in place (throttled
+		 * ~1×/sec), and `finalize()` settles it on turn end. Returns `null` when
+		 * streaming is disabled in config (`channels.telegram.liveStream` is not
+		 * true) OR the connection isn't live, so the pipeline falls back to the
+		 * single final `sendText` — byte-unchanged from before streaming existed.
+		 *
+		 * Each draft chunk is rendered through the SAME markdown→HTML converter the
+		 * final path uses; a chunk whose HTML is empty/unparseable streams as plain
+		 * text. When the running answer exceeds 4096 chars the stream finalizes the
+		 * current message at a boundary and rolls overflow into a new message.
+		 */
+		beginReplyStream(conversationId: string, sendOpts?: OutboundSendOptions): ChannelReplyStream | null {
+			if (!connection) return null;
+			if (tokenInvalid || connection.isTokenInvalid()) return null;
+			const cfg = lastConfig;
+			if (!cfg || !telegramLiveStreamEnabled(cfg)) return null;
+			const conn = connection;
+			const threadId = sendOpts?.threadId;
+			const stream = createDraftStream({
+				transport: {
+					async sendMessage(text, o): Promise<{ messageId: number }> {
+						const sent = await conn.sendText(conversationId, text, {
+							...(o.parseMode === "HTML" ? { html: true } : {}),
+							...(o.threadId !== undefined ? { threadId: o.threadId } : {}),
+						});
+						return { messageId: sent.messageId };
+					},
+					async editMessageText(messageId, text, o): Promise<void> {
+						await conn.editMessageText(conversationId, String(messageId), text, {
+							...(o.parseMode === "HTML" ? { html: true } : {}),
+						});
+					},
+				},
+				throttleMs: telegramStreamThrottleMs(cfg),
+				maxChars: TELEGRAM_TEXT_LIMIT,
+				// Render each draft chunk to Telegram HTML; fall back to plain text
+				// when the HTML is empty (syntax-only) so a half-streamed fence
+				// never wedges the edit.
+				renderText: (chunk) => {
+					const html = markdownToTelegramHtml(chunk);
+					if (telegramHtmlIsEmpty(html)) return { text: chunk };
+					return { text: html, parseMode: "HTML" as const };
+				},
+			});
+			return {
+				update: (text: string) => stream.update(text),
+				async finalize(finalText: string): Promise<{ messageId?: string } | void> {
+					await stream.finalize(finalText);
+					const ids = stream.messageIds();
+					const last = ids[ids.length - 1];
+					return last !== undefined ? { messageId: String(last) } : undefined;
+				},
+				stop: () => stream.stop(),
+			};
+		},
+
+		/**
+		 * OPTIONAL reasoning lane (default OFF). When `channels.telegram.
+		 * surfaceReasoning` is true, split the raw reply's `<think>` trace out and
+		 * send it as a separate `🧠 Reasoning:` message BEFORE the answer. When the
+		 * config gate is off (the default) OR the reply carried no reasoning, this
+		 * sends NOTHING — the answer message the pipeline sends afterward is
+		 * byte-identical either way.
+		 */
+		async deliverReasoning(conversationId: string, rawReply: string, sendOpts?: OutboundSendOptions): Promise<void> {
+			if (!connection) return;
+			if (tokenInvalid || connection.isTokenInvalid()) return;
+			const cfg = lastConfig;
+			if (!cfg || !telegramSurfaceReasoning(cfg)) return;
+			const { reasoningText } = splitTelegramReasoning(rawReply ?? "");
+			if (!reasoningText) return;
+			// Reuse the adapter's own chunk+HTML send path so a long reasoning trace
+			// is chunked at 4096 and formatted consistently with replies.
+			await adapter.sendText(conversationId, reasoningText, sendOpts);
+		},
+
 		// Telegram ids are numeric user/chat ids and @usernames, so the pairing
 		// challenge card uses the "Your username" line.
 		pairing: { idLabel: "username" as const },
 
 		// Token-based setup wizard — `brigade channels add --channel telegram`
 		// prompts for the bot token and writes `channels.telegram.botToken`.
+		// Proxy is intentionally NOT a wizard prompt (it's a rare, optional knob,
+		// and the wizard treats every credential as required): set it directly as
+		// `channels.telegram.proxy: "http://host:port"` (or `"${TG_PROXY}"`) or via
+		// the `HTTPS_PROXY` / `ALL_PROXY` env var when api.telegram.org is blocked.
 		setup: {
 			credentialKeys: [
 				{
@@ -444,6 +565,41 @@ export function createTelegramAdapter(opts: CreateTelegramAdapterOptions = {}): 
 						});
 						return { ok: true, messageId: String(sent.messageId) };
 					}
+					case "topic-create": {
+						// Create a forum topic in this supergroup; return the new thread
+						// id as messageId so the agent can immediately send into it.
+						const created = await connection.createForumTopic(p.conversationId, a.name, {
+							...(a.iconColor !== undefined ? { iconColor: a.iconColor } : {}),
+							...(a.iconCustomEmojiId !== undefined ? { iconCustomEmojiId: a.iconCustomEmojiId } : {}),
+						});
+						return { ok: true, messageId: created.threadId };
+					}
+					case "buttons": {
+						// Send a NEW message with a general inline keyboard. The button
+						// data is prefixed/sanitized by the keyboard builder; a press
+						// arrives as `callbackQuery` and routes through the pipeline as a
+						// turn (the central approval path declines a general payload).
+						const keyboard = buildTelegramInlineKeyboard(
+							a.buttons.map((row) => row.map((b) => ({ text: b.text, data: b.data }))),
+						);
+						if (!keyboard) {
+							return { ok: false, error: "no usable buttons (each needs a label + a data token ≤ ~60 bytes)" };
+						}
+						// Render the body to Telegram HTML like the reply path; the
+						// interactive send is verbatim, so format here then mark html.
+						const html = markdownToTelegramHtml(a.text);
+						const useHtml = !telegramHtmlIsEmpty(html);
+						const sent = await connection.sendInteractive(
+							p.conversationId,
+							useHtml ? html : a.text,
+							keyboard,
+							{
+								...(useHtml ? { html: true } : {}),
+								...(a.threadId !== undefined ? { threadId: a.threadId } : {}),
+							},
+						);
+						return { ok: true, messageId: String(sent.messageId) };
+					}
 					default:
 						return { ok: false, error: `unsupported action kind` };
 				}
@@ -486,6 +642,17 @@ export function createTelegramAdapter(opts: CreateTelegramAdapterOptions = {}): 
 	}
 
 	return adapter;
+}
+
+/**
+ * Synthesise the agent-facing note for an inbound reaction. The reaction itself
+ * carries no text, so the note ("<who> reacted <emoji> to message <id>") is what
+ * the central pipeline routes through dispatchTurn so the agent has context.
+ */
+export function buildReactionNote(emojis: string[], targetMessageId: string, fromName?: string): string {
+	const who = fromName?.trim() || "Someone";
+	const emoji = emojis.join(" ");
+	return `${who} reacted ${emoji} to message ${targetMessageId}.`;
 }
 
 /** Static Telegram capability flags (shared by the legacy adapter + plugin meta). */

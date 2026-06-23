@@ -50,10 +50,12 @@ const ActionKind = Type.Union(
 		Type.Literal("react"),
 		Type.Literal("pin"),
 		Type.Literal("unpin"),
+		Type.Literal("topic-create"),
+		Type.Literal("buttons"),
 	],
 	{
 		description:
-			"What to do to the target message: edit its text, delete it, react with an emoji, or pin/unpin it.",
+			"What to do: edit a message's text, delete it, react with an emoji, pin/unpin it, `topic-create` a new forum topic, or send a message with inline `buttons` the user can tap.",
 	},
 );
 
@@ -86,6 +88,28 @@ const MessageActionParams = Type.Object({
 			Type.String({
 				description: "Emoji to react with — required for `react`. Pass an empty string to clear a reaction.",
 			}),
+		),
+		name: Type.Optional(
+			Type.String({
+				description: "Forum topic title — required for `topic-create`. Ignored for other kinds.",
+			}),
+		),
+		buttons: Type.Optional(
+			Type.Array(
+				Type.Array(
+					Type.Object({
+						text: Type.String({ description: "Button label shown to the user." }),
+						data: Type.String({
+							description:
+								"Short app-defined token (≤ ~60 bytes) delivered back to you when the user taps this button.",
+						}),
+					}),
+				),
+				{
+					description:
+						"Inline-keyboard grid (rows of buttons) — required for `buttons`. A tap posts the button's `data` back to you as a new message. Ignored for other kinds.",
+				},
+			),
 		),
 	}),
 	accountId: Type.Optional(
@@ -129,7 +153,7 @@ export interface MakeMessageActionToolOptions {
  * the contract surfaces here at compile time rather than silently skipping a
  * pre-check.
  */
-type BooleanCapabilityFlag = Extract<keyof ChannelCapabilities, "edit" | "unsend" | "reactions" | "reply">;
+type BooleanCapabilityFlag = Extract<keyof ChannelCapabilities, "edit" | "unsend" | "reactions" | "reply" | "threads">;
 
 /**
  * Map an action `kind` to the `ChannelCapabilities` flag that gates it. `pin`/
@@ -149,6 +173,8 @@ function capabilityFlagForKind(
 			return "reactions";
 		case "reply":
 			return "reply";
+		case "topic-create":
+			return "threads";
 		default:
 			return undefined; // pin / unpin — no flag in the contract
 	}
@@ -180,6 +206,10 @@ export function makeMessageActionTool(
 			let messageId = typeof rawAction.messageId === "string" ? rawAction.messageId.trim() : "";
 			const emoji = typeof rawAction.emoji === "string" ? rawAction.emoji : "";
 			const rawText = typeof rawAction.text === "string" ? rawAction.text : "";
+			const rawName = typeof rawAction.name === "string" ? rawAction.name : "";
+			const rawButtons = Array.isArray(rawAction.buttons)
+				? (rawAction.buttons as Array<Array<{ text?: unknown; data?: unknown }>>)
+				: undefined;
 
 			const fail = (error: string): AgentToolResult<MessageActionDetails> =>
 				jsonResult({
@@ -228,7 +258,16 @@ export function makeMessageActionTool(
 			if (kind === "react" && rawAction.emoji === undefined) {
 				return fail("react requires `action.emoji` (pass an empty string to clear a reaction).");
 			}
-			if (kind !== "reply" && !messageId) {
+			if (kind === "topic-create" && !rawName.trim()) return fail("topic-create requires `action.name`.");
+			if (kind === "buttons") {
+				if (!rawText.trim()) return fail("buttons requires `action.text` (the message body).");
+				if (!rawButtons || rawButtons.length === 0) {
+					return fail("buttons requires a non-empty `action.buttons` grid.");
+				}
+			}
+			// `reply` + `topic-create` + `buttons` act on the conversation, not a
+			// target message, so they don't need a messageId; every other kind does.
+			if (kind !== "reply" && kind !== "topic-create" && kind !== "buttons" && !messageId) {
 				return fail(
 					`${kind} requires action.messageId (and no prior sent message was found on this chat to default to).`,
 				);
@@ -265,6 +304,28 @@ export function makeMessageActionTool(
 				case "unpin":
 					action = { kind: "unpin", messageId };
 					break;
+				case "topic-create":
+					action = { kind: "topic-create", name: rawName.trim() };
+					break;
+				case "buttons": {
+					// Coerce the loosely-typed button grid to the contract shape, dropping
+					// malformed cells. The adapter validates byte budgets + label presence.
+					const grid = (rawButtons ?? [])
+						.map((row) =>
+							(Array.isArray(row) ? row : [])
+								.map((b) => ({
+									text: typeof b?.text === "string" ? b.text : "",
+									data: typeof b?.data === "string" ? b.data : "",
+								}))
+								.filter((b) => b.text && b.data),
+						)
+						.filter((row) => row.length > 0);
+					if (grid.length === 0) {
+						return fail("buttons requires at least one button with both `text` and `data`.");
+					}
+					action = { kind: "buttons", text: sanitizeReplyForChannel(rawText), buttons: grid };
+					break;
+				}
 				default:
 					return fail(`unknown action kind "${kind}".`);
 			}

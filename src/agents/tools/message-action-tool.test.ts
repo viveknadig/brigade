@@ -94,6 +94,7 @@ const ALL_CAPS: ChannelCapabilities = {
 	edit: true,
 	unsend: true,
 	reply: true,
+	threads: true,
 };
 
 function parse(result: { details: unknown }): Record<string, unknown> {
@@ -177,6 +178,93 @@ describe("message_action — dispatch", () => {
 		const d = parse(res);
 		assert.equal(d.ok, true);
 		assert.equal(d.messageId, "edited-77");
+	});
+
+	it("topic-create dispatches a typed topic-create action (no messageId required)", async () => {
+		const { calls } = mountAdapter({ capabilities: ALL_CAPS, result: { ok: true, messageId: "thread-101" } });
+		const tool = makeMessageActionTool({ senderIsOwner: true });
+		const res = await tool.execute("c1", {
+			channel: "telegram",
+			to: "-100999",
+			action: { kind: "topic-create", name: "Roadmap" },
+		} as never);
+		const d = parse(res);
+		assert.equal(d.ok, true);
+		assert.equal(d.messageId, "thread-101");
+		assert.deepEqual(calls[0]?.action, { kind: "topic-create", name: "Roadmap" });
+	});
+
+	it("buttons dispatches a typed buttons action with the grid (no messageId required)", async () => {
+		const { calls } = mountAdapter({ capabilities: ALL_CAPS, result: { ok: true, messageId: "msg-55" } });
+		const tool = makeMessageActionTool({ senderIsOwner: true });
+		const res = await tool.execute("c1", {
+			channel: "telegram",
+			to: "chat-1",
+			action: {
+				kind: "buttons",
+				text: "Pick one",
+				buttons: [[{ text: "Yes", data: "yes" }, { text: "No", data: "no" }]],
+			},
+		} as never);
+		const d = parse(res);
+		assert.equal(d.ok, true);
+		assert.equal(d.messageId, "msg-55");
+		assert.equal(calls.length, 1);
+		const action = calls[0]?.action as { kind: string; text: string; buttons: unknown };
+		assert.equal(action.kind, "buttons");
+		assert.equal(action.text, "Pick one");
+		assert.deepEqual(action.buttons, [[{ text: "Yes", data: "yes" }, { text: "No", data: "no" }]]);
+	});
+
+	it("buttons is refused before the adapter when the grid is empty", async () => {
+		const { calls } = mountAdapter({ capabilities: ALL_CAPS });
+		const tool = makeMessageActionTool({ senderIsOwner: true });
+		const res = await tool.execute("c1", {
+			channel: "telegram",
+			to: "chat-1",
+			action: { kind: "buttons", text: "hi", buttons: [] },
+		} as never);
+		assert.equal(parse(res).ok, false);
+		assert.equal(calls.length, 0);
+	});
+
+	it("buttons is refused when the message body is missing", async () => {
+		const { calls } = mountAdapter({ capabilities: ALL_CAPS });
+		const tool = makeMessageActionTool({ senderIsOwner: true });
+		const res = await tool.execute("c1", {
+			channel: "telegram",
+			to: "chat-1",
+			action: { kind: "buttons", buttons: [[{ text: "Yes", data: "yes" }]] },
+		} as never);
+		assert.equal(parse(res).ok, false);
+		assert.equal(calls.length, 0);
+	});
+
+	it("topic-create without a name is refused before the adapter", async () => {
+		const { calls } = mountAdapter({ capabilities: ALL_CAPS });
+		const tool = makeMessageActionTool({ senderIsOwner: true });
+		const res = await tool.execute("c1", {
+			channel: "telegram",
+			to: "-100999",
+			action: { kind: "topic-create" },
+		} as never);
+		assert.equal(parse(res).ok, false);
+		assert.equal(calls.length, 0);
+	});
+
+	it("topic-create is refused when the channel lacks threads capability", async () => {
+		const { calls } = mountAdapter({
+			capabilities: { chatTypes: ["group"], threads: false },
+		});
+		const tool = makeMessageActionTool({ senderIsOwner: true });
+		const res = await tool.execute("c1", {
+			channel: "telegram",
+			to: "-100999",
+			action: { kind: "topic-create", name: "X" },
+		} as never);
+		assert.equal(parse(res).ok, false);
+		assert.match(String(parse(res).error), /threads|does not support/i);
+		assert.equal(calls.length, 0);
 	});
 
 	it("runs edit text through the reply sanitizer (strips <think>)", async () => {

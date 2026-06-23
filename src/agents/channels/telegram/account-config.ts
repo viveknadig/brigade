@@ -38,6 +38,14 @@ const DEFAULT_ACCOUNT_ID = "default";
 /** The env var consulted as a last-resort token fallback. */
 const TOKEN_ENV_VAR = "TELEGRAM_BOT_TOKEN";
 
+/**
+ * Standard proxy env vars consulted as a last-resort proxy fallback, in
+ * precedence order. Lower-case wins over upper-case (curl/undici convention),
+ * and a TLS-oriented `https_proxy` outranks the catch-all `ALL_PROXY`. These
+ * mirror the keys undici's own `EnvHttpProxyAgent` honours.
+ */
+const PROXY_ENV_VARS = ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"] as const;
+
 /** `${VAR}` secret-ref form — identical to `config/io.ts`'s SECRET_REF_PATTERN. */
 const SECRET_REF_PATTERN = /^\$\{([A-Z_][A-Z0-9_]*)\}$/;
 
@@ -46,6 +54,8 @@ interface TelegramAccountEntry {
 	id?: string;
 	enabled?: boolean;
 	botToken?: string;
+	/** Per-account proxy URL (`http(s)://[user:pass@]host:port`). `${VAR}`-resolved. */
+	proxy?: string;
 	[key: string]: unknown;
 }
 
@@ -53,6 +63,16 @@ interface TelegramChannelConfigSlot {
 	enabled?: boolean;
 	verbose?: boolean;
 	botToken?: string;
+	/**
+	 * Top-level proxy URL applied to ALL accounts that don't set their own
+	 * `accounts[].proxy`. Use this on networks where `api.telegram.org` is
+	 * blocked — every Telegram API call (incl. `getMe`) routes through it.
+	 * Form: `http(s)://[user:pass@]host:port` for an HTTP CONNECT proxy, or
+	 * `socks5://[user:pass@]host:port` (also `socks://` / `socks4://` /
+	 * `socks5h://`) for a SOCKS proxy. `${VAR}`-resolved like `botToken`.
+	 * Env fallback: `HTTPS_PROXY` / `ALL_PROXY`.
+	 */
+	proxy?: string;
 	accounts?: TelegramAccountEntry[];
 	/** Transport mode — `"polling"` (default, local-first) or `"webhook"`. */
 	mode?: string;
@@ -62,6 +82,20 @@ interface TelegramChannelConfigSlot {
 	autoLabelTopics?: boolean;
 	/** Idle TTL (ms / duration string) after which idle thread sessions are reaped. */
 	threadIdleTtlMs?: number | string;
+	/**
+	 * Live-stream the agent reply by progressively editing one message as tokens
+	 * arrive (default OFF → one final chunked message, byte-unchanged). When true
+	 * the adapter posts a placeholder and edits it ~1×/sec until the turn settles.
+	 */
+	liveStream?: boolean;
+	/** Override the streaming edit throttle in ms (clamped ≥ 250). Default 1000. */
+	streamThrottleMs?: number;
+	/**
+	 * ALSO deliver the model's `<think>` reasoning as a separate prefixed message
+	 * (default OFF → reasoning stripped as today). The answer message is unchanged
+	 * either way; this only ADDS the reasoning message in front.
+	 */
+	surfaceReasoning?: boolean;
 	[key: string]: unknown;
 }
 
@@ -82,6 +116,11 @@ export interface ResolvedTelegramAccount {
 	enabled: boolean;
 	/** Bot API token, fully resolved (`${VAR}` + env fallback applied), or `""` when unset. */
 	botToken: string;
+	/**
+	 * Proxy URL all Telegram API calls route through, fully resolved (`${VAR}` +
+	 * env fallback applied), or `""` for a direct connection (the default).
+	 */
+	proxyUrl: string;
 	verbose: boolean;
 }
 
@@ -173,6 +212,55 @@ export function resolveTelegramBotToken(
 	return (env[TOKEN_ENV_VAR] ?? "").trim();
 }
 
+/**
+ * Resolve the proxy URL all Telegram API calls should route through. Precedence:
+ *   1. The per-account `accounts[].proxy` (multi-account shape), `${VAR}`-resolved.
+ *   2. The top-level `channels.telegram.proxy`, `${VAR}`-resolved.
+ *   3. The first set standard proxy env var (`https_proxy` / `HTTPS_PROXY` /
+ *      `all_proxy` / `ALL_PROXY`) — last-resort fallback.
+ * Returns `""` when none is configured → a DIRECT connection (the default,
+ * byte-unchanged from before proxy support existed).
+ *
+ * Note `${VAR}` refs are resolved here the same way `botToken` is, so an
+ * operator can keep the proxy (which may carry `user:pass@` creds) out of the
+ * committed config as `channels.telegram.proxy: "${TG_PROXY}"`.
+ */
+export function resolveTelegramProxyUrl(
+	cfg: BrigadeConfig,
+	accountId?: string | null,
+	env: NodeJS.ProcessEnv = process.env,
+): string {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = telegramChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	const perAccount = resolveTokenRef(entry?.proxy, env);
+	if (perAccount) return perAccount;
+	const topLevel = resolveTokenRef(slot?.proxy, env);
+	if (topLevel) return topLevel;
+	for (const key of PROXY_ENV_VARS) {
+		const value = (env[key] ?? "").trim();
+		if (value) return value;
+	}
+	return "";
+}
+
+/**
+ * Mask a proxy URL down to `scheme://host:port` (creds + path dropped) so it is
+ * safe to log. A malformed URL is reduced to its scheme only; an empty input
+ * returns "". NEVER log a raw proxy URL — it may embed `user:pass@`.
+ */
+export function maskProxyUrl(proxyUrl: string): string {
+	const raw = (proxyUrl ?? "").trim();
+	if (!raw) return "";
+	try {
+		const u = new URL(raw);
+		return `${u.protocol}//${u.host}`; // host includes :port; userinfo + path/query dropped
+	} catch {
+		const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(raw)?.[1];
+		return scheme ? `${scheme}://<masked>` : "<masked>";
+	}
+}
+
 /** Resolve a per-account view of the config (defaults + token resolution filled in). */
 export function resolveTelegramAccount(
 	cfg: BrigadeConfig,
@@ -187,6 +275,7 @@ export function resolveTelegramAccount(
 		accountId: id,
 		enabled,
 		botToken: resolveTelegramBotToken(cfg, id, env),
+		proxyUrl: resolveTelegramProxyUrl(cfg, id, env),
 		verbose: slot?.verbose === true,
 	};
 }
@@ -233,6 +322,32 @@ export function telegramWebhookConfig(
 /** True when forum-topic auto-labeling is enabled (`channels.telegram.autoLabelTopics`). */
 export function telegramAutoLabelTopics(cfg: BrigadeConfig): boolean {
 	return telegramChannelConfig(cfg)?.autoLabelTopics === true;
+}
+
+/**
+ * True when live reply-streaming is enabled (`channels.telegram.liveStream`).
+ * Default OFF — the adapter delivers one final chunked message as before.
+ */
+export function telegramLiveStreamEnabled(cfg: BrigadeConfig): boolean {
+	return telegramChannelConfig(cfg)?.liveStream === true;
+}
+
+/**
+ * Resolve the streaming edit throttle in ms. Reads
+ * `channels.telegram.streamThrottleMs`; falls back to 1000ms. The draft-stream
+ * floors this at 250ms, so a too-small value is harmless.
+ */
+export function telegramStreamThrottleMs(cfg: BrigadeConfig): number {
+	const raw = telegramChannelConfig(cfg)?.streamThrottleMs;
+	return typeof raw === "number" && raw > 0 ? raw : 1000;
+}
+
+/**
+ * True when reasoning surfacing is enabled (`channels.telegram.surfaceReasoning`).
+ * Default OFF — `<think>` reasoning is stripped from channel replies as today.
+ */
+export function telegramSurfaceReasoning(cfg: BrigadeConfig): boolean {
+	return telegramChannelConfig(cfg)?.surfaceReasoning === true;
 }
 
 /**

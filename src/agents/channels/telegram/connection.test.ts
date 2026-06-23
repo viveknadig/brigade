@@ -30,15 +30,26 @@ interface FakeRunner {
 	finish(err?: unknown): void;
 }
 
+type SimpleHandler = (ctx: Record<string, unknown>) => unknown;
+
 interface FakeBot extends TelegramBotLike {
 	handlers: MessageHandler[];
 	callbackHandlers: CallbackHandler[];
+	editedHandlers: SimpleHandler[];
+	channelPostHandlers: SimpleHandler[];
+	reactionHandlers: SimpleHandler[];
 	deletedWebhook: boolean;
 	stopped: number;
 	/** Push a message update into all registered message handlers. */
 	emit(update: Update): void;
 	/** Push a callback_query update into all registered callback handlers. */
 	emitCallback(update: Update): void;
+	/** Push an edited_message update into all registered edited handlers. */
+	emitEdited(update: Update): void;
+	/** Push a channel_post update into all registered channel_post handlers. */
+	emitChannelPost(update: Update): void;
+	/** Push a message_reaction update into all registered reaction handlers. */
+	emitReaction(update: Update): void;
 	sent: Array<{ chatId: string | number; text: string; opts?: Record<string, unknown> }>;
 	/** Recorded calls to the action / menu / webhook API methods. */
 	calls: {
@@ -49,6 +60,7 @@ interface FakeBot extends TelegramBotLike {
 		pins: Array<{ chatId: string | number; messageId: number; opts?: Record<string, unknown> }>;
 		unpins: Array<{ chatId: string | number; opts?: Record<string, unknown> }>;
 		forumLabels: Array<{ chatId: string | number; threadId: number; opts?: Record<string, unknown> }>;
+		forumTopics: Array<{ chatId: string | number; name: string; opts?: Record<string, unknown> }>;
 		commandMenus: Array<Array<{ command: string; description: string }>>;
 		answeredCallbacks: Array<{ id: string; opts?: Record<string, unknown> }>;
 		setWebhooks: Array<{ url: string; opts?: Record<string, unknown> }>;
@@ -58,6 +70,9 @@ interface FakeBot extends TelegramBotLike {
 function makeFakeBot(overrides: Partial<TelegramBotLike["api"]> & { meId?: number; meUsername?: string } = {}): FakeBot {
 	const handlers: MessageHandler[] = [];
 	const callbackHandlers: CallbackHandler[] = [];
+	const editedHandlers: SimpleHandler[] = [];
+	const channelPostHandlers: SimpleHandler[] = [];
+	const reactionHandlers: SimpleHandler[] = [];
 	const sent: FakeBot["sent"] = [];
 	const calls: FakeBot["calls"] = {
 		polls: [],
@@ -67,6 +82,7 @@ function makeFakeBot(overrides: Partial<TelegramBotLike["api"]> & { meId?: numbe
 		pins: [],
 		unpins: [],
 		forumLabels: [],
+		forumTopics: [],
 		commandMenus: [],
 		answeredCallbacks: [],
 		setWebhooks: [],
@@ -74,6 +90,9 @@ function makeFakeBot(overrides: Partial<TelegramBotLike["api"]> & { meId?: numbe
 	const bot: FakeBot = {
 		handlers,
 		callbackHandlers,
+		editedHandlers,
+		channelPostHandlers,
+		reactionHandlers,
 		deletedWebhook: false,
 		stopped: 0,
 		sent,
@@ -129,6 +148,10 @@ function makeFakeBot(overrides: Partial<TelegramBotLike["api"]> & { meId?: numbe
 				calls.forumLabels.push({ chatId, threadId, opts });
 				return true;
 			},
+			async createForumTopic(chatId, name, opts) {
+				calls.forumTopics.push({ chatId, name, opts });
+				return { message_thread_id: 4242, name };
+			},
 			async setMyCommands(commands) {
 				calls.commandMenus.push(commands);
 				return true;
@@ -145,6 +168,9 @@ function makeFakeBot(overrides: Partial<TelegramBotLike["api"]> & { meId?: numbe
 		},
 		on(filter, handler) {
 			if (filter === "callback_query") callbackHandlers.push(handler as CallbackHandler);
+			else if (filter === "edited_message") editedHandlers.push(handler as SimpleHandler);
+			else if (filter === "channel_post") channelPostHandlers.push(handler as SimpleHandler);
+			else if (filter === "message_reaction") reactionHandlers.push(handler as SimpleHandler);
 			else handlers.push(handler as MessageHandler);
 		},
 		stop() {
@@ -152,6 +178,18 @@ function makeFakeBot(overrides: Partial<TelegramBotLike["api"]> & { meId?: numbe
 		},
 		emit(update: Update) {
 			for (const h of handlers) h({ update, message: update.message });
+		},
+		emitEdited(update: Update) {
+			const edited = (update as { edited_message?: Message }).edited_message;
+			for (const h of editedHandlers) h({ update, editedMessage: edited });
+		},
+		emitChannelPost(update: Update) {
+			const post = (update as { channel_post?: Message }).channel_post;
+			for (const h of channelPostHandlers) h({ update, channelPost: post });
+		},
+		emitReaction(update: Update) {
+			const reaction = (update as { message_reaction?: unknown }).message_reaction;
+			for (const h of reactionHandlers) h({ update, messageReaction: reaction });
 		},
 		emitCallback(update: Update) {
 			const cb = (update as { callback_query?: unknown }).callback_query;
@@ -756,7 +794,13 @@ describe("connectTelegram webhook mode", () => {
 		assert.equal(bot.calls.setWebhooks.length, 1);
 		assert.equal(bot.calls.setWebhooks[0]?.url, "https://bot.example.com/tg");
 		assert.equal(bot.calls.setWebhooks[0]?.opts?.secret_token, "s3cr3t");
-		assert.deepEqual(bot.calls.setWebhooks[0]?.opts?.allowed_updates, ["message", "callback_query"]);
+		assert.deepEqual(bot.calls.setWebhooks[0]?.opts?.allowed_updates, [
+			"message",
+			"callback_query",
+			"message_reaction",
+			"edited_message",
+			"channel_post",
+		]);
 		assert.equal(conn.isConnected(), true);
 		await conn.close();
 	});
@@ -803,6 +847,191 @@ describe("connectTelegram webhook mode", () => {
 		assert.equal(callbacks.length, 1);
 		assert.deepEqual(callbacks[0]?.callbackQuery, { data: "bv1:ZA:o", callbackId: "cbq-w" });
 		assert.ok(bot.calls.answeredCallbacks.length >= 1, "webhook callback must be acked");
+		await conn.close();
+	});
+});
+
+/* ─────────────────────────── proxy paths ─────────────────────────── */
+
+describe("connectTelegram proxy", () => {
+	const startConn = async (proxyUrl?: string) => {
+		const bot = makeFakeBot();
+		const runner = makeFakeRunner();
+		const conn = await connectTelegram({
+			token: "tkn",
+			log: noopLog,
+			...(proxyUrl ? { proxyUrl } : {}),
+			onMessage: () => {},
+			botFactory: () => bot,
+			runnerFactory: () => runner,
+			sleepImpl: instantSleep,
+		});
+		assert.equal(conn.isConnected(), true);
+		runner.finish();
+		await conn.close();
+	};
+
+	it("constructs the bot with NO proxy (direct)", async () => {
+		await startConn();
+	});
+
+	it("constructs the bot through an http:// proxy", async () => {
+		await startConn("http://127.0.0.1:8080");
+	});
+
+	it("constructs the bot through a socks5:// proxy (real SOCKS dispatcher)", async () => {
+		// The dispatcher is built but never dialled here (the fake bot makes no
+		// network call); the test asserts construction does not throw.
+		await startConn("socks5://user:pass@127.0.0.1:1080");
+	});
+});
+
+/* ─────────────────────────── edited / channel_post / reaction ─────────────────────────── */
+
+describe("connectTelegram parity inbound", () => {
+	const start = async (over: Partial<Parameters<typeof connectTelegram>[0]> = {}) => {
+		const bot = makeFakeBot();
+		const runner = makeFakeRunner();
+		const conn = await connectTelegram({
+			token: "tkn",
+			log: noopLog,
+			onMessage: () => {},
+			botFactory: () => bot,
+			runnerFactory: () => runner,
+			sleepImpl: instantSleep,
+			...over,
+		});
+		return { bot, runner, conn };
+	};
+
+	it("routes an edited_message through onMessage flagged edited", async () => {
+		const received: TgInboundMessage[] = [];
+		const { bot, runner, conn } = await start({ onMessage: (m) => received.push(m) });
+		bot.emitEdited({
+			update_id: 700,
+			edited_message: makeMessage({ message_id: 11, text: "corrected text" }),
+		} as unknown as Update);
+		assert.equal(received.length, 1);
+		assert.equal(received[0]?.edited, true);
+		assert.equal(received[0]?.text, "corrected text");
+		assert.equal(received[0]?.messageId, "11");
+		runner.finish();
+		await conn.close();
+	});
+
+	it("routes a channel_post through onMessage as a group chat", async () => {
+		const received: TgInboundMessage[] = [];
+		const { bot, runner, conn } = await start({ onMessage: (m) => received.push(m) });
+		bot.emitChannelPost({
+			update_id: 701,
+			channel_post: {
+				message_id: 22,
+				date: 1_700_000_000,
+				chat: { id: -100123, type: "channel", title: "News" },
+				sender_chat: { id: -100123, type: "channel", title: "News" },
+				text: "broadcast",
+			},
+		} as unknown as Update);
+		assert.equal(received.length, 1);
+		assert.equal(received[0]?.chatType, "group");
+		assert.equal(received[0]?.text, "broadcast");
+		runner.finish();
+		await conn.close();
+	});
+
+	it("routes a message_reaction (added emoji) through onReaction", async () => {
+		const reactions: TgInboundMessage[] = [];
+		const { bot, runner, conn } = await start({ onReaction: (m) => reactions.push(m) });
+		bot.emitReaction({
+			update_id: 702,
+			message_reaction: {
+				chat: { id: 555, type: "private" },
+				message_id: 33,
+				user: { id: 555, is_bot: false, first_name: "Alice" },
+				old_reaction: [],
+				new_reaction: [{ type: "emoji", emoji: "👍" }],
+			},
+		} as unknown as Update);
+		assert.equal(reactions.length, 1);
+		assert.deepEqual(reactions[0]?.reaction, { emojis: ["👍"], targetMessageId: "33" });
+		assert.equal(reactions[0]?.from, "555");
+		runner.finish();
+		await conn.close();
+	});
+
+	it("ignores a reaction REMOVAL (no newly-added emoji)", async () => {
+		const reactions: TgInboundMessage[] = [];
+		const { bot, runner, conn } = await start({ onReaction: (m) => reactions.push(m) });
+		bot.emitReaction({
+			update_id: 703,
+			message_reaction: {
+				chat: { id: 555, type: "private" },
+				message_id: 33,
+				user: { id: 555, is_bot: false, first_name: "Alice" },
+				old_reaction: [{ type: "emoji", emoji: "👍" }],
+				new_reaction: [],
+			},
+		} as unknown as Update);
+		assert.equal(reactions.length, 0);
+		runner.finish();
+		await conn.close();
+	});
+
+	it("ignores a bot-authored reaction", async () => {
+		const reactions: TgInboundMessage[] = [];
+		const { bot, runner, conn } = await start({ onReaction: (m) => reactions.push(m) });
+		bot.emitReaction({
+			update_id: 704,
+			message_reaction: {
+				chat: { id: 555, type: "private" },
+				message_id: 33,
+				user: { id: 9, is_bot: true, first_name: "Bot" },
+				old_reaction: [],
+				new_reaction: [{ type: "emoji", emoji: "🤖" }],
+			},
+		} as unknown as Update);
+		assert.equal(reactions.length, 0);
+		runner.finish();
+		await conn.close();
+	});
+});
+
+/* ─────────────────────────── createForumTopic ─────────────────────────── */
+
+describe("connectTelegram createForumTopic", () => {
+	it("creates a forum topic and returns the new thread id", async () => {
+		const bot = makeFakeBot();
+		const runner = makeFakeRunner();
+		const conn = await connectTelegram({
+			token: "tkn",
+			log: noopLog,
+			onMessage: () => {},
+			botFactory: () => bot,
+			runnerFactory: () => runner,
+			sleepImpl: instantSleep,
+		});
+		const res = await conn.createForumTopic("-100999", "Roadmap");
+		assert.deepEqual(res, { threadId: "4242", name: "Roadmap" });
+		assert.equal(bot.calls.forumTopics.length, 1);
+		assert.equal(bot.calls.forumTopics[0]?.name, "Roadmap");
+		runner.finish();
+		await conn.close();
+	});
+
+	it("rejects an empty / overlong topic name", async () => {
+		const bot = makeFakeBot();
+		const runner = makeFakeRunner();
+		const conn = await connectTelegram({
+			token: "tkn",
+			log: noopLog,
+			onMessage: () => {},
+			botFactory: () => bot,
+			runnerFactory: () => runner,
+			sleepImpl: instantSleep,
+		});
+		await assert.rejects(() => conn.createForumTopic("-100999", "   "));
+		await assert.rejects(() => conn.createForumTopic("-100999", "x".repeat(129)));
+		runner.finish();
 		await conn.close();
 	});
 });

@@ -72,8 +72,8 @@ export declare const inboxEnqueue: import("convex/server").RegisteredMutation<"p
     ts?: number | undefined;
     deliveryContext?: any;
     contextKey?: string | undefined;
-    text: ArrayBuffer;
     sessionKey: string;
+    text: ArrayBuffer;
     trusted: boolean;
 }, Promise<{
     seq: number;
@@ -85,8 +85,8 @@ export declare const inboxPeek: import("convex/server").RegisteredQuery<"public"
     _creationTime: number;
     deliveryContext?: any;
     contextKey?: string | undefined;
-    text: ArrayBuffer;
     sessionKey: string;
+    text: ArrayBuffer;
     ts: number;
     trusted: boolean;
     seq: number;
@@ -98,8 +98,8 @@ export declare const inboxDrain: import("convex/server").RegisteredMutation<"pub
     _creationTime: number;
     deliveryContext?: any;
     contextKey?: string | undefined;
-    text: ArrayBuffer;
     sessionKey: string;
+    text: ArrayBuffer;
     ts: number;
     trusted: boolean;
     seq: number;
@@ -112,8 +112,8 @@ export declare const inboxConsumePrefix: import("convex/server").RegisteredMutat
     _creationTime: number;
     deliveryContext?: any;
     contextKey?: string | undefined;
-    text: ArrayBuffer;
     sessionKey: string;
+    text: ArrayBuffer;
     ts: number;
     trusted: boolean;
     seq: number;

@@ -2292,7 +2292,7 @@ function joinAssistantTextFrom(session: AgentSession, fromIndex: number): string
   return parts.join("\n\n");
 }
 
-function flattenAssistantContent(content: unknown): string {
+export function flattenAssistantContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   const parts: string[] = [];
