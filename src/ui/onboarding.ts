@@ -722,8 +722,8 @@ async function promptTypedKey(
 			return "back"; // user pressed Esc — caller rewinds to provider picker
 		}
 
-		// Step 1: cheap local format check (length, whitespace, prefix).
-		const localCheck = validateApiKey(providerId, key);
+		// Step 1: cheap, format-agnostic sanity check (length, whitespace only).
+		const localCheck = validateApiKey(key);
 		if (!localCheck.ok) {
 			lastError = localCheck.reason;
 			continue;
@@ -778,37 +778,19 @@ async function promptTypedKey(
 }
 
 /**
- * Cheap, provider-aware sanity check on the pasted key.
- * Catches obvious mistakes (empty, accidental newline, wrong provider's key)
- * BEFORE we persist garbage to disk. Doesn't validate against the real API —
- * that happens implicitly on the first model call.
+ * Cheap, provider-AGNOSTIC sanity check on the pasted key.
+ * Catches only the universal mistakes (empty, obviously truncated, stray
+ * whitespace/newline) BEFORE we persist garbage to disk. It deliberately does
+ * NOT guess at per-provider key prefixes: key formats change over time (e.g.
+ * Google now issues both "AIza…" and "AQ.…" Gemini keys), and hard-coding the
+ * expected letters wrongly rejects perfectly valid keys. Whether the key is
+ * actually accepted is decided *dynamically* by `validateApiKeyOnline`, which
+ * fires a real request at the provider and judges by the live response.
  */
-function validateApiKey(providerId: string, key: string): { ok: true } | { ok: false; reason: string } {
+function validateApiKey(key: string): { ok: true } | { ok: false; reason: string } {
 	if (!key) return { ok: false, reason: "Please enter an API key." };
 	if (key.length < 16) return { ok: false, reason: `That looks incomplete (only ${key.length} characters). Try copying the key again.` };
 	if (/\s/.test(key)) return { ok: false, reason: "The key has extra spaces or line breaks. Copy just the key value." };
-
-	// Provider-specific prefix hints. Hard reject only when we have a stable, well-known prefix
-	// for that provider — we never want to block someone with a freshly-rotated format.
-	// For providers without a stable prefix (cerebras, mistral) we fall through to length+whitespace
-	// only, which is intentional.
-	const prefixHints: Record<string, string> = {
-		anthropic: "sk-ant-",
-		openai: "sk-",
-		google: "AIza", // Google API keys (Gemini Studio) all start with AIza
-		groq: "gsk_",
-		openrouter: "sk-or-",
-		xai: "xai-",
-		deepseek: "sk-", // DeepSeek mirrors OpenAI's prefix convention
-	};
-	const expected = prefixHints[providerId];
-	const providerName = findProvider(providerId)?.name ?? providerId;
-	if (expected && !key.startsWith(expected)) {
-		return {
-			ok: false,
-			reason: `That doesn't look like a ${providerName} key (${providerName} keys start with "${expected}"). Make sure you picked the right provider.`,
-		};
-	}
 	return { ok: true };
 }
 
@@ -1278,10 +1260,10 @@ async function ensureCustomProvider(
 			continue;
 		}
 
-		// Cheap LOCAL format check (length / whitespace / known prefix). Custom
+		// Cheap, format-agnostic sanity check (length / whitespace). Custom
 		// endpoints vary, so we do NOT online-validate here — but an obviously
 		// malformed key is rejected with feedback rather than persisted.
-		const localCheck = validateApiKey(provider.id, key);
+		const localCheck = validateApiKey(key);
 		if (!localCheck.ok) {
 			lastError = localCheck.reason;
 			continue;
