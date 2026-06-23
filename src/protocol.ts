@@ -128,6 +128,14 @@ export type RequestMethod =
 	| "list-models"
 	/** Reload the model registry from disk. Reply: void. */
 	| "refresh-models"
+	/**
+	 * Validate + persist a provider API key into the gateway's auth-profiles.json
+	 * (the same store `brigade onboard` writes), hot-load it into the live auth
+	 * view, and refresh the model registry so the provider's models become
+	 * available WITHOUT a gateway restart. Backs the TUI `/provider` command's
+	 * inline add-a-new-provider path. Reply: { ok, provider, modelCount?, warning? }.
+	 */
+	| "add-provider"
 	/** Get the current state snapshot on demand. Reply: SessionStateSnapshot. */
 	| "get-state"
 	/** Memory Graph dashboard data — nodes + typed edges + topic clusters + stats.
@@ -310,6 +318,14 @@ export interface RequestParams {
 	};
 	"list-models": void;
 	"refresh-models": void;
+	"add-provider": {
+		/** Provider id (Pi KnownProvider, e.g. "anthropic" | "openai" | "openrouter"). */
+		providerId: string;
+		/** Plaintext API key to validate + persist into the gateway's auth-profiles.json. */
+		apiKey: string;
+		/** Skip the live key-validation HTTP probe (trust the caller). */
+		skipValidation?: boolean;
+	};
 	"get-state": void;
 	"memory-graph": {
 		/** Agent whose memory graph is exported; defaults to the boot agent. */
@@ -385,6 +401,15 @@ export interface ResponseFor {
 	};
 	"list-models": ModelSummary[];
 	"refresh-models": void;
+	"add-provider": {
+		ok: boolean;
+		/** Provider id that was added/updated. */
+		provider: string;
+		/** Model count reported by the validation probe, when available. */
+		modelCount?: number;
+		/** Non-fatal validation note (e.g. rate-limited / provider outage at probe time). */
+		warning?: string;
+	};
 	"get-state": SessionStateSnapshot;
 	"memory-graph": MemoryGraphExport;
 	"memory-query": MemoryQueryResult;

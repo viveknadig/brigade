@@ -5,7 +5,13 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import type { ChannelAdapter } from "../../agents/extensions/types.js";
-import { readAllowFrom, readPendingPairings, upsertPairingRequest } from "../../agents/channels/access-control/index.js";
+import {
+	readAllowFrom,
+	readChannelOwner,
+	readPendingPairings,
+	setChannelOwner,
+	upsertPairingRequest,
+} from "../../agents/channels/access-control/index.js";
 import { __resetConfigParseCacheForTests } from "../../config/io.js";
 import { runChannelsAllowAdd, runChannelsAllowList, runChannelsAllowRemove } from "./channels.js";
 import { __setPairingChannelsForTests, runPairingApprove, runPairingList, runPairingRevoke } from "./pairing.js";
@@ -142,6 +148,49 @@ describe("brigade pairing list/approve/revoke", () => {
 		const { code } = upsertPairingRequest({ channelId: "fake-bare", senderId: "bob" });
 		const exit = await runPairingApprove({ code, channel: "fake-bare" }, { json: true });
 		assert.equal(exit, 0, "approve still succeeds even without a notify hook");
+	});
+});
+
+describe("brigade pairing approve — owner bootstrap (separate-bot channels)", () => {
+	it("first approval on a botIsSeparateFromOperator channel records the sender as owner", async () => {
+		const fake = makeStubAdapter({
+			id: "tg",
+			label: "TG",
+			pairing: { idLabel: "username", botIsSeparateFromOperator: true },
+		});
+		__setPairingChannelsForTests([fake]);
+		const { code } = upsertPairingRequest({ channelId: "tg", senderId: "operator123" });
+		assert.equal(readChannelOwner("tg"), null, "no owner before approval");
+		const { result, out } = await captureStdout(() => runPairingApprove({ code, channel: "tg" }));
+		assert.equal(result, 0);
+		assert.equal(readChannelOwner("tg"), "operator123", "first approved sender becomes owner");
+		assert.match(out, /OWNER/, "CLI tells the operator they're now the owner");
+	});
+
+	it("does NOT set an owner for a channel whose bot IS the operator (WhatsApp-style)", async () => {
+		const fake = makeStubAdapter({
+			id: "wa",
+			label: "WA",
+			pairing: { idLabel: "phone" }, // no botIsSeparateFromOperator
+		});
+		__setPairingChannelsForTests([fake]);
+		const { code } = upsertPairingRequest({ channelId: "wa", senderId: "+15550001111" });
+		await runPairingApprove({ code, channel: "wa" }, { json: true });
+		assert.equal(readChannelOwner("wa"), null, "selfId-operator channels never record an owner here");
+	});
+
+	it("does NOT overwrite an existing owner (first-write-wins)", async () => {
+		const fake = makeStubAdapter({
+			id: "tg2",
+			label: "TG2",
+			pairing: { idLabel: "username", botIsSeparateFromOperator: true },
+		});
+		__setPairingChannelsForTests([fake]);
+		setChannelOwner("tg2", "realOwner");
+		const { code } = upsertPairingRequest({ channelId: "tg2", senderId: "laterUser" });
+		await runPairingApprove({ code, channel: "tg2" }, { json: true });
+		assert.equal(readChannelOwner("tg2"), "realOwner", "a later approval can't seize ownership");
+		assert.ok(readAllowFrom("tg2").includes("laterUser"), "but the later user is still approved");
 	});
 });
 

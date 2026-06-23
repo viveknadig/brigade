@@ -34,6 +34,7 @@ import {
 	runChannelInboundPipeline,
 	createInboundPipelineContext,
 } from "./inbound-pipeline.js";
+import { readChannelOwner, setChannelOwner } from "./access-control/index.js";
 import { startChannels } from "./manager.js";
 
 let stateDir: string;
@@ -199,6 +200,84 @@ describe("inbound-pipeline: /agent <id> interception writes binding + suppresses
 		assert.equal(turnRan, false);
 		assert.match(fake.sent[0]?.text ?? "", /Pins on fake:/);
 		assert.match(fake.sent[0]?.text ?? "", /agent:ops/);
+		await mgr.stop();
+	});
+});
+
+describe("inbound-pipeline: recorded owner on a separate-bot channel (secure model)", () => {
+	const BOT_ID = "bot999"; // adapter.selfId() — the bot, NOT the operator
+	const OWNER = "operator123";
+	const STRANGER = "stranger456";
+
+	function makeSeparateBotChannel() {
+		return makeFakeChannel({
+			selfId: () => BOT_ID,
+			pairing: { idLabel: "account", botIsSeparateFromOperator: true },
+		});
+	}
+
+	it("a bare /start NEVER grants ownership — the sender is challenged like any stranger", async () => {
+		writeConfig({ agents: { main: {} }, channels: { fake: { dmPolicy: "pairing" } } });
+		const fake = makeSeparateBotChannel();
+		let turnRan = false;
+		const mgr = await startChannels({
+			adapters: [fake.adapter],
+			config: loadConfig(),
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "nope" };
+			},
+		});
+		await fake.ctx().onInbound({ channel: "fake", conversationId: STRANGER, from: STRANGER, text: "/start" });
+		assert.equal(turnRan, false);
+		assert.equal(readChannelOwner("fake"), null, "no owner is set just by texting /start");
+		assert.match(fake.sent[0]?.text ?? "", /approve/i, "sender gets the approval challenge");
+		await mgr.stop();
+	});
+
+	it("once an owner is recorded, they are admitted (no challenge) and can run operator commands", async () => {
+		writeConfig({ agents: { main: {} }, channels: { fake: { dmPolicy: "pairing" } } });
+		// Owner established out-of-band (the CLI `pairing approve` bootstrap path).
+		setChannelOwner("fake", OWNER);
+		const fake = makeSeparateBotChannel();
+		let turnRan = false;
+		const mgr = await startChannels({
+			adapters: [fake.adapter],
+			config: loadConfig(),
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "hi owner" };
+			},
+		});
+		// Normal message → admitted, runs a turn (not challenged).
+		await fake.ctx().onInbound({ channel: "fake", conversationId: OWNER, from: OWNER, text: "hello" });
+		assert.equal(turnRan, true, "owner's normal message runs a turn");
+		// Operator-only command → handler runs (no "operator only" refusal).
+		fake.sent.length = 0;
+		await fake.ctx().onInbound({ channel: "fake", conversationId: OWNER, from: OWNER, text: "/pending" });
+		assert.doesNotMatch(fake.sent[0]?.text ?? "", /only be run by the operator/i);
+		await mgr.stop();
+	});
+
+	it("a stranger is still challenged after an owner exists", async () => {
+		writeConfig({ agents: { main: {} }, channels: { fake: { dmPolicy: "pairing" } } });
+		setChannelOwner("fake", OWNER);
+		const fake = makeSeparateBotChannel();
+		let turnRan = false;
+		const mgr = await startChannels({
+			adapters: [fake.adapter],
+			config: loadConfig(),
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "nope" };
+			},
+		});
+		await fake.ctx().onInbound({ channel: "fake", conversationId: STRANGER, from: STRANGER, text: "hi" });
+		assert.equal(turnRan, false);
+		assert.match(fake.sent[0]?.text ?? "", /approve/i, "stranger gets the challenge, not access");
 		await mgr.stop();
 	});
 });

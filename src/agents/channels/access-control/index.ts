@@ -6,13 +6,16 @@ export {
 	PAIRING_TTL_MS,
 	addAllowFrom,
 	approvePairingCode,
+	clearChannelOwner,
 	eraseAccessState,
 	isAllowed,
 	readAllowFrom,
+	readChannelOwner,
 	readGroupAllowFrom,
 	readPendingPairings,
 	removeAllowFrom,
 	revokePairingCode,
+	setChannelOwner,
 	upsertPairingRequest,
 } from "./store.js";
 export type { AccessDecision, DmPolicy, PairingRequest } from "./types.js";

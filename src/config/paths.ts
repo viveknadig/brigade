@@ -359,6 +359,14 @@ export function resolveChannelAllowFromPath(channelId: string, accountId?: strin
   if (!id || id === "default") return path.join(resolveChannelStateDir(channelId), "allow-from.json");
   return path.join(resolveChannelStateDir(channelId), "accounts", id, "allow-from.json");
 }
+// Per-channel OWNER id — the single operator identity for channels whose bot
+// account is separate from the operator (Telegram). WhatsApp doesn't use this
+// (its linked-self id already identifies the operator). One id per channel/acct.
+export function resolveChannelOwnerPath(channelId: string, accountId?: string | null): string {
+  const id = (accountId ?? "").trim();
+  if (!id || id === "default") return path.join(resolveChannelStateDir(channelId), "owner.json");
+  return path.join(resolveChannelStateDir(channelId), "accounts", id, "owner.json");
+}
 // Group allow-from is a separate file so revoking a group's access doesn't
 // kick the operator out of their own DMs and vice-versa.
 export function resolveChannelGroupAllowFromPath(channelId: string, accountId?: string | null): string {

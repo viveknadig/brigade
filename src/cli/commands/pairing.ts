@@ -13,7 +13,13 @@
 
 import { BUNDLED_MODULES, loadModules } from "../../agents/extensions/index.js";
 import type { ChannelAdapter } from "../../agents/extensions/types.js";
-import { approvePairingCode, readPendingPairings, revokePairingCode } from "../../agents/channels/access-control/index.js";
+import {
+	approvePairingCode,
+	readChannelOwner,
+	readPendingPairings,
+	revokePairingCode,
+	setChannelOwner,
+} from "../../agents/channels/access-control/index.js";
 import { DEFAULT_AGENT_ID, resolveAgentWorkspaceDir } from "../../config/paths.js";
 import { loadConfig } from "../../core/config.js";
 
@@ -121,11 +127,29 @@ export async function runPairingApprove(
 		else process.stderr.write(`${msg}\n`);
 		return 1;
 	}
+	// Owner bootstrap. On a channel whose bot account is SEPARATE from the
+	// operator (Telegram: `selfId()` is the bot, never the human), the FIRST
+	// approved sender becomes the recorded owner — so owner-only commands and the
+	// skip-challenge path work for them. Running `pairing approve` requires
+	// gateway-machine access, which IS the proof that this is the operator (a
+	// stranger who merely texts the bot can never reach here). Never overwrites an
+	// existing owner.
+	let becameOwner = false;
+	if (resolved.adapter.pairing?.botIsSeparateFromOperator && !readChannelOwner(resolved.id)) {
+		becameOwner = setChannelOwner(resolved.id, approved.senderId);
+	}
 	if (opts.json) {
-		process.stdout.write(`${JSON.stringify({ ok: true, channel: resolved.id, sender: approved.senderId }, null, 2)}\n`);
+		process.stdout.write(
+			`${JSON.stringify({ ok: true, channel: resolved.id, sender: approved.senderId, owner: becameOwner }, null, 2)}\n`,
+		);
 	} else {
 		const who = approved.senderName ? `${approved.senderName} (${approved.senderId})` : approved.senderId;
 		process.stdout.write(`Approved ${who} on ${resolved.id}. They can now DM the agent.\n`);
+		if (becameOwner) {
+			process.stdout.write(
+				`Set ${who} as the OWNER of ${resolved.id} — they can now run admin commands (/pending, /approve, /allowlist) from the chat.\n`,
+			);
+		}
 	}
 	// Best-effort in-channel confirmation — when the channel adapter declares
 	// a `pairing.notifyApproval` hook, fire it so the requester sees a

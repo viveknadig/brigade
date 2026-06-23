@@ -41,6 +41,7 @@ const NO_REQUIRED_ARG = new Set([
 	"session", // [<session-key>] — optional
 	"sessions", // [--all] — optional
 	"model", // [<model-id>] — optional
+	"provider", // [<provider>] — optional (no arg lists providers)
 	"reasoning", // [on|off] — optional toggle
 ]);
 

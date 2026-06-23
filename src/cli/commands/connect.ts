@@ -8,18 +8,15 @@
  *
  * Feature parity with `brigade chat` for the common path (send a message,
  * stream the reply, see tool calls, abort with Ctrl+C, switch model, set
- * thinking level, compact, exit). Inline `/provider` onboarding is NOT
- * available from connect mode in v1 — onboarding writes to the gateway's
- * filesystem and is out-of-band; the user runs `brigade onboard` against
- * the gateway machine instead.
+ * thinking level, compact, exit).
  *
- * MAINTAINER NOTE: The footer at `wireConnectUi` deliberately OMITS
- * `/provider` from the slash-command list. Do NOT add it to the connect
- * footer "for parity with chat" — connect cannot perform provider
- * onboarding (no gateway-side filesystem access from the TUI client), and
- * advertising a command we can't honour confuses users. The chat-mode
- * footer (in `src/ui/chat.ts`) DOES list `/provider` because in-process
- * chat owns the filesystem the wizard needs to write to.
+ * `/provider` works here too: switching among configured providers reuses the
+ * `set-model` RPC, and adding a new API-key provider inline routes the typed
+ * key to the gateway's `add-provider` RPC, which validates + persists it on
+ * the GATEWAY side (auth-profiles.json) and hot-refreshes the model registry.
+ * Because the credential write happens server-side, the TUI client never needs
+ * gateway-filesystem access. Subscription / local / custom providers (OAuth,
+ * Ollama, BYO-endpoint) still need the full `brigade onboard` wizard.
  */
 
 import process from "node:process";
@@ -34,6 +31,7 @@ import {
 } from "@earendil-works/pi-tui";
 
 import { BrigadeEditor } from "../../ui/editor.js";
+import { PROVIDERS, findProvider } from "../../providers/catalog.js";
 import { sanitizeTerminalInput } from "../../security/terminal-input-sanitizer.js";
 import chalk from "chalk";
 
@@ -273,6 +271,11 @@ export async function wireConnectUi(
 	// (Carrow) mid-turn model handoff: abort the live turn, swap, re-run this on the new model.
 	let lastUserPrompt = "";
 	let isAgentRunning = false;
+	// `/provider <name>` for an UNCONFIGURED provider arms this — the NEXT line
+	// the operator submits is captured as that provider's API key (sent to the
+	// gateway's `add-provider`, never echoed into the transcript or input
+	// history) instead of being sent as a chat prompt. Cleared on submit/cancel.
+	let pendingProviderEntry: { providerId: string; providerName: string } | null = null;
 	// Connection-bound agent id. Defaults to the gateway's boot agent (filled
 	// in from the first `state` snapshot) so legacy single-agent gateways keep
 	// working unchanged. The `/agent <id>` slash command rebinds the connection
@@ -589,6 +592,20 @@ export async function wireConnectUi(
 			argumentHint: "[<model-id>]",
 		},
 		{
+			name: "provider",
+			description: "switch model provider, or add a new one (no arg = list)",
+			argumentHint: "[<provider>]",
+			getArgumentCompletions: (prefix) => {
+				const lower = prefix.toLowerCase();
+				return PROVIDERS.filter(
+					(pr) => !pr.noAuth && !pr.custom && !pr.subscription && !pr.cliLogin,
+				)
+					.map((pr) => pr.id)
+					.filter((id) => id.startsWith(lower))
+					.map((id) => ({ value: id, label: id }));
+			},
+		},
+		{
 			name: "thinking",
 			description: "set the model's reasoning effort",
 			argumentHint: "<off|low|medium|high|xhigh>",
@@ -642,13 +659,13 @@ export async function wireConnectUi(
 	];
 	editor.setAutocompleteProvider(new CombinedAutocompleteProvider(SLASH_COMMANDS, process.cwd()));
 
-	// Connect mode cannot run the provider-onboarding wizard (it writes to the
-	// gateway machine's filesystem, which we don't have). We surface that gap
-	// inline above the footer so users who notice `/provider` is missing aren't
-	// left guessing — they get the exact escape hatch.
+	// `/provider` switches the model provider and can add an API-key provider
+	// inline — the credential write happens on the GATEWAY side (`add-provider`
+	// RPC), so it works from connect mode too. Subscription / local / custom
+	// providers still need `brigade onboard` on the gateway machine.
 	tui.addChild(
 		new Text(
-			brand.dim("  connect-mode: /agent /agents /sessions · /model /thinking /reasoning · /abort /steer /compact · /usage /help (use 'brigade chat' on the gateway machine for /provider)"),
+			brand.dim("  connect-mode: /agent /agents /sessions · /model /provider /thinking /reasoning · /abort /steer /compact · /usage /help"),
 			0,
 			0,
 		),
@@ -1329,6 +1346,57 @@ export async function wireConnectUi(
 		});
 	});
 
+	// Switch the live session onto a CONFIGURED provider by reusing the same
+	// `set-model` path `/model` uses. Picks a model on that provider, preferring
+	// the one whose id matches the current model so a same-id model on the new
+	// provider continues seamlessly; otherwise the provider's first model. Used
+	// by `/provider <configured>` and right after a successful inline add.
+	const applyProviderSwitch = async (providerName: string): Promise<void> => {
+		let models: ModelSummary[];
+		try {
+			models = await client.request("list-models");
+		} catch (err) {
+			insertBeforeEditor(
+				new Text(
+					`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`,
+					0,
+					0,
+				),
+			);
+			return;
+		}
+		const providerModels = models.filter((m) => m.provider === providerName);
+		const curModelId = lastSnapshot?.modelId;
+		const target =
+			providerModels.find((m) => m.id === curModelId) ?? providerModels[0];
+		if (!target) {
+			insertBeforeEditor(
+				new Text(
+					`  ${brand.error("✗")} ${brand.error(`no models available for provider "${providerName}" yet.`)}`,
+					0,
+					0,
+				),
+			);
+			return;
+		}
+		try {
+			await client.request(
+				"set-model",
+				withBinding({ provider: providerName, modelId: target.id }),
+			);
+			insertBeforeEditor(
+				new Text(
+					`  ${brand.amber("✓")} ${brand.dim("switched to")} ${brand.white(`${providerName} · ${target.id}`)}`,
+					0,
+					0,
+				),
+			);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0));
+		}
+	};
+
 	// Slash command + send wiring.
 	editor.onSubmit = async (value: string) => {
 		// SECURITY — scrub terminal escape sequences, leaked bracketed-paste markers,
@@ -1338,6 +1406,52 @@ export async function wireConnectUi(
 		// bytes into the transcript. The single submit chokepoint covers every path.
 		const trimmed = sanitizeTerminalInput(value).trim();
 		if (!trimmed) return;
+
+		// API-key capture for `/provider <new-provider>`. When armed, this line
+		// IS the key — consume it here before any command dispatch or echo so it
+		// never reaches the model payload or the transcript. The editor clears
+		// immediately and we don't insert the raw key into scrollback (and the
+		// editor never adds submits to up-arrow history), so it isn't recoverable.
+		if (pendingProviderEntry) {
+			const entry = pendingProviderEntry;
+			pendingProviderEntry = null;
+			editor.setText("");
+			if (trimmed === "/cancel" || trimmed === "/abort") {
+				insertBeforeEditor(
+					new Text(`  ${brand.dim(`cancelled adding ${entry.providerName}.`)}`, 0, 0),
+				);
+				return;
+			}
+			insertBeforeEditor(
+				new Text(`  ${brand.dim(`validating ${entry.providerName} key…`)}`, 0, 0),
+			);
+			try {
+				const res = await client.request("add-provider", {
+					providerId: entry.providerId,
+					apiKey: trimmed,
+				});
+				if (res.warning) {
+					insertBeforeEditor(
+						new Text(`  ${brand.amber("⚠")} ${brand.dim(res.warning)}`, 0, 0),
+					);
+				}
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.amber("✓")} ${brand.dim("added provider")} ${brand.white(entry.providerId)}`,
+						0,
+						0,
+					),
+				);
+				// Now switch the live session onto the freshly-added provider.
+				await applyProviderSwitch(entry.providerId);
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				insertBeforeEditor(
+					new Text(`  ${brand.error("✗")} ${brand.error(`add provider failed: ${msg}`)}`, 0, 0),
+				);
+			}
+			return;
+		}
 
 		// Local commands first — never reach the gateway.
 		if (trimmed === "/exit" || trimmed === "/quit") {
@@ -1354,6 +1468,7 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/exit")} or ${chalk.bold("/quit")} — disconnect & quit\n` +
 						`- ${chalk.bold("/help")} — this list\n` +
 						`- ${chalk.bold("/model <id>")} — switch to a configured model on the gateway\n` +
+						`- ${chalk.bold("/provider [<name>]")} — switch model provider, or add a new one with an API key (no arg = list)\n` +
 						`- ${chalk.bold("/thinking <level>")} — set reasoning effort (off|minimal|low|medium|high|xhigh)\n` +
 						`- ${chalk.bold("/compact")} — summarize older turns to free up context\n` +
 						`- ${chalk.bold("/allow-all <on|off>")} — skip shell-approval prompts for this session (safety guards still apply)\n` +
@@ -1377,7 +1492,7 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/org --explain <from> <to>")} — why this edge exists (or does not)\n` +
 						`- ${chalk.bold("Ctrl+C")} — abort the current turn (same as /abort)\n` +
 						`- ${chalk.bold("Ctrl+D")} — quit\n\n` +
-						brand.dim("To add a new provider, run `brigade onboard` on the gateway machine."),
+						brand.dim("Subscription / local / custom providers still need `brigade onboard` on the gateway machine."),
 					1,
 					0,
 					markdownTheme,
@@ -2103,6 +2218,109 @@ export async function wireConnectUi(
 					new Text(`  ${brand.error("✗")} ${brand.error(`revoke-skill failed: ${msg}`)}`, 0, 0),
 				);
 			}
+			return;
+		}
+
+		// /provider [<name>] — switch the active model PROVIDER mid-chat, or add a
+		// brand-new one inline. No arg lists configured providers (switchable) plus
+		// addable catalog providers. `/provider <configured>` switches to it (keeps
+		// the current model id if that provider has it). `/provider <new>` for an
+		// API-key catalog provider arms key capture: the next line you type is sent
+		// to the gateway's `add-provider`, which validates + persists it server-side,
+		// then we switch onto it. Subscription / local / custom providers still need
+		// the full `brigade onboard` wizard.
+		if (trimmed === "/provider" || trimmed.startsWith("/provider ")) {
+			editor.setText("");
+			const arg = trimmed === "/provider" ? "" : trimmed.slice("/provider ".length).trim();
+			let models: ModelSummary[];
+			try {
+				models = await client.request("list-models");
+			} catch (err) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.error("✗")} ${brand.error(err instanceof Error ? err.message : String(err))}`,
+						0,
+						0,
+					),
+				);
+				return;
+			}
+			const configured = new Set(models.map((m) => m.provider));
+			const current = lastSnapshot?.provider;
+			// An addable catalog entry = plain API-key provider (not local/no-auth,
+			// custom BYO-endpoint, OAuth subscription, or CLI-login) that isn't
+			// already configured. Those excluded kinds need the full wizard.
+			const isInlineAddable = (pr: (typeof PROVIDERS)[number]): boolean =>
+				!pr.noAuth && !pr.custom && !pr.subscription && !pr.cliLogin;
+
+			if (!arg) {
+				const configuredList =
+					[...configured]
+						.sort()
+						.map(
+							(pName) =>
+								`  ${pName === current ? brand.amber("●") : brand.dim("○")} ${brand.white(pName)}${pName === current ? brand.dim(" (current)") : ""}`,
+						)
+						.join("\n") || `  ${brand.dim("(none)")}`;
+				const addable = PROVIDERS.filter(
+					(pr) => isInlineAddable(pr) && !configured.has(pr.providerId ?? pr.id),
+				)
+					.map((pr) => `  ${brand.dim(pr.id)} ${brand.dim("·")} ${brand.dim(pr.name)}`)
+					.join("\n");
+				insertBeforeEditor(
+					new Markdown(
+						`${brand.dim("configured providers — switch with /provider <name>:")}\n${configuredList}\n\n` +
+							`${brand.dim("add a new one — /provider <name>, then paste an API key:")}\n${addable}`,
+						1,
+						0,
+						markdownTheme,
+					),
+				);
+				return;
+			}
+
+			const name = arg.toLowerCase();
+			if (configured.has(name)) {
+				await applyProviderSwitch(name);
+				return;
+			}
+			// Not configured — can we add it inline?
+			const cat = findProvider(name);
+			if (cat && isInlineAddable(cat)) {
+				pendingProviderEntry = {
+					providerId: cat.providerId ?? cat.id,
+					providerName: cat.name,
+				};
+				insertBeforeEditor(
+					new Markdown(
+						`${brand.amber(`Add ${cat.name}`)} — paste your API key and press Enter ${brand.dim("(or /cancel)")}.\n` +
+							`${brand.dim(`get a key: ${cat.keyUrl}`)}\n` +
+							`${brand.dim("the key goes to your gateway and is saved there; it won't appear in this transcript.")}`,
+						1,
+						0,
+						markdownTheme,
+					),
+				);
+				return;
+			}
+			if (cat) {
+				// Known catalog entry, but a kind the inline flow can't handle.
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim(`${cat.name} needs the full setup wizard — run `)}${brand.white("brigade onboard")}${brand.dim(" on the gateway machine.")}`,
+						0,
+						0,
+					),
+				);
+				return;
+			}
+			insertBeforeEditor(
+				new Text(
+					`  ${brand.error(`✗ unknown provider "${arg}".`)} ${brand.dim("Run /provider with no argument to see the list.")}`,
+					0,
+					0,
+				),
+			);
 			return;
 		}
 

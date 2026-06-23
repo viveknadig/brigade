@@ -20,6 +20,7 @@ import lockfile from "proper-lockfile";
 import {
 	resolveChannelAllowFromPath,
 	resolveChannelGroupAllowFromPath,
+	resolveChannelOwnerPath,
 	resolveChannelPairingPath,
 	resolveChannelStateDir,
 } from "../../../config/paths.js";
@@ -338,6 +339,56 @@ export function removeAllowFrom(channelId: string, senderId: string, accountId?:
 		const current = readAllowFrom(channelId, acct || null);
 		if (!current.includes(id)) return false;
 		writeJsonAtomic(filePath, { version: 1, allowFrom: current.filter((x) => x !== id) } satisfies AllowFromFile);
+		return true;
+	});
+}
+
+/* ─────────────────────────── channel owner ─────────────────────────── */
+
+interface OwnerFile {
+	version: 1;
+	owner?: string;
+}
+
+/**
+ * Read the recorded operator id for a channel whose bot account is separate
+ * from the operator (Telegram). Returns null when no owner has been claimed.
+ * WhatsApp never writes this — its linked-self id already identifies the owner.
+ */
+export function readChannelOwner(channelId: string, accountId?: string | null): string | null {
+	const acct = (accountId ?? "").trim();
+	const data = readJson<OwnerFile>(resolveChannelOwnerPath(channelId, acct || null), { version: 1 });
+	const id = normalizeId(data.owner ?? "");
+	return id || null;
+}
+
+/**
+ * Record the channel's operator id. First-write-wins: once an owner is set it is
+ * NOT overwritten (so a later stranger can't seize ownership). Returns true when
+ * this call established the owner, false when one already existed or the id was
+ * empty. Use `clearChannelOwner` to reset.
+ */
+export function setChannelOwner(channelId: string, senderId: string, accountId?: string | null): boolean {
+	const id = normalizeId(senderId);
+	if (!id) return false;
+	const acct = (accountId ?? "").trim();
+	const filePath = resolveChannelOwnerPath(channelId, acct || null);
+	return withFileLock(filePath, () => {
+		const existing = normalizeId(readJson<OwnerFile>(filePath, { version: 1 }).owner ?? "");
+		if (existing) return false; // first-write-wins — never seize an existing owner
+		writeJsonAtomic(filePath, { version: 1, owner: id } satisfies OwnerFile);
+		return true;
+	});
+}
+
+/** Clear the recorded owner (operator reset). Returns true if one was present. */
+export function clearChannelOwner(channelId: string, accountId?: string | null): boolean {
+	const acct = (accountId ?? "").trim();
+	const filePath = resolveChannelOwnerPath(channelId, acct || null);
+	return withFileLock(filePath, () => {
+		const existing = normalizeId(readJson<OwnerFile>(filePath, { version: 1 }).owner ?? "");
+		if (!existing) return false;
+		writeJsonAtomic(filePath, { version: 1 } satisfies OwnerFile);
 		return true;
 	});
 }

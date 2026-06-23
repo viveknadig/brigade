@@ -28,12 +28,17 @@ import type { BrigadeConfig } from "../../config/io.js";
 import type { ChannelAdapter, ChannelCommand, InboundMessage } from "../extensions/types.js";
 import { getActiveRegistry } from "../extensions/active-registry.js";
 import {
+	type AccessDecision,
 	addAllowFrom,
+	approvePairingCode,
 	type DmPolicy,
 	evaluateAccess,
 	readAllowFrom,
+	readChannelOwner,
 	readGroupAllowFrom,
+	readPendingPairings,
 	removeAllowFrom,
+	revokePairingCode,
 	upsertPairingRequest,
 } from "./access-control/index.js";
 import { isAbortTrigger } from "./abort-triggers.js";
@@ -177,7 +182,13 @@ function senderLineFor(senderId: string, idLabel?: PairingIdLabel): string {
 	return `👤  *Your account:*  ${senderId}`;
 }
 
-function buildChallengeReply(args: { code: string; senderId: string; channelLabel: string; idLabel?: PairingIdLabel }): string {
+function buildChallengeReply(args: {
+	code: string;
+	senderId: string;
+	channelId: string;
+	channelLabel: string;
+	idLabel?: PairingIdLabel;
+}): string {
 	void args.channelLabel;
 	return [
 		"🦁  *Brigade* — your private AI crew",
@@ -188,9 +199,11 @@ function buildChallengeReply(args: { code: string; senderId: string; channelLabe
 		"```",
 		args.code,
 		"```",
-		"Share it with your admin — they'll approve you by running:",
+		"Send this code to your admin. They approve you by either:",
+		`  •  replying  *\`/approve ${args.code}\`*  to this bot, or`,
+		`  •  running this on the server:`,
 		"```",
-		`brigade pairing approve ${args.code}`,
+		`brigade pairing approve ${args.code} --channel ${args.channelId}`,
 		"```",
 		"✨  Once approved, just send your next message.",
 		"⏱️  _Expires in 1 hour._",
@@ -236,10 +249,16 @@ export interface PendingDispatch {
 
 /** Bundled built-in channel commands an operator can DM to admin the bot. */
 export function buildBundledCommands(adapter: ChannelAdapter): ChannelCommand[] {
-	const isOperator = (senderId: string): boolean => {
+	const norm = (s: string): string => s.replace(/\s+/g, "");
+	const isOperator = (senderId: string, accountId?: string | null): boolean => {
+		const id = norm(senderId);
+		// The linked-self id (WhatsApp: the bot runs AS the operator).
 		const self = adapter.selfId?.();
-		if (!self) return false;
-		return self.replace(/\s+/g, "") === senderId.replace(/\s+/g, "");
+		if (self && norm(self) === id) return true;
+		// The recorded channel owner (Telegram: bot ≠ operator, owner is claimed
+		// via first /start). accountId scopes multi-account installs.
+		const owner = readChannelOwner(adapter.id, accountId ?? null);
+		return !!owner && norm(owner) === id;
 	};
 	return [
 		{
@@ -249,7 +268,11 @@ export function buildBundledCommands(adapter: ChannelAdapter): ChannelCommand[] 
 				[
 					"Brigade channel commands:",
 					"  /help            — show this list",
+					"  /start           — welcome + how to use this bot",
 					"  /status          — show your access state on this channel",
+					"  /pending         — operator-only: list people waiting for approval",
+					"  /approve <code>  — operator-only: approve a waiting person by their code",
+					"  /deny <code>     — operator-only: reject a pending request",
 					"  /allowlist list  — operator-only: show approved senders",
 					"  /allowlist add <id> | /allowlist remove <id> — operator-only",
 					"  /agent <id>      — pin future messages from you to that agent",
@@ -264,10 +287,80 @@ export function buildBundledCommands(adapter: ChannelAdapter): ChannelCommand[] 
 				].join("\n"),
 		},
 		{
+			name: "start",
+			description: "Welcome message + how to use this bot.",
+			handler: (ctx) => {
+				if (isOperator(ctx.from, ctx.accountId ?? null)) {
+					return [
+						"🦁 *Brigade* — your private AI crew is online.",
+						"",
+						"Just send a message to chat with your crew.",
+						"Admin: /pending, /approve <code>, /allowlist, /agents, /org.",
+						"Type /help for the full list.",
+					].join("\n");
+				}
+				return [
+					"🦁 *Brigade* — your private AI crew.",
+					"",
+					"Send a message and your crew will reply.",
+					"Type /help to see what you can do, or /whoami to see who answers you.",
+				].join("\n");
+			},
+		},
+		{
+			name: "pending",
+			description: "Operator-only: list people waiting for approval.",
+			handler: (ctx) => {
+				if (!isOperator(ctx.from, ctx.accountId ?? null))
+					return "This command can only be run by the operator (the linked account).";
+				const pending = readPendingPairings(ctx.channel, ctx.accountId ?? null);
+				if (pending.length === 0) return "No one is waiting for approval right now.";
+				const lines = pending.map((r) => {
+					const who = r.senderName ? `${r.senderName} (${r.senderId})` : r.senderId;
+					return `  ${r.code}  —  ${who}`;
+				});
+				return [
+					`${pending.length} waiting for approval:`,
+					...lines,
+					"",
+					"Approve with /approve <code>, or reject with /deny <code>.",
+				].join("\n");
+			},
+		},
+		{
+			name: "approve",
+			description: "Operator-only: approve a waiting person by their pairing code.",
+			handler: (ctx) => {
+				if (!isOperator(ctx.from, ctx.accountId ?? null))
+					return "This command can only be run by the operator (the linked account).";
+				const code = ctx.args.trim().split(/\s+/)[0] ?? "";
+				if (!code) return "Usage: /approve <code>   (see waiting codes with /pending)";
+				const approved = approvePairingCode(ctx.channel, code, ctx.accountId ?? null);
+				if (!approved) return `No pending request with code "${code}". Check /pending.`;
+				const who = approved.senderName
+					? `${approved.senderName} (${approved.senderId})`
+					: approved.senderId;
+				return `✅ Approved ${who}. They can chat now — no restart needed.`;
+			},
+		},
+		{
+			name: "deny",
+			description: "Operator-only: reject a pending request by its pairing code.",
+			handler: (ctx) => {
+				if (!isOperator(ctx.from, ctx.accountId ?? null))
+					return "This command can only be run by the operator (the linked account).";
+				const code = ctx.args.trim().split(/\s+/)[0] ?? "";
+				if (!code) return "Usage: /deny <code>   (see waiting codes with /pending)";
+				return revokePairingCode(ctx.channel, code, ctx.accountId ?? null)
+					? `⛔ Rejected request ${code}.`
+					: `No pending request with code "${code}".`;
+			},
+		},
+		{
 			name: "status",
 			description: "Show your access state on this channel.",
 			handler: (ctx) => {
-				const op = isOperator(ctx.from);
+				const op = isOperator(ctx.from, ctx.accountId ?? null);
 				const allow = readAllowFrom(ctx.channel);
 				const role = op ? "operator (self)" : allow.includes(ctx.from) ? "approved" : "unapproved";
 				return [
@@ -282,7 +375,7 @@ export function buildBundledCommands(adapter: ChannelAdapter): ChannelCommand[] 
 			name: "allowlist",
 			description: "Operator-only: list / add / remove approved senders.",
 			handler: (ctx) => {
-				if (!isOperator(ctx.from)) return "This command can only be run by the operator (the linked account).";
+				if (!isOperator(ctx.from, ctx.accountId ?? null)) return "This command can only be run by the operator (the linked account).";
 				const parts = ctx.args.trim().split(/\s+/);
 				const sub = (parts[0] ?? "list").toLowerCase();
 				if (sub === "list" || !sub) {
@@ -414,7 +507,14 @@ export async function runChannelInboundPipeline(
 		const groupAllowJids = configIds(cfgEntry.groupAllowJids);
 		const selfId = adapter.selfId?.();
 		const mentioned = !!(selfId && msg.mentions?.includes(selfId));
-		const senderIsOwner = !!(selfId && selfId.trim() === msg.from.trim());
+		const fromId = msg.from.trim();
+		// On WhatsApp the bot runs AS the operator, so selfId === operator. On a
+		// separate-bot channel (Telegram) the operator is the RECORDED owner —
+		// established securely by the first CLI `pairing approve` (gateway-machine
+		// access is the proof), NOT by anyone who merely texts /start.
+		const isSelfOperator = !!(selfId && selfId.trim() === fromId);
+		const channelOwner = readChannelOwner(adapter.id, aclAccountId);
+		const senderIsOwner = isSelfOperator || (!!channelOwner && channelOwner === fromId);
 		// "Addressed" superset for groups: mention OR a reply/quote to one of the
 		// bot's OWN messages OR within the active follow-up window for this speaker.
 		// Lets a member tag once / reply to the bot and keep the thread going
@@ -428,20 +528,24 @@ export async function runChannelInboundPipeline(
 		const addressed = isGroup
 			? mentioned || isReplyToBot || withinGroupFollowUp(fuKey, groupFollowUpWindowMs)
 			: mentioned;
-		const decision = evaluateAccess({
-			policy: dmPolicy,
-			groupPolicy,
-			senderId: msg.from,
-			...(msg.senderLid !== undefined ? { senderLid: msg.senderLid } : {}),
-			selfId,
-			allowFrom,
-			groupAllowFrom,
-			groupAllowJids,
-			groupId: msg.conversationId,
-			isGroup,
-			mentioned,
-			addressed,
-		});
+		// The owner is ALWAYS admitted — skip the pairing/allowlist gate entirely
+		// (covers the just-claimed Telegram owner, whose id isn't selfId).
+		const decision: AccessDecision = senderIsOwner
+			? { kind: "allow", reason: "owner" }
+			: evaluateAccess({
+					policy: dmPolicy,
+					groupPolicy,
+					senderId: msg.from,
+					...(msg.senderLid !== undefined ? { senderLid: msg.senderLid } : {}),
+					selfId,
+					allowFrom,
+					groupAllowFrom,
+					groupAllowJids,
+					groupId: msg.conversationId,
+					isGroup,
+					mentioned,
+					addressed,
+				});
 		// Keep the active-conversation window alive on every admitted group turn,
 		// so an ongoing back-and-forth doesn't require re-tagging.
 		if (isGroup && decision.kind === "allow") stampGroupFollowUp(fuKey);
@@ -491,6 +595,7 @@ export async function runChannelInboundPipeline(
 				buildChallengeReply({
 					code,
 					senderId: challengeSenderId,
+					channelId: adapter.id,
 					channelLabel: adapter.label,
 					idLabel: adapter.pairing?.idLabel,
 				}),

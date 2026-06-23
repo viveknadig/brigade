@@ -404,8 +404,10 @@ export function createTelegramAdapter(opts: CreateTelegramAdapterOptions = {}): 
 		},
 
 		// Telegram ids are numeric user/chat ids and @usernames, so the pairing
-		// challenge card uses the "Your username" line.
-		pairing: { idLabel: "username" as const },
+		// challenge card uses the "Your username" line. The bot is a SEPARATE
+		// account from the operator (unlike WhatsApp), so ownership is bootstrapped
+		// from the first CLI `pairing approve` — see `botIsSeparateFromOperator`.
+		pairing: { idLabel: "username" as const, botIsSeparateFromOperator: true },
 
 		// Token-based setup wizard — `brigade channels add --channel telegram`
 		// prompts for the bot token and writes `channels.telegram.botToken`.

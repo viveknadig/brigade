@@ -222,6 +222,8 @@ import {
 	shouldRunConsolidation,
 } from "../agents/memory/consolidate.js";
 import { loadBrigadeAuthStorage } from "./auth-bridge.js";
+import { validateApiKeyOnline } from "../providers/validate-key.js";
+import { upsertApiKeyProfile } from "../auth/profiles.js";
 import { BRIGADE_DIR, getBrigadeWorkspaceDir, loadConfig, saveConfig, type Config } from "./config.js";
 import { mutateConfigAtomic } from "../config/io.js";
 import { acquireGatewayLock, type GatewayLockHandle } from "./gateway-lock.js";
@@ -3195,6 +3197,48 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				modelRegistry.refresh();
 				broadcastStateAllBindings();
 				return undefined as ResponseFor[M];
+			}
+			case "add-provider": {
+				const p = params as RequestParams["add-provider"];
+				// Adding a provider persists a gateway-WIDE credential — strictly an
+				// operator write. Every WS connection is currently granted the full
+				// operator scope set (single-operator model), but gate explicitly so
+				// the day a narrower scope is issued, key-add stays owner-only.
+				if (
+					!caller.scopes.includes("operator.write") &&
+					!caller.scopes.includes("operator.admin")
+				) {
+					const err = new Error("add-provider requires operator.write");
+					(err as Error & { code?: string }).code = "forbidden";
+					throw err;
+				}
+				const providerId = p.providerId?.trim();
+				const apiKey = p.apiKey?.trim();
+				if (!providerId) throw new Error("providerId is required");
+				if (!apiKey) throw new Error("apiKey is required");
+				// Live validation against the provider's models endpoint (8s timeout):
+				// 401/403 hard-reject; rate-limit / outage soft-accept with a warning.
+				let warning: string | undefined;
+				let modelCount: number | undefined;
+				if (!p.skipValidation) {
+					const v = await validateApiKeyOnline(providerId, apiKey);
+					if (!v.ok) throw new Error(v.reason);
+					warning = v.warning;
+					modelCount = v.modelCount;
+				}
+				// Persist into main's auth-profiles.json (mode 0600) — the same store
+				// `brigade onboard` writes, so the key survives a gateway restart.
+				upsertApiKeyProfile(DEFAULT_AGENT_ID, { provider: providerId, key: apiKey });
+				// Hot-load the credential into the gateway's live auth view so the model
+				// registry resolves this provider's models on the NEXT turn without a
+				// restart. `authStorage` is the boot store ModelRegistry was created with.
+				(authStorage as AuthStorage).set(providerId, { type: "api_key", key: apiKey });
+				// Drop cached per-agent auth views so non-boot agents rebuild from disk
+				// and see the new credential too (boot agent re-caches `authStorage`).
+				authStorageByAgent.clear();
+				modelRegistry.refresh();
+				broadcastStateAllBindings();
+				return { ok: true, provider: providerId, modelCount, warning } as ResponseFor[M];
 			}
 			case "get-state": {
 				return buildSnapshot() as ResponseFor[M];
