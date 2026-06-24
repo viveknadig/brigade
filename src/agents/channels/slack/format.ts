@@ -138,6 +138,24 @@ function renderInlineSpans(text: string): string {
 				continue;
 			}
 		}
+		// Pre-formed Slack token typed by the agent: a mention `<@U…>`, channel
+		// `<#C…|label>`, special `<!here>` / `<!subteam^S|label>`, or a bare
+		// `<url|label>`. Pass it through VERBATIM so the mention actually pings and
+		// the link actually links — entity-escaping the `<` would neutralize it.
+		// Only inner forms Slack recognises pass; any other `<…>` (e.g. `a < b`)
+		// stays plain text and is escaped as before.
+		if (ch === "<") {
+			const close = text.indexOf(">", i + 1);
+			if (close > i) {
+				const inner = text.slice(i + 1, close);
+				if (/^(?:[@#!]|https?:|mailto:|tel:|slack:)/.test(inner)) {
+					flushPlain();
+					out.push(`<${inner}>`);
+					i = close + 1;
+					continue;
+				}
+			}
+		}
 		plain += ch;
 		i += 1;
 	}

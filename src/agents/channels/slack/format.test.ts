@@ -76,6 +76,18 @@ describe("markdownToSlackMrkdwn", () => {
 		assert.equal(markdownToSlackMrkdwn("see [readme](./README.md)"), "see [readme](./README.md)");
 	});
 
+	it("passes pre-formed Slack tokens through verbatim so mentions actually ping", () => {
+		assert.equal(markdownToSlackMrkdwn("hi <@U123>"), "hi <@U123>");
+		assert.equal(markdownToSlackMrkdwn("see <#C1|general>"), "see <#C1|general>");
+		assert.equal(markdownToSlackMrkdwn("<!here> heads up"), "<!here> heads up");
+		assert.equal(markdownToSlackMrkdwn("ping <@U1> and <@U2>"), "ping <@U1> and <@U2>");
+	});
+
+	it("still escapes a non-token angle (comparison / math stays literal)", () => {
+		assert.equal(markdownToSlackMrkdwn("a < b > c"), "a &lt; b &gt; c");
+		assert.equal(markdownToSlackMrkdwn("if x < 3 and y > 4"), "if x &lt; 3 and y &gt; 4");
+	});
+
 	it("converts ATX headings to a bold line", () => {
 		assert.equal(markdownToSlackMrkdwn("# Title\nbody"), "*Title*\nbody");
 		assert.equal(markdownToSlackMrkdwn("### sub *x*"), "*sub _x_*");
