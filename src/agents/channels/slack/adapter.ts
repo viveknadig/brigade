@@ -44,6 +44,7 @@ import {
 	listSlackAccountIds,
 	resolveSlackAppToken,
 	resolveSlackBotToken,
+	resolveSlackProxyUrl,
 	slackChannelEnabled,
 	slackEventsConfig,
 	slackLiveStreamEnabled,
@@ -131,9 +132,13 @@ export function createSlackAdapter(opts: CreateSlackAdapterOptions = {}): Channe
 				ctx.log("Slack not started — socket mode needs an app-level token (set channels.slack.appToken or SLACK_APP_TOKEN).");
 				return;
 			}
+			// Optional proxy — routes the Web API + Socket Mode websocket through it
+			// on networks where slack.com is blocked. Empty → direct (unchanged).
+			const proxyUrl = resolveSlackProxyUrl(cfg, accountId, lastEnv);
 			connection = await connectImpl({
 				botToken,
 				...(appToken ? { appToken } : {}),
+				...(proxyUrl ? { proxyUrl } : {}),
 				accountId,
 				mode: transport.mode,
 				log: ctx.log,
@@ -530,6 +535,10 @@ export function createSlackAdapter(opts: CreateSlackAdapterOptions = {}): Channe
 			return connection?.connectedAt() ?? null;
 		},
 
+		lastEventAt(): number | null {
+			return connection?.lastEventAt() ?? null;
+		},
+
 		feedWebhookEvent(kind: "event" | "interactive" | "slash", payload: unknown): void {
 			// Defensive: only dispatch a plausibly-shaped payload object.
 			if (!connection || !payload || typeof payload !== "object") return;
@@ -581,6 +590,12 @@ export interface SlackAdapter extends ChannelAdapter {
 	feedWebhookEvent(kind: "event" | "interactive" | "slash", payload: unknown): void;
 	/** The transport mode this adapter's connection runs (`"socket"` | `"events"`). */
 	transportMode(): "socket" | "events" | "unstarted";
+	/**
+	 * Epoch ms of the most recent inbound event (liveness diagnostic), or null
+	 * before the first event / when not started. Observability only — never flips
+	 * health to "down" (a quiet channel is legitimately idle).
+	 */
+	lastEventAt(): number | null;
 }
 
 /**

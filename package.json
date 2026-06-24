@@ -196,6 +196,7 @@
     "convex": "^1.40.0",
     "croner": "^10.0.1",
     "grammy": "^1.42.0",
+    "https-proxy-agent": "^7.0.6",
     "jiti": "^2.6.1",
     "json5": "^2.2.3",
     "linkedom": "^0.18.12",

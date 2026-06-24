@@ -58,6 +58,15 @@ const SIGNING_SECRET_ENV_VAR = "SLACK_SIGNING_SECRET";
 const USER_TOKEN_ENV_VAR = "SLACK_USER_TOKEN";
 
 /**
+ * Standard proxy env vars consulted as a last-resort proxy fallback, in
+ * precedence order. Lower-case wins over upper-case (curl/undici convention),
+ * and a TLS-oriented `https_proxy` outranks the catch-all `ALL_PROXY`. These
+ * mirror the keys undici's own `EnvHttpProxyAgent` honours (same set Telegram
+ * uses).
+ */
+const PROXY_ENV_VARS = ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"] as const;
+
+/**
  * Sealed-token key for the bot token (`channel:slack`) — the ONLY Slack secret
  * `connect_channel` seals today. The app token + signing secret are not sealed
  * (see the header note), so their resolvers pass `sealKey: null`.
@@ -78,6 +87,14 @@ interface SlackAccountEntry {
 	appToken?: string;
 	signingSecret?: string;
 	userToken?: string;
+	/**
+	 * Per-account events-mode gateway path. When unset the resolver derives one
+	 * (`${basePath}/<accountId>` for named accounts) so two workspaces don't
+	 * collide on the same route. `${VAR}`-resolved like the other fields.
+	 */
+	webhookPath?: string;
+	/** Per-account proxy URL (`http(s)://[user:pass@]host:port`). `${VAR}`-resolved. */
+	proxy?: string;
 	[key: string]: unknown;
 }
 
@@ -88,6 +105,16 @@ interface SlackChannelConfigSlot {
 	appToken?: string;
 	signingSecret?: string;
 	userToken?: string;
+	/**
+	 * Top-level proxy URL applied to ALL accounts that don't set their own
+	 * `accounts[].proxy`. Use this on networks where `slack.com` is blocked —
+	 * every Web API call + the Socket Mode websocket route through it. Form:
+	 * `http(s)://[user:pass@]host:port` for an HTTP CONNECT proxy, or
+	 * `socks5://[user:pass@]host:port` (also `socks://` / `socks4://` /
+	 * `socks5h://`) for a SOCKS proxy. `${VAR}`-resolved like `botToken`. Env
+	 * fallback: `HTTPS_PROXY` / `ALL_PROXY`.
+	 */
+	proxy?: string;
 	accounts?: SlackAccountEntry[];
 	/** Transport mode — `"socket"` (default, local-first) or `"events"` (HTTP). */
 	mode?: string;
@@ -132,6 +159,12 @@ export interface ResolvedSlackAccount {
 	signingSecret: string;
 	/** Optional user token (`xoxp-…`) for user-scoped reads, or `""`. */
 	userToken: string;
+	/**
+	 * Proxy URL all Slack API calls + the Socket Mode websocket route through,
+	 * fully resolved (`${VAR}` + env fallback applied), or `""` for a direct
+	 * connection (the default).
+	 */
+	proxyUrl: string;
 	verbose: boolean;
 }
 
@@ -266,6 +299,56 @@ export function resolveSlackUserToken(
 	return resolveSecret(cfg, accountId, "userToken", null, USER_TOKEN_ENV_VAR, env);
 }
 
+/**
+ * Resolve the proxy URL all Slack API calls (+ the Socket Mode websocket) should
+ * route through. Precedence (mirrors Telegram's `resolveTelegramProxyUrl`):
+ *   1. The per-account `accounts[].proxy` (multi-workspace shape), `${VAR}`-resolved.
+ *   2. The top-level `channels.slack.proxy`, `${VAR}`-resolved.
+ *   3. The first set standard proxy env var (`https_proxy` / `HTTPS_PROXY` /
+ *      `all_proxy` / `ALL_PROXY`) — last-resort fallback.
+ * Returns `""` when none is configured → a DIRECT connection (the default,
+ * byte-unchanged from before proxy support existed).
+ *
+ * `${VAR}` refs are resolved here the same way `botToken` is, so an operator can
+ * keep the proxy (which may carry `user:pass@` creds) out of the committed
+ * config as `channels.slack.proxy: "${SLACK_PROXY}"`.
+ */
+export function resolveSlackProxyUrl(
+	cfg: BrigadeConfig,
+	accountId?: string | null,
+	env: NodeJS.ProcessEnv = process.env,
+): string {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = slackChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	const perAccount = resolveTokenRef(entry?.proxy as string | undefined, env);
+	if (perAccount) return perAccount;
+	const topLevel = resolveTokenRef(slot?.proxy as string | undefined, env);
+	if (topLevel) return topLevel;
+	for (const key of PROXY_ENV_VARS) {
+		const value = (env[key] ?? "").trim();
+		if (value) return value;
+	}
+	return "";
+}
+
+/**
+ * Mask a proxy URL down to `scheme://host:port` (creds + path dropped) so it is
+ * safe to log. A malformed URL is reduced to its scheme only; an empty input
+ * returns "". NEVER log a raw proxy URL — it may embed `user:pass@`.
+ */
+export function maskProxyUrl(proxyUrl: string): string {
+	const raw = (proxyUrl ?? "").trim();
+	if (!raw) return "";
+	try {
+		const u = new URL(raw);
+		return `${u.protocol}//${u.host}`; // host includes :port; userinfo + path/query dropped
+	} catch {
+		const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(raw)?.[1];
+		return scheme ? `${scheme}://<masked>` : "<masked>";
+	}
+}
+
 /** Resolve a per-account view of the config (defaults + token resolution filled in). */
 export function resolveSlackAccount(
 	cfg: BrigadeConfig,
@@ -283,6 +366,7 @@ export function resolveSlackAccount(
 		appToken: resolveSlackAppToken(cfg, id, env),
 		signingSecret: resolveSlackSigningSecret(cfg, id, env),
 		userToken: resolveSlackUserToken(cfg, id, env),
+		proxyUrl: resolveSlackProxyUrl(cfg, id, env),
 		verbose: slot?.verbose === true,
 	};
 }
@@ -315,6 +399,47 @@ export function slackEventsConfig(cfg: BrigadeConfig): SlackEventsConfig {
 		url: typeof ev.url === "string" ? ev.url.trim() : "",
 		path: path.startsWith("/") ? path : `/${path}`,
 	};
+}
+
+/**
+ * Normalize a path to a leading-slash, trailing-slash-stripped form so derived
+ * per-account paths concatenate cleanly. `"/slack/events/"` → `"/slack/events"`.
+ */
+function normalizeEventsPath(raw: string): string {
+	const trimmed = (raw ?? "").trim();
+	const withSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+	return withSlash.length > 1 ? withSlash.replace(/\/+$/, "") : withSlash;
+}
+
+/**
+ * Resolve the events-mode gateway route path for ONE account. Multi-workspace
+ * installs need a DISTINCT path per workspace (Slack POSTs to a per-app URL, and
+ * the gateway routes by exact path):
+ *
+ *   - default account → the configured base events path (`channels.slack.events.
+ *     path`, default `/slack/events`) — byte-identical to the single-workspace
+ *     path so an existing default-only install is unchanged.
+ *   - a named account → its explicit `accounts[].webhookPath` when set
+ *     (`${VAR}`-resolved), else the derived `${basePath}/<accountId>` so two
+ *     workspaces can't collide on one route.
+ *
+ * The base path is read from `slackEventsConfig`, so a custom
+ * `channels.slack.events.path` propagates to every derived per-account path.
+ */
+export function resolveSlackEventsPath(
+	cfg: BrigadeConfig,
+	accountId?: string | null,
+	env: NodeJS.ProcessEnv = process.env,
+): string {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const basePath = normalizeEventsPath(slackEventsConfig(cfg).path);
+	if (id === DEFAULT_ACCOUNT_ID) return basePath;
+	const entry = findAccountEntry(cfg, id);
+	const explicit = resolveTokenRef(entry?.webhookPath as string | undefined, env);
+	if (explicit) return normalizeEventsPath(explicit);
+	// Derive a collision-free path from the account id (path-segment-safe slug).
+	const slug = id.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || id;
+	return `${basePath}/${slug}`;
 }
 
 /**

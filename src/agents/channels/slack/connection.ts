@@ -55,7 +55,9 @@ import {
 	type SlackMessageEvent,
 	type SlackReactionEvent,
 } from "./inbound-extras.js";
+import { maskProxyUrl } from "./account-config.js";
 import { downloadSlackFile, uploadSlackFile, type SlackUploadApi } from "./media.js";
+import { buildSlackProxyAgent } from "./proxy-agent.js";
 import { createSlackUserDirectory, type SlackUserDirectory } from "./user-directory.js";
 
 /* ───────────────────────── reconnect backoff ───────────────────────── */
@@ -254,6 +256,16 @@ export interface ConnectSlackArgs {
 	 * {@link SlackConnection.feedEvent}. Defaults to socket.
 	 */
 	mode?: "socket" | "events";
+	/**
+	 * Optional proxy URL all Slack API calls (+ the Socket Mode websocket) route
+	 * through. Use it on networks where `slack.com` is blocked. Form:
+	 * `http(s)://[user:pass@]host:port` for an HTTP CONNECT proxy, or
+	 * `socks5://[user:pass@]host:port` (also `socks://` / `socks4://` /
+	 * `socks5h://`) for a SOCKS proxy. When omitted/empty the connection is DIRECT
+	 * (unchanged default). HTTP(S) proxies use `https-proxy-agent`; SOCKS proxies
+	 * use `socks-proxy-agent` (see `proxy-agent.ts`).
+	 */
+	proxyUrl?: string;
 	/** Called once `auth.test` succeeds and the socket connects. */
 	onConnected?: () => void;
 	/** Called when the token is rejected (invalid_auth) — terminal, re-token required. */
@@ -277,10 +289,19 @@ export interface ConnectSlackArgs {
 	log: (msg: string, meta?: Record<string, unknown>) => void;
 	/**
 	 * TEST SEAM: supply the WebClient + SocketModeClient instead of building real
-	 * ones. Production leaves these undefined and the SDKs are lazy-imported.
+	 * ones. Production leaves these undefined and the SDKs are lazy-imported. The
+	 * second `agent` arg is the resolved proxy agent (undefined for a direct
+	 * connection) — production threads it into the real `WebClient` /
+	 * `SocketModeClient`; a test fake can assert it was handed the agent.
 	 */
-	webClientFactory?: (botToken: string) => SlackWebClientLike;
-	socketModeFactory?: (appToken: string) => SlackSocketClientLike;
+	webClientFactory?: (botToken: string, agent?: unknown) => SlackWebClientLike;
+	socketModeFactory?: (appToken: string, agent?: unknown) => SlackSocketClientLike;
+	/**
+	 * TEST SEAM: override how the proxy agent is built from `proxyUrl`. Production
+	 * leaves this undefined and `buildSlackProxyAgent` lazy-imports the proxy-agent
+	 * packages. Lets a test assert the resolver ran without a real proxy.
+	 */
+	proxyAgentFactory?: (proxyUrl: string) => Promise<unknown>;
 	/** TEST SEAM: skip the real backoff sleep so reconnect tests run instantly. */
 	sleepImpl?: (ms: number) => Promise<void>;
 }
@@ -294,6 +315,14 @@ export interface SlackConnection {
 	teamId(): string | null;
 	/** Epoch ms of the most recent successful connect, else null. */
 	connectedAt(): number | null;
+	/**
+	 * Epoch ms of the most recent INBOUND event of any kind (message / reaction /
+	 * interactive / slash, via socket OR webhook), else null. Liveness signal: a
+	 * socket can read "connected" while silently dead, so a stale `lastEventAt`
+	 * surfaces a half-dead connection. Observability only — a quiet channel is
+	 * legitimately idle, so this NEVER flips health to "down".
+	 */
+	lastEventAt(): number | null;
 	/** True once `auth.test` has succeeded and the socket is live. */
 	isConnected(): boolean;
 	/** True once an auth error marked the token terminally invalid. */
@@ -430,21 +459,53 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 		args.log(redactedMsg, redactedMeta);
 	};
 
+	// ── resolve proxy (optional) ──
+	// A configured proxy reroutes EVERY Slack API call (auth.test / sends) + the
+	// Socket Mode websocket through the proxy — the fix for networks where
+	// `slack.com` is blocked. Both Slack SDKs accept a Node `http.Agent`; we build
+	// the matching one (http(s) → https-proxy-agent, socks → socks-proxy-agent)
+	// and hand it to the client constructors. No proxy → the agent stays undefined
+	// and the clients are built exactly as before.
+	const proxyUrl = (args.proxyUrl ?? "").trim();
+	let proxyAgent: unknown;
+	if (proxyUrl) {
+		const buildAgent = args.proxyAgentFactory ?? buildSlackProxyAgent;
+		try {
+			proxyAgent = await buildAgent(proxyUrl);
+			safeLog("slack routing through proxy", { account: accountId, proxy: maskProxyUrl(proxyUrl) });
+		} catch (err) {
+			// A malformed proxy URL / missing module must not wedge the channel.
+			safeLog("slack proxy setup failed — connecting directly", {
+				account: accountId,
+				proxy: maskProxyUrl(proxyUrl),
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+
 	// ── lazy-load the Slack SDKs (production path only) ──
 	let buildWebClient: (botToken: string) => SlackWebClientLike;
 	let buildSocket: ((appToken: string) => SlackSocketClientLike) | null;
 	if (args.webClientFactory) {
-		buildWebClient = args.webClientFactory;
+		const factory = args.webClientFactory;
+		buildWebClient = (botToken: string) => factory(botToken, proxyAgent);
 	} else {
 		const { WebClient } = await import("@slack/web-api");
-		buildWebClient = (botToken: string) => new WebClient(botToken) as unknown as SlackWebClientLike;
+		buildWebClient = (botToken: string) =>
+			(proxyAgent
+				? new WebClient(botToken, { agent: proxyAgent as never })
+				: new WebClient(botToken)) as unknown as SlackWebClientLike;
 	}
 	if (mode === "socket") {
 		if (args.socketModeFactory) {
-			buildSocket = args.socketModeFactory;
+			const factory = args.socketModeFactory;
+			buildSocket = (appToken: string) => factory(appToken, proxyAgent);
 		} else {
 			const { SocketModeClient } = await import("@slack/socket-mode");
-			buildSocket = (appToken: string) => new SocketModeClient({ appToken }) as unknown as SlackSocketClientLike;
+			buildSocket = (appToken: string) =>
+				(proxyAgent
+					? new SocketModeClient({ appToken, clientOptions: { agent: proxyAgent as never } })
+					: new SocketModeClient({ appToken })) as unknown as SlackSocketClientLike;
 		}
 	} else {
 		buildSocket = null;
@@ -455,6 +516,13 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 	let selfName: string | null = null;
 	let teamIdValue: string | null = null;
 	let connectedAtMs: number | null = null;
+	// Epoch ms of the most recent inbound event of any kind (liveness signal —
+	// see SlackConnection.lastEventAt). Stamped at the entry of every inbound
+	// handler so it covers BOTH the socket and the webhook (feedEvent) paths.
+	let lastEventAtMs: number | null = null;
+	const stampInboundEvent = (): void => {
+		lastEventAtMs = Date.now();
+	};
 	let connected = false;
 	let tokenInvalid = false;
 	let closed = false;
@@ -579,6 +647,9 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 	 */
 	const handleMessageEvent = (event: SlackMessageEvent, teamId: string | undefined): void => {
 		try {
+			// Liveness: any inbound message event proves the connection is alive,
+			// even one we ultimately skip (echo / system subtype).
+			stampInboundEvent();
 			// message_deleted carries no routable content (the agent can't act on a
 			// vanished message); log-free skip.
 			if (event.subtype === "message_deleted") return;
@@ -637,6 +708,7 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 	/** Handle a `reaction_added` event → normalize + route through `onReaction`. */
 	const handleReactionEvent = (event: SlackReactionEvent, teamId: string | undefined): void => {
 		try {
+			stampInboundEvent();
 			// Dedupe on actor+emoji+target so a redelivery doesn't double-route.
 			const key = `react:${event.user}:${event.reaction}:${event.item?.ts}`;
 			if (!eventDedupe.claim(key)) return;
@@ -682,6 +754,7 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 	/** Handle a `block_actions` interaction → normalize + route through `onCallbackQuery`. */
 	const handleInteractive = (payload: SlackInteractivePayload): void => {
 		try {
+			stampInboundEvent();
 			const normalized = normalizeInteractive(payload);
 			if (!normalized) return;
 			args.onCallbackQuery?.(normalized);
@@ -698,6 +771,7 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 	 */
 	const handleSlashCommand = (payload: SlackSlashCommandPayload): void => {
 		try {
+			stampInboundEvent();
 			const command = typeof payload.command === "string" ? payload.command : "";
 			const text = typeof payload.text === "string" ? payload.text : "";
 			const channel = typeof payload.channel_id === "string" ? payload.channel_id : "";
@@ -754,6 +828,7 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 			// redelivering it. CRUCIALLY we also RELEASE the add-dedupe key so a later
 			// re-add of the same emoji by the same user (add→remove→add) re-claims and
 			// routes — without this the re-add is silently dropped as a "redelivery".
+			stampInboundEvent(); // liveness: a removal is still inbound traffic
 			const args2 = a as SocketEventArgs;
 			void args2.ack?.().catch(() => {});
 			const event = (args2.event ?? args2.body?.event) as SlackReactionEvent | undefined;
@@ -1028,6 +1103,10 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 	};
 
 	const feedEvent: SlackConnection["feedEvent"] = (kind, payload) => {
+		// Stamp liveness for EVERY webhook-fed event up front — even a
+		// reaction_removed (handled below by releasing a dedupe key, not a handler)
+		// is inbound traffic that proves the events route is alive.
+		stampInboundEvent();
 		if (kind === "interactive") {
 			handleInteractive(payload as SlackInteractivePayload);
 			return;
@@ -1073,6 +1152,7 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 		selfName: () => selfName,
 		teamId: () => teamIdValue,
 		connectedAt: () => connectedAtMs,
+		lastEventAt: () => lastEventAtMs,
 		isConnected: () => connected,
 		isTokenInvalid: () => tokenInvalid,
 		sendText,

@@ -38,6 +38,7 @@ function makeFakeConnectImpl(): {
 			selfName: () => "brigade",
 			teamId: () => "T1",
 			connectedAt: () => 1234,
+			lastEventAt: () => 5678,
 			isConnected: () => state.connected,
 			isTokenInvalid: () => state.tokenInvalid,
 			sendText: async (channel, text, o) => {

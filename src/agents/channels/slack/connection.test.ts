@@ -514,3 +514,136 @@ describe("connectSlack — outbound", () => {
 		assert.equal(web.opened[0]?.users, "U9");
 	});
 });
+
+describe("connectSlack — proxy support", () => {
+	it("resolves a proxy agent and hands it to BOTH client factories", async () => {
+		const socket = makeFakeSocket();
+		const web = makeFakeWeb();
+		const sentinel = { proxy: true };
+		let webAgent: unknown;
+		let socketAgent: unknown;
+		let builtFor = "";
+		const conn = await connectSlack({
+			botToken: "xoxb-AAA",
+			appToken: "xapp-BBB",
+			proxyUrl: "http://user:pass@proxy.local:8080",
+			proxyAgentFactory: async (url) => {
+				builtFor = url;
+				return sentinel;
+			},
+			webClientFactory: (_token, agent) => {
+				webAgent = agent;
+				return web;
+			},
+			socketModeFactory: (_token, agent) => {
+				socketAgent = agent;
+				return socket;
+			},
+			sleepImpl: async () => {},
+			log: () => {},
+			onMessage: () => {},
+		});
+		assert.equal(builtFor, "http://user:pass@proxy.local:8080");
+		assert.equal(webAgent, sentinel, "web client received the resolved proxy agent");
+		assert.equal(socketAgent, sentinel, "socket client received the resolved proxy agent");
+		await conn.close();
+	});
+
+	it("no proxy → the agent stays undefined (direct, unchanged)", async () => {
+		const socket = makeFakeSocket();
+		const web = makeFakeWeb();
+		let webAgent: unknown = "untouched";
+		const conn = await connectSlack({
+			botToken: "xoxb-AAA",
+			appToken: "xapp-BBB",
+			webClientFactory: (_token, agent) => {
+				webAgent = agent;
+				return web;
+			},
+			socketModeFactory: () => socket,
+			sleepImpl: async () => {},
+			log: () => {},
+			onMessage: () => {},
+		});
+		assert.equal(webAgent, undefined);
+		await conn.close();
+	});
+
+	it("a proxy-build failure does NOT wedge the channel — connects directly", async () => {
+		const socket = makeFakeSocket();
+		const web = makeFakeWeb();
+		let webAgent: unknown = "untouched";
+		const conn = await connectSlack({
+			botToken: "xoxb-AAA",
+			appToken: "xapp-BBB",
+			proxyUrl: "http://broken",
+			proxyAgentFactory: async () => {
+				throw new Error("bad proxy");
+			},
+			webClientFactory: (_token, agent) => {
+				webAgent = agent;
+				return web;
+			},
+			socketModeFactory: () => socket,
+			sleepImpl: async () => {},
+			log: () => {},
+			onMessage: () => {},
+		});
+		// Agent resolution failed → undefined agent, but the connection still came up.
+		assert.equal(webAgent, undefined);
+		assert.equal(conn.isConnected(), true);
+		await conn.close();
+	});
+});
+
+describe("connectSlack — lastEventAt liveness", () => {
+	async function connect() {
+		const socket = makeFakeSocket();
+		const web = makeFakeWeb();
+		const conn = await connectSlack({
+			botToken: "xoxb-AAA",
+			appToken: "xapp-BBB",
+			webClientFactory: () => web,
+			socketModeFactory: () => socket,
+			sleepImpl: async () => {},
+			log: () => {},
+			onMessage: () => {},
+			onReaction: () => {},
+			onCallbackQuery: () => {},
+		});
+		return { socket, conn };
+	}
+
+	it("is null before any inbound event", async () => {
+		const { conn } = await connect();
+		assert.equal(conn.lastEventAt(), null);
+		await conn.close();
+	});
+
+	it("stamps on an inbound message (socket path)", async () => {
+		const { socket, conn } = await connect();
+		const before = Date.now();
+		socket.emitEvent("message", { type: "message", user: "U2", channel: "C1", text: "hi", ts: "5.0" }, "T1");
+		await flush();
+		const at = conn.lastEventAt();
+		assert.ok(at !== null && at >= before, "lastEventAt advanced on the inbound");
+		await conn.close();
+	});
+
+	it("stamps even on the bot's OWN echo (any traffic proves liveness)", async () => {
+		const { socket, conn } = await connect();
+		socket.emitEvent("message", { type: "message", user: "UBOT", channel: "C1", text: "echo", ts: "6.0" });
+		await flush();
+		assert.ok(conn.lastEventAt() !== null, "a skipped self-message still counts as liveness");
+		await conn.close();
+	});
+
+	it("stamps on a webhook-fed event (feedEvent path)", async () => {
+		const { conn } = await connect();
+		assert.equal(conn.lastEventAt(), null);
+		conn.feedEvent("event", { team_id: "T1", event: { type: "message", user: "U2", channel: "C1", text: "fed", ts: "7.0" } });
+		await flush();
+		assert.ok(conn.lastEventAt() !== null, "feedEvent stamped liveness");
+		await conn.close();
+	});
+});

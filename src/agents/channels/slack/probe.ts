@@ -51,6 +51,15 @@ export interface SlackProbeResult {
 	bot?: SlackProbeBot;
 	/** Workspace identity (populated on success). */
 	team?: SlackProbeTeam;
+	/**
+	 * Epoch ms of the most recent inbound event seen by the STARTED adapter for
+	 * this account, when one is running (liveness signal — `auth.test` proves the
+	 * token but not that the events stream is flowing). `null` when no inbound has
+	 * arrived yet; `undefined` when the probe couldn't consult a live adapter
+	 * (e.g. a cold status check before the channel started). Observability only —
+	 * a stale value never means "unhealthy" (a quiet channel is idle, not down).
+	 */
+	lastEventAt?: number | null;
 }
 
 export interface SlackProbeArgs {

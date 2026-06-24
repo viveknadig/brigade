@@ -68,7 +68,8 @@ import {
 	SLACK_DEFAULT_ACCOUNT_ID,
 	type ResolvedSlackAccount,
 } from "./account-config.js";
-import { createSlackAdapter, SLACK_CAPABILITIES } from "./adapter.js";
+import { registerSlackAccountSink, removeSlackAccountSink } from "./account-registry.js";
+import { createSlackAdapter, SLACK_CAPABILITIES, type SlackAdapter } from "./adapter.js";
 import { probeSlack, type SlackProbeResult } from "./probe.js";
 
 const log = createSubsystemLogger("channels/slack/plugin");
@@ -155,6 +156,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): SlackPluginHandle {
 				/* best-effort */
 			}
 			removeChannelApprovalDispatcher(SLACK_CHANNEL_ID, accountId);
+			removeSlackAccountSink(accountId);
 			accountRuntimes.delete(accountId);
 		}
 
@@ -201,6 +203,16 @@ export function createSlackPlugin(deps: SlackPluginDeps): SlackPluginHandle {
 		try {
 			await adapter.start(startCtx);
 			accountRuntimes.set(accountId, { adapter, pipeline, abort: accountAbort });
+			// Bridge this started adapter to its events-mode webhook route. The route
+			// (registered by the module at boot) resolves the sink through this
+			// registry at request time, so an event POSTed for THIS workspace's path
+			// reaches THIS adapter. Only adapters that carry `feedWebhookEvent` (the
+			// real Slack adapter does; a bare test fake may not) are bridged.
+			const sinkCapable = adapter as Partial<SlackAdapter>;
+			if (typeof sinkCapable.feedWebhookEvent === "function") {
+				const feed = sinkCapable.feedWebhookEvent.bind(adapter);
+				registerSlackAccountSink(accountId, { feedWebhookEvent: feed });
+			}
 			// Per-account approval dispatcher — native Block Kit prompt + per-account
 			// routing. Without this an exec-gate prompt from a turn on (slack, labs)
 			// would fall through to the channel default.
@@ -225,9 +237,10 @@ export function createSlackPlugin(deps: SlackPluginDeps): SlackPluginHandle {
 		const runtime = accountRuntimes.get(ctx.accountId);
 		if (!runtime) return;
 		accountRuntimes.delete(ctx.accountId);
-		// Drop the per-account dispatcher BEFORE adapter.stop() so a late in-flight
-		// bridge can't ask a torn-down app to send.
+		// Drop the per-account dispatcher + webhook sink BEFORE adapter.stop() so a
+		// late in-flight bridge / event POST can't ask a torn-down app to act.
 		removeChannelApprovalDispatcher(SLACK_CHANNEL_ID, ctx.accountId);
+		removeSlackAccountSink(ctx.accountId);
 		try {
 			runtime.abort.abort("stop-requested");
 		} catch {
@@ -263,7 +276,14 @@ export function createSlackPlugin(deps: SlackPluginDeps): SlackPluginHandle {
 		getAdapter: (accountId: string) => accountRuntimes.get(accountId)?.adapter,
 		probeAccount: async (accountId, cfg) => {
 			const token = resolveSlackBotToken(cfg, accountId);
-			return probeSlack({ token });
+			const result = await probeSlack({ token });
+			// Surface the started adapter's liveness signal alongside the auth.test
+			// reachability check (observability only — never changes `ok`).
+			const live = accountRuntimes.get(accountId)?.adapter as Partial<SlackAdapter> | undefined;
+			if (live && typeof live.lastEventAt === "function") {
+				return { ...result, lastEventAt: live.lastEventAt() };
+			}
+			return result;
 		},
 		config: {
 			listAccountIds: (cfg) => listSlackAccountIds(cfg),

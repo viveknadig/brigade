@@ -4,9 +4,12 @@ import { describe, it } from "node:test";
 import type { BrigadeConfig } from "../../../config/io.js";
 import {
 	listSlackAccountIds,
+	maskProxyUrl,
 	resolveSlackAccount,
 	resolveSlackAppToken,
 	resolveSlackBotToken,
+	resolveSlackEventsPath,
+	resolveSlackProxyUrl,
 	resolveSlackSigningSecret,
 	slackChannelEnabled,
 	slackEventsConfig,
@@ -112,5 +115,82 @@ describe("slack account-config — thread idle ttl", () => {
 		assert.equal(slackThreadIdleTtlMs(cfg({ enabled: true, threadIdleTtlMs: "6h" })), 6 * 3_600_000);
 		assert.equal(slackThreadIdleTtlMs(cfg({ enabled: true, threadIdleTtlMs: 5000 })), 5000);
 		assert.equal(slackThreadIdleTtlMs(cfg({ enabled: true })), null);
+	});
+});
+
+describe("slack account-config — per-account events path", () => {
+	it("default account → the base events path (single-workspace unchanged)", () => {
+		assert.equal(resolveSlackEventsPath(cfg({ enabled: true, mode: "events" }), "default"), "/slack/events");
+		// no accountId → also the default
+		assert.equal(resolveSlackEventsPath(cfg({ enabled: true, mode: "events" })), "/slack/events");
+	});
+
+	it("a custom base path propagates to derived per-account paths", () => {
+		const c = cfg({
+			enabled: true,
+			mode: "events",
+			events: { path: "/hooks/slack/" },
+			accounts: [{ id: "acme" }, { id: "labs" }],
+		});
+		assert.equal(resolveSlackEventsPath(c, "default"), "/hooks/slack");
+		assert.equal(resolveSlackEventsPath(c, "acme"), "/hooks/slack/acme");
+	});
+
+	it("named accounts derive a collision-free path; an explicit webhookPath wins", () => {
+		const c = cfg({
+			enabled: true,
+			mode: "events",
+			accounts: [{ id: "acme" }, { id: "labs", webhookPath: "/custom/labs" }],
+		});
+		assert.equal(resolveSlackEventsPath(c, "acme"), "/slack/events/acme");
+		assert.equal(resolveSlackEventsPath(c, "labs"), "/custom/labs");
+	});
+
+	it("sanitizes an id with path-unsafe characters into a slug", () => {
+		const c = cfg({ enabled: true, mode: "events", accounts: [{ id: "Team Space/01" }] });
+		assert.equal(resolveSlackEventsPath(c, "Team Space/01"), "/slack/events/Team-Space-01");
+	});
+});
+
+describe("slack account-config — proxy resolution", () => {
+	it("returns '' (direct) when no proxy is configured", () => {
+		assert.equal(resolveSlackProxyUrl(cfg({ enabled: true }), "default", noEnv), "");
+	});
+
+	it("reads the top-level proxy", () => {
+		assert.equal(
+			resolveSlackProxyUrl(cfg({ enabled: true, proxy: "http://p.local:8080" }), "default", noEnv),
+			"http://p.local:8080",
+		);
+	});
+
+	it("per-account proxy overrides the top-level one", () => {
+		const c = cfg({
+			enabled: true,
+			proxy: "http://top:8080",
+			accounts: [{ id: "acme", proxy: "socks5://acme:1080" }],
+		});
+		assert.equal(resolveSlackProxyUrl(c, "acme", noEnv), "socks5://acme:1080");
+	});
+
+	it("resolves a ${VAR} ref against env", () => {
+		const c = cfg({ enabled: true, proxy: "${SLACK_PROXY}" });
+		assert.equal(resolveSlackProxyUrl(c, "default", { SLACK_PROXY: "http://env:3128" }), "http://env:3128");
+	});
+
+	it("falls back to standard proxy env vars (https_proxy / ALL_PROXY)", () => {
+		assert.equal(resolveSlackProxyUrl(cfg({ enabled: true }), "default", { HTTPS_PROXY: "http://envp:8080" }), "http://envp:8080");
+		assert.equal(resolveSlackProxyUrl(cfg({ enabled: true }), "default", { ALL_PROXY: "socks5://envs:1080" }), "socks5://envs:1080");
+	});
+
+	it("resolveSlackAccount surfaces the resolved proxyUrl", () => {
+		const c = cfg({ enabled: true, proxy: "http://p:8080" });
+		assert.equal(resolveSlackAccount(c, "default", noEnv).proxyUrl, "http://p:8080");
+	});
+
+	it("maskProxyUrl drops credentials + path for safe logging", () => {
+		assert.equal(maskProxyUrl("http://user:pass@p.local:8080/path"), "http://p.local:8080");
+		assert.equal(maskProxyUrl(""), "");
+		assert.equal(maskProxyUrl("not a url"), "<masked>");
 	});
 });
