@@ -67,6 +67,7 @@ interface FakeWeb extends SlackWebClientLike {
 	updates: Array<Record<string, unknown>>;
 	deletes: Array<Record<string, unknown>>;
 	reactionsAdded: Array<Record<string, unknown>>;
+	reactionsRemoved: Array<Record<string, unknown>>;
 	opened: Array<Record<string, unknown>>;
 }
 
@@ -75,6 +76,7 @@ function makeFakeWeb(over: { authOk?: boolean; authError?: string } = {}): FakeW
 	const updates: FakeWeb["updates"] = [];
 	const deletes: FakeWeb["deletes"] = [];
 	const reactionsAdded: FakeWeb["reactionsAdded"] = [];
+	const reactionsRemoved: FakeWeb["reactionsRemoved"] = [];
 	const opened: FakeWeb["opened"] = [];
 	let postSeq = 0;
 	return {
@@ -82,6 +84,7 @@ function makeFakeWeb(over: { authOk?: boolean; authError?: string } = {}): FakeW
 		updates,
 		deletes,
 		reactionsAdded,
+		reactionsRemoved,
 		opened,
 		auth: {
 			async test() {
@@ -108,7 +111,8 @@ function makeFakeWeb(over: { authOk?: boolean; authError?: string } = {}): FakeW
 				reactionsAdded.push(args);
 				return { ok: true };
 			},
-			async remove() {
+			async remove(args) {
+				reactionsRemoved.push(args);
 				return { ok: true };
 			},
 		},
@@ -201,6 +205,26 @@ describe("connectSlack — inbound routing", () => {
 		assert.equal(messages[0]?.messageId, "5.5");
 		assert.equal(messages[0]?.teamId, "T1");
 		assert.deepEqual(messages[0]?.mentions, ["UBOT"]);
+	});
+
+	it("emulates typing — reacts ⏳ to the user's last message on composing, removes it on paused", async () => {
+		const { socket, web, conn } = await connect();
+		socket.emitEvent("message", { type: "message", user: "U2", channel: "C1", text: "do a thing", ts: "9.0" });
+		await flush();
+		await conn.setComposing("C1", "composing");
+		assert.equal(web.reactionsAdded.length, 1);
+		assert.equal(web.reactionsAdded[0]?.name, "hourglass_flowing_sand");
+		assert.equal(web.reactionsAdded[0]?.channel, "C1");
+		assert.equal(web.reactionsAdded[0]?.timestamp, "9.0");
+		await conn.setComposing("C1", "paused");
+		assert.equal(web.reactionsRemoved.length, 1);
+		assert.equal(web.reactionsRemoved[0]?.timestamp, "9.0");
+	});
+
+	it("typing is a no-op when the channel has no prior inbound message", async () => {
+		const { web, conn } = await connect();
+		await conn.setComposing("CNONE", "composing");
+		assert.equal(web.reactionsAdded.length, 0);
 	});
 
 	it("filters the bot's own messages (no self-reply loop)", async () => {

@@ -87,6 +87,14 @@ export function slackBackoffDelay(attempt: number): number {
 /** Slack's hard limit on a single message body is 40k; we chunk well under it. */
 const SLACK_MESSAGE_LIMIT = 8_000;
 
+/**
+ * Emoji reacted onto the user's last message as a "working…" affordance. Slack
+ * has no bot typing-indicator API, so `setComposing` emulates it with this
+ * reaction (added while the agent works, removed when idle) — same trick the
+ * reference Slack channel uses.
+ */
+const TYPING_REACTION = "hourglass_flowing_sand";
+
 /* ───────────────────────── normalized inbound shape ───────────────────────── */
 
 /** A normalized inbound Slack message (text and/or files). Mirrors `TgInboundMessage`. */
@@ -311,7 +319,7 @@ export interface SlackConnection {
 	feedEvent(kind: "event" | "interactive" | "slash", payload: unknown): void;
 	/** The transport mode this connection runs (`"socket"` | `"events"`). */
 	mode(): "socket" | "events";
-	/** Signal typing — Slack has no bot typing indicator, so this is a no-op. */
+	/** Signal typing — emulated with a ⏳ reaction on the user's last message (Slack has no bot typing API). */
 	setComposing(channel: string, state: "composing" | "paused", threadId?: string): Promise<void>;
 	/** Read-receipt no-op (Slack bots can't mark-read). */
 	markRead(): Promise<void>;
@@ -435,6 +443,10 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 	// after a reconnect must not double-run the agent. Per-connection lifetime.
 	const eventDedupe = createDedupeCache({ maxEntries: 10_000, ttlMs: 60 * 60 * 1_000 });
 
+	// Last inbound message `ts` per channel — the target the typing affordance
+	// reacts to. Updated when a user message routes; read by `setComposing`.
+	const lastInboundTs = new Map<string, string>();
+
 	/** Normalize one Slack message event into the deferred-media inbound shape. */
 	const normalize = (event: SlackMessageEvent, teamId: string | undefined, opts?: { edited?: boolean }): SlackInboundMessage | null => {
 		// An edit (message_changed) carries the new message under `message`; the
@@ -448,7 +460,7 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 		const mentions = extractSlackMentions(event, selfId ?? undefined);
 		const replyTo = extractSlackReplyContext(event);
 		const fromName = buildSlackSenderName(event);
-		const fromId = typeof inner.user === "string" ? inner.user : channel;
+		const fromId = typeof inner.user === "string" ? inner.user : typeof inner.bot_id === "string" ? inner.bot_id : channel;
 		const ts = typeof inner.ts === "string" ? inner.ts : typeof event.ts === "string" ? event.ts : undefined;
 
 		// DEFERRED media — captured by reference, not downloaded. The thunk is only
@@ -526,6 +538,8 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 			const normalized = normalize(event, teamId, { edited: subtype === "message_changed" });
 			if (!normalized) return;
 			args.onMessage(normalized);
+			// Remember the user's last message ts so setComposing can react to it.
+			if (normalized.messageId) lastInboundTs.set(normalized.conversationId, normalized.messageId);
 		} catch (err) {
 			safeLog("slack inbound handler error", { error: err instanceof Error ? err.message : String(err) });
 		}
@@ -987,7 +1001,20 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 		openDirectMessage,
 		feedEvent,
 		mode: () => mode,
-		setComposing: async () => {},
+		setComposing: async (channel, state) => {
+			// Slack has no bot typing API; emulate it — react ⏳ to the user's last
+			// message while the agent works, remove it when idle. Best-effort +
+			// cosmetic: a failure (no scope / already-reacted / not live) never blocks.
+			const ts = lastInboundTs.get(channel);
+			const w = web;
+			if (!ts || !w) return;
+			try {
+				if (state === "composing") await w.reactions.add({ channel, timestamp: ts, name: TYPING_REACTION });
+				else await w.reactions.remove({ channel, timestamp: ts, name: TYPING_REACTION });
+			} catch {
+				/* cosmetic — already_reacted / no_reaction / missing scope: ignore */
+			}
+		},
 		markRead: async () => {},
 		close,
 	};
