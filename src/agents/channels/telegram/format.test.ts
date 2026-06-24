@@ -73,6 +73,13 @@ describe("markdownToTelegramHtml", () => {
 		);
 	});
 
+	it("keeps a closing paren inside a linkified URL (balanced-paren scan)", () => {
+		assert.equal(
+			markdownToTelegramHtml("see [Mercury](https://en.wikipedia.org/wiki/Mercury_(planet))"),
+			'see <a href="https://en.wikipedia.org/wiki/Mercury_(planet)">Mercury</a>',
+		);
+	});
+
 	it("leaves a non-http link literal (never emits a bad href)", () => {
 		// javascript: / file paths must not linkify.
 		assert.equal(markdownToTelegramHtml("[x](javascript:alert(1))"), "[x](javascript:alert(1))");

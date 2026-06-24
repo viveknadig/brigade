@@ -34,7 +34,22 @@ function matchMarkdownLink(text: string, start: number): { label: string; url: s
 	const labelEnd = text.indexOf("]", start + 1);
 	if (labelEnd === -1) return null;
 	if (text[labelEnd + 1] !== "(") return null;
-	const urlEnd = text.indexOf(")", labelEnd + 2);
+	// Balanced-paren scan from just after the opening `(` so a URL that itself
+	// contains parentheses (e.g. `…/Mercury_(planet)`) keeps its closing `)`. A
+	// plain `indexOf(")")` truncated at the FIRST `)`, dropping the rest of the url.
+	let depth = 1;
+	let urlEnd = -1;
+	for (let j = labelEnd + 2; j < text.length; j++) {
+		const c = text[j];
+		if (c === "(") depth += 1;
+		else if (c === ")") {
+			depth -= 1;
+			if (depth === 0) {
+				urlEnd = j;
+				break;
+			}
+		}
+	}
 	if (urlEnd === -1) return null;
 	const label = text.slice(start + 1, labelEnd);
 	const url = text.slice(labelEnd + 2, urlEnd).trim();
@@ -52,12 +67,24 @@ function matchMarkdownLink(text: string, start: number): { label: string; url: s
  * so `**x**` is not eaten by the single-asterisk italic rule.
  */
 function renderEmphasis(text: string): string {
+	// Slack has no bold-italic marker. Pre-collapse the CommonMark triple form
+	// (`***x***` / `___x___`) to markdown BOLD (`**x**`) before the rule loop, so
+	// the bold rule below claims it and emits Slack bold (`*x*`). Without this the
+	// bold rule would eat only the outer `**` and strand a stray `*` that mangles
+	// the output. Idempotent over recursion.
+	text = text
+		.replace(/\*\*\*([^*\n]+?)\*\*\*/g, "**$1**")
+		.replace(/(?<![A-Za-z0-9_])___([^_\n]+?)___(?![A-Za-z0-9_])/g, "**$1**");
 	type Rule = { re: RegExp; open: string; close: string };
 	const rules: Rule[] = [
 		{ re: /\*\*([^*]+?)\*\*/, open: "*", close: "*" }, // **bold** → *bold*
 		{ re: /__([^_]+?)__/, open: "*", close: "*" }, // __bold__ → *bold*
 		{ re: /~~([^~]+?)~~/, open: "~", close: "~" }, // ~~strike~~ → ~strike~
-		{ re: /\*([^*\n]+?)\*/, open: "_", close: "_" }, // *italic* → _italic_
+		// *italic* → _italic_ — flanking-guarded so a whitespace-flanked `*`
+		// (a glob `*.ts` / arithmetic `2 * 3`) is NOT treated as an italic marker.
+		// The marker must hug its content (no inner space) and not sit between
+		// alphanumerics (which would be a mid-word `*`).
+		{ re: /(?<![A-Za-z0-9])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![A-Za-z0-9])/, open: "_", close: "_" },
 		{ re: /(?<![A-Za-z0-9_])_([^_\n]+?)_(?![A-Za-z0-9_])/, open: "_", close: "_" }, // _italic_ → _italic_
 	];
 	for (const rule of rules) {

@@ -9,17 +9,30 @@ import {
 	TELEGRAM_WEBHOOK_SECRET_HEADER,
 } from "./webhook.js";
 
-/** Minimal fake request that streams a body + carries headers. */
-function fakeReq(opts: { method?: string; headers?: Record<string, string>; body?: string }): EventEmitter & {
+/**
+ * Minimal fake request. By default it STREAMS the body (the out-of-gateway
+ * path). With `preBuffered: true` it instead attaches the body to `req.body`
+ * (mirroring the gateway dispatcher, which drains + buffers the stream before
+ * the route runs) and emits NO stream events — so a handler that re-reads the
+ * stream would hang. This lets the tests exercise both paths.
+ */
+function fakeReq(opts: { method?: string; headers?: Record<string, string>; body?: string; preBuffered?: boolean }): EventEmitter & {
 	method?: string;
 	headers: Record<string, string | string[] | undefined>;
+	body?: Buffer;
 } {
 	const req = new EventEmitter() as EventEmitter & {
 		method?: string;
 		headers: Record<string, string | string[] | undefined>;
+		body?: Buffer;
 	};
 	req.method = opts.method ?? "POST";
 	req.headers = opts.headers ?? {};
+	if (opts.preBuffered) {
+		// Gateway already drained the stream onto req.body; no stream events fire.
+		req.body = Buffer.from(opts.body ?? "", "utf8");
+		return req;
+	}
 	// Emit the body on next tick so handlers can subscribe first.
 	queueMicrotask(() => {
 		if (opts.body !== undefined) req.emit("data", Buffer.from(opts.body, "utf8"));
@@ -114,6 +127,24 @@ describe("buildTelegramWebhookRoute", () => {
 		assert.deepEqual(JSON.parse(res.body), { ok: true });
 		assert.equal(fed.length, 1);
 		assert.deepEqual(fed[0], { update_id: 7, message: { text: "hi" } });
+	});
+
+	it("reads the gateway PRE-BUFFERED body (req.body) without re-streaming", async () => {
+		// The gateway already drained the stream onto req.body; if the handler
+		// re-read the stream it would hang to the 30s timeout. preBuffered emits NO
+		// stream events, so this test only passes when the handler reads req.body.
+		const { route, fed } = baseRoute();
+		const req = fakeReq({
+			headers: { [TELEGRAM_WEBHOOK_SECRET_HEADER]: "s3cr3t" },
+			body: JSON.stringify({ update_id: 9, message: { text: "buffered" } }),
+			preBuffered: true,
+		});
+		const res = fakeRes();
+		await route.handler(req as never, res as never);
+		assert.equal(res.statusCode, 200);
+		assert.deepEqual(JSON.parse(res.body), { ok: true });
+		assert.equal(fed.length, 1);
+		assert.deepEqual(fed[0], { update_id: 9, message: { text: "buffered" } });
 	});
 
 	it("returns 400 for invalid JSON (after secret passes)", async () => {

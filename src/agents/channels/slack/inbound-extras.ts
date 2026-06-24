@@ -72,6 +72,12 @@ export interface SlackMessageEvent {
 	thread_ts?: string;
 	/** Client-generated id — a stable dedupe key across redeliveries. */
 	client_msg_id?: string;
+	/**
+	 * Edit stamp Slack sets on an edited message (`{ user, ts }` where `ts` is
+	 * WHEN the edit happened, distinct from the message's own `ts`). Folded into
+	 * the dedupe key so a SECOND edit of the same message isn't dropped.
+	 */
+	edited?: { ts?: string; user?: string };
 	/** Files attached to the message. */
 	files?: SlackFileObject[];
 	/** The edited / changed message envelope (subtype `message_changed`). */

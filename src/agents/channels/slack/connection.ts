@@ -358,16 +358,32 @@ function errorText(err: unknown): string {
 	return e.data?.error ?? e.message ?? String(err);
 }
 
-/** An auth failure → the token is wrong / revoked / the app was uninstalled (terminal). */
+/**
+ * The non-recoverable Slack auth error codes — the token is wrong / revoked /
+ * expired / the app was uninstalled or lost a required scope. Re-tokening is the
+ * only fix; reconnecting with the same token loops forever. Mirrors the
+ * reference Slack channel's terminal set.
+ */
+const SLACK_UNAUTHORIZED_CODES = [
+	"invalid_auth",
+	"not_authed",
+	"account_inactive",
+	"token_revoked",
+	"token_expired",
+	"invalid_token",
+	"org_login_required",
+	"missing_scope",
+];
+
+/** An auth failure → the token is wrong / revoked / expired / scope-stripped (terminal). */
 export function isSlackUnauthorized(err: unknown): boolean {
 	const code = errorCode(err);
-	if (code === "invalid_auth" || code === "not_authed" || code === "account_inactive" || code === "token_revoked") {
-		return true;
-	}
+	if (code && SLACK_UNAUTHORIZED_CODES.includes(code)) return true;
 	// SocketModeClient throws an UnrecoverableSocketModeStartError on a bad app token.
 	const name = (err as { name?: string })?.name ?? "";
 	if (/UnrecoverableSocketModeStartError/i.test(name)) return true;
-	return /invalid_auth|not_authed|account_inactive|token_revoked/i.test(errorText(err));
+	const pattern = new RegExp(SLACK_UNAUTHORIZED_CODES.join("|"), "i");
+	return pattern.test(errorText(err));
 }
 
 /** Strip a Slack token (`xoxb-…`/`xapp-…`/`xoxp-…`) out of a string before it logs. */
@@ -497,13 +513,26 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 		};
 	};
 
-	/** A stable dedupe key for a message event (prefers client_msg_id, then ts). */
+	/**
+	 * A stable dedupe key for a message event, keyed on CHANNEL + ts (NOT
+	 * client_msg_id). A channel @-mention is delivered TWICE — once as a `message`
+	 * event (carries `client_msg_id`) and once as an `app_mention` event (no
+	 * client_msg_id, only `ts`). Keying on client_msg_id gave the two events
+	 * different keys, so the agent ran/replied/billed twice. Keying on
+	 * `channel:ts` collapses them (both share the same channel + ts). For an edit
+	 * the per-edit `edited.ts` is folded in so a SECOND edit of the same message
+	 * (same `ts`, new `edited.ts`) still routes instead of being dropped.
+	 */
 	const messageDedupeKey = (event: SlackMessageEvent): string | undefined => {
 		const inner = event.subtype === "message_changed" && event.message ? event.message : event;
-		const id = inner.client_msg_id ?? inner.ts ?? event.ts;
-		if (!id) return undefined;
-		// Distinguish an edit from the original so a corrected message still routes.
-		return event.subtype === "message_changed" ? `edit:${id}` : String(id);
+		const channel = typeof event.channel === "string" ? event.channel : typeof inner.channel === "string" ? inner.channel : "";
+		const ts = typeof inner.ts === "string" ? inner.ts : typeof event.ts === "string" ? event.ts : "";
+		if (!ts) return undefined;
+		if (event.subtype === "message_changed") {
+			const editTs = typeof inner.edited?.ts === "string" ? inner.edited.ts : "";
+			return `edit:${channel}:${ts}:${editTs}`;
+		}
+		return `${channel}:${ts}`;
 	};
 
 	/** Is this event one the bot itself authored (its own echo)? */
@@ -688,8 +717,15 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 		s.on("reaction_added", (a) => void onReaction(a as SocketEventArgs));
 		s.on("reaction_removed", (a) => {
 			// A removal isn't routed (nothing to act on) but is acked so Slack stops
-			// redelivering it.
-			void (a as SocketEventArgs).ack?.().catch(() => {});
+			// redelivering it. CRUCIALLY we also RELEASE the add-dedupe key so a later
+			// re-add of the same emoji by the same user (add→remove→add) re-claims and
+			// routes — without this the re-add is silently dropped as a "redelivery".
+			const args2 = a as SocketEventArgs;
+			void args2.ack?.().catch(() => {});
+			const event = (args2.event ?? args2.body?.event) as SlackReactionEvent | undefined;
+			if (event) {
+				eventDedupe.release(`react:${event.user}:${event.reaction}:${event.item?.ts}`);
+			}
 		});
 		s.on("interactive", (a) => {
 			const args2 = a as SocketInteractiveArgs;
@@ -703,15 +739,24 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 			void args2.ack?.().catch(() => {});
 			if (args2.body) handleSlashCommand(args2.body);
 		});
-		// Terminal-auth + disconnect awareness — a bad app token surfaces here.
-		s.on("disconnected", (err) => {
-			if (err && isSlackUnauthorized(err)) {
-				tokenInvalid = true;
-				connected = false;
-				safeLog("slack socket disconnected — token rejected; re-token required");
-				args.onTokenInvalid?.();
-			}
-		});
+		// Terminal-auth awareness mid-session. A token revoked AFTER connect surfaces
+		// on `error` / `unable_to_socket_mode_start` (NOT reliably on `disconnected`,
+		// which @slack/socket-mode emits with NO argument — so the old
+		// disconnected-only hook was dead and a revoked token left health stuck at
+		// "disconnected" forever). We bind all three and mark the token invalid on
+		// any auth-class error so health flips to "logged-out" and the operator is
+		// prompted to re-token.
+		const markTokenInvalidIfAuth = (err: unknown, where: string): void => {
+			if (!isSlackUnauthorized(err)) return;
+			if (tokenInvalid) return; // already terminal — don't re-fire
+			tokenInvalid = true;
+			connected = false;
+			safeLog(`slack ${where} — token rejected; re-token required`);
+			args.onTokenInvalid?.();
+		};
+		s.on("disconnected", (err) => markTokenInvalidIfAuth(err, "socket disconnected"));
+		s.on("error", (e) => markTokenInvalidIfAuth(e, "socket error"));
+		s.on("unable_to_socket_mode_start", (e) => markTokenInvalidIfAuth(e, "unable to start socket mode"));
 	};
 
 	/* ── bootstrap + supervise ── */
@@ -963,8 +1008,13 @@ export async function connectSlack(args: ConnectSlackArgs): Promise<SlackConnect
 		const event = env.event ?? (payload as SlackMessageEvent | SlackReactionEvent);
 		const teamId = typeof env.team_id === "string" ? env.team_id : undefined;
 		const type = (event as { type?: string })?.type;
-		if (type === "reaction_added" || type === "reaction_removed") {
+		if (type === "reaction_added") {
 			handleReactionEvent(event as SlackReactionEvent, teamId);
+		} else if (type === "reaction_removed") {
+			// Mirror the socket path: a removal isn't routed, but it RELEASES the
+			// add-dedupe key so a later re-add (add→remove→add) re-claims + routes.
+			const re = event as SlackReactionEvent;
+			eventDedupe.release(`react:${re.user}:${re.reaction}:${re.item?.ts}`);
 		} else {
 			handleMessageEvent(event as SlackMessageEvent, teamId);
 		}

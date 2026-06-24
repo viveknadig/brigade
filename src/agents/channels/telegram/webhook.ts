@@ -115,7 +115,13 @@ export function buildTelegramWebhookRoute(args: BuildTelegramWebhookRouteArgs): 
 			res.end(JSON.stringify({ ok: false, error: "unauthorized" }));
 			return;
 		}
-		const raw = await readBody(req, WEBHOOK_MAX_BODY_BYTES);
+		// The gateway dispatcher has ALREADY drained the request stream and buffered
+		// it onto `req.body` (see core/server.ts). Re-reading the stream here would
+		// hang until the 30s timeout (→ 408) because the `data`/`end` events already
+		// fired. Read the pre-buffered body first; only fall back to streaming when
+		// the route is exercised outside the gateway (e.g. a direct unit test).
+		const pre = (req as IncomingMessage & { body?: Buffer }).body;
+		const raw = pre ? pre.toString("utf8") : await readBody(req, WEBHOOK_MAX_BODY_BYTES);
 		if (raw === null) {
 			res.statusCode = 413;
 			res.setHeader("content-type", "application/json");

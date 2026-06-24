@@ -31,12 +31,18 @@
  * A legacy config with no `accounts[]` reads as `[{ id: "default" }]`.
  *
  * Token resolution mirrors Telegram: a `${VAR}` ref expands against
- * `process.env`; otherwise the literal passes through; then a DURABLE sealed
- * token (written by `connect_channel`) is consulted so the channel survives a
- * reboot; finally a per-secret env var is the last-resort fallback. Each Slack
- * secret seals under its own sub-key (`channel:slack` for the bot token,
- * `channel:slack:app` / `channel:slack:signing` for the others) so all three
- * ride the same encrypted credential store.
+ * `process.env`; otherwise the literal passes through; then — for the bot token
+ * only — a DURABLE sealed token (written by `connect_channel`) is consulted so
+ * the channel survives a reboot; finally a per-secret env var is the last-resort
+ * fallback.
+ *
+ * Honesty note on sealing: `connect_channel` seals exactly ONE secret per
+ * channel, under `channel:slack` — that is the BOT token. The app-level token
+ * and signing secret are NOT durably sealed today; they must come from config
+ * (`${VAR}`/literal) or their per-secret env var (`SLACK_APP_TOKEN` /
+ * `SLACK_SIGNING_SECRET`). If a future `connect_channel` learns to seal those
+ * under `channel:slack:app` / `channel:slack:signing`, wire the sealed-read
+ * fallback back into `resolveSlackAppToken` / `resolveSlackSigningSecret`.
  */
 
 import type { BrigadeConfig } from "../../../config/io.js";
@@ -51,10 +57,12 @@ const APP_TOKEN_ENV_VAR = "SLACK_APP_TOKEN";
 const SIGNING_SECRET_ENV_VAR = "SLACK_SIGNING_SECRET";
 const USER_TOKEN_ENV_VAR = "SLACK_USER_TOKEN";
 
-/** Sealed-token sub-keys (so the three Slack secrets each get a durable home). */
+/**
+ * Sealed-token key for the bot token (`channel:slack`) — the ONLY Slack secret
+ * `connect_channel` seals today. The app token + signing secret are not sealed
+ * (see the header note), so their resolvers pass `sealKey: null`.
+ */
 const SEAL_KEY_BOT = CHANNEL_ID; // `channel:slack`
-const SEAL_KEY_APP = `${CHANNEL_ID}:app`; // `channel:slack:app`
-const SEAL_KEY_SIGNING = `${CHANNEL_ID}:signing`; // `channel:slack:signing`
 
 /** `${VAR}` secret-ref form — identical to `config/io.ts`'s SECRET_REF_PATTERN. */
 const SECRET_REF_PATTERN = /^\$\{([A-Z_][A-Z0-9_]*)\}$/;
@@ -223,22 +231,30 @@ export function resolveSlackBotToken(
 	return resolveSecret(cfg, accountId, "botToken", SEAL_KEY_BOT, BOT_TOKEN_ENV_VAR, env);
 }
 
-/** Resolve the app-level token (`xapp-…`, Socket Mode) for an account. */
+/**
+ * Resolve the app-level token (`xapp-…`, Socket Mode) for an account. NOT sealed
+ * by `connect_channel` today (sealKey `null`) — comes from config or
+ * `SLACK_APP_TOKEN`.
+ */
 export function resolveSlackAppToken(
 	cfg: BrigadeConfig,
 	accountId?: string | null,
 	env: NodeJS.ProcessEnv = process.env,
 ): string {
-	return resolveSecret(cfg, accountId, "appToken", SEAL_KEY_APP, APP_TOKEN_ENV_VAR, env);
+	return resolveSecret(cfg, accountId, "appToken", null, APP_TOKEN_ENV_VAR, env);
 }
 
-/** Resolve the HMAC signing secret (Events-API mode) for an account. */
+/**
+ * Resolve the HMAC signing secret (Events-API mode) for an account. NOT sealed
+ * by `connect_channel` today (sealKey `null`) — comes from config or
+ * `SLACK_SIGNING_SECRET`.
+ */
 export function resolveSlackSigningSecret(
 	cfg: BrigadeConfig,
 	accountId?: string | null,
 	env: NodeJS.ProcessEnv = process.env,
 ): string {
-	return resolveSecret(cfg, accountId, "signingSecret", SEAL_KEY_SIGNING, SIGNING_SECRET_ENV_VAR, env);
+	return resolveSecret(cfg, accountId, "signingSecret", null, SIGNING_SECRET_ENV_VAR, env);
 }
 
 /** Resolve the optional user token (`xoxp-…`) for an account. */

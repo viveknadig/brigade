@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { downloadSlackFile, withSlackRetry } from "./media.js";
+import { downloadSlackFile, isAllowedSlackFileUrl, withSlackRetry } from "./media.js";
 
 describe("withSlackRetry", () => {
 	it("returns the first successful result without retrying", async () => {
@@ -76,5 +76,50 @@ describe("downloadSlackFile", () => {
 		});
 		// The oversized `size` short-circuits before fetch, so assert the guard works.
 		assert.equal(seenAuth, undefined);
+	});
+
+	it("refuses a non-Slack host and NEVER fetches with the token (SSRF / exfil guard)", async () => {
+		let fetched = false;
+		const out = await downloadSlackFile({
+			// A spoofed event pointing the download at cloud-metadata.
+			file: { id: "F1", url_private: "http://169.254.169.254/latest/meta-data/" },
+			token: "xoxb-secret",
+			fetchImpl: (async () => {
+				fetched = true;
+				return new Response("secrets", { status: 200 });
+			}) as unknown as typeof fetch,
+		});
+		assert.equal(out, null);
+		assert.equal(fetched, false, "the bot token must never be sent to a non-Slack host");
+	});
+
+	it("passes redirect:manual so a cross-origin redirect can't leak the token", async () => {
+		let seenRedirect: string | undefined;
+		await downloadSlackFile({
+			file: { id: "F1", url_private: "https://files.slack.com/F1" },
+			token: "xoxb-secret",
+			fetchImpl: (async (_url: string, init?: RequestInit) => {
+				seenRedirect = init?.redirect;
+				return new Response("bytes", { status: 200 });
+			}) as unknown as typeof fetch,
+		});
+		assert.equal(seenRedirect, "manual");
+	});
+});
+
+describe("isAllowedSlackFileUrl", () => {
+	it("allows https Slack file-CDN hosts and their subdomains", () => {
+		assert.equal(isAllowedSlackFileUrl("https://files.slack.com/F1"), true);
+		assert.equal(isAllowedSlackFileUrl("https://slack.com/x"), true);
+		assert.equal(isAllowedSlackFileUrl("https://a.b.slack-edge.com/x"), true);
+		assert.equal(isAllowedSlackFileUrl("https://x.slack-files.com/y"), true);
+	});
+
+	it("rejects non-https, non-Slack hosts, look-alikes, and junk", () => {
+		assert.equal(isAllowedSlackFileUrl("http://files.slack.com/F1"), false); // not https
+		assert.equal(isAllowedSlackFileUrl("http://169.254.169.254/"), false); // metadata
+		assert.equal(isAllowedSlackFileUrl("https://evil.com/F1"), false);
+		assert.equal(isAllowedSlackFileUrl("https://slack.com.evil.com/F1"), false); // suffix look-alike
+		assert.equal(isAllowedSlackFileUrl("not a url"), false);
 	});
 });

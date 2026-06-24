@@ -100,7 +100,22 @@ function matchMarkdownLink(text: string, start: number): { label: string; url: s
 	const labelEnd = text.indexOf("]", start + 1);
 	if (labelEnd === -1) return null;
 	if (text[labelEnd + 1] !== "(") return null;
-	const urlEnd = text.indexOf(")", labelEnd + 2);
+	// Balanced-paren scan from just after the opening `(` so a URL that itself
+	// contains parentheses (e.g. `…/Mercury_(planet)`) keeps its closing `)`. A
+	// plain `indexOf(")")` truncated at the FIRST `)`, dropping the rest of the url.
+	let depth = 1;
+	let urlEnd = -1;
+	for (let j = labelEnd + 2; j < text.length; j++) {
+		const c = text[j];
+		if (c === "(") depth += 1;
+		else if (c === ")") {
+			depth -= 1;
+			if (depth === 0) {
+				urlEnd = j;
+				break;
+			}
+		}
+	}
 	if (urlEnd === -1) return null;
 	const label = text.slice(start + 1, labelEnd);
 	const url = text.slice(labelEnd + 2, urlEnd).trim();

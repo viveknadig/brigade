@@ -41,6 +41,33 @@ const CHANNEL_ID = "slack";
  */
 const MAX_BYTES = 50 * 1024 * 1024;
 
+/**
+ * Slack's file-CDN hosts. An inbound `url_private` only ever points at one of
+ * these — we attach the bot token as `Authorization: Bearer …`, so before
+ * fetching we REQUIRE https + a Slack host. Without this guard a
+ * prompt-injected / spoofed event could carry `http://169.254.169.254/…` (cloud
+ * metadata) or any attacker host and Brigade would happily send the bot token to
+ * it (SSRF + token exfiltration). Subdomains of these hosts are allowed.
+ */
+const SLACK_FILE_HOSTS = ["slack.com", "slack-edge.com", "slack-files.com"];
+
+/**
+ * True when `rawUrl` is an https URL whose host is a Slack file-CDN host (or a
+ * subdomain of one). Anything else (non-https, a non-Slack host, or an
+ * unparseable URL) returns false so the caller refuses to fetch with the token.
+ */
+export function isAllowedSlackFileUrl(rawUrl: string): boolean {
+	let parsed: URL;
+	try {
+		parsed = new URL(rawUrl);
+	} catch {
+		return false;
+	}
+	if (parsed.protocol !== "https:") return false;
+	const host = parsed.hostname.toLowerCase();
+	return SLACK_FILE_HOSTS.some((h) => host === h || host.endsWith(`.${h}`));
+}
+
 /** YYYY-MM-DD (UTC) bucket — stable filename grouping for grep / review. */
 function dayBucket(): string {
 	const d = new Date();
@@ -122,6 +149,14 @@ export async function downloadSlackFile(args: DownloadSlackFileArgs): Promise<In
 		log?.("slack file skipped — no private url", { fileId: file.id });
 		return null;
 	}
+	// SSRF / token-exfil guard: the bot token is attached below, so REFUSE any
+	// url that isn't https on a Slack file-CDN host. A spoofed event pointing at
+	// `http://169.254.169.254/…` (or any attacker host) must never receive the
+	// token. Checked BEFORE the fetch so the token never leaves the process.
+	if (!isAllowedSlackFileUrl(url)) {
+		log?.("slack file skipped — url is not an allowed Slack host (SSRF guard)", { fileId: file.id });
+		return null;
+	}
 	if (typeof file.size === "number" && file.size > MAX_BYTES) {
 		log?.("slack file skipped — exceeds size cap", { fileId: file.id, bytes: file.size, cap: MAX_BYTES });
 		return null;
@@ -129,7 +164,11 @@ export async function downloadSlackFile(args: DownloadSlackFileArgs): Promise<In
 	const kind = resolveSlackFileKind(file);
 	try {
 		const res = await withSlackRetry(async () => {
-			const r = await doFetch(url, { headers: { Authorization: `Bearer ${token}` } });
+			// `redirect: "manual"` so a cross-origin 30x can't carry the
+			// Authorization header off to a non-Slack host (Slack file urls don't
+			// legitimately redirect cross-origin). A redirect surfaces as an opaque
+			// / non-ok response and falls through to the `!r.ok` handler below.
+			const r = await doFetch(url, { headers: { Authorization: `Bearer ${token}` }, redirect: "manual" });
 			// Retry 5xx (transient server/CDN blip); a 4xx falls through to the !ok
 			// handler below (no point retrying a permanent client error).
 			if (!r.ok && r.status >= 500) throw new Error(`slack file fetch failed (${r.status})`);

@@ -25,6 +25,8 @@ interface FakeSocket extends SlackSocketClientLike {
 	emitInteractive(payload: Record<string, unknown>): void;
 	/** Emit a `slash_commands` payload. */
 	emitSlash(payload: Record<string, unknown>): void;
+	/** Emit a RAW argument to a named handler (e.g. `error` carries the error directly). */
+	emitRaw(eventType: string, arg: unknown): void;
 }
 
 function makeFakeSocket(): FakeSocket {
@@ -57,6 +59,9 @@ function makeFakeSocket(): FakeSocket {
 		},
 		emitSlash(payload) {
 			for (const h of handlers.get("slash_commands") ?? []) h({ ack: ackNoop, body: payload });
+		},
+		emitRaw(eventType, arg) {
+			for (const h of handlers.get(eventType) ?? []) h(arg);
 		},
 	};
 	return socket;
@@ -149,6 +154,14 @@ describe("isSlackUnauthorized", () => {
 		assert.equal(isSlackUnauthorized({ data: { error: "invalid_auth" } }), true);
 		assert.equal(isSlackUnauthorized({ name: "UnrecoverableSocketModeStartError" }), true);
 		assert.equal(isSlackUnauthorized({ data: { error: "channel_not_found" } }), false);
+	});
+
+	it("recognises the broadened non-recoverable codes (expired / invalid / inactive / scope)", () => {
+		for (const code of ["token_expired", "invalid_token", "account_inactive", "org_login_required", "missing_scope"]) {
+			assert.equal(isSlackUnauthorized({ data: { error: code } }), true, code);
+		}
+		// A transient / unrelated error is NOT terminal.
+		assert.equal(isSlackUnauthorized({ data: { error: "ratelimited" } }), false);
 	});
 });
 
@@ -265,6 +278,33 @@ describe("connectSlack — inbound routing", () => {
 		assert.deepEqual(messages[0]?.mentions, ["UBOT"]);
 	});
 
+	it("collapses a message + app_mention with the SAME ts into ONE onMessage (no double-dispatch)", async () => {
+		const { socket, messages } = await connect();
+		// A channel @-mention arrives as BOTH events: `message` (carries
+		// client_msg_id) and `app_mention` (only ts). Keying on channel+ts must
+		// collapse them so the agent runs/replies/bills only once.
+		socket.emitEvent("message", { type: "message", user: "U2", channel: "C1", text: "<@UBOT> hi", ts: "12.0", client_msg_id: "cmid-1" });
+		socket.emitEvent("app_mention", { type: "app_mention", user: "U2", channel: "C1", text: "<@UBOT> hi", ts: "12.0" });
+		await flush();
+		assert.equal(messages.length, 1);
+	});
+
+	it("routes BOTH edits of the same message when edited.ts differs (no edit-drop)", async () => {
+		const { socket, messages } = await connect();
+		const editOf = (editTs: string, text: string) => ({
+			type: "message",
+			subtype: "message_changed",
+			channel: "C1",
+			message: { type: "message", user: "U2", text, ts: "13.0", edited: { ts: editTs, user: "U2" } },
+		});
+		socket.emitEvent("message", editOf("13.1", "first edit"));
+		socket.emitEvent("message", editOf("13.2", "second edit"));
+		await flush();
+		assert.equal(messages.length, 2);
+		assert.equal(messages[0]?.text, "first edit");
+		assert.equal(messages[1]?.text, "second edit");
+	});
+
 	it("routes a block_actions press to onCallbackQuery carrying the value", async () => {
 		const { socket, callbacks } = await connect();
 		socket.emitInteractive({
@@ -288,6 +328,22 @@ describe("connectSlack — inbound routing", () => {
 		assert.deepEqual(reactions[0]?.reaction, { emojis: ["thumbsup"], targetMessageId: "11.0" });
 	});
 
+	it("re-routes a re-added reaction after a removal (add→remove→add fires onReaction twice)", async () => {
+		const { socket, reactions } = await connect();
+		const added = { type: "reaction_added", user: "U2", reaction: "eyes", item: { type: "message", channel: "C1", ts: "14.0" } };
+		const removed = { type: "reaction_removed", user: "U2", reaction: "eyes", item: { type: "message", channel: "C1", ts: "14.0" } };
+		// Flush between events so each is fully processed in arrival order (the
+		// reaction_added handler defers its dedupe-claim behind an async ack).
+		socket.emitEvent("reaction_added", added);
+		await flush();
+		socket.emitEvent("reaction_removed", removed);
+		await flush();
+		socket.emitEvent("reaction_added", added);
+		await flush();
+		// Without the release on removal the re-add is dropped as a redelivery (1).
+		assert.equal(reactions.length, 2);
+	});
+
 	it("routes a slash command as a message ('/status foo')", async () => {
 		const { socket, messages } = await connect();
 		socket.emitSlash({ command: "/status", text: "foo", user_id: "U2", channel_id: "C1", team_id: "T1" });
@@ -301,6 +357,35 @@ describe("connectSlack — inbound routing", () => {
 		assert.equal(conn.isTokenInvalid(), true);
 		assert.equal(conn.isConnected(), false);
 		assert.equal(tokenInvalid(), true);
+	});
+
+	it("detects a token revoked MID-SESSION via a socket `error` event", async () => {
+		const { socket, conn, tokenInvalid } = await connect();
+		assert.equal(conn.isConnected(), true);
+		// @slack/socket-mode emits `error` (not a useful `disconnected` arg) when the
+		// token is revoked after connect.
+		socket.emitRaw("error", { data: { error: "invalid_auth" } });
+		await flush();
+		assert.equal(conn.isTokenInvalid(), true);
+		assert.equal(conn.isConnected(), false);
+		assert.equal(tokenInvalid(), true);
+	});
+
+	it("detects a bad token via `unable_to_socket_mode_start`", async () => {
+		const { socket, conn, tokenInvalid } = await connect();
+		socket.emitRaw("unable_to_socket_mode_start", { data: { error: "token_expired" } });
+		await flush();
+		assert.equal(conn.isTokenInvalid(), true);
+		assert.equal(tokenInvalid(), true);
+	});
+
+	it("ignores a non-auth socket `error` (stays connected)", async () => {
+		const { socket, conn, tokenInvalid } = await connect();
+		socket.emitRaw("error", { data: { error: "ratelimited" } });
+		await flush();
+		assert.equal(conn.isTokenInvalid(), false);
+		assert.equal(conn.isConnected(), true);
+		assert.equal(tokenInvalid(), false);
 	});
 });
 

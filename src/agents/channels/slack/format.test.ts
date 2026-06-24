@@ -22,6 +22,26 @@ describe("markdownToSlackMrkdwn", () => {
 		assert.equal(markdownToSlackMrkdwn("an _emphatic_ word"), "an _emphatic_ word");
 	});
 
+	it("does not treat whitespace-flanked * as italic (globs + arithmetic survive)", () => {
+		// A glob list and a multiplication must pass through unchanged — the old
+		// single-* rule turned `*.ts` / `2 * 3` into stray `_` italic markers.
+		assert.equal(markdownToSlackMrkdwn("ls *.ts and *.js"), "ls *.ts and *.js");
+		assert.equal(markdownToSlackMrkdwn("2 * 3 * 4"), "2 * 3 * 4");
+	});
+
+	it("collapses *** bold-italic to Slack bold (no stray asterisk)", () => {
+		// Slack has no bold-italic; ***x*** / ___x___ collapse to *x* (bold).
+		assert.equal(markdownToSlackMrkdwn("a ***strong*** word"), "a *strong* word");
+		assert.equal(markdownToSlackMrkdwn("a ___strong___ word"), "a *strong* word");
+	});
+
+	it("keeps a closing paren inside a linkified URL (balanced-paren scan)", () => {
+		assert.equal(
+			markdownToSlackMrkdwn("see [Mercury](https://en.wikipedia.org/wiki/Mercury_(planet))"),
+			"see <https://en.wikipedia.org/wiki/Mercury_(planet)|Mercury>",
+		);
+	});
+
 	it("does not italicize underscores inside identifiers", () => {
 		assert.equal(markdownToSlackMrkdwn("call foo_bar_baz now"), "call foo_bar_baz now");
 	});
