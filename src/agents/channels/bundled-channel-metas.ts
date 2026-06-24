@@ -52,9 +52,21 @@ export const SLACK_CHANNEL_META: ChannelMeta = {
 	markdownCapable: true,
 };
 
+/** Discord channel metadata (markdown-capable; visible everywhere by default). */
+export const DISCORD_CHANNEL_META: ChannelMeta = {
+	id: "discord",
+	label: "Discord",
+	selectionLabel: "Discord",
+	docsPath: "channels/discord",
+	blurb: "Paste a bot token, DM/server/thread chat over a Discord bot.",
+	order: 40,
+	markdownCapable: true,
+};
+
 /** Every bundled channel meta, in declaration order. The registry seeds from this. */
 export const BUNDLED_CHANNEL_METAS: readonly ChannelMeta[] = [
 	WHATSAPP_CHANNEL_META,
 	TELEGRAM_CHANNEL_META,
 	SLACK_CHANNEL_META,
+	DISCORD_CHANNEL_META,
 ];

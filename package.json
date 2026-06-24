@@ -195,6 +195,7 @@
     "commander": "^12.1.0",
     "convex": "^1.40.0",
     "croner": "^10.0.1",
+    "discord.js": "^14.26.4",
     "grammy": "^1.42.0",
     "https-proxy-agent": "^7.0.6",
     "jiti": "^2.6.1",
