@@ -153,10 +153,11 @@ describe("createDiscordAdapter — inbound + health", () => {
 		assert.ok((reg[0] as unknown[]).length > 0, "the bundled commands (/help, /status, …) must be registered");
 	});
 
-	it("routes a reaction as a synthesised note", async () => {
+	it("routes a reaction as a synthesised note (reactionNotifications: all)", async () => {
 		const { connectImpl, handle } = makeFakeConnectImpl();
 		const a = createDiscordAdapter({ connectImpl });
-		a.isConfigured(enabledCfg(), {});
+		// Default is "own" (gated); "all" preserves the legacy route-every-reaction path.
+		a.isConfigured(enabledCfg({ reactionNotifications: "all" }), {});
 		const received: InboundMessage[] = [];
 		await a.start(makeStartCtx((m) => received.push(m)));
 		handle()!.args.onReaction?.({
@@ -169,6 +170,60 @@ describe("createDiscordAdapter — inbound + health", () => {
 		});
 		assert.equal(received.length, 1);
 		assert.match(received[0]?.text ?? "", /reacted :tada: to message 90/);
+	});
+
+	it("default reactionNotifications=own drops a reaction on a non-bot message (Fix 1e)", async () => {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createDiscordAdapter({ connectImpl });
+		a.isConfigured(enabledCfg(), {}); // no override → default "own"
+		const received: InboundMessage[] = [];
+		await a.start(makeStartCtx((m) => received.push(m)));
+		// Reacted message authored by U1 (not the bot "BOT") → dropped.
+		handle()!.args.onReaction?.({
+			conversationId: "C1",
+			from: "U2",
+			text: "",
+			chatType: "group",
+			reaction: { emojis: ["tada"], targetMessageId: "90", targetAuthorId: "U1" },
+			raw: {},
+		});
+		assert.equal(received.length, 0);
+	});
+
+	it("default reactionNotifications=own keeps a reaction on a BOT-authored message (Fix 1e)", async () => {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createDiscordAdapter({ connectImpl });
+		a.isConfigured(enabledCfg(), {}); // default "own"; the fake connection's selfId() is "BOT"
+		const received: InboundMessage[] = [];
+		await a.start(makeStartCtx((m) => received.push(m)));
+		handle()!.args.onReaction?.({
+			conversationId: "C1",
+			from: "U2",
+			text: "",
+			chatType: "group",
+			reaction: { emojis: ["tada"], targetMessageId: "90", targetAuthorId: "BOT" },
+			raw: {},
+		});
+		assert.equal(received.length, 1);
+		assert.match(received[0]?.text ?? "", /reacted :tada: to message 90/);
+	});
+
+	it("reactionNotifications=off drops every reaction (Fix 1e)", async () => {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createDiscordAdapter({ connectImpl });
+		a.isConfigured(enabledCfg({ reactionNotifications: "off" }), {});
+		const received: InboundMessage[] = [];
+		await a.start(makeStartCtx((m) => received.push(m)));
+		// Even a reaction on the bot's OWN message is dropped when "off".
+		handle()!.args.onReaction?.({
+			conversationId: "C1",
+			from: "U2",
+			text: "",
+			chatType: "group",
+			reaction: { emojis: ["tada"], targetMessageId: "90", targetAuthorId: "BOT" },
+			raw: {},
+		});
+		assert.equal(received.length, 0);
 	});
 
 	it("routes a button press as callbackQuery", async () => {

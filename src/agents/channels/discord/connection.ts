@@ -42,6 +42,7 @@ import {
 import { maskProxyUrl } from "./account-config.js";
 import { type DiscordActionRow } from "./components.js";
 import {
+	assembleDiscordText,
 	buildDiscordSenderName,
 	discordChannelType,
 	discordThreadId,
@@ -49,7 +50,6 @@ import {
 	extractDiscordMemberRoleIds,
 	extractDiscordMentions,
 	extractDiscordReplyContext,
-	extractDiscordText,
 	hasInboundMedia,
 	isThreadChannel,
 	resolveInboundAttachments,
@@ -57,6 +57,7 @@ import {
 	type DiscordMessageLike,
 } from "./inbound-extras.js";
 import { buildDiscordAttachment, downloadDiscordAttachment } from "./media.js";
+import { isDiscordUserMessageType, resolveDiscordSystemEvent } from "./system-events.js";
 
 /* ───────────────────────── reconnect backoff ───────────────────────── */
 // Shares the neutral `nextBackoffDelay` curve with every other channel (see
@@ -145,9 +146,11 @@ export interface DiscordInboundMessage {
 	/**
 	 * Inbound reaction context — present ONLY when this inbound is a reaction-add.
 	 * `emojis` are the newly-added reaction emoji name(s); `targetMessageId` is the
-	 * message they landed on. Undefined for typed messages.
+	 * message they landed on; `targetAuthorId` is the author of the reacted message
+	 * (so the adapter can gate `reactionNotifications: "own"`). Undefined for typed
+	 * messages.
 	 */
-	reaction?: { emojis: string[]; targetMessageId: string };
+	reaction?: { emojis: string[]; targetMessageId: string; targetAuthorId?: string };
 	/** Raw discord.js object (for adapters that need more). */
 	raw: unknown;
 }
@@ -581,7 +584,10 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		const channelId = typeof message.channelId === "string" ? message.channelId : typeof message.channel?.id === "string" ? message.channel.id : "";
 		if (!channelId) return null;
 		const resolve = resolveLookups(message);
-		const text = extractDiscordText(message, resolve);
+		// Assembled text: content leads, with an embed-title/description fallback when
+		// content is empty, plus appended `<sticker: …>` + `[Forwarded from …]` blocks
+		// so an embed-only / sticker-only / forwarded message isn't dropped as empty.
+		const text = assembleDiscordText(message, resolve);
 		const chatType = discordChannelType(message);
 		const threadId = discordThreadId(message);
 		const mentions = extractDiscordMentions(message, selfId ?? undefined);
@@ -638,8 +644,53 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		return false;
 	};
 
-	/** Handle a messageCreate / messageUpdate event. */
-	const handleMessage = (message: DiscordMessageLike, opts?: { edited?: boolean }): void => {
+	/**
+	 * Best-effort resolve the parent of a reply into `replyTo.body` (+ `from`).
+	 * Discord doesn't inline the replied-to text, so we fetch it: `fetchReference()`
+	 * first (discord.js resolves the reference directly), then `channel.messages.fetch(id)`
+	 * as a fallback. The body is the parent's assembled text (token-expanded), hard-capped.
+	 * Mutates `normalized.replyTo` in place. Fully guarded — any error leaves the
+	 * `{ messageId }`-only context untouched so delivery never blocks/fails.
+	 */
+	const backfillReplyBody = async (message: DiscordMessageLike, normalized: DiscordInboundMessage): Promise<void> => {
+		const refId = message.reference?.messageId;
+		if (!normalized.replyTo || normalized.replyTo.body || typeof refId !== "string" || !refId) return;
+		try {
+			let parent: DiscordMessageLike | null = null;
+			if (typeof message.fetchReference === "function") {
+				parent = await message.fetchReference();
+			}
+			if (!parent && typeof message.channel?.messages?.fetch === "function") {
+				parent = await message.channel.messages.fetch(refId);
+			}
+			if (!parent) return;
+			const body = assembleDiscordText(parent, resolveLookups(parent)).replace(/\n/g, " ").slice(0, 300);
+			const from = typeof parent.author?.id === "string" ? parent.author.id : undefined;
+			if (body || from) {
+				normalized.replyTo = {
+					...normalized.replyTo,
+					...(body ? { body } : {}),
+					...(from ? { from } : {}),
+				};
+			}
+		} catch (err) {
+			safeLog("discord reply-parent backfill failed", { error: err instanceof Error ? err.message : String(err) });
+		}
+	};
+
+	/**
+	 * Handle a messageCreate / messageUpdate event.
+	 *
+	 * ASYNC because of three best-effort REST hydrations (all guarded, all
+	 * post-`normalize`, mirroring the Slack thread-backfill pattern):
+	 *   - reply-parent backfill → fills `replyTo.body` so the agent sees what was
+	 *     replied to (Fix 1b);
+	 *   - system events (joins / pins / boosts / thread-created …) → synthesize a
+	 *     concise note as the inbound text so the agent learns the event (Fix 1c);
+	 *   - empty-payload hydration → re-pull a late / proxied empty-content message
+	 *     once and re-assemble before bailing (Fix 1d).
+	 */
+	const handleMessage = async (message: DiscordMessageLike, opts?: { edited?: boolean }): Promise<void> => {
 		try {
 			stampInboundEvent();
 			// Skip the bot's own messages (echoes) — a bot must never reply to itself.
@@ -653,8 +704,65 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 			const editStamp = opts?.edited && typeof message.editedTimestamp === "number" ? message.editedTimestamp : "";
 			const key = opts?.edited ? `edit:${id}:${editStamp}` : id;
 			if (!eventDedupe.claim(key)) return; // already seen
-			const normalized = normalize(message, opts);
+
+			// SYSTEM event (join / pin / boost / thread-created …): no user content, so
+			// synthesize a concise note as the inbound text and route it (no debounce).
+			// An UNMAPPED system type yields null → drop it. Checked BEFORE normalize so
+			// a content-less system message isn't treated as an empty user message.
+			if (!isDiscordUserMessageType(message.type)) {
+				const channelId = typeof message.channelId === "string" ? message.channelId : typeof message.channel?.id === "string" ? message.channel.id : "";
+				const note = resolveDiscordSystemEvent(message, channelId);
+				if (!note) return; // unmapped system type — drop
+				const normalized = normalize(message, opts);
+				if (!normalized) return;
+				normalized.text = note;
+				args.onMessage(normalized);
+				lastInboundChannel.add(normalized.conversationId);
+				return;
+			}
+
+			let normalized = normalize(message, opts);
 			if (!normalized) return;
+
+			// Does this message need any async REST hydration? (Empty-payload re-pull OR
+			// reply-parent backfill.) When NOTHING async applies — the common case — we
+			// deliver SYNCHRONOUSLY so callers see the inbound on the same tick.
+			const needsHydration = !normalized.text.trim() && !hasInboundMedia(message) && typeof message.fetch === "function";
+			const refId = message.reference?.messageId;
+			const needsReplyBackfill =
+				!!normalized.replyTo &&
+				!normalized.replyTo.body &&
+				typeof refId === "string" &&
+				!!refId &&
+				(typeof message.fetchReference === "function" || typeof message.channel?.messages?.fetch === "function");
+
+			if (!needsHydration && !needsReplyBackfill) {
+				args.onMessage(normalized);
+				lastInboundChannel.add(normalized.conversationId);
+				return;
+			}
+
+			// Empty-payload hydration (Fix 1d): the MESSAGE CONTENT intent can deliver a
+			// late / proxied payload with empty content + no media. Best-effort re-pull
+			// the message once, re-assemble, and only bail if STILL empty.
+			if (needsHydration) {
+				try {
+					const refetched = await message.fetch!();
+					if (refetched && typeof refetched === "object") {
+						const renorm = normalize(refetched, opts);
+						if (renorm && (renorm.text.trim() || renorm.resolveMedia)) {
+							normalized = renorm;
+							message = refetched;
+						}
+					}
+				} catch (err) {
+					safeLog("discord empty-payload hydration failed", { error: err instanceof Error ? err.message : String(err) });
+				}
+			}
+
+			// Reply-parent backfill (Fix 1b): fill `replyTo.body` from the parent message.
+			await backfillReplyBody(message, normalized);
+
 			args.onMessage(normalized);
 			lastInboundChannel.add(normalized.conversationId);
 		} catch (err) {
@@ -682,6 +790,8 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		if (user?.bot === true) return null; // ignore other bots' reactions
 		const fromName = user?.username;
 		const guildId = typeof msg?.guildId === "string" ? msg.guildId : undefined;
+		// Author of the REACTED message — lets the adapter gate `reactionNotifications: "own"`.
+		const targetAuthorId = typeof msg?.author?.id === "string" ? msg.author.id : undefined;
 		return {
 			conversationId: channel,
 			from: fromId,
@@ -689,7 +799,7 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 			text: "",
 			chatType: msg?.guildId ? "group" : "direct",
 			...(guildId ? { guildId } : {}),
-			reaction: { emojis: [emoji], targetMessageId: target },
+			reaction: { emojis: [emoji], targetMessageId: target, ...(targetAuthorId ? { targetAuthorId } : {}) },
 			raw: { reaction, user },
 		};
 	};
@@ -792,11 +902,13 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 	/* ── event wiring ── */
 
 	const wireClient = (c: DiscordClientLike): void => {
-		c.on("messageCreate", ((message: DiscordMessageLike) => handleMessage(message)) as never);
+		// handleMessage is async (it does best-effort REST hydration for reply bodies /
+		// empty payloads); it self-guards every path, so the promise is voided here.
+		c.on("messageCreate", ((message: DiscordMessageLike) => void handleMessage(message)) as never);
 		c.on("messageUpdate", ((_old: unknown, updated: DiscordMessageLike) => {
 			// messageUpdate fires for non-content edits too (embeds resolving, pins);
 			// only route when there's content to act on.
-			if (updated && typeof updated === "object") handleMessage(updated, { edited: true });
+			if (updated && typeof updated === "object") void handleMessage(updated, { edited: true });
 		}) as never);
 		c.on("messageDelete", (() => {
 			// A deleted message carries no routable content — just stamp liveness.

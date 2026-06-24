@@ -17,6 +17,16 @@ import {
 
 /* ─────────────────────── fake discord client harness ─────────────────────── */
 
+/**
+ * Drain the microtask queue so an async `handleMessage` (reply-parent backfill /
+ * empty-payload hydration) settles before the assertion. A couple of awaited
+ * macrotask hops covers the chain of `await`ed fetches.
+ */
+async function tick(): Promise<void> {
+	await new Promise((r) => setTimeout(r, 0));
+	await new Promise((r) => setTimeout(r, 0));
+}
+
 type Handler = (...args: unknown[]) => unknown;
 
 interface FakeMessage {
@@ -27,11 +37,17 @@ interface FakeMessage {
 	guildId?: string | null;
 	createdTimestamp?: number;
 	editedTimestamp?: number | null;
-	reference?: { messageId?: string | null } | null;
+	type?: number;
+	reference?: { messageId?: string | null; type?: number | null } | null;
+	embeds?: Array<{ title?: string | null; description?: string | null; url?: string | null }> | null;
+	stickers?: Array<{ id?: string; name?: string | null; format?: number }> | null;
+	messageSnapshots?: Array<{ message?: { content?: string | null; author?: { username?: string | null } } | null }> | null;
 	mentions?: { users?: Array<{ id?: string; username?: string }> };
 	attachments?: unknown[];
-	channel?: { id?: string; isThread?: () => boolean; isDMBased?: () => boolean; type?: number };
+	channel?: { id?: string; isThread?: () => boolean; isDMBased?: () => boolean; type?: number; messages?: { fetch?: (id: string) => Promise<unknown> } };
 	member?: { nickname?: string | null; roles?: { cache?: Map<string, { id?: string }> } | string[] } | null;
+	fetch?: () => Promise<unknown>;
+	fetchReference?: () => Promise<unknown>;
 }
 
 interface SentRecord {
@@ -371,6 +387,126 @@ describe("connectDiscord — inbound messages", () => {
 		h.client.emit("messageCreate", baseMessage({ reference: { messageId: "parent1" } }));
 		assert.deepEqual(h.messages[0]?.replyTo, { messageId: "parent1" });
 	});
+
+	it("carries an embed-only message's title/description as text (Fix 1a)", async () => {
+		const h = await boot();
+		h.client.emit("messageCreate", baseMessage({ content: "", embeds: [{ title: "Release", description: "ships today" }] }));
+		assert.equal(h.messages.length, 1);
+		assert.equal(h.messages[0]?.text, "Release\nships today");
+	});
+
+	it("carries a sticker-only message as <sticker: …> text + a deferred media thunk (Fix 1a)", async () => {
+		const h = await boot();
+		h.client.emit("messageCreate", baseMessage({ content: "", stickers: [{ id: "55", name: "wave", format: 1 }] }));
+		assert.equal(h.messages.length, 1);
+		assert.equal(h.messages[0]?.text, "<sticker: wave>");
+		assert.equal(typeof h.messages[0]?.resolveMedia, "function");
+	});
+
+	it("carries a forwarded message as a [Forwarded …] block (Fix 1a)", async () => {
+		const h = await boot();
+		h.client.emit(
+			"messageCreate",
+			baseMessage({ content: "", reference: { messageId: "p", type: 1 }, messageSnapshots: [{ message: { content: "the original", author: { username: "sam" } } }] }),
+		);
+		assert.equal(h.messages.length, 1);
+		assert.equal(h.messages[0]?.text, "[Forwarded from sam]\nthe original");
+		// A forward is NOT surfaced as a reply (its content rides in the snapshot).
+		assert.equal(h.messages[0]?.replyTo, undefined);
+	});
+});
+
+describe("connectDiscord — reply-parent backfill (Fix 1b)", () => {
+	it("fills replyTo.body from fetchReference()", async () => {
+		const h = await boot();
+		h.client.emit(
+			"messageCreate",
+			baseMessage({
+				reference: { messageId: "parent1" },
+				fetchReference: async () => ({ id: "parent1", content: "the parent text", author: { id: "U7", username: "ana" } }),
+			}),
+		);
+		await tick();
+		assert.equal(h.messages.length, 1);
+		assert.equal(h.messages[0]?.replyTo?.messageId, "parent1");
+		assert.equal(h.messages[0]?.replyTo?.body, "the parent text");
+		assert.equal(h.messages[0]?.replyTo?.from, "U7");
+	});
+
+	it("falls back to channel.messages.fetch when fetchReference is absent", async () => {
+		const h = await boot();
+		h.client.emit(
+			"messageCreate",
+			baseMessage({
+				reference: { messageId: "parent2" },
+				channel: { id: "C1", messages: { fetch: async () => ({ id: "parent2", content: "from channel fetch", author: { id: "U8" } }) } },
+			}),
+		);
+		await tick();
+		assert.equal(h.messages[0]?.replyTo?.body, "from channel fetch");
+		assert.equal(h.messages[0]?.replyTo?.from, "U8");
+	});
+
+	it("degrades to messageId-only when the parent fetch throws (Fix 1b)", async () => {
+		const h = await boot();
+		h.client.emit(
+			"messageCreate",
+			baseMessage({
+				reference: { messageId: "parent3" },
+				fetchReference: async () => {
+					throw new Error("missing");
+				},
+			}),
+		);
+		await tick();
+		assert.equal(h.messages.length, 1);
+		assert.deepEqual(h.messages[0]?.replyTo, { messageId: "parent3" });
+	});
+});
+
+describe("connectDiscord — system events (Fix 1c)", () => {
+	it("routes a UserJoin (type 7) as a synthesized system note", async () => {
+		const h = await boot();
+		h.client.emit("messageCreate", baseMessage({ type: 7, content: "", author: { id: "U1", username: "sam" } }));
+		assert.equal(h.messages.length, 1);
+		assert.match(h.messages[0]?.text ?? "", /Discord system: sam joined the server/);
+	});
+
+	it("routes a pin (type 6) system note", async () => {
+		const h = await boot();
+		h.client.emit("messageCreate", baseMessage({ type: 6, content: "", author: { id: "U1", username: "sam" } }));
+		assert.match(h.messages[0]?.text ?? "", /pinned a message/);
+	});
+
+	it("drops an unmapped system type", async () => {
+		const h = await boot();
+		h.client.emit("messageCreate", baseMessage({ type: 9999, content: "", author: { id: "U1", username: "sam" } }));
+		assert.equal(h.messages.length, 0);
+	});
+});
+
+describe("connectDiscord — empty-payload hydration (Fix 1d)", () => {
+	it("re-pulls an empty-content message and delivers the hydrated text", async () => {
+		const h = await boot();
+		h.client.emit(
+			"messageCreate",
+			baseMessage({ content: "", fetch: async () => ({ id: "m1", content: "now I have text", author: { id: "U1", username: "alex" }, channelId: "C1", guildId: "G1" }) }),
+		);
+		await tick();
+		assert.equal(h.messages.length, 1);
+		assert.equal(h.messages[0]?.text, "now I have text");
+	});
+
+	it("still bails when the re-pull is also empty", async () => {
+		const h = await boot();
+		h.client.emit(
+			"messageCreate",
+			baseMessage({ content: "", fetch: async () => ({ id: "m1", content: "", author: { id: "U1" }, channelId: "C1", guildId: "G1" }) }),
+		);
+		await tick();
+		// Empty text + no media + no system note → no inbound delivered.
+		assert.equal(h.messages.filter((m) => m.text.trim().length > 0).length, 0);
+	});
 });
 
 describe("connectDiscord — reactions", () => {
@@ -378,7 +514,9 @@ describe("connectDiscord — reactions", () => {
 		const h = await boot();
 		h.client.emit("messageReactionAdd", { emoji: { name: "thumbsup" }, message: baseMessage({ id: "tgt" }) }, { id: "U9", bot: false, username: "sam" });
 		assert.equal(h.reactions.length, 1);
-		assert.deepEqual(h.reactions[0]?.reaction, { emojis: ["thumbsup"], targetMessageId: "tgt" });
+		// targetAuthorId is the reacted message's author (U1 from baseMessage), surfaced
+		// so the adapter can gate `reactionNotifications: "own"`.
+		assert.deepEqual(h.reactions[0]?.reaction, { emojis: ["thumbsup"], targetMessageId: "tgt", targetAuthorId: "U1" });
 	});
 
 	it("ignores the bot's own reaction", async () => {

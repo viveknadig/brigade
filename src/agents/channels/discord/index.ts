@@ -14,6 +14,7 @@ export {
 	resolveDiscordProxyUrl,
 	discordChannelEnabled,
 	discordLiveStreamEnabled,
+	discordReactionNotifications,
 	discordStreamThrottleMs,
 	discordSurfaceReasoning,
 	discordThreadIdleTtlMs,
@@ -22,6 +23,7 @@ export {
 	DISCORD_BOT_TOKEN_ENV_VAR,
 	DISCORD_CHANNEL_ID,
 	DISCORD_DEFAULT_ACCOUNT_ID,
+	type DiscordReactionNotificationMode,
 	type ResolvedDiscordAccount,
 } from "./account-config.js";
 export {

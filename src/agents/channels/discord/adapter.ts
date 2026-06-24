@@ -39,9 +39,11 @@ import {
 	type OutboundMedia,
 	type OutboundSendOptions,
 } from "../sdk.js";
+import { readAllowFrom } from "../access-control/store.js";
 import {
 	discordChannelEnabled,
 	discordLiveStreamEnabled,
+	discordReactionNotifications,
 	discordStreamThrottleMs,
 	discordSurfaceReasoning,
 	listDiscordAccountIds,
@@ -54,7 +56,7 @@ import { resolveDiscordApprover } from "./approval-authorize.js";
 import { buildDiscordApprovalMessage } from "./approval-native.js";
 import { buildDiscordButtonRows } from "./components.js";
 import { buildDiscordCommandManifest } from "./command-menu.js";
-import { connectDiscord, type ConnectDiscordArgs, type DiscordConnection } from "./connection.js";
+import { connectDiscord, type ConnectDiscordArgs, type DiscordConnection, type DiscordInboundMessage } from "./connection.js";
 import { createDraftStream } from "./draft-stream.js";
 import { discordTextIsEmpty, markdownToDiscord } from "./format.js";
 import { splitDiscordReasoning } from "./reasoning-lane.js";
@@ -175,8 +177,14 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 				// Inbound reaction → synthesise a short note and route it through the
 				// SAME inbound pipeline as a normal message so the access gate + routing
 				// apply uniformly. The note carries the added emoji(s) + the target id.
+				//
+				// GATED by `channels.discord.reactionNotifications` (default "own") so a
+				// stranger's reaction in an admitted channel no longer spams the agent:
+				//   off → drop all; own → only reactions on the bot's own messages;
+				//   all → route every reaction; allowlist → only allow-listed reactors.
 				onReaction: (msg) => {
 					if (!msg.reaction) return;
+					if (!shouldNotifyReaction(msg, lastConfig, connection?.selfId() ?? undefined, accountId)) return;
 					const note = buildReactionNote(msg.reaction.emojis, msg.reaction.targetMessageId, msg.fromName);
 					void ctx.onInbound({
 						channel: DISCORD_CHANNEL_ID,
@@ -533,6 +541,54 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 	};
 
 	return adapter;
+}
+
+/**
+ * Decide whether an inbound reaction-add should wake the agent, per the
+ * `channels.discord.reactionNotifications` mode (default `"own"`):
+ *   - `"off"`       → never;
+ *   - `"own"`       → only when the reacted message was authored by the bot
+ *                     (`reaction.targetAuthorId === selfId`);
+ *   - `"all"`       → always (legacy behavior);
+ *   - `"allowlist"` → only when the reactor (`msg.from`) is on the channel
+ *                     allow-list — the central store list ∪ config `allowFrom`.
+ * A null config defensively falls back to `"own"`. Reaction-REMOVE is unaffected
+ * (handled in the connection's dedupe-release path).
+ */
+export function shouldNotifyReaction(
+	msg: DiscordInboundMessage,
+	cfg: BrigadeConfig | null,
+	selfId: string | undefined,
+	accountId?: string,
+): boolean {
+	const mode = cfg ? discordReactionNotifications(cfg) : "own";
+	switch (mode) {
+		case "off":
+			return false;
+		case "all":
+			return true;
+		case "allowlist": {
+			const reactor = msg.from?.trim();
+			if (!reactor) return false;
+			const acct = accountId?.trim() || undefined;
+			const storeAllow = readAllowFrom(DISCORD_CHANNEL_ID, acct);
+			const configAllow = readDiscordAllowFrom(cfg);
+			const allow = new Set([...storeAllow, ...configAllow].map((id) => id.trim()).filter(Boolean));
+			return allow.has(reactor);
+		}
+		case "own":
+		default: {
+			const targetAuthor = msg.reaction?.targetAuthorId?.trim();
+			return Boolean(selfId && targetAuthor && targetAuthor === selfId.trim());
+		}
+	}
+}
+
+/** Read `channels.discord.allowFrom` (config-declared allow-list ids) defensively. */
+function readDiscordAllowFrom(cfg: BrigadeConfig | null): string[] {
+	const slot = (cfg as { channels?: Record<string, { allowFrom?: unknown }> } | null)?.channels?.[DISCORD_CHANNEL_ID];
+	const list = slot?.allowFrom;
+	return Array.isArray(list) ? list.map((x) => String(x)) : [];
 }
 
 /**

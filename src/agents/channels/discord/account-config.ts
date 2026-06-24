@@ -101,8 +101,20 @@ interface DiscordChannelConfigSlot {
 	 * (default OFF). The answer message is unchanged either way.
 	 */
 	surfaceReasoning?: boolean;
+	/**
+	 * Which inbound reaction-adds notify the agent as a turn (default `"own"`):
+	 *   - `"off"`       — never (reactions are ignored entirely);
+	 *   - `"own"`       — only reactions on a message the BOT itself authored;
+	 *   - `"all"`       — every reaction-add (legacy behavior);
+	 *   - `"allowlist"` — only reactions from a sender on the channel allow-list.
+	 * A stranger spamming reactions in an admitted channel no longer wakes the agent.
+	 */
+	reactionNotifications?: DiscordReactionNotificationMode;
 	[key: string]: unknown;
 }
+
+/** Reaction-notification gating modes (see `channels.discord.reactionNotifications`). */
+export type DiscordReactionNotificationMode = "off" | "own" | "all" | "allowlist";
 
 /** Resolved per-account info — what the adapter runtime reads. */
 export interface ResolvedDiscordAccount {
@@ -303,6 +315,18 @@ export function discordStreamThrottleMs(cfg: BrigadeConfig): number {
  */
 export function discordSurfaceReasoning(cfg: BrigadeConfig): boolean {
 	return discordChannelConfig(cfg)?.surfaceReasoning === true;
+}
+
+/**
+ * Resolve the reaction-notification mode (`channels.discord.reactionNotifications`).
+ * Defaults to `"own"` (only reactions on the bot's own messages wake the agent) so
+ * a stranger's reaction in an admitted channel no longer spams a turn. An invalid /
+ * unset value degrades to the `"own"` default.
+ */
+export function discordReactionNotifications(cfg: BrigadeConfig): DiscordReactionNotificationMode {
+	const raw = discordChannelConfig(cfg)?.reactionNotifications;
+	if (raw === "off" || raw === "own" || raw === "all" || raw === "allowlist") return raw;
+	return "own";
 }
 
 /**
