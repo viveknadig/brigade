@@ -7,6 +7,7 @@
  * + loaded by the loader alongside these (same gating) — see `discovery.ts`.
  */
 
+import { slackModule } from "../../channels/slack/module.js";
 import { telegramModule } from "../../channels/telegram/module.js";
 import { whatsAppModule } from "../../channels/whatsapp/module.js";
 import { arxivModule } from "./arxiv.js";
@@ -29,6 +30,10 @@ export const BUNDLED_MODULES: BrigadeModule[] = [
 	// Telegram channel adapter — inert until `channels.telegram.enabled: true`
 	// and a bot token resolves (config `${VAR}` ref or TELEGRAM_BOT_TOKEN env).
 	telegramModule,
+	// Slack channel adapter — inert until `channels.slack.enabled: true` and a
+	// bot token resolves (config `${VAR}` ref or SLACK_BOT_TOKEN env). Socket Mode
+	// (default) also needs an app token; events mode registers an HTTP route.
+	slackModule,
 	// Web-fetch + web-search providers. Each module is inert unless its
 	// credential is configured (env var or `tools.web.{search,fetch}.providers.<id>`).
 	// The registry picks the active provider by `autoDetectOrder` ascending —

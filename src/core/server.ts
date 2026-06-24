@@ -82,6 +82,12 @@ import {
 	telegramThreadIdleTtlMs,
 } from "../agents/channels/telegram/account-config.js";
 import { createTelegramPlugin, type TelegramPluginHandle } from "../agents/channels/telegram/plugin.js";
+import {
+	listSlackAccountIds,
+	slackChannelEnabled,
+	slackThreadIdleTtlMs,
+} from "../agents/channels/slack/account-config.js";
+import { createSlackPlugin, type SlackPluginHandle } from "../agents/channels/slack/plugin.js";
 import { createPluginChannelManagerFacade } from "../agents/channels/plugin-channel-manager-facade.js";
 import type { ChannelPlugin } from "../agents/channels/types.plugin.js";
 import {
@@ -1994,15 +2000,18 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			listKnownChannelIds: () => channelManager?.started ?? [],
 			/**
 			 * Idle channel-thread TTL for the session-reaper's thread sweep — read
-			 * live from `channels.telegram.threadIdleTtlMs` so an idle Telegram
-			 * forum-topic session gets aged out. `null` (default / unset) leaves
-			 * thread sessions untouched; the isolated-cron-run reaper is unaffected.
+			 * live from `channels.telegram.threadIdleTtlMs` (Telegram forum topics)
+			 * or, when that's unset, `channels.slack.threadIdleTtlMs` (Slack threads)
+			 * so an idle threaded session gets aged out. `null` (default / unset)
+			 * leaves thread sessions untouched; the isolated-cron-run reaper is
+			 * unaffected.
 			 */
 			resolveThreadIdleTtlMs: () => {
 				try {
 					// `loadConfig` is synchronous + cheap; reading fresh keeps the TTL
 					// live across config reloads without threading a mutable holder.
-					return telegramThreadIdleTtlMs(loadConfig() as never);
+					const cfg = loadConfig() as never;
+					return telegramThreadIdleTtlMs(cfg) ?? slackThreadIdleTtlMs(cfg);
 				} catch {
 					return null;
 				}
@@ -5284,12 +5293,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		const telegramAccounts = telegramChannelEnabled(cfg as never)
 			? listTelegramAccountIds(cfg as never)
 			: [];
+		const slackAccounts = slackChannelEnabled(cfg as never)
+			? listSlackAccountIds(cfg as never)
+			: [];
 		const wantWhatsAppMulti = whatsappAccounts.length > 1;
 		const wantTelegramMulti = telegramAccounts.length > 1;
-		if (wantWhatsAppMulti || wantTelegramMulti) {
+		const wantSlackMulti = slackAccounts.length > 1;
+		if (wantWhatsAppMulti || wantTelegramMulti || wantSlackMulti) {
 			// Fresh list each (re)start so a reload doesn't accumulate stale plugins.
 			bundledChannelPlugins = [];
-			const facadeHandles: Array<WhatsAppPluginHandle | TelegramPluginHandle> = [];
+			const facadeHandles: Array<WhatsAppPluginHandle | TelegramPluginHandle | SlackPluginHandle> = [];
 			const multiAccountSummary: string[] = [];
 			if (wantWhatsAppMulti) {
 				const whatsappPlugin = createWhatsAppPlugin({
@@ -5318,6 +5331,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				bundledChannelPlugins.push(telegramPlugin);
 				facadeHandles.push(telegramPlugin);
 				multiAccountSummary.push(`telegram x${telegramAccounts.length}`);
+			}
+			if (wantSlackMulti) {
+				const slackPlugin = createSlackPlugin({
+					defaultAgentId: agentId,
+					loadConfig: () => cfg as never,
+					runTurn: (turn) => runGatewayTurn(turn),
+				});
+				bundledChannelPlugins.push(slackPlugin);
+				facadeHandles.push(slackPlugin);
+				multiAccountSummary.push(`slack x${slackAccounts.length}`);
 			}
 			const pluginById = new Map(bundledChannelPlugins.map((p) => [p.id, p] as const));
 			// Register each constructed plugin's `meta` + its `messaging`/`security`

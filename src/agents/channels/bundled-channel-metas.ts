@@ -41,8 +41,20 @@ export const TELEGRAM_CHANNEL_META: ChannelMeta = {
 	markdownCapable: true,
 };
 
+/** Slack channel metadata (markdown-capable; visible everywhere by default). */
+export const SLACK_CHANNEL_META: ChannelMeta = {
+	id: "slack",
+	label: "Slack",
+	selectionLabel: "Slack",
+	docsPath: "channels/slack",
+	blurb: "Paste a bot + app token, DM/channel/thread chat over a Slack app.",
+	order: 30,
+	markdownCapable: true,
+};
+
 /** Every bundled channel meta, in declaration order. The registry seeds from this. */
 export const BUNDLED_CHANNEL_METAS: readonly ChannelMeta[] = [
 	WHATSAPP_CHANNEL_META,
 	TELEGRAM_CHANNEL_META,
+	SLACK_CHANNEL_META,
 ];

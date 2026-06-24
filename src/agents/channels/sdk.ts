@@ -234,6 +234,8 @@ export {
 	WHATSAPP_CHANNEL_META,
 	/** Telegram's user-facing `ChannelMeta` — import this for your plugin's `meta` field. */
 	TELEGRAM_CHANNEL_META,
+	/** Slack's user-facing `ChannelMeta` — import this for your plugin's `meta` field. */
+	SLACK_CHANNEL_META,
 	/** Every bundled channel meta in declaration order (the meta registry seeds from this). */
 	BUNDLED_CHANNEL_METAS,
 } from "./bundled-channel-metas.js";
