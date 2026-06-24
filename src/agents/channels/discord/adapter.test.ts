@@ -5,18 +5,21 @@ import type { BrigadeConfig } from "../../../config/io.js";
 import type { ChannelStartContext, InboundMessage } from "../sdk.js";
 import { createDiscordAdapter, DISCORD_CAPABILITIES, buildReactionNote, type DiscordAdapter } from "./adapter.js";
 import type { ConnectDiscordArgs, DiscordConnection } from "./connection.js";
+import { __resetDiscordDirectoryCacheForTest, rememberDiscordUser } from "./directory-cache.js";
 
 const enabledCfg = (over: Record<string, unknown> = {}): BrigadeConfig =>
 	({ channels: { discord: { enabled: true, botToken: "tok-AAAAAAAAAA.bbb.ccccccccccc", ...over } } }) as unknown as BrigadeConfig;
 
 /** Recorded calls to the fake connection's methods (for parity assertions). */
 interface FakeConnCalls {
-	sentText: Array<{ channel: string; text: string; threadId?: string; replyToMessageId?: string }>;
+	sentText: Array<{ channel: string; text: string; threadId?: string; replyToMessageId?: string; silent?: boolean }>;
 	sentInteractive: Array<{ channel: string; text: string; rows: unknown; threadId?: string }>;
 	edits: Array<{ channel: string; messageId: string; text: string }>;
 	deletes: Array<{ channel: string; messageId: string }>;
 	reactions: Array<{ channel: string; messageId: string; emoji: string }>;
 	reactionsCleared: Array<{ channel: string; messageId: string }>;
+	pins: Array<{ channel: string; messageId: string }>;
+	unpins: Array<{ channel: string; messageId: string }>;
 	registered: Array<unknown[]>;
 }
 
@@ -32,7 +35,7 @@ function makeFakeConnectImpl(): {
 	let handle: FakeConnHandle | null = null;
 	const connectImpl = async (args: ConnectDiscordArgs): Promise<DiscordConnection> => {
 		const state = { connected: true, tokenInvalid: false };
-		const calls: FakeConnCalls = { sentText: [], sentInteractive: [], edits: [], deletes: [], reactions: [], reactionsCleared: [], registered: [] };
+		const calls: FakeConnCalls = { sentText: [], sentInteractive: [], edits: [], deletes: [], reactions: [], reactionsCleared: [], pins: [], unpins: [], registered: [] };
 		let seq = 0;
 		const conn: DiscordConnection = {
 			selfId: () => "BOT",
@@ -42,7 +45,7 @@ function makeFakeConnectImpl(): {
 			isConnected: () => state.connected,
 			isTokenInvalid: () => state.tokenInvalid,
 			sendText: async (channel, text, o) => {
-				calls.sentText.push({ channel, text, threadId: o?.threadId, replyToMessageId: o?.replyToMessageId });
+				calls.sentText.push({ channel, text, threadId: o?.threadId, replyToMessageId: o?.replyToMessageId, silent: o?.silent });
 				return { messageId: `m${++seq}` };
 			},
 			sendInteractive: async (channel, text, rows, o) => {
@@ -61,6 +64,12 @@ function makeFakeConnectImpl(): {
 			},
 			deleteMessage: async (channel, messageId) => {
 				calls.deletes.push({ channel, messageId });
+			},
+			pinMessage: async (channel, messageId) => {
+				calls.pins.push({ channel, messageId });
+			},
+			unpinMessage: async (channel, messageId) => {
+				calls.unpins.push({ channel, messageId });
 			},
 			registerCommands: async (cmds) => {
 				calls.registered.push(cmds);
@@ -283,6 +292,49 @@ describe("createDiscordAdapter — outbound", () => {
 		assert.equal(calls.edits[0]?.text, "new **x**");
 		assert.equal(calls.deletes[0]?.messageId, "20");
 		assert.equal(calls.reactions[0]?.emoji, "tada");
+	});
+
+	it("handleAction pin/unpin routes to the connection (Fix 2e)", async () => {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createDiscordAdapter({ connectImpl }) as DiscordAdapter;
+		a.isConfigured(enabledCfg(), {});
+		await a.start(makeStartCtx(() => {}));
+		const pin = await a.handleAction!({ conversationId: "C1", action: { kind: "pin", messageId: "42" } });
+		assert.equal(pin.ok, true);
+		assert.equal(pin.messageId, "42");
+		const unpin = await a.handleAction!({ conversationId: "C1", action: { kind: "unpin", messageId: "42" } });
+		assert.equal(unpin.ok, true);
+		const calls = handle()!.calls;
+		assert.deepEqual(calls.pins, [{ channel: "C1", messageId: "42" }]);
+		assert.deepEqual(calls.unpins, [{ channel: "C1", messageId: "42" }]);
+	});
+
+	it("sendText threads a silent flag through to the connection (Fix 2c)", async () => {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createDiscordAdapter({ connectImpl }) as DiscordAdapter;
+		a.isConfigured(enabledCfg(), {});
+		await a.start(makeStartCtx(() => {}));
+		await a.sendText("C1", "quiet", { silent: true });
+		assert.equal(handle()!.calls.sentText[0]?.silent, true);
+		await a.sendText("C1", "loud");
+		assert.equal(handle()!.calls.sentText[1]?.silent, undefined);
+	});
+
+	it("sendText rewrites a known @handle to <@id> before sending (Fix 2a)", async () => {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		// The adapter's resolver is bound to the DEFAULT account; prime the directory
+		// cache directly (a faked connection bypasses the real normalize/prime path).
+		__resetDiscordDirectoryCacheForTest();
+		rememberDiscordUser("default", { id: "111", username: "alex" });
+		const a = createDiscordAdapter({ connectImpl }) as DiscordAdapter;
+		a.isConfigured(enabledCfg(), {});
+		await a.start(makeStartCtx(() => {}));
+		await a.sendText("C1", "ping @alex");
+		assert.equal(handle()!.calls.sentText.at(-1)?.text, "ping <@111>");
+		// An unknown handle stays literal.
+		await a.sendText("C1", "ping @nobody");
+		assert.equal(handle()!.calls.sentText.at(-1)?.text, "ping @nobody");
+		__resetDiscordDirectoryCacheForTest();
 	});
 
 	it("handleAction react with an EMPTY emoji clears the bot's own reactions; non-empty adds", async () => {

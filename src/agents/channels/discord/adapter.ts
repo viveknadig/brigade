@@ -57,8 +57,9 @@ import { buildDiscordApprovalMessage } from "./approval-native.js";
 import { buildDiscordButtonRows } from "./components.js";
 import { buildDiscordCommandManifest } from "./command-menu.js";
 import { connectDiscord, type ConnectDiscordArgs, type DiscordConnection, type DiscordInboundMessage } from "./connection.js";
+import { resolveDiscordHandle } from "./directory-cache.js";
 import { createDraftStream } from "./draft-stream.js";
-import { discordTextIsEmpty, markdownToDiscord } from "./format.js";
+import { discordTextIsEmpty, markdownToDiscord, rewriteKnownMentions } from "./format.js";
 import { splitDiscordReasoning } from "./reasoning-lane.js";
 
 /** Discord's per-message text limit (chars) for chunked sends. */
@@ -78,6 +79,18 @@ export interface CreateDiscordAdapterOptions {
 export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): ChannelAdapter {
 	const accountId = opts.accountId?.trim() || DISCORD_DEFAULT_ACCOUNT_ID;
 	const connectImpl = opts.connectImpl ?? connectDiscord;
+	// Resolver bound to THIS adapter's account, handed to `rewriteKnownMentions`
+	// so a plain `@handle` the agent typed becomes a `<@id>` ping when (and only
+	// when) the inbound directory cache has seen that handle for this account.
+	const resolveMention = (handle: string): string | undefined => resolveDiscordHandle(accountId, handle);
+	// Render an outbound chunk: rewrite known `@handle` mentions to `<@id>` FIRST
+	// (so the converter sees a real mention token), then markdown→Discord, with the
+	// raw chunk as the empty-render fallback (a syntax-only chunk must still send).
+	const renderOutbound = (chunk: string): string => {
+		const withMentions = rewriteKnownMentions(chunk, resolveMention);
+		const rendered = markdownToDiscord(withMentions);
+		return discordTextIsEmpty(rendered) ? withMentions : rendered;
+	};
 	let connection: DiscordConnection | null = null;
 	// The ChannelStartContext doesn't carry the config, but the manager ALWAYS
 	// calls `isConfigured(cfg, env)` immediately before `start(ctx)` — so we
@@ -286,13 +299,14 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 			// convert each chunk to Discord markup and send. A chunk whose rendered
 			// markup is empty (syntax-only) is re-sent as the raw chunk.
 			const chunks = chunkText(text, { limit: DISCORD_TEXT_LIMIT });
+			// A silent send rides through on every chunk (SuppressNotifications).
+			const silentOpt = opts?.silent ? { silent: true } : {};
 			let first = true;
 			for (const chunk of chunks) {
 				const replyOpt = first && replyToMessageId ? { replyToMessageId } : {};
-				const rendered = markdownToDiscord(chunk);
-				const body = discordTextIsEmpty(rendered) ? chunk : rendered;
+				const body = renderOutbound(chunk);
 				if (body.trim().length === 0) continue;
-				await connection.sendText(conversationId, body, { ...sendExtras, ...replyOpt });
+				await connection.sendText(conversationId, body, { ...sendExtras, ...silentOpt, ...replyOpt });
 				first = false;
 			}
 		},
@@ -332,11 +346,10 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 				...(threadId !== undefined ? { threadId } : {}),
 				throttleMs: discordStreamThrottleMs(cfg),
 				maxChars: DISCORD_TEXT_LIMIT,
-				// Render each draft chunk to Discord markup; fall back to the plain chunk
-				// when it renders empty (syntax-only).
+				// Render each draft chunk to Discord markup (incl. known-mention rewrite);
+				// fall back to the plain chunk when it renders empty (syntax-only).
 				renderText: (chunk) => {
-					const rendered = markdownToDiscord(chunk);
-					return { text: discordTextIsEmpty(rendered) ? chunk : rendered };
+					return { text: renderOutbound(chunk) };
 				},
 			});
 			return {
@@ -478,13 +491,18 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 			try {
 				switch (a.kind) {
 					case "edit": {
-						const rendered = markdownToDiscord(a.text);
-						const body = discordTextIsEmpty(rendered) ? a.text : rendered;
+						const body = renderOutbound(a.text);
 						await connection.editMessageText(p.conversationId, a.messageId, body);
 						return { ok: true, messageId: a.messageId };
 					}
 					case "delete":
 						await connection.deleteMessage(p.conversationId, a.messageId);
+						return { ok: true, messageId: a.messageId };
+					case "pin":
+						await connection.pinMessage(p.conversationId, a.messageId);
+						return { ok: true, messageId: a.messageId };
+					case "unpin":
+						await connection.unpinMessage(p.conversationId, a.messageId);
 						return { ok: true, messageId: a.messageId };
 					case "react":
 						// An EMPTY emoji means "clear" (parity with WhatsApp/Telegram/Slack):
@@ -512,8 +530,7 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 						if (!rows) {
 							return { ok: false, error: "no usable buttons (each needs a label + a data token ≤ 100 chars)" };
 						}
-						const rendered = markdownToDiscord(a.text);
-						const body = discordTextIsEmpty(rendered) ? a.text : rendered;
+						const body = renderOutbound(a.text);
 						const sent = await connection.sendInteractive(p.conversationId, body, rows, {
 							...(a.threadId !== undefined ? { threadId: a.threadId } : {}),
 						});

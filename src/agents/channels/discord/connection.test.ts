@@ -14,6 +14,7 @@ import {
 	type DiscordSendOptions,
 	type DiscordSentMessageLike,
 } from "./connection.js";
+import { __resetDiscordDirectoryCacheForTest, resolveDiscordHandle } from "./directory-cache.js";
 
 /* ─────────────────────── fake discord client harness ─────────────────────── */
 
@@ -63,6 +64,9 @@ interface FakeClient extends DiscordClientLike {
 	edits: Array<{ id: string; options: DiscordSendOptions | string }>;
 	deletes: string[];
 	reactsAdded: Array<{ id: string; emoji: string }>;
+	pins: string[];
+	unpins: string[];
+	threadsCreated: Array<{ channelId: string; options: { name: string; message: { content?: string; flags?: number } } }>;
 	emit(event: string, ...payload: unknown[]): void;
 	ready(): void;
 }
@@ -74,6 +78,10 @@ interface FakeClientOver {
 	messageReactions?: Array<{ me?: boolean; emoji?: { name?: string } }>;
 	/** Provide a rest.put spy (application-command registration). */
 	restPut?: (route: unknown, options?: { body?: unknown }) => Promise<unknown>;
+	/** discord.js ChannelType number on the resolved channel (15/16 = forum/media). */
+	channelType?: number;
+	/** When set, `channel.send()` rejects with this error (send-error-decode tests). */
+	sendError?: unknown;
 }
 
 function makeFakeClient(over: FakeClientOver = {}): FakeClient {
@@ -82,6 +90,9 @@ function makeFakeClient(over: FakeClientOver = {}): FakeClient {
 	const edits: FakeClient["edits"] = [];
 	const deletes: string[] = [];
 	const reactsAdded: FakeClient["reactsAdded"] = [];
+	const pins: string[] = [];
+	const unpins: string[] = [];
+	const threadsCreated: Array<{ channelId: string; options: { name: string; message: { content?: string; flags?: number } } }> = [];
 	let sendSeq = 0;
 	const userObj: { id?: string; username?: string } = { id: "BOT", username: "brigadebot" };
 
@@ -99,17 +110,35 @@ function makeFakeClient(over: FakeClientOver = {}): FakeClient {
 			reactsAdded.push({ id, emoji });
 			return undefined;
 		},
+		async pin() {
+			pins.push(id);
+			return undefined;
+		},
+		async unpin() {
+			unpins.push(id);
+			return undefined;
+		},
 		reactions: {
 			cache: new Map((over.messageReactions ?? []).map((r, i) => [String(i), { ...r, users: { remove: async () => undefined } }])),
 		},
 	});
 
+	const isForum = over.channelType === 15 || over.channelType === 16;
 	const makeChannel = (channelId: string): DiscordSendChannelLike => ({
 		id: channelId,
-		isTextBased: () => true,
+		...(over.channelType !== undefined ? { type: over.channelType } : {}),
+		// A forum/media channel reports isTextBased() === false (like the real one).
+		isTextBased: () => !isForum,
 		async send(options) {
+			if (over.sendError !== undefined) throw over.sendError;
 			sent.push({ channelId, options });
 			return makeMessage(`sent-${++sendSeq}`);
+		},
+		threads: {
+			async create(options) {
+				threadsCreated.push({ channelId, options });
+				return { id: `thread-${++sendSeq}`, lastMessage: { id: `tmsg-${sendSeq}` } };
+			},
 		},
 		messages: {
 			async fetch(id) {
@@ -129,6 +158,9 @@ function makeFakeClient(over: FakeClientOver = {}): FakeClient {
 		edits,
 		deletes,
 		reactsAdded,
+		pins,
+		unpins,
+		threadsCreated,
 		user: userObj,
 		...(over.restPut ? { rest: { put: over.restPut } } : {}),
 		channels: {
@@ -322,6 +354,25 @@ describe("connectDiscord — inbound messages", () => {
 		assert.equal(m.guildId, "G1");
 		// Bot id surfaces (addressed) so the central group ACL admits the message.
 		assert.ok(m.mentions?.includes("BOT"));
+	});
+
+	it("primes the directory cache from the author + resolved mentions (Fix 2a)", async () => {
+		__resetDiscordDirectoryCacheForTest();
+		const h = await boot();
+		h.client.emit(
+			"messageCreate",
+			baseMessage({
+				// Numeric snowflakes — the cache only remembers valid Discord ids.
+				author: { id: "111", bot: false, username: "alex" },
+				content: "hey <@222>",
+				mentions: { users: [{ id: "222", username: "sam" }] },
+			}),
+		);
+		await tick();
+		// Author "alex" (111) + mentioned "sam" (222) are both now resolvable on "default".
+		assert.equal(resolveDiscordHandle("default", "alex"), "111");
+		assert.equal(resolveDiscordHandle("default", "sam"), "222");
+		__resetDiscordDirectoryCacheForTest();
 	});
 
 	it("populates guildId + memberRoleIds for a guild message (Fix 1: NOT teamId)", async () => {
@@ -682,5 +733,117 @@ describe("connectDiscord — outbound", () => {
 		await h.conn.registerCommands([{ name: "help", description: "x", type: 1 }]);
 		assert.ok(Array.isArray(putBody));
 		assert.equal((putBody as unknown[]).length, 1);
+	});
+});
+
+describe("connectDiscord — forum auto-thread (Fix 2b)", () => {
+	it("sendText to a GuildForum channel creates a thread (not a bare send)", async () => {
+		const h = await boot({ channelType: 15 });
+		const res = await h.conn.sendText("F1", "Topic title\nbody line two");
+		// No plain send happened; a thread was created instead.
+		assert.equal(h.client.sent.length, 0);
+		assert.equal(h.client.threadsCreated.length, 1);
+		const created = h.client.threadsCreated[0];
+		// Name derived from the first non-empty line; content carried in the starter.
+		assert.equal(created?.options.name, "Topic title");
+		assert.equal(created?.options.message.content, "Topic title\nbody line two");
+		// The created message id is returned.
+		assert.ok(res.messageId.startsWith("tmsg-"));
+	});
+
+	it("sendText to a GuildMedia channel also creates a thread", async () => {
+		const h = await boot({ channelType: 16 });
+		await h.conn.sendText("M1", "Media post");
+		assert.equal(h.client.threadsCreated.length, 1);
+		assert.equal(h.client.threadsCreated[0]?.options.name, "Media post");
+	});
+
+	it("derives a thread name capped at 100 chars", async () => {
+		const h = await boot({ channelType: 15 });
+		const long = "x".repeat(200);
+		await h.conn.sendText("F1", long);
+		assert.equal(h.client.threadsCreated[0]?.options.name.length, 100);
+	});
+
+	it("a normal text channel still uses a plain send (no thread)", async () => {
+		const h = await boot();
+		await h.conn.sendText("C1", "hello");
+		assert.equal(h.client.sent.length, 1);
+		assert.equal(h.client.threadsCreated.length, 0);
+	});
+});
+
+describe("connectDiscord — silent send (Fix 2c)", () => {
+	it("a silent sendText sets the SuppressNotifications flag (4096)", async () => {
+		const h = await boot();
+		await h.conn.sendText("C1", "quietly", { silent: true });
+		assert.equal(h.client.sent[0]?.options.flags, 1 << 12);
+	});
+
+	it("a normal sendText sets no flags", async () => {
+		const h = await boot();
+		await h.conn.sendText("C1", "loudly");
+		assert.equal(h.client.sent[0]?.options.flags, undefined);
+	});
+
+	it("a silent forum post carries the flag into the thread starter", async () => {
+		const h = await boot({ channelType: 15 });
+		await h.conn.sendText("F1", "Quiet topic", { silent: true });
+		assert.equal(h.client.threadsCreated[0]?.options.message.flags, 1 << 12);
+	});
+
+	it("a silent sendInteractive + sendMedia set the flag too", async () => {
+		const h = await boot();
+		await h.conn.sendInteractive("C1", "choose", [[{ label: "Yes", customId: "g:yes", style: 2 }]], { silent: true });
+		await h.conn.sendMedia("C1", { kind: "image", path: "/tmp/pic.png", caption: "look" }, { silent: true });
+		assert.equal(h.client.sent[0]?.options.flags, 1 << 12);
+		assert.equal(h.client.sent[1]?.options.flags, 1 << 12);
+	});
+});
+
+describe("connectDiscord — structured send-error decode (Fix 2d)", () => {
+	it("a 50013 error → the missing-permission message", async () => {
+		const h = await boot({ sendError: { code: 50013, message: "Missing Permissions" } });
+		await assert.rejects(
+			() => h.conn.sendText("C1", "hi"),
+			/Missing permission to post in this channel/,
+		);
+	});
+
+	it("a 50007 error → the DM-blocked message", async () => {
+		const h = await boot({ sendError: { code: 50007, message: "Cannot send messages to this user" } });
+		await assert.rejects(() => h.conn.sendText("C1", "hi"), /Can't DM this user/);
+	});
+
+	it("an unknown code rethrows the original message", async () => {
+		const h = await boot({ sendError: new Error("some other failure") });
+		await assert.rejects(() => h.conn.sendText("C1", "hi"), /some other failure/);
+	});
+
+	it("decodes a code nested under rawError too", async () => {
+		const h = await boot({ sendError: { rawError: { code: 50013 } } });
+		await assert.rejects(() => h.conn.sendText("C1", "hi"), /Missing permission to post/);
+	});
+
+	it("a 50007 on sendInteractive is decoded the same way", async () => {
+		const h = await boot({ sendError: { code: 50007 } });
+		await assert.rejects(
+			() => h.conn.sendInteractive("C1", "x", [[{ label: "Y", customId: "g:y", style: 2 }]]),
+			/Can't DM this user/,
+		);
+	});
+});
+
+describe("connectDiscord — pin / unpin (Fix 2e)", () => {
+	it("pinMessage pins the fetched message", async () => {
+		const h = await boot();
+		await h.conn.pinMessage("C1", "m9");
+		assert.deepEqual(h.client.pins, ["m9"]);
+	});
+
+	it("unpinMessage unpins the fetched message", async () => {
+		const h = await boot();
+		await h.conn.unpinMessage("C1", "m9");
+		assert.deepEqual(h.client.unpins, ["m9"]);
 	});
 });

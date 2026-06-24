@@ -41,6 +41,7 @@ import {
 } from "../sdk.js";
 import { maskProxyUrl } from "./account-config.js";
 import { type DiscordActionRow } from "./components.js";
+import { rememberDiscordUser } from "./directory-cache.js";
 import {
 	assembleDiscordText,
 	buildDiscordSenderName,
@@ -188,6 +189,12 @@ export interface DiscordClientLike {
 /** The outbound surface a resolved channel exposes (send / typing). */
 export interface DiscordSendChannelLike {
 	id?: string;
+	/**
+	 * discord.js `ChannelType` enum value. A `GuildForum` (15) / `GuildMedia` (16)
+	 * channel REJECTS a plain `.send()` — the outbound path must open a thread
+	 * (forum post) instead (Fix 2b).
+	 */
+	type?: number;
 	/** True for a text-capable channel (guild text, DM, thread). */
 	isTextBased?: () => boolean;
 	/**
@@ -196,6 +203,14 @@ export interface DiscordSendChannelLike {
 	 * sent message (carrying `.id`).
 	 */
 	send(options: DiscordSendOptions): Promise<DiscordSentMessageLike>;
+	/**
+	 * Thread manager — present on forum/media/text channels. `create` opens a new
+	 * thread; for a forum/media channel it MUST carry a starter `message` (Discord
+	 * rejects an empty forum post). Used by the forum auto-thread path (Fix 2b).
+	 */
+	threads?: {
+		create(options: DiscordThreadCreateOptions): Promise<DiscordThreadCreateResult>;
+	};
 	/** Fetch a message in this channel by id (for edit / delete / react). */
 	messages?: {
 		fetch(id: string): Promise<DiscordSentMessageLike | null>;
@@ -204,12 +219,35 @@ export interface DiscordSendChannelLike {
 	sendTyping?: () => Promise<unknown>;
 }
 
+/** Forum/media post creation options (the subset the connection sets). */
+export interface DiscordThreadCreateOptions {
+	/** Thread title (Discord caps at 100 chars). */
+	name: string;
+	/** Starter message — REQUIRED for a forum/media post. */
+	message: { content?: string; flags?: number };
+}
+
+/**
+ * The created thread handle. discord.js returns a `ThreadChannel` carrying its
+ * own `.id` and (on a forum post) the starter `.lastMessage` / a fetchable
+ * starter message; we read whichever id is available.
+ */
+export interface DiscordThreadCreateResult {
+	id?: string;
+	/** Some discord.js versions expose the starter message directly. */
+	lastMessage?: { id?: string } | null;
+}
+
 /** A sent / fetched message handle the outbound path acts on. */
 export interface DiscordSentMessageLike {
 	id?: string;
 	edit(options: DiscordSendOptions | string): Promise<DiscordSentMessageLike>;
 	delete(): Promise<unknown>;
 	react(emoji: string): Promise<unknown>;
+	/** Pin this message (Fix 2e). */
+	pin?: () => Promise<unknown>;
+	/** Unpin this message (Fix 2e). */
+	unpin?: () => Promise<unknown>;
 	/** The bot's own reactions live under `.reactions.cache`; used by removeOwnReactions. */
 	reactions?: {
 		cache?: Map<string, DiscordReactionLike> | Iterable<DiscordReactionLike>;
@@ -254,6 +292,44 @@ export interface DiscordSendOptions {
 	files?: unknown[];
 	reply?: { messageReference: string; failIfNotExists: boolean };
 	allowedMentions?: DiscordAllowedMentions;
+	/**
+	 * Message flags bitfield. The connection sets `MessageFlags.SuppressNotifications`
+	 * (1 << 12 = 4096) for a silent send (Fix 2c) so the recipient gets no push/ping.
+	 */
+	flags?: number;
+}
+
+/* ───────────────────────── channel-type + flag constants ───────────────────────── */
+
+/**
+ * discord.js `ChannelType` values for forum/media channels (Fix 2b). A plain
+ * `.send()` to these is REJECTED — the connection opens a thread (forum post)
+ * instead. Hardcoded so the connection never has to import the discord.js enum on
+ * the (injected-fake) test path; the values are stable wire constants.
+ */
+const CHANNEL_TYPE_GUILD_FORUM = 15;
+const CHANNEL_TYPE_GUILD_MEDIA = 16;
+
+/** `MessageFlags.SuppressNotifications` (1 << 12) — a silent send (Fix 2c). */
+const MESSAGE_FLAG_SUPPRESS_NOTIFICATIONS = 1 << 12;
+
+/** Discord thread titles are capped at 100 chars. */
+const DISCORD_THREAD_NAME_LIMIT = 100;
+
+/** True for a forum / media channel (which rejects a plain `.send()`). */
+function isForumLikeChannel(channel: DiscordSendChannelLike): boolean {
+	return channel.type === CHANNEL_TYPE_GUILD_FORUM || channel.type === CHANNEL_TYPE_GUILD_MEDIA;
+}
+
+/**
+ * Derive a forum-post thread name from the first non-empty line of the body,
+ * trimmed to {@link DISCORD_THREAD_NAME_LIMIT}. Falls back to a timestamp stub
+ * when the body is empty so the post always has a title.
+ */
+function deriveForumThreadName(text: string): string {
+	const firstLine = (text ?? "").split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+	const name = firstLine.slice(0, DISCORD_THREAD_NAME_LIMIT).trim();
+	return name || new Date().toISOString().slice(0, 16);
 }
 
 /**
@@ -388,6 +464,10 @@ export interface DiscordConnection {
 	editMessageText(channel: string, messageId: string, text: string): Promise<void>;
 	/** Delete a message. */
 	deleteMessage(channel: string, messageId: string): Promise<void>;
+	/** Pin a message in a channel (Fix 2e). */
+	pinMessage(channel: string, messageId: string): Promise<void>;
+	/** Unpin a previously-pinned message (Fix 2e). */
+	unpinMessage(channel: string, messageId: string): Promise<void>;
 	/** Register the bot's application (slash) commands. Best-effort. */
 	registerCommands(commands: unknown[]): Promise<void>;
 	/** Show typing in a channel (Discord clears it after ~10s or on the next send). */
@@ -403,11 +483,15 @@ export interface DiscordSendTextOpts {
 	threadId?: string;
 	/** Native reply target — the message id to reply under. */
 	replyToMessageId?: string;
+	/** Suppress the recipient's notification (SuppressNotifications flag) (Fix 2c). */
+	silent?: boolean;
 }
 
 export interface DiscordSendMediaOpts {
 	/** Thread id to upload into. */
 	threadId?: string;
+	/** Suppress the recipient's notification (SuppressNotifications flag) (Fix 2c). */
+	silent?: boolean;
 }
 
 /* ───────────────────────── error classification ───────────────────────── */
@@ -433,6 +517,41 @@ export function isDiscordUnauthorized(err: unknown): boolean {
 	const code = (err as { code?: unknown })?.code;
 	if (code === "TokenInvalid" || code === "DisallowedIntents") return true;
 	return /invalid token|incorrect login|disallowed intents|used disallowed intents/i.test(errorText(err));
+}
+
+/* ───────────────────────── structured send-error decode (Fix 2d) ───────────────────────── */
+
+/** Discord JSON error code: the bot lacks permission to act in the channel. */
+const DISCORD_ERR_MISSING_PERMISSIONS = 50013;
+/** Discord JSON error code: cannot send messages to this user (DM blocked / disabled). */
+const DISCORD_ERR_CANNOT_SEND_TO_USER = 50007;
+
+/** Pull the numeric Discord error `code` off a thrown discord.js error, if any. */
+function discordErrorCode(err: unknown): number | undefined {
+	if (!err || typeof err !== "object") return undefined;
+	const e = err as { code?: unknown; rawError?: { code?: unknown } };
+	const candidate = e.code !== undefined ? e.code : e.rawError?.code;
+	if (typeof candidate === "number") return candidate;
+	if (typeof candidate === "string" && /^\d+$/.test(candidate)) return Number(candidate);
+	return undefined;
+}
+
+/**
+ * Turn a raw discord.js send error into an operator-readable one for the two
+ * actionable cases (Fix 2d). A 50013 (Missing Permissions) and a 50007
+ * (cannot-send-to-user / DM blocked) each map to a specific remediation hint;
+ * every other error is rethrown VERBATIM so nothing is masked. Wrapped around the
+ * three send fns so `adapter.handleAction`'s catch surfaces the decoded message.
+ */
+function decodeDiscordSendError(err: unknown): Error {
+	const code = discordErrorCode(err);
+	if (code === DISCORD_ERR_MISSING_PERMISSIONS) {
+		return new Error("Missing permission to post in this channel (need View Channel + Send Messages).");
+	}
+	if (code === DISCORD_ERR_CANNOT_SEND_TO_USER) {
+		return new Error("Can't DM this user — they've blocked the bot or disabled DMs.");
+	}
+	return err instanceof Error ? err : new Error(typeof err === "string" ? err : String(err));
 }
 
 /** Strip a Discord token out of a string before it logs. */
@@ -579,10 +698,44 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		return { user: (id) => users.get(id) };
 	};
 
+	/**
+	 * Prime the account's handle→id directory cache (Fix 2a) from an inbound: the
+	 * message author plus every resolved `<@…>` mention. This is what later lets
+	 * the outbound path rewrite a plain `@handle` the agent typed into a real
+	 * `<@id>` ping. Best-effort + side-effect-only — never throws into normalize.
+	 */
+	const primeDirectoryFromMessage = (message: DiscordMessageLike): void => {
+		try {
+			const author = message.author;
+			if (author && typeof author.id === "string") {
+				rememberDiscordUser(accountId, {
+					id: author.id,
+					username: author.username ?? undefined,
+					displayName: (author.globalName ?? author.displayName ?? undefined) as string | undefined,
+				});
+			}
+			const mentionUsers = (message.mentions as { users?: Iterable<{ id?: string; username?: string; globalName?: string | null; displayName?: string }> } | undefined)?.users;
+			if (mentionUsers) {
+				const iter = mentionUsers instanceof Map ? mentionUsers.values() : mentionUsers;
+				for (const u of iter) {
+					if (typeof u?.id !== "string") continue;
+					rememberDiscordUser(accountId, {
+						id: u.id,
+						username: u.username ?? undefined,
+						displayName: (u.globalName ?? u.displayName ?? undefined) as string | undefined,
+					});
+				}
+			}
+		} catch {
+			/* directory priming is best-effort */
+		}
+	};
+
 	/** Normalize a discord.js message into the deferred-media inbound shape. */
 	const normalize = (message: DiscordMessageLike, opts?: { edited?: boolean }): DiscordInboundMessage | null => {
 		const channelId = typeof message.channelId === "string" ? message.channelId : typeof message.channel?.id === "string" ? message.channel.id : "";
 		if (!channelId) return null;
+		primeDirectoryFromMessage(message);
 		const resolve = resolveLookups(message);
 		// Assembled text: content leads, with an embed-title/description fallback when
 		// content is empty, plus appended `<sticker: …>` + `[Forwarded from …]` blocks
@@ -1066,47 +1219,88 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		const targetId = threadId || channel;
 		const ch = await c.channels.fetch(targetId);
 		if (!ch) throw new Error(`Discord: channel ${targetId} not found`);
-		if (typeof ch.isTextBased === "function" && !ch.isTextBased()) {
+		// A forum / media channel reports `isTextBased() === false` but IS a valid
+		// send target — the post is created as a thread (Fix 2b). So we only reject
+		// genuinely non-text channels (voice/category/…) that aren't forum-like.
+		if (typeof ch.isTextBased === "function" && !ch.isTextBased() && !isForumLikeChannel(ch)) {
 			throw new Error(`Discord: channel ${targetId} is not text-based`);
 		}
 		return ch;
 	};
 
-	const sendText: DiscordConnection["sendText"] = async (channel, text, opts) => {
-		const ch = await resolveSendChannel(channel, opts?.threadId);
-		// SAFE allowed-mentions on EVERY send: explicit user/role pings still notify,
-		// but a stray `@everyone`/`@here` (agent text or prompt injection) can't
-		// mass-ping, and a reply won't ping the author it answers.
-		const options: DiscordSendOptions = { content: text, allowedMentions: safeDiscordAllowedMentions() };
-		// Native reply target — reply under the message being answered (only when not
-		// threading, since a thread send is already scoped).
-		if (opts?.replyToMessageId && !opts?.threadId) {
-			options.reply = { messageReference: opts.replyToMessageId, failIfNotExists: false };
+	/**
+	 * Post a message to a resolved channel, auto-creating a forum/media thread when
+	 * the target is a `GuildForum`/`GuildMedia` channel (Fix 2b) — those reject a
+	 * plain `.send()`. The thread name is derived from the first non-empty content
+	 * line. Returns the created message's id. Used by every text-ish send path.
+	 */
+	const postToChannel = async (ch: DiscordSendChannelLike, options: DiscordSendOptions): Promise<{ messageId: string }> => {
+		if (isForumLikeChannel(ch)) {
+			if (typeof ch.threads?.create !== "function") {
+				throw new Error("Discord: forum/media channel cannot create a thread (missing threads.create)");
+			}
+			const name = deriveForumThreadName(options.content ?? "");
+			const message: { content?: string; flags?: number } = {};
+			if (options.content !== undefined) message.content = options.content;
+			if (options.flags !== undefined) message.flags = options.flags;
+			const created = await ch.threads.create({ name, message });
+			const messageId = typeof created.lastMessage?.id === "string" ? created.lastMessage.id : typeof created.id === "string" ? created.id : "";
+			return { messageId };
 		}
 		const sent = await ch.send(options);
 		return { messageId: typeof sent.id === "string" ? sent.id : "" };
+	};
+
+	const sendText: DiscordConnection["sendText"] = async (channel, text, opts) => {
+		try {
+			const ch = await resolveSendChannel(channel, opts?.threadId);
+			// SAFE allowed-mentions on EVERY send: explicit user/role pings still notify,
+			// but a stray `@everyone`/`@here` (agent text or prompt injection) can't
+			// mass-ping, and a reply won't ping the author it answers.
+			const options: DiscordSendOptions = { content: text, allowedMentions: safeDiscordAllowedMentions() };
+			// Silent send — suppress the recipient's notification (Fix 2c).
+			if (opts?.silent) options.flags = MESSAGE_FLAG_SUPPRESS_NOTIFICATIONS;
+			// Native reply target — reply under the message being answered (only when not
+			// threading, since a thread send is already scoped).
+			if (opts?.replyToMessageId && !opts?.threadId) {
+				options.reply = { messageReference: opts.replyToMessageId, failIfNotExists: false };
+			}
+			return await postToChannel(ch, options);
+		} catch (err) {
+			throw decodeDiscordSendError(err);
+		}
 	};
 
 	const sendInteractive: DiscordConnection["sendInteractive"] = async (channel, text, rows, opts) => {
-		const ch = await resolveSendChannel(channel, opts?.threadId);
-		const components = resolvedBuilders.buildComponentRows(rows);
-		const options: DiscordSendOptions = { content: text, components, allowedMentions: safeDiscordAllowedMentions() };
-		if (opts?.replyToMessageId && !opts?.threadId) {
-			options.reply = { messageReference: opts.replyToMessageId, failIfNotExists: false };
+		try {
+			const ch = await resolveSendChannel(channel, opts?.threadId);
+			const components = resolvedBuilders.buildComponentRows(rows);
+			const options: DiscordSendOptions = { content: text, components, allowedMentions: safeDiscordAllowedMentions() };
+			if (opts?.silent) options.flags = MESSAGE_FLAG_SUPPRESS_NOTIFICATIONS;
+			if (opts?.replyToMessageId && !opts?.threadId) {
+				options.reply = { messageReference: opts.replyToMessageId, failIfNotExists: false };
+			}
+			const sent = await ch.send(options);
+			return { messageId: typeof sent.id === "string" ? sent.id : "" };
+		} catch (err) {
+			throw decodeDiscordSendError(err);
 		}
-		const sent = await ch.send(options);
-		return { messageId: typeof sent.id === "string" ? sent.id : "" };
 	};
 
 	const sendMedia: DiscordConnection["sendMedia"] = async (channel, media, opts) => {
-		const ch = await resolveSendChannel(channel, opts?.threadId);
-		// validateOutboundMediaPath runs inside buildDiscordAttachment (throws on a
-		// refused path).
-		const att = buildDiscordAttachment(media);
-		const file = resolvedBuilders.buildAttachment(att.path, att.name);
-		const options: DiscordSendOptions = { files: [file], allowedMentions: safeDiscordAllowedMentions() };
-		if (att.caption) options.content = att.caption;
-		await ch.send(options);
+		try {
+			const ch = await resolveSendChannel(channel, opts?.threadId);
+			// validateOutboundMediaPath runs inside buildDiscordAttachment (throws on a
+			// refused path).
+			const att = buildDiscordAttachment(media);
+			const file = resolvedBuilders.buildAttachment(att.path, att.name);
+			const options: DiscordSendOptions = { files: [file], allowedMentions: safeDiscordAllowedMentions() };
+			if (opts?.silent) options.flags = MESSAGE_FLAG_SUPPRESS_NOTIFICATIONS;
+			if (att.caption) options.content = att.caption;
+			await ch.send(options);
+		} catch (err) {
+			throw decodeDiscordSendError(err);
+		}
 	};
 
 	const fetchMessage = async (channel: string, messageId: string): Promise<DiscordSentMessageLike> => {
@@ -1126,6 +1320,18 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 	const deleteMessage: DiscordConnection["deleteMessage"] = async (channel, messageId) => {
 		const msg = await fetchMessage(channel, messageId);
 		await msg.delete();
+	};
+
+	const pinMessage: DiscordConnection["pinMessage"] = async (channel, messageId) => {
+		const msg = await fetchMessage(channel, messageId);
+		if (typeof msg.pin !== "function") throw new Error("Discord: message cannot be pinned");
+		await msg.pin();
+	};
+
+	const unpinMessage: DiscordConnection["unpinMessage"] = async (channel, messageId) => {
+		const msg = await fetchMessage(channel, messageId);
+		if (typeof msg.unpin !== "function") throw new Error("Discord: message cannot be unpinned");
+		await msg.unpin();
 	};
 
 	const react: DiscordConnection["react"] = async (channel, messageId, emoji) => {
@@ -1222,6 +1428,8 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		removeOwnReactions,
 		editMessageText,
 		deleteMessage,
+		pinMessage,
+		unpinMessage,
 		registerCommands,
 		setComposing,
 		markRead: async () => {},

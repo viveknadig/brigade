@@ -15,8 +15,7 @@
  *
  * The enum values are inlined (not imported from discord.js) so this module
  * stays dependency-light + unit-testable without a live gateway — the runtime
- * message carries the same numeric `type`. Mirrors the SHAPE of OpenClaw's
- * `monitor/system-events.ts` while speaking discord.js semantics.
+ * message carries the same numeric `type`.
  */
 
 import { buildDiscordSenderName, type DiscordMessageLike } from "./inbound-extras.js";
