@@ -74,7 +74,7 @@ export function loadBrigadeAuthStorage(agentId: string = DEFAULT_AGENT_ID): unkn
   );
 }
 
-function readBrigadeCredentials(agentId: string): Record<string, unknown> {
+export function readBrigadeCredentials(agentId: string): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   // Route through the mode-aware `readProfiles` choke point: filesystem mode
   // reads auth-profiles.json, convex mode reads the in-process cache primed
@@ -116,6 +116,45 @@ function readBrigadeCredentials(agentId: string): Record<string, unknown> {
       out[provider.id] = { type: "api_key", key: value };
       break;
     }
+  }
+  // Main-agent credential fallback. Org agents (eng-intern-1, ceo, …) have no
+  // auth profile of their own and the env fallback is dead in convex mode — so
+  // a non-`main` agent would otherwise resolve an empty credential map. For any
+  // provider STILL missing after its own profiles + env, merge in `main`'s
+  // credential. Precedence is preserved (per-agent profile → env → main), so a
+  // non-main agent with its OWN key keeps it. Mode-agnostic.
+  if (agentId !== DEFAULT_AGENT_ID) {
+    const mainCreds = readAgentProfileCredentials(DEFAULT_AGENT_ID);
+    for (const [provider, cred] of Object.entries(mainCreds)) {
+      if (out[provider] !== undefined) continue;
+      out[provider] = cred;
+    }
+  }
+  return out;
+}
+
+// Resolve only an agent's STORED profile credentials (api_key / oauth / token),
+// without env or main fallback. Used by the non-main fallback above to surface
+// `main`'s keys for org agents. Routes through the mode-aware `readProfiles`.
+function readAgentProfileCredentials(agentId: string): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  let parsed: ReadProfilesFile = {};
+  try {
+    parsed = readProfiles(agentId) as unknown as ReadProfilesFile;
+  } catch {
+    parsed = {};
+  }
+  for (const profile of Object.values(parsed.profiles ?? {})) {
+    if (!profile?.provider) continue;
+    if (out[profile.provider] !== undefined) continue; // first-wins per provider
+    if (profile.type === "oauth" || profile.type === "token") {
+      const cred = subscriptionProfileToCredential(profile);
+      if (cred) out[profile.provider] = cred;
+      continue;
+    }
+    if (profile.type !== "api_key") continue;
+    const resolvedKey = resolveProfileKey(profile);
+    if (resolvedKey) out[profile.provider] = { type: "api_key", key: resolvedKey };
   }
   return out;
 }

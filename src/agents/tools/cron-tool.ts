@@ -213,7 +213,10 @@ const CronToolParams = Type.Object({
 				'"payload":{"kind":"agentTurn","message":"…"} or {"kind":"systemEvent","text":"…"} ' +
 				'or {"kind":"script","command":"<shell>","wakeAgent"?:false} (owner-only — runs a shell ' +
 				"command and by DEFAULT delivers its output with NO model turn; set wakeAgent:true to act " +
-				'on the output), "delivery"?,"sessionTarget"?}. Use "script" for cheap scheduled ' +
+				'on the output), "delivery"?,"sessionTarget"?}. For an "agentTurn" payload you may also set ' +
+				'"runAsOwner":true to run the scheduled task with the OWNER\'s tool permissions (so it can ' +
+				"use owner-only tools like `composio`). Only honored for owner-created jobs; ignored for " +
+				'jobs created from a channel. Use "script" for cheap scheduled ' +
 				"health-checks/probes that cost zero tokens. Copy a TEMPLATE and fill only the ⟨slots⟩.",
 		}),
 	),

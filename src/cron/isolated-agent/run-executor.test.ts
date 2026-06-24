@@ -10,9 +10,11 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
 import type { BrigadeConfig } from "../../config/io.js";
+import type { CronJob, CronPayloadAgentTurn } from "../types.js";
 import {
 	resolveAgentModel,
 	resolveAgentProvider,
+	resolveCronSenderIsOwner,
 } from "./run-executor.js";
 
 describe("resolveAgentProvider", () => {
@@ -83,5 +85,42 @@ describe("resolveAgentModel", () => {
 			},
 		} as unknown as BrigadeConfig;
 		assert.equal(resolveAgentModel(cfg, "ops"), "claude-opus-4-7");
+	});
+});
+
+describe("resolveCronSenderIsOwner (Fix 2 — opt-in owner elevation)", () => {
+	const payload = (runAsOwner?: boolean): CronPayloadAgentTurn => ({
+		kind: "agentTurn",
+		message: "do the thing",
+		...(runAsOwner !== undefined ? { runAsOwner } : {}),
+	});
+	const job = (createdBy?: CronJob["createdBy"]): Pick<CronJob, "createdBy"> =>
+		createdBy === undefined ? {} : { createdBy };
+
+	it("owner-created job + runAsOwner:true elevates to owner", () => {
+		assert.equal(resolveCronSenderIsOwner(payload(true), job({ kind: "owner" })), true);
+	});
+
+	it("legacy job (createdBy undefined) + runAsOwner:true elevates (treated as owner)", () => {
+		assert.equal(resolveCronSenderIsOwner(payload(true), job(undefined)), true);
+	});
+
+	it("channel-created job + runAsOwner:true can NEVER self-elevate", () => {
+		assert.equal(
+			resolveCronSenderIsOwner(
+				payload(true),
+				job({ kind: "channel", channelId: "whatsapp", conversationId: "123" }),
+			),
+			false,
+		);
+	});
+
+	it("no flag → false (unchanged default behavior), even for an owner job", () => {
+		assert.equal(resolveCronSenderIsOwner(payload(), job({ kind: "owner" })), false);
+		assert.equal(resolveCronSenderIsOwner(payload(undefined), job(undefined)), false);
+	});
+
+	it("runAsOwner:false is explicit opt-out → false", () => {
+		assert.equal(resolveCronSenderIsOwner(payload(false), job({ kind: "owner" })), false);
 	});
 });

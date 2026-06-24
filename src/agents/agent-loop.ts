@@ -31,6 +31,7 @@ import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 
 import {
+  DEFAULT_AGENT_ID,
   resolveAgentDir,
   resolveAgentWorkspaceDir,
   resolveAuthProfilesPath,
@@ -2101,7 +2102,74 @@ export function readAuthProfilesAsCredentialMap(
     }
   }
 
+  // Main-agent credential fallback. Org agents (eng-intern-1, ceo, …) have no
+  // auth profile of their own and the env fallback is dead in convex mode — so
+  // a non-`main` agent would otherwise boot with an empty credential map and
+  // fail with "No API key found for <provider>". For any provider STILL missing
+  // after its own profiles + env, merge in `main`'s credential. Precedence is
+  // preserved: per-agent profile → env → main fallback, so a non-main agent
+  // with its OWN explicit key for a provider keeps it (override wins). Mode-
+  // agnostic — `readProfilesAsCredentialMapForAgent` routes through the same
+  // mode-aware `readProfiles` choke point as the per-agent build above.
+  if (agentId && agentId !== DEFAULT_AGENT_ID) {
+    const mainCreds = readProfilesAsCredentialMap(DEFAULT_AGENT_ID);
+    for (const [provider, cred] of Object.entries(mainCreds)) {
+      if (out[provider] !== undefined) continue;
+      out[provider] = cred;
+    }
+  }
+
   return { credentials: out, selectedProfileId };
+}
+
+// Build the resolved provider→credential map for a single agent's stored
+// profiles (api_key / oauth / token), WITHOUT cooldown ordering or env / main
+// fallback. Used by the non-main credential fallback above to surface `main`'s
+// keys for org agents. Routes through the mode-aware `readProfiles` choke point
+// so it works identically in filesystem and convex mode.
+function readProfilesAsCredentialMap(agentId: string): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  let parsed: {
+    profiles?: Record<
+      string,
+      {
+        provider?: string;
+        type?: string;
+        key?: string;
+        keyRef?: string | { source?: string; provider?: string; id?: string };
+        access?: string;
+        accessRef?: string | { source?: string; provider?: string; id?: string };
+        refresh?: string;
+        refreshRef?: string | { source?: string; provider?: string; id?: string };
+        expires?: number;
+        token?: string;
+        tokenRef?: string | { source?: string; provider?: string; id?: string };
+        alias?: string;
+      }
+    >;
+  } = {};
+  try {
+    parsed = readProfiles(agentId) as unknown as typeof parsed;
+  } catch {
+    parsed = {};
+  }
+  for (const profile of Object.values(parsed.profiles ?? {})) {
+    if (!profile?.provider) continue;
+    if (out[profile.provider] !== undefined) continue; // first-wins per provider
+    if (profile.type === "oauth" || profile.type === "token") {
+      const cred = subscriptionProfileToCredential(profile);
+      if (cred) out[profile.provider] = cred;
+      continue;
+    }
+    if (profile.type !== "api_key") continue;
+    const resolvedKey = resolveCredentialSecret(
+      profile.key,
+      profile.keyRef,
+      profile.provider,
+    );
+    if (resolvedKey) out[profile.provider] = { type: "api_key", key: resolvedKey };
+  }
+  return out;
 }
 
 // Resolve a profile's api-key secret across both persisted shapes:

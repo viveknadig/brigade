@@ -7,6 +7,7 @@
  * + loaded by the loader alongside these (same gating) — see `discovery.ts`.
  */
 
+import { discordModule } from "../../channels/discord/module.js";
 import { slackModule } from "../../channels/slack/module.js";
 import { telegramModule } from "../../channels/telegram/module.js";
 import { whatsAppModule } from "../../channels/whatsapp/module.js";
@@ -34,6 +35,10 @@ export const BUNDLED_MODULES: BrigadeModule[] = [
 	// bot token resolves (config `${VAR}` ref or SLACK_BOT_TOKEN env). Socket Mode
 	// (default) also needs an app token; events mode registers an HTTP route.
 	slackModule,
+	// Discord channel adapter — inert until `channels.discord.enabled: true` and a
+	// bot token resolves (config `${VAR}` ref, sealed token, or DISCORD_BOT_TOKEN
+	// env). Inbound is the Gateway (WebSocket) only — no HTTP route.
+	discordModule,
 	// Web-fetch + web-search providers. Each module is inert unless its
 	// credential is configured (env var or `tools.web.{search,fetch}.providers.<id>`).
 	// The registry picks the active provider by `autoDetectOrder` ascending —

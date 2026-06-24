@@ -24,6 +24,7 @@ import { __resetConfigParseCacheForTests } from "../../config/io.js";
 import { loadConfig } from "../../core/config.js";
 import type {
 	ChannelAdapter,
+	ChannelCommand,
 	ChannelCommandContext,
 	ChannelStartContext,
 	InboundMessage,
@@ -1283,5 +1284,114 @@ describe("inbound-pipeline: ChannelSecurityAdapter supplementary DM-policy consu
 			"pairing",
 			"the slot-declared security adapter tightens open → pairing",
 		);
+	});
+});
+
+describe("inbound-pipeline: Fix 3a — a quoted /command is dispatched as a command, not to the LLM", () => {
+	it("a reply that quotes an earlier message + types /ping runs the command (turn does NOT run)", async () => {
+		const fake = makeFakeChannel();
+		let turnRan = false;
+		let pingRan = false;
+		const commandMap = new Map<string, ChannelCommand>([
+			[
+				"ping",
+				{
+					name: "ping",
+					handler: () => {
+						pingRan = true;
+						return "pong";
+					},
+				},
+			],
+		]);
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "should not happen" };
+			},
+			commandMap,
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "c1",
+			from: "u1",
+			text: "/ping",
+			// The reply-note prefix (`> quoted…\n`) used to mask the leading `/`.
+			replyTo: { body: "the message they tapped reply on" },
+		});
+		assert.equal(pingRan, true, "the quoted /ping resolved as a command");
+		assert.equal(turnRan, false, "the quoted command did NOT leak to the LLM");
+		assert.equal(fake.sent[0]?.text, "pong", "the command's reply was sent");
+	});
+
+	it("a plain quoted (non-command) message still goes to the LLM", async () => {
+		const fake = makeFakeChannel();
+		let turnRan = false;
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "ok" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "c1",
+			from: "u1",
+			text: "hello there",
+			replyTo: { body: "earlier" },
+		});
+		assert.equal(turnRan, true, "a normal quoted message is dispatched to the LLM as before");
+	});
+});
+
+describe("inbound-pipeline: Fix 3b — WhatsApp pairing challenge is simplified", () => {
+	const STRANGER = "stranger-wa";
+
+	it("the WhatsApp challenge uses the clean bc484729 card — single approve command with --channel, no /approve reply how-to", async () => {
+		writeConfig({ agents: { main: {} }, channels: { whatsapp: { dmPolicy: "pairing" } } });
+		const wa = makeFakeChannel({ id: "whatsapp", label: "WhatsApp" });
+		let turnRan = false;
+		const mgr = await startChannels({
+			adapters: [wa.adapter],
+			config: loadConfig(),
+			agentId: "main",
+			runTurn: async () => {
+				turnRan = true;
+				return { reply: "nope" };
+			},
+		});
+		await wa.ctx().onInbound({ channel: "whatsapp", conversationId: STRANGER, from: STRANGER, text: "hi" });
+		assert.equal(turnRan, false, "stranger is challenged, no turn");
+		const sent = wa.sent[0]?.text ?? "";
+		assert.match(sent, /one-time code/i, "keeps the one-time code line");
+		assert.match(sent, /expires in 1 hour/i, "keeps the expiry line");
+		assert.match(sent, /Welcome!/, "keeps the formatted welcome card (restored from bc484729)");
+		assert.match(sent, /brigade pairing approve/, "keeps the single approve command");
+		assert.match(sent, /--channel whatsapp/, "keeps the --channel flag (needed for the command to work)");
+		assert.doesNotMatch(sent, /\/approve/, "drops only the /approve reply how-to (operator-facing noise)");
+		await mgr.stop();
+	});
+
+	it("a non-WhatsApp channel keeps the full challenge (server command + /approve how-to)", async () => {
+		writeConfig({ agents: { main: {} }, channels: { fake: { dmPolicy: "pairing" } } });
+		const fake = makeFakeChannel({ selfId: () => "bot999", pairing: { idLabel: "account", botIsSeparateFromOperator: true } });
+		const mgr = await startChannels({
+			adapters: [fake.adapter],
+			config: loadConfig(),
+			agentId: "main",
+			runTurn: async () => ({ reply: "nope" }),
+		});
+		await fake.ctx().onInbound({ channel: "fake", conversationId: "stranger-fake", from: "stranger-fake", text: "hi" });
+		const sent = fake.sent[0]?.text ?? "";
+		assert.match(sent, /\/approve/, "non-WhatsApp keeps the /approve how-to");
+		assert.match(sent, /brigade pairing approve/, "non-WhatsApp keeps the server command");
+		await mgr.stop();
 	});
 });

@@ -40,6 +40,22 @@ const log = createSubsystemLogger("cron/run-executor");
 
 const DEFAULT_AGENT_ID = "main";
 
+/**
+ * Resolve whether a cron agent turn runs with the OWNER's tool permissions.
+ *
+ * Opt-in + safe-by-default: only an OWNER-created job (`createdBy` is
+ * `{kind:"owner"}` or legacy `undefined`) that explicitly set
+ * `payload.runAsOwner:true` elevates. A channel-created job
+ * (`{kind:"channel",…}`) can NEVER self-elevate even if the flag is set, and a
+ * job with no flag stays `false` (unchanged behavior).
+ */
+export function resolveCronSenderIsOwner(
+	payload: CronPayloadAgentTurn,
+	job: Pick<CronJob, "createdBy">,
+): boolean {
+	return payload.runAsOwner === true && (job.createdBy?.kind ?? "owner") === "owner";
+}
+
 function resolveDefaultProvider(config: BrigadeConfig): string {
 	const provider = (config.agents as { defaults?: { provider?: unknown } } | undefined)
 		?.defaults?.provider;
@@ -171,10 +187,14 @@ export async function executeCronAgentRun(
 			sessionKey,
 			...(payload.thinking !== undefined ? { thinkingLevel: payload.thinking } : {}),
 			...(abortSignal ? { signal: abortSignal } : {}),
-			// Cron turns NEVER act as the operator. Owner-only tools (bash) get
-			// pre-filtered out by `applyOwnerOnlyToolPolicy` so the model never
-			// sees them — no possibility of an unanswerable approval prompt.
-			senderIsOwner: false,
+			// Cron turns are non-operator by default. Owner-only tools (composio,
+			// bash) are refused at call time so the model can't act as the owner.
+			// OPT-IN elevation: an owner-CREATED job may set `runAsOwner:true` to
+			// run with the owner's tool permissions (so it can use owner-only
+			// tools). A channel-created job can NEVER self-elevate — its
+			// `createdBy.kind` is "channel", so the gate stays false even when the
+			// flag is set. Legacy jobs (`createdBy` undefined) are treated as owner.
+			senderIsOwner: resolveCronSenderIsOwner(payload, job),
 			// Cron-mode flag — flips the assembler into the "# Scheduled Task
 			// Context" banner + gates operator-only sections. Without this the
 			// cron run would render as a normal operator turn, which is the bug

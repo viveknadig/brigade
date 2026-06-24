@@ -88,6 +88,12 @@ import {
 	slackThreadIdleTtlMs,
 } from "../agents/channels/slack/account-config.js";
 import { createSlackPlugin, type SlackPluginHandle } from "../agents/channels/slack/plugin.js";
+import {
+	listDiscordAccountIds,
+	discordChannelEnabled,
+	discordThreadIdleTtlMs,
+} from "../agents/channels/discord/account-config.js";
+import { createDiscordPlugin, type DiscordPluginHandle } from "../agents/channels/discord/plugin.js";
 import { createPluginChannelManagerFacade } from "../agents/channels/plugin-channel-manager-facade.js";
 import type { ChannelPlugin } from "../agents/channels/types.plugin.js";
 import {
@@ -2011,7 +2017,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					// `loadConfig` is synchronous + cheap; reading fresh keeps the TTL
 					// live across config reloads without threading a mutable holder.
 					const cfg = loadConfig() as never;
-					return telegramThreadIdleTtlMs(cfg) ?? slackThreadIdleTtlMs(cfg);
+					return telegramThreadIdleTtlMs(cfg) ?? slackThreadIdleTtlMs(cfg) ?? discordThreadIdleTtlMs(cfg);
 				} catch {
 					return null;
 				}
@@ -5296,13 +5302,17 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		const slackAccounts = slackChannelEnabled(cfg as never)
 			? listSlackAccountIds(cfg as never)
 			: [];
+		const discordAccounts = discordChannelEnabled(cfg as never)
+			? listDiscordAccountIds(cfg as never)
+			: [];
 		const wantWhatsAppMulti = whatsappAccounts.length > 1;
 		const wantTelegramMulti = telegramAccounts.length > 1;
 		const wantSlackMulti = slackAccounts.length > 1;
-		if (wantWhatsAppMulti || wantTelegramMulti || wantSlackMulti) {
+		const wantDiscordMulti = discordAccounts.length > 1;
+		if (wantWhatsAppMulti || wantTelegramMulti || wantSlackMulti || wantDiscordMulti) {
 			// Fresh list each (re)start so a reload doesn't accumulate stale plugins.
 			bundledChannelPlugins = [];
-			const facadeHandles: Array<WhatsAppPluginHandle | TelegramPluginHandle | SlackPluginHandle> = [];
+			const facadeHandles: Array<WhatsAppPluginHandle | TelegramPluginHandle | SlackPluginHandle | DiscordPluginHandle> = [];
 			const multiAccountSummary: string[] = [];
 			if (wantWhatsAppMulti) {
 				const whatsappPlugin = createWhatsAppPlugin({
@@ -5341,6 +5351,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				bundledChannelPlugins.push(slackPlugin);
 				facadeHandles.push(slackPlugin);
 				multiAccountSummary.push(`slack x${slackAccounts.length}`);
+			}
+			if (wantDiscordMulti) {
+				const discordPlugin = createDiscordPlugin({
+					defaultAgentId: agentId,
+					loadConfig: () => cfg as never,
+					runTurn: (turn) => runGatewayTurn(turn),
+				});
+				bundledChannelPlugins.push(discordPlugin);
+				facadeHandles.push(discordPlugin);
+				multiAccountSummary.push(`discord x${discordAccounts.length}`);
 			}
 			const pluginById = new Map(bundledChannelPlugins.map((p) => [p.id, p] as const));
 			// Register each constructed plugin's `meta` + its `messaging`/`security`
