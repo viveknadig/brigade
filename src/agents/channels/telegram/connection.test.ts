@@ -482,6 +482,58 @@ describe("connectTelegram inbound normalization", () => {
 		assert.equal(getFileCalls, 0, "normalize must NOT download — download is deferred to the pipeline");
 	});
 
+	it("coalesces an album (same media_group_id) into ONE inbound, leading with the captioned item", async () => {
+		const bot = makeFakeBot();
+		const runner = makeFakeRunner();
+		const received: TgInboundMessage[] = [];
+		const conn = await connectTelegram({
+			token: "tkn",
+			log: noopLog,
+			onMessage: (m) => received.push(m),
+			botFactory: () => bot,
+			runnerFactory: () => runner,
+			sleepImpl: instantSleep,
+		});
+		const album = (id: number, fileId: string, caption?: string): Update =>
+			({
+				update_id: id,
+				message: makeMessage({
+					message_id: id,
+					text: undefined,
+					media_group_id: "ALBUM1",
+					caption,
+					photo: [{ file_id: fileId, file_unique_id: fileId, width: 100, height: 100 }],
+				} as Partial<Message>),
+			}) as Update;
+		bot.emit(album(20, "a", "two pics"));
+		bot.emit(album(21, "b"));
+		// Wait out the 250ms album debounce (a real timer; sleepImpl only stubs reconnect).
+		await new Promise((r) => setTimeout(r, 350));
+		assert.equal(received.length, 1, "an album collapses to a single inbound");
+		assert.equal(received[0]?.text, "two pics", "the captioned item leads the coalesced message");
+		assert.equal(typeof received[0]?.resolveMedia, "function", "the coalesced inbound carries a deferred multi-download thunk");
+		runner.finish();
+		await conn.close();
+	});
+
+	it("logs + skips a group→supergroup migration service message (not dispatched)", async () => {
+		const bot = makeFakeBot();
+		const runner = makeFakeRunner();
+		const received: TgInboundMessage[] = [];
+		const conn = await connectTelegram({
+			token: "tkn",
+			log: noopLog,
+			onMessage: (m) => received.push(m),
+			botFactory: () => bot,
+			runnerFactory: () => runner,
+			sleepImpl: instantSleep,
+		});
+		bot.emit({ update_id: 30, message: makeMessage({ migrate_to_chat_id: -1009999 } as Partial<Message>) } as Update);
+		runner.finish();
+		await conn.close();
+		assert.equal(received.length, 0, "the migration service message is not dispatched as a normal inbound");
+	});
+
 	it("dedupes by update_id — a redelivered update runs the agent once", async () => {
 		const bot = makeFakeBot();
 		const runner = makeFakeRunner();

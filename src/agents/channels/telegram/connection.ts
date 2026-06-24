@@ -684,6 +684,65 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 		};
 	};
 
+	/* ── album / media-group coalescing ── */
+	// Telegram delivers an album as N separate `message` updates that share a
+	// `media_group_id` and arrive within milliseconds (the caption rides on ONE
+	// item). Buffer them briefly and emit a SINGLE inbound carrying every
+	// attachment — so an album is one agent turn instead of N, and the items past
+	// the captioned one aren't surfaced as empty text messages.
+	const ALBUM_DEBOUNCE_MS = 250;
+	const albumBuffers = new Map<string, { messages: Message[]; timer: ReturnType<typeof setTimeout> }>();
+
+	const flushAlbum = (key: string): void => {
+		const buf = albumBuffers.get(key);
+		if (!buf) return;
+		albumBuffers.delete(key);
+		clearTimeout(buf.timer);
+		if (closed || buf.messages.length === 0) return;
+		try {
+			// Lead = the item carrying the caption (Telegram puts it on one), else the first.
+			const lead = buf.messages.find((m) => typeof m.caption === "string" && m.caption.length > 0) ?? buf.messages[0];
+			if (!lead) return;
+			const groupMessages = buf.messages;
+			const inbound = normalize(lead);
+			// Replace the single-attachment thunk with one that downloads EVERY item.
+			inbound.resolveMedia = async (): Promise<InboundMediaAttachment[]> => {
+				if (!bot) return [];
+				const out: InboundMediaAttachment[] = [];
+				for (const m of groupMessages) {
+					const fileId = resolveInboundMediaFileId(m);
+					const kind = resolveInboundMediaKind(m);
+					if (!fileId || !kind) continue;
+					const att = await downloadTelegramMedia({
+						bot: bot.api,
+						fileId,
+						kind,
+						token: args.token,
+						caption: typeof m.caption === "string" ? m.caption : undefined,
+						fileName: m.document?.file_name ?? m.audio?.file_name ?? m.video?.file_name,
+						log: safeLog,
+					});
+					if (att) out.push(att);
+				}
+				return out;
+			};
+			args.onMessage(inbound);
+		} catch (err) {
+			safeLog("telegram album flush error", { error: err instanceof Error ? err.message : String(err) });
+		}
+	};
+
+	const bufferAlbumItem = (key: string, message: Message): void => {
+		const existing = albumBuffers.get(key);
+		if (existing) {
+			existing.messages.push(message);
+			clearTimeout(existing.timer);
+			existing.timer = setTimeout(() => flushAlbum(key), ALBUM_DEBOUNCE_MS);
+		} else {
+			albumBuffers.set(key, { messages: [message], timer: setTimeout(() => flushAlbum(key), ALBUM_DEBOUNCE_MS) });
+		}
+	};
+
 	const onUpdate = (ctx: { update: Update; message?: Message }): void => {
 		try {
 			const updateId = ctx.update?.update_id;
@@ -693,6 +752,24 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 			// Ignore the bot's own outbound echoes (a bot never sees its own sends
 			// via getUpdates, but a linked-account self-message would carry our id).
 			if (typeof message.from?.id === "number" && selfId && String(message.from.id) === selfId) return;
+			// Group → supergroup migration: the old chat is now dead and future
+			// messages arrive from the new supergroup id. Log it so the operator can
+			// rebind; the service message itself carries no content to dispatch.
+			const migrateTo = (message as { migrate_to_chat_id?: number }).migrate_to_chat_id;
+			if (typeof migrateTo === "number") {
+				safeLog("telegram group migrated to a supergroup — rebind to keep receiving messages", {
+					from: String(message.chat.id),
+					to: String(migrateTo),
+				});
+				return;
+			}
+			// Album item → buffer + coalesce (see flushAlbum) instead of dispatching
+			// each photo/video of the group as its own turn.
+			const groupId = typeof message.media_group_id === "string" ? message.media_group_id : undefined;
+			if (groupId) {
+				bufferAlbumItem(`${message.chat.id}:${groupId}`, message);
+				return;
+			}
 			args.onMessage(normalize(message));
 		} catch (err) {
 			safeLog("telegram inbound handler error", { error: err instanceof Error ? err.message : String(err) });
@@ -1436,6 +1513,9 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 	const close: TelegramConnection["close"] = async () => {
 		closed = true;
 		connected = false;
+		// Drop any pending album debounce timers so none fire after close.
+		for (const buf of albumBuffers.values()) clearTimeout(buf.timer);
+		albumBuffers.clear();
 		await teardownRunner();
 		// Wait for the supervise loop to unwind, but never hang on it — teardown
 		// resolves the active runner's task() so the loop sees `closed` and
