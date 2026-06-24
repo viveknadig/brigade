@@ -185,6 +185,29 @@ function senderLineFor(senderId: string, idLabel?: PairingIdLabel): string {
 	return `👤  *Your account:*  ${senderId}`;
 }
 
+/**
+ * Strip a leading markdown quote block (the reply-note shape `> …\n`, possibly
+ * several quoted lines) plus surrounding blank lines so the FIRST non-quote
+ * line can be tested for a `/command`. Used only for command / abort / approval
+ * detection — the LLM still receives the full quote-annotated text for context.
+ * Returns the input unchanged when there's no leading quote block.
+ */
+function stripLeadingQuoteBlock(text: string): string {
+	let rest = text;
+	// Drop consecutive leading lines that begin with `>` (a markdown quote).
+	while (true) {
+		const nl = rest.indexOf("\n");
+		const line = nl === -1 ? rest : rest.slice(0, nl);
+		if (!/^\s*>/.test(line)) break;
+		if (nl === -1) {
+			rest = "";
+			break;
+		}
+		rest = rest.slice(nl + 1);
+	}
+	return rest.trim();
+}
+
 function buildChallengeReply(args: {
 	code: string;
 	senderId: string;
@@ -193,6 +216,30 @@ function buildChallengeReply(args: {
 	idLabel?: PairingIdLabel;
 }): string {
 	void args.channelLabel;
+	// WhatsApp gets the clean single-method card (restored from commit bc484729):
+	// the stranger shares the code with their admin, who approves with one
+	// `brigade pairing approve <code>` — no `/approve` how-to and no `--channel`
+	// noise, which read as operator-facing clutter in a stranger's chat.
+	if (args.channelId === "whatsapp") {
+		return [
+			"🦁  *Brigade* — your private AI crew",
+			"╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+			"👋  *Welcome!*  An admin needs to approve you before we can chat.",
+			senderLineFor(args.senderId, args.idLabel),
+			"🔐  *Your one-time code*",
+			"```",
+			args.code,
+			"```",
+			"Share it with your admin — they'll approve you by running:",
+			"```",
+			`brigade pairing approve ${args.code} --channel ${args.channelId}`,
+			"```",
+			"✨  Once approved, just send your next message.",
+			"⏱️  _Expires in 1 hour._",
+			"╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+			"_powered by_ ✨ *Spinabot*",
+		].join("\n");
+	}
 	return [
 		"🦁  *Brigade* — your private AI crew",
 		"╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
@@ -786,11 +833,20 @@ export async function runChannelInboundPipeline(
 			.trim();
 		// Media-only message whose deferred download failed → nothing usable.
 		if (!text) return;
+		// Command / abort / approval-reply detection must run against the RAW
+		// user text, NOT the reply-note-prefixed `text`. When the operator taps
+		// "reply" on the challenge card and types `/approve CODE`, the leading
+		// `> <quoted>\n` reply-note would otherwise mask the leading `/` so the
+		// command is never recognised and the whole thing is dispatched to the
+		// LLM. We strip a leading markdown quote block (the reply-note shape) as
+		// a fallback so a genuinely quoted command still resolves. The LLM
+		// dispatch below keeps using the quote-annotated `text` for context.
+		const commandText = stripLeadingQuoteBlock(msg.text?.trim() ?? text);
 		// Approval-reply intercept (AFTER access gate, BEFORE abort triggers).
 		const approvalIntercept = tryConsumeChannelApprovalReply({
 			channelId: adapter.id,
 			conversationId: msg.conversationId,
-			text,
+			text: commandText,
 			...(msg.threadId !== undefined ? { threadId: msg.threadId } : {}),
 			...(msg.accountId !== undefined ? { accountId: msg.accountId } : {}),
 		});
@@ -805,7 +861,7 @@ export async function runChannelInboundPipeline(
 			return;
 		}
 		// Abort trigger — kill in-flight turn + clear pending slots.
-		if (isAbortTrigger(text)) {
+		if (isAbortTrigger(commandText)) {
 			let cancelledAny = false;
 			for (const [key, slot] of pendingDispatches) {
 				if (slot.baseMsg.conversationId !== msg.conversationId) continue;
@@ -838,10 +894,12 @@ export async function runChannelInboundPipeline(
 			}
 			return;
 		}
-		// Channel command (`/name ...`).
-		if (text.startsWith("/") && commandMap.size > 0) {
-			const space = text.indexOf(" ");
-			const name = (space === -1 ? text.slice(1) : text.slice(1, space)).toLowerCase();
+		// Channel command (`/name ...`). Evaluate against the RAW user text
+		// (`commandText`) so a quoted reply like `> …\n/approve CODE` still
+		// resolves as a command instead of leaking to the LLM.
+		if (commandText.startsWith("/") && commandMap.size > 0) {
+			const space = commandText.indexOf(" ");
+			const name = (space === -1 ? commandText.slice(1) : commandText.slice(1, space)).toLowerCase();
 			const command = commandMap.get(name);
 			if (command) {
 				const cmdCtx = {
@@ -849,7 +907,7 @@ export async function runChannelInboundPipeline(
 					conversationId: msg.conversationId,
 					from: msg.from,
 					fromName: msg.fromName,
-					args: space === -1 ? "" : text.slice(space + 1).trim(),
+					args: space === -1 ? "" : commandText.slice(space + 1).trim(),
 					config: cfg,
 					// Additive scope: handlers like `/agent` need accountId +
 					// isGroup to build a peer-scoped binding. Legacy handlers

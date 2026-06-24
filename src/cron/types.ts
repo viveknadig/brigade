@@ -59,6 +59,14 @@ export interface CronPayloadAgentTurn {
 	toolsAllow?: string[];
 	/** Drop ALL workspace bootstrap files from the system prompt to save tokens. */
 	lightContext?: boolean;
+	/**
+	 * Run this scheduled turn with the OWNER's tool permissions, so it can use
+	 * owner-only tools (e.g. `composio`). Opt-in, safe-by-default: only honored
+	 * for owner-created jobs (`createdBy` is `{kind:"owner"}` or legacy
+	 * `undefined`) — a channel-created job can NEVER self-elevate even if this
+	 * is set. Unset/false ⇒ unchanged behavior (`senderIsOwner:false`).
+	 */
+	runAsOwner?: boolean;
 }
 
 /**

@@ -327,8 +327,10 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
       "the most sensible interpretation and proceed; explain the choice in your final reply.",
     );
     lines.push(
-      "3. **Stay in your tool surface** — owner-only tools have been filtered out for unattended " +
-      "runs. If you need a tool that isn't available, say so in the reply rather than refusing.",
+      "3. **Stay in your tool surface** — this run is unattended, so owner-only tools (e.g. " +
+      "`composio`) are REFUSED at call time unless the schedule was created with `runAsOwner:true`. " +
+      "If you hit such a refusal, don't retry — surface it in your reply and suggest the remedy: " +
+      "recreate the cron with `runAsOwner:true`, or run the task from the operator's main session.",
     );
     lines.push(
       "4. **Be self-contained** — no \"I'll follow up next time\". This run ends when you reply. " +
