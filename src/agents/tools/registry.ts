@@ -538,6 +538,9 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 	if (opts.sessionContext) {
 		const sessionsTools = createSessionsBrigadeTools({
 			sessionContext: opts.sessionContext,
+			...(opts.channelContext !== undefined
+				? { channelContext: opts.channelContext }
+				: {}),
 			callerDepth: opts.subagentContext?.callerDepth ?? 0,
 			maxSpawnDepth: opts.subagentMaxDepth,
 			workspaceDir: opts.workspaceDir,

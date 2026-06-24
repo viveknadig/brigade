@@ -269,10 +269,60 @@ export async function spawnSubagentDirect(
 		}
 	}
 
-	const childSessionKey = `agent:${targetAgentId}:subagent:${crypto.randomUUID()}`;
+	const baseChildSessionKey = `agent:${targetAgentId}:subagent:${crypto.randomUUID()}`;
 	const childDepth = callerDepth + 1;
 	const requesterDisplayKey = ctx.agentSessionKey ?? "main";
-	const requesterOrigin = buildRequesterOrigin(ctx);
+
+	// Phase 6 — Discord sub-agent thread-binding. When a `thread: true` spawn
+	// originates from a Discord conversation, materialize a dedicated Discord
+	// thread, re-root the child session INTO it, post an intro, and set the
+	// child's delivery threadId so its completion lands in the thread. Gated on
+	// origin channel === "discord" AND `thread: true` — every other spawn keeps
+	// the base key + origin untouched (byte-identical to before).
+	let childSessionKey = baseChildSessionKey;
+	let requesterOrigin = buildRequesterOrigin(ctx);
+	let childThreadId: string | number | undefined = ctx.agentThreadId;
+	if (requestThreadBinding) {
+		const originChannel = ctx.agentChannel?.trim().toLowerCase();
+		const parentChannelId = ctx.agentTo?.trim();
+		if (originChannel === "discord" && parentChannelId) {
+			try {
+				const { materializeDiscordSubagentThread } = await import(
+					"./channels/discord/subagent-thread-binding.js"
+				);
+				const materialized = await materializeDiscordSubagentThread({
+					parentChannelId,
+					...(ctx.agentAccountId ? { accountId: ctx.agentAccountId } : {}),
+					baseChildSessionKey,
+					agentId: targetAgentId,
+					task,
+					...(label ? { label } : {}),
+				});
+				if (materialized) {
+					childSessionKey = materialized.childSessionKey;
+					childThreadId = materialized.threadId;
+					// Re-point the completion delivery context at the bound thread
+					// so the child's reply lands IN the thread, not the parent
+					// channel. `buildRequesterOrigin` returns undefined when the
+					// origin was empty; build a minimal Discord origin in that case.
+					requesterOrigin = {
+						...(requesterOrigin ?? {}),
+						channel: "discord",
+						...(ctx.agentAccountId ? { accountId: ctx.agentAccountId } : {}),
+						to: `channel:${materialized.threadId}`,
+						threadId: materialized.threadId,
+					};
+				}
+			} catch (err) {
+				// Thread materialization is best-effort — a Discord hiccup must
+				// never fail the spawn. Fall back to the base (un-threaded) key.
+				log.warn("discord subagent thread materialize failed (continuing un-threaded)", {
+					baseChildSessionKey,
+					error: summarizeError(err),
+				});
+			}
+		}
+	}
 
 	const runId = crypto.randomUUID();
 
@@ -374,9 +424,14 @@ export async function spawnSubagentDirect(
 				message: task,
 				sessionKey: childSessionKey,
 				channel: ctx.agentChannel,
-				to: ctx.agentTo,
+				// When the child was re-rooted into a Discord thread (Phase 6),
+				// target the thread channel id + threadId so its completion
+				// context points at the thread, not the parent channel.
+				to: childThreadId != null && childThreadId !== ctx.agentThreadId
+					? `channel:${childThreadId}`
+					: ctx.agentTo,
 				accountId: ctx.agentAccountId,
-				threadId: ctx.agentThreadId,
+				threadId: childThreadId,
 				idempotencyKey: runId,
 				deliver: false,
 				// Per-parent FIFO lane so spawns from different parents run in
