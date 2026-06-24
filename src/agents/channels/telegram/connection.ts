@@ -176,6 +176,8 @@ export interface TelegramBotLike {
 		sendVoice?(chatId: string | number, voice: unknown, opts?: Record<string, unknown>): Promise<{ message_id: number }>;
 		sendDocument?(chatId: string | number, document: unknown, opts?: Record<string, unknown>): Promise<{ message_id: number }>;
 		sendSticker?(chatId: string | number, sticker: unknown, opts?: Record<string, unknown>): Promise<{ message_id: number }>;
+		/** Send a GIF / short looping animation inline (vs a static photo). */
+		sendAnimation?(chatId: string | number, animation: unknown, opts?: Record<string, unknown>): Promise<{ message_id: number }>;
 		/** Send a native poll (outbound poll support). */
 		sendPoll?(chatId: string | number, question: string, options: string[], opts?: Record<string, unknown>): Promise<{ message_id: number }>;
 		/** Acknowledge an inline-button press (clears the loading spinner client-side). */
@@ -1303,7 +1305,16 @@ export async function connectTelegram(args: ConnectTelegramArgs): Promise<Telegr
 			}
 		}
 		const api = b.api;
+		// A GIF (image/gif) plays inline via sendAnimation; the kind inference maps
+		// .gif → "image", which would otherwise send a STATIC first frame via
+		// sendPhoto. Detect it here so the animation actually animates (falls back
+		// to the normal switch when the bot build lacks sendAnimation).
+		const isAnimation = media.mimeType === "image/gif" || /\.gif$/i.test(media.path);
 		const send = async (p: Record<string, unknown>): Promise<void> => {
+			if (isAnimation && api.sendAnimation) {
+				await api.sendAnimation(chatId, input, p);
+				return;
+			}
 			switch (media.kind) {
 				case "image":
 					await api.sendPhoto?.(chatId, input, p);
