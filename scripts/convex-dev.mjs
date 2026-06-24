@@ -15,7 +15,7 @@
 //   logs/                               — backend stderr captures
 
 import { spawn } from "node:child_process";
-import { mkdirSync, existsSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, existsSync, writeFileSync, readFileSync, unlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
@@ -24,7 +24,11 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const BIN_DIR = join(ROOT, "bin");
-const DATA_DIR = join(ROOT, ".convex-data");
+// Honor the data dir the `brigade convex` command resolves + exports, so the
+// pidfile (and all backend state) lands where `brigade convex stop` looks for
+// it — whether launched via the CLI (global install → ~/.brigade/convex/data)
+// or `npm run convex:dev` from a checkout (→ <root>/.convex-data, the default).
+const DATA_DIR = process.env.BRIGADE_CONVEX_DATA_DIR?.trim() || join(ROOT, ".convex-data");
 const DASHBOARD_DIR = join(BIN_DIR, "dashboard");
 const BACKEND_BIN = join(BIN_DIR, process.platform === "win32" ? "convex-local-backend.exe" : "convex-local-backend");
 
@@ -135,6 +139,27 @@ const backend = spawn(BACKEND_BIN, [
   "--do-not-require-ssl",
   dbPath,
 ], { stdio: ["ignore", "pipe", "pipe"] });
+
+// Record a pidfile so `brigade convex stop` can find and terminate this run.
+// The orchestrator (this process) owns the dashboard server; the backend is
+// its child — stop needs both pids. Removed in shutdown() below.
+const PID_FILE = join(DATA_DIR, "convex.pid");
+writeFileSync(
+  PID_FILE,
+  JSON.stringify(
+    {
+      orchestratorPid: process.pid,
+      backendPid: backend.pid,
+      host: BACKEND_HOST,
+      port: BACKEND_PORT,
+      sitePort: SITE_PROXY_PORT,
+      dashboardPort: DASHBOARD_PORT,
+      startedAt: new Date().toISOString(),
+    },
+    null,
+    2,
+  ),
+);
 
 backend.stdout.on("data", (b) => process.stdout.write(`\x1b[90m[backend]\x1b[0m ${b}`));
 backend.stderr.on("data", (b) => process.stderr.write(`\x1b[90m[backend]\x1b[0m ${b}`));
@@ -308,6 +333,7 @@ function shutdown(code = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`\n\x1b[36m▌ Stopping...\x1b[0m`);
+  try { unlinkSync(PID_FILE); } catch {}
   try { dashboardServer.close(); } catch {}
   try { backend.kill("SIGTERM"); } catch {}
   setTimeout(() => process.exit(code), 500);

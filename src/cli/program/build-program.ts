@@ -1670,7 +1670,7 @@ export function buildProgram(): Command {
 
   convex
     .command("stop")
-    .description("Explain how to stop the foreground backend (Ctrl-C)")
+    .description("Stop the backend + dashboard started by a previous `dev`/`start`")
     .option("-h, --host <host>", "backend host (default: 127.0.0.1)")
     .option("-p, --port <port>", "backend port (default: 3210)", (v) => parseInt(v, 10))
     .action(async (opts: { host?: string; port?: number }) => {

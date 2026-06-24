@@ -15,11 +15,12 @@
  *   brigade convex status    — probe the backend and report running / not.
  *   brigade convex push      — deploy the bundled convex/ functions.
  *   brigade convex codegen   — regenerate the convex/_generated client.
- *   brigade convex stop      — reminder that `dev` is foreground (Ctrl-C).
+ *   brigade convex stop      — terminate the backend + dashboard started by a
+ *                              previous `dev`/`start`, via its pidfile.
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -38,6 +39,30 @@ export interface ConvexCommandOptions {
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 3210;
 const DASHBOARD_PORT = 6791;
+
+/** True if a process with this pid exists (EPERM still means it's alive). */
+function isAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return (err as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+/** Probe the backend's /version endpoint; true if it answers OK within 2s. */
+async function probeRunning(host: string, port: number): Promise<boolean> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 2_000);
+	try {
+		const res = await fetch(`http://${host}:${port}/version`, { signal: controller.signal });
+		return res.ok;
+	} catch {
+		return false;
+	} finally {
+		clearTimeout(timer);
+	}
+}
 
 /** Friendly rendering of a data dir — collapses $HOME to ~ for the boot note. */
 function friendlyPath(p: string): string {
@@ -159,11 +184,65 @@ export async function runConvexCommand(opts: ConvexCommandOptions): Promise<numb
 	}
 
 	if (opts.action === "stop") {
-		// Kept deliberately simple + safe: `brigade convex dev` runs in the
-		// foreground, so there's no daemon PID to signal. Killing arbitrary
-		// processes by port would be unsafe; tell the operator how to stop it.
+		// `dev`/`start` drop a pidfile (scripts/convex-dev.mjs) recording the
+		// orchestrator + backend pids. Read it and terminate them directly —
+		// safe and precise (no port-scanning, no killing arbitrary processes).
+		const pidFile = join(dataDir, "convex.pid");
+
+		if (!existsSync(pidFile)) {
+			// No pidfile — either nothing is running, or it was started some other
+			// way. Probe so we report accurately instead of guessing.
+			const host = opts.host ?? DEFAULT_HOST;
+			const port = opts.port ?? DEFAULT_PORT;
+			if (await probeRunning(host, port)) {
+				process.stdout.write(
+					`Convex is running on ${host}:${port}, but no pidfile was found ` +
+						`(${friendlyPath(pidFile)}).\n` +
+						`It was likely started directly in a terminal — stop it there with Ctrl-C.\n`,
+				);
+				return 1;
+			}
+			process.stdout.write("Convex is not running.\n");
+			return 0;
+		}
+
+		let info: { orchestratorPid?: number; backendPid?: number };
+		try {
+			info = JSON.parse(readFileSync(pidFile, "utf8"));
+		} catch {
+			process.stderr.write(
+				`Could not parse pidfile ${friendlyPath(pidFile)} — delete it and retry.\n`,
+			);
+			return 1;
+		}
+
+		// Kill the backend first, then the orchestrator (which serves the
+		// dashboard). On POSIX the orchestrator handles SIGTERM gracefully; on
+		// Windows the signal hard-terminates — either way both end up stopped.
+		const pids = [info.backendPid, info.orchestratorPid].filter(
+			(p): p is number => typeof p === "number" && p > 0,
+		);
+		let killedAny = false;
+		for (const pid of pids) {
+			if (!isAlive(pid)) continue;
+			try {
+				process.kill(pid, "SIGTERM");
+				killedAny = true;
+			} catch (err) {
+				process.stderr.write(`Failed to stop pid ${pid}: ${(err as Error).message}\n`);
+			}
+		}
+
+		try {
+			unlinkSync(pidFile);
+		} catch {
+			/* best-effort — the orchestrator removes it on its own shutdown too */
+		}
+
 		process.stdout.write(
-			"`brigade convex dev` runs in the foreground — stop it with Ctrl-C in its terminal.\n",
+			killedAny
+				? "Stopped Convex (backend + dashboard).\n"
+				: "Convex was not running (cleared a stale pidfile).\n",
 		);
 		return 0;
 	}
