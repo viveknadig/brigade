@@ -7,6 +7,7 @@ import {
 	buildTelegramSenderName,
 	extractTelegramForwardContext,
 	extractTelegramMentions,
+	extractTelegramNonTextBody,
 	extractTelegramReplyContext,
 	extractTelegramText,
 	hasInboundMedia,
@@ -45,6 +46,49 @@ describe("extractTelegramText", () => {
 			msg({ text: "go here now", entities: [{ type: "text_link", offset: 3, length: 4, url: "https://e.com" }] }),
 		);
 		assert.equal(out, "go [here](https://e.com) now");
+	});
+
+	it("falls back to a location rendering when there is no text/caption", () => {
+		assert.equal(extractTelegramText(msg({ location: { latitude: 1, longitude: 2 } } as Partial<Message>)), "[Location: 1, 2]");
+	});
+
+	it("prefers real text over the non-text rendering", () => {
+		assert.equal(extractTelegramText(msg({ text: "look", location: { latitude: 1, longitude: 2 } } as Partial<Message>)), "look");
+	});
+});
+
+describe("extractTelegramNonTextBody", () => {
+	it("renders a location pin", () => {
+		assert.equal(extractTelegramNonTextBody(msg({ location: { latitude: 37.77, longitude: -122.41 } } as Partial<Message>)), "[Location: 37.77, -122.41]");
+	});
+
+	it("renders a live location", () => {
+		assert.equal(extractTelegramNonTextBody(msg({ location: { latitude: 1, longitude: 2, live_period: 600 } } as Partial<Message>)), "[Live location: 1, 2]");
+	});
+
+	it("renders a venue with title + address + coords", () => {
+		assert.equal(
+			extractTelegramNonTextBody(msg({ venue: { title: "Cafe", address: "1 Main St", location: { latitude: 1, longitude: 2 } } } as Partial<Message>)),
+			"[Venue: Cafe — 1 Main St (1, 2)]",
+		);
+	});
+
+	it("renders a contact", () => {
+		assert.equal(
+			extractTelegramNonTextBody(msg({ contact: { phone_number: "+15551234", first_name: "Jane", last_name: "Doe" } } as Partial<Message>)),
+			"[Contact: Jane Doe · +15551234]",
+		);
+	});
+
+	it("renders a poll question + options", () => {
+		assert.equal(
+			extractTelegramNonTextBody(msg({ poll: { question: "Lunch?", options: [{ text: "Pizza" }, { text: "Tacos" }] } } as Partial<Message>)),
+			'[Poll: "Lunch?" — Pizza / Tacos]',
+		);
+	});
+
+	it("returns empty for a plain text message", () => {
+		assert.equal(extractTelegramNonTextBody(msg({ text: "hi" })), "");
 	});
 });
 
@@ -107,6 +151,31 @@ describe("extractTelegramReplyContext", () => {
 		assert.equal(ctx?.messageId, "33");
 		assert.equal(ctx?.from, "7");
 		assert.equal(ctx?.body?.length, 280);
+	});
+
+	it("prefers the user's partial-quote selection over the full quoted text", () => {
+		const m = msg({
+			quote: { text: "the important part" },
+			reply_to_message: { message_id: 8, date: 1, chat: { id: 5, type: "private", first_name: "A" }, from: { id: 7, is_bot: false, first_name: "B" }, text: "a long original body" } as Message["reply_to_message"],
+		} as Partial<Message>);
+		const ctx = extractTelegramReplyContext(m);
+		assert.equal(ctx?.body, "the important part");
+		assert.equal(ctx?.messageId, "8");
+	});
+
+	it("appends a media marker when the quoted message was media", () => {
+		const m = msg({
+			reply_to_message: { message_id: 8, date: 1, chat: { id: 5, type: "private", first_name: "A" }, from: { id: 7, is_bot: false, first_name: "B" }, photo: [{ file_id: "p", file_unique_id: "u", width: 1, height: 1 }] } as Message["reply_to_message"],
+		} as Partial<Message>);
+		assert.equal(extractTelegramReplyContext(m)?.body, "[image]");
+	});
+
+	it("handles an external_reply that quotes a message from another chat", () => {
+		const m = msg({ quote: { text: "quoted bit" }, external_reply: { origin: { type: "channel" } } } as Partial<Message>);
+		const ctx = extractTelegramReplyContext(m);
+		assert.equal(ctx?.messageId, undefined);
+		assert.match(ctx?.body ?? "", /quoted bit/);
+		assert.match(ctx?.body ?? "", /another chat/);
 	});
 });
 

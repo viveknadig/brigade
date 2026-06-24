@@ -75,10 +75,55 @@ function expandTextLinks(text: string, entities?: TelegramTextEntity[] | null): 
 	return result;
 }
 
+/**
+ * Render the non-text payloads Telegram delivers with NO text/caption —
+ * location, venue, contact, poll — into one readable line so the agent actually
+ * SEES them. Without this such a message arrives with empty text and is
+ * effectively invisible (the central pipeline drops empty inbound). Returns ""
+ * for a message that carries none of these.
+ */
+export function extractTelegramNonTextBody(msg: Message): string {
+	const m = msg as Message & {
+		venue?: { title?: string; address?: string; location?: { latitude?: number; longitude?: number } };
+		location?: { latitude?: number; longitude?: number; live_period?: number };
+		contact?: { first_name?: string; last_name?: string; phone_number?: string };
+		poll?: { question?: string; options?: { text?: string }[] };
+	};
+	if (m.venue) {
+		const v = m.venue;
+		const coords = v.location ? ` (${v.location.latitude}, ${v.location.longitude})` : "";
+		return `[Venue: ${[v.title, v.address].filter(Boolean).join(" — ")}${coords}]`;
+	}
+	if (m.location) {
+		const l = m.location;
+		const live = typeof l.live_period === "number" && l.live_period > 0 ? "Live location" : "Location";
+		return `[${live}: ${l.latitude}, ${l.longitude}]`;
+	}
+	if (m.contact) {
+		const c = m.contact;
+		const name = [c.first_name, c.last_name].filter(Boolean).join(" ").trim() || "(no name)";
+		const phone = c.phone_number ? ` · ${c.phone_number}` : "";
+		return `[Contact: ${name}${phone}]`;
+	}
+	if (m.poll) {
+		const p = m.poll;
+		const opts = (p.options ?? [])
+			.map((o) => o.text)
+			.filter(Boolean)
+			.join(" / ");
+		return `[Poll: "${p.question ?? ""}"${opts ? ` — ${opts}` : ""}]`;
+	}
+	return "";
+}
+
 /** Extract the agent-facing plain text (caption-aware + text_link-expanded). */
 export function extractTelegramText(msg: Message): string {
 	const { text, entities } = getTelegramTextParts(msg);
-	return expandTextLinks(text, entities).trim();
+	const expanded = expandTextLinks(text, entities).trim();
+	if (expanded) return expanded;
+	// No text/caption — fall back to a readable rendering of location / venue /
+	// contact / poll so the message is visible to the agent instead of empty.
+	return extractTelegramNonTextBody(msg);
 }
 
 /** Telegram chat kind → Brigade chat type. private → direct; group/supergroup → group. */
@@ -182,14 +227,35 @@ export function extractTelegramMentions(
 	return out;
 }
 
-/** Reply-context (what message this inbound quotes), when it's a reply. */
+/**
+ * Reply-context (what message this inbound quotes), when it's a reply. Covers
+ * three shapes: a normal `reply_to_message`, a partial-quote (`msg.quote` — the
+ * exact fragment the user highlighted, Bot API 7.0+), and an `external_reply`
+ * (quoting a message from ANOTHER chat). The `body` excerpt prefers the user's
+ * explicit partial quote, then the quoted message's own text, and appends a
+ * `[kind]` marker when the quoted message was media — so the agent knows it
+ * replied to a photo/voice/etc., not just text.
+ */
 export function extractTelegramReplyContext(msg: Message): InboundReplyContext | undefined {
 	const reply = msg.reply_to_message;
-	if (!reply) return undefined;
-	const messageId = typeof reply.message_id === "number" ? String(reply.message_id) : undefined;
-	const from = typeof reply.from?.id === "number" ? String(reply.from.id) : undefined;
-	const quotedText = extractTelegramText(reply);
-	const body = quotedText ? quotedText.slice(0, 280) : undefined; // bound LLM context
+	const quote = (msg as { quote?: { text?: string } }).quote;
+	const external = (msg as { external_reply?: Record<string, unknown> }).external_reply;
+	if (!reply && !quote && !external) return undefined;
+
+	const messageId = reply && typeof reply.message_id === "number" ? String(reply.message_id) : undefined;
+	const from = reply && typeof reply.from?.id === "number" ? String(reply.from.id) : undefined;
+
+	// Body: explicit partial-quote → quoted message text → media marker. A
+	// cross-chat reply is tagged so the agent knows the target isn't local.
+	const quotedText = quote?.text?.trim() || (reply ? extractTelegramText(reply) : "");
+	const mediaSource = reply ?? (external as Message | undefined);
+	const mediaKind = mediaSource ? resolveInboundMediaKind(mediaSource) : undefined;
+	const bits: string[] = [];
+	if (quotedText) bits.push(quotedText.slice(0, 280)); // bound LLM context
+	if (mediaKind) bits.push(`[${mediaKind}]`);
+	if (!reply && external) bits.push("(quoting a message from another chat)");
+	const body = bits.length ? bits.join(" ") : undefined;
+
 	if (!messageId && !from && !body) return undefined;
 	return { messageId, from, body };
 }
