@@ -769,6 +769,30 @@ describe("inbound-pipeline: reasoning lane + general button callbacks", () => {
 		assert.match(turnText ?? "", /buy/, "the button token reaches the agent as a turn");
 	});
 
+	it("surfaces a general SELECT callback's values in the turn text (Fix 3a)", async () => {
+		let turnText: string | undefined;
+		const fake = makeFakeChannel();
+		const pipeline = createInboundPipelineContext({
+			adapter: fake.adapter,
+			config: ACL_OPEN,
+			agentId: "main",
+			runTurn: async (args) => {
+				turnText = args.text;
+				return { reply: "ack" };
+			},
+			commandMap: new Map(),
+		});
+		await runChannelInboundPipeline(pipeline, {
+			channel: "fake",
+			conversationId: "+12025550100",
+			from: "+12025550100",
+			text: "",
+			callbackQuery: { data: "g:pick", callbackId: "cb3", values: ["apple", "banana"] },
+		});
+		assert.match(turnText ?? "", /pick/, "the select token reaches the agent");
+		assert.match(turnText ?? "", /Selected: apple, banana/, "the chosen values are surfaced");
+	});
+
 	it("DROPS a non-approval, non-general callback (no turn)", async () => {
 		let turns = 0;
 		const fake = makeFakeChannel();

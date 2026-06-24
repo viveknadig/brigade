@@ -40,7 +40,27 @@ import {
 	type OutboundMedia,
 } from "../sdk.js";
 import { maskProxyUrl } from "./account-config.js";
-import { type DiscordActionRow } from "./components.js";
+import {
+	isDiscordSelectSpec,
+	type DiscordActionRow,
+	type DiscordSelectSpec,
+} from "./components.js";
+import {
+	DISCORD_FLAG_IS_COMPONENTS_V2,
+	DISCORD_BUTTON_STYLE_LINK,
+	isDiscordLinkButton,
+	isDiscordV2MessageSpec,
+	type DiscordBlockSpec,
+	type DiscordV2MessageSpec,
+} from "./component-blocks.js";
+import {
+	buildDiscordModal,
+	decodeDiscordModalCustomId,
+	extractModalFieldValues,
+	formatModalSubmissionText,
+	isDiscordModalCustomId,
+} from "./modals.js";
+import { consumeDiscordModal, getDiscordModal, type DiscordModalEntry } from "./modal-registry.js";
 import { rememberDiscordUser } from "./directory-cache.js";
 import {
 	assembleDiscordText,
@@ -139,9 +159,12 @@ export interface DiscordInboundMessage {
 	 * press rather than a typed message. `data` is the opaque payload the pressed
 	 * button declared at send time (an approval-callback codec string OR a
 	 * general-prefixed token); `callbackId` is the interaction id (so the press
-	 * can be acked). Undefined for ordinary messages.
+	 * can be acked). `values` carries the chosen value(s) when the press came from
+	 * a SELECT menu (entity selects prefix ids: `user:` / `role:` / `channel:` /
+	 * `mentionable:`); a plain button press carries no `values`. Undefined for
+	 * ordinary messages.
 	 */
-	callbackQuery?: { data: string; callbackId: string };
+	callbackQuery?: { data: string; callbackId: string; values?: string[] };
 	/** True when this inbound is a message edit (text carries the NEW text). */
 	edited?: boolean;
 	/**
@@ -345,12 +368,30 @@ export function safeDiscordAllowedMentions(): DiscordAllowedMentions {
 	return { parse: ["users", "roles"], repliedUser: false };
 }
 
+/**
+ * A `buildComponentRows` entry: a classic BUTTON row (an array of button specs),
+ * a SELECT-row marker (Fix 3a — alone in its ActionRow), or a Components-V2
+ * container marker (Fix 3c). The builders dispatch on shape: an array → buttons,
+ * `{ row: "select" }` → a select menu, `{ row: "v2" }` → a V2 container.
+ */
+export type DiscordComponentRow = DiscordActionRow | DiscordSelectSpec | DiscordV2MessageSpec;
+
 /** The builders the connection needs from discord.js (injected for tests). */
 export interface DiscordBuilders {
 	/** Wrap `{ path, name }` into an `AttachmentBuilder`-shaped object. */
 	buildAttachment(path: string, name: string): unknown;
-	/** Turn a serializable button-row grid into discord.js `ActionRowBuilder[]`. */
-	buildComponentRows(rows: DiscordActionRow[]): unknown[];
+	/**
+	 * Turn a serializable component-row list into discord.js builder objects. A
+	 * button row → `ActionRowBuilder<ButtonBuilder>`; a select marker → an
+	 * `ActionRowBuilder<*SelectMenuBuilder>`; a V2 marker → a `ContainerBuilder`.
+	 */
+	buildComponentRows(rows: DiscordComponentRow[]): unknown[];
+	/**
+	 * Build a discord.js `ModalBuilder` from a registered modal entry (Fix 3b).
+	 * Optional — a build that never opens modals (or a minimal test fake) can omit
+	 * it; the connection guards its absence.
+	 */
+	buildModal?(params: { modalId: string; title: string; entry: DiscordModalEntry }): unknown;
 }
 
 /** A discord.js Interaction (the subset Brigade reads). */
@@ -358,10 +399,20 @@ export interface DiscordInteractionLike {
 	/** True for a button press (`isButton()`); a command interaction sets `isChatInputCommand()`. */
 	isButton?: () => boolean;
 	isChatInputCommand?: () => boolean;
-	/** The button's `custom_id` (button interactions). */
+	/** Select-menu type guards (Fix 3a) — exactly one is true for a select press. */
+	isStringSelectMenu?: () => boolean;
+	isUserSelectMenu?: () => boolean;
+	isRoleSelectMenu?: () => boolean;
+	isChannelSelectMenu?: () => boolean;
+	isMentionableSelectMenu?: () => boolean;
+	/** True for a modal submission (Fix 3b). */
+	isModalSubmit?: () => boolean;
+	/** The component's `custom_id` (button / select / modal interactions). */
 	customId?: string;
 	/** Slash-command name (command interactions). */
 	commandName?: string;
+	/** The chosen value(s) on a select press (raw ids/values; entity selects carry ids). */
+	values?: string[];
 	/** The interaction id (acked via the reply/deferUpdate path). */
 	id?: string;
 	channelId?: string;
@@ -370,8 +421,12 @@ export interface DiscordInteractionLike {
 	user?: { id?: string; username?: string; globalName?: string | null };
 	member?: { nickname?: string | null } | null;
 	message?: { id?: string };
+	/** Modal-submit field accessor (Fix 3b) — `getTextInputValue(id)` yields a value. */
+	fields?: { getTextInputValue?: (customId: string) => string; fields?: unknown };
 	/** Ack a button press silently (no visible change). */
 	deferUpdate?: () => Promise<unknown>;
+	/** Open a modal in response to a button press (Fix 3b). */
+	showModal?: (modal: unknown) => Promise<unknown>;
 	/** Ack a slash command with an ephemeral ack. */
 	reply?: (options: unknown) => Promise<unknown>;
 	deferReply?: (options?: unknown) => Promise<unknown>;
@@ -448,12 +503,15 @@ export interface DiscordConnection {
 	/** Send a single text message. Returns the posted message's id. */
 	sendText(channel: string, text: string, opts?: DiscordSendTextOpts): Promise<{ messageId: string }>;
 	/**
-	 * Send a message carrying component button `rows` (the native approval prompt /
-	 * general buttons). `text` is the message content; `rows` is a serializable
-	 * button grid the builders turn into ActionRows. Text is sent verbatim (no
-	 * markdown pass) so the caller controls formatting.
+	 * Send a message carrying component `rows` — button grids (the native approval
+	 * prompt / general buttons), SELECT-menu markers (Fix 3a), and/or a
+	 * Components-V2 container marker (Fix 3c). `text` is the message content; the
+	 * builders turn each row into the matching discord.js component. Text is sent
+	 * verbatim (no markdown pass) so the caller controls formatting. When a V2
+	 * container is present the `IsComponentsV2` flag is set and the text moves into
+	 * a V2 text block (a V2 message cannot carry plain `content`).
 	 */
-	sendInteractive(channel: string, text: string, rows: DiscordActionRow[], opts?: DiscordSendTextOpts): Promise<{ messageId: string }>;
+	sendInteractive(channel: string, text: string, rows: DiscordComponentRow[], opts?: DiscordSendTextOpts): Promise<{ messageId: string }>;
 	/** Upload a media attachment via an AttachmentBuilder. */
 	sendMedia(channel: string, media: OutboundMedia, opts?: DiscordSendMediaOpts): Promise<void>;
 	/** React to a previous message with an emoji (unicode or `name:id` custom). */
@@ -567,6 +625,153 @@ export function redactDiscordToken(text: string, ...tokens: string[]): string {
 	return out;
 }
 
+/* ───────────────────────── discord.js component builders (Fix 3a / 3c) ───────────────────────── */
+
+/** The discord.js namespace (lazy-imported); typed loosely so the static import never pulls the runtime. */
+type DiscordModule = typeof import("discord.js");
+
+/**
+ * Build the discord.js `ActionRowBuilder` wrapping ONE select menu (Fix 3a). The
+ * `kind` picks the builder; a STRING select adds its options, an entity select
+ * (user/role/channel/mentionable) carries none. Placeholder + min/max are set
+ * when present.
+ */
+function buildSelectActionRow(discord: DiscordModule, spec: DiscordSelectSpec): unknown {
+	const applyCommon = (menu: {
+		setCustomId(id: string): unknown;
+		setPlaceholder?(p: string): unknown;
+		setMinValues?(n: number): unknown;
+		setMaxValues?(n: number): unknown;
+	}): void => {
+		menu.setCustomId(spec.customId);
+		if (spec.placeholder && typeof menu.setPlaceholder === "function") menu.setPlaceholder(spec.placeholder);
+		if (typeof spec.minValues === "number" && typeof menu.setMinValues === "function") menu.setMinValues(spec.minValues);
+		if (typeof spec.maxValues === "number" && typeof menu.setMaxValues === "function") menu.setMaxValues(spec.maxValues);
+	};
+	let menu: unknown;
+	switch (spec.kind) {
+		case "user": {
+			const m = new discord.UserSelectMenuBuilder();
+			applyCommon(m as never);
+			menu = m;
+			break;
+		}
+		case "role": {
+			const m = new discord.RoleSelectMenuBuilder();
+			applyCommon(m as never);
+			menu = m;
+			break;
+		}
+		case "channel": {
+			const m = new discord.ChannelSelectMenuBuilder();
+			applyCommon(m as never);
+			menu = m;
+			break;
+		}
+		case "mentionable": {
+			const m = new discord.MentionableSelectMenuBuilder();
+			applyCommon(m as never);
+			menu = m;
+			break;
+		}
+		case "string":
+		default: {
+			const s = new discord.StringSelectMenuBuilder();
+			applyCommon(s as never);
+			const options = (spec.options ?? []).map((o) => {
+				const opt = new discord.StringSelectMenuOptionBuilder().setLabel(o.label).setValue(o.value);
+				if (o.description) opt.setDescription(o.description);
+				return opt;
+			});
+			if (options.length > 0) s.addOptions(...options);
+			menu = s;
+			break;
+		}
+	}
+	const row = new discord.ActionRowBuilder();
+	(row as { addComponents(c: unknown): unknown }).addComponents(menu);
+	return row;
+}
+
+/** Map ONE V2 block spec to its discord.js builder (Fix 3c). */
+function buildV2Block(discord: DiscordModule, block: DiscordBlockSpec): unknown {
+	switch (block.type) {
+		case "text":
+			return new discord.TextDisplayBuilder().setContent(block.text);
+		case "section": {
+			const section = new discord.SectionBuilder();
+			(section as { addTextDisplayComponents(...c: unknown[]): unknown }).addTextDisplayComponents(
+				...block.texts.map((t) => new discord.TextDisplayBuilder().setContent(t)),
+			);
+			if (block.accessory?.kind === "thumbnail") {
+				(section as { setThumbnailAccessory(c: unknown): unknown }).setThumbnailAccessory(
+					new discord.ThumbnailBuilder().setURL(block.accessory.url),
+				);
+			} else if (block.accessory?.kind === "button") {
+				(section as { setButtonAccessory(c: unknown): unknown }).setButtonAccessory(buildV2Button(discord, block.accessory.button));
+			}
+			return section;
+		}
+		case "separator": {
+			const sep = new discord.SeparatorBuilder();
+			if (typeof block.divider === "boolean") (sep as { setDivider(b: boolean): unknown }).setDivider(block.divider);
+			if (block.spacing) {
+				const spacing = block.spacing === "large" ? 2 : 1;
+				(sep as { setSpacing(n: number): unknown }).setSpacing(spacing);
+			}
+			return sep;
+		}
+		case "actions": {
+			const row = new discord.ActionRowBuilder();
+			(row as { addComponents(...c: unknown[]): unknown }).addComponents(...block.buttons.map((b) => buildV2Button(discord, b)));
+			return row;
+		}
+		case "media-gallery": {
+			const gallery = new discord.MediaGalleryBuilder();
+			(gallery as { addItems(...i: unknown[]): unknown }).addItems(
+				...block.items.map((it) => {
+					const item = new discord.MediaGalleryItemBuilder().setURL(it.url);
+					if (it.description) item.setDescription(it.description);
+					if (typeof it.spoiler === "boolean") item.setSpoiler(it.spoiler);
+					return item;
+				}),
+			);
+			return gallery;
+		}
+		case "file": {
+			const file = new discord.FileBuilder().setURL(block.url);
+			if (typeof block.spoiler === "boolean") file.setSpoiler(block.spoiler);
+			return file;
+		}
+		default:
+			return new discord.TextDisplayBuilder().setContent("");
+	}
+}
+
+/** Build a V2 button (a link button when it has a url, else an interactive button). */
+function buildV2Button(discord: DiscordModule, b: { label: string; url?: string; customId?: string; style?: number }): unknown {
+	if (isDiscordLinkButton(b as never)) {
+		return new discord.ButtonBuilder().setLabel(b.label).setStyle(DISCORD_BUTTON_STYLE_LINK as never).setURL((b as { url: string }).url);
+	}
+	return new discord.ButtonBuilder().setLabel(b.label).setCustomId((b as { customId: string }).customId).setStyle((b.style ?? 2) as never);
+}
+
+/** Build the discord.js `ContainerBuilder` for a Components-V2 message (Fix 3c). */
+function buildV2Container(discord: DiscordModule, spec: DiscordV2MessageSpec): unknown {
+	const container = new discord.ContainerBuilder();
+	if (typeof spec.accentColor === "number") (container as { setAccentColor(n: number): unknown }).setAccentColor(spec.accentColor);
+	for (const block of spec.blocks) {
+		const built = buildV2Block(discord, block);
+		if (block.type === "section") (container as { addSectionComponents(...c: unknown[]): unknown }).addSectionComponents(built);
+		else if (block.type === "separator") (container as { addSeparatorComponents(...c: unknown[]): unknown }).addSeparatorComponents(built);
+		else if (block.type === "actions") (container as { addActionRowComponents(...c: unknown[]): unknown }).addActionRowComponents(built);
+		else if (block.type === "media-gallery") (container as { addMediaGalleryComponents(...c: unknown[]): unknown }).addMediaGalleryComponents(built);
+		else if (block.type === "file") (container as { addFileComponents(...c: unknown[]): unknown }).addFileComponents(built);
+		else (container as { addTextDisplayComponents(...c: unknown[]): unknown }).addTextDisplayComponents(built);
+	}
+	return container;
+}
+
 /* ───────────────────────── the connection ───────────────────────── */
 
 export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordConnection> {
@@ -597,7 +802,8 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		buildClient = (botToken: string) => factory(botToken, proxyUrl || undefined);
 		builders ??= {
 			buildAttachment: (p: string, name: string) => ({ attachment: p, name }),
-			buildComponentRows: (rows: DiscordActionRow[]) => rows.map((row) => ({ components: row })),
+			buildComponentRows: (rows: DiscordComponentRow[]) => rows.map((row) => ({ components: row })),
+			buildModal: (params: { modalId: string; title: string; entry: DiscordModalEntry }) => ({ modal: params }),
 		};
 	} else {
 		const discord = await import("discord.js");
@@ -640,8 +846,17 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 			buildAttachment(p: string, name: string): unknown {
 				return new discord.AttachmentBuilder(p, { name });
 			},
-			buildComponentRows(rows: DiscordActionRow[]): unknown[] {
+			buildComponentRows(rows: DiscordComponentRow[]): unknown[] {
 				return rows.map((row) => {
+					// SELECT row (Fix 3a) — alone in its ActionRow; the kind picks the builder.
+					if (isDiscordSelectSpec(row)) {
+						return buildSelectActionRow(discord, row);
+					}
+					// Components-V2 container (Fix 3c) — a single ContainerBuilder of blocks.
+					if (isDiscordV2MessageSpec(row)) {
+						return buildV2Container(discord, row);
+					}
+					// Classic BUTTON row (unchanged byte-for-byte behavior).
 					const r = new discord.ActionRowBuilder<import("discord.js").ButtonBuilder>();
 					for (const b of row) {
 						r.addComponents(
@@ -650,6 +865,16 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 					}
 					return r;
 				});
+			},
+			buildModal(params: { modalId: string; title: string; entry: DiscordModalEntry }): unknown {
+				return buildDiscordModal(
+					{
+						ModalBuilder: discord.ModalBuilder as never,
+						ActionRowBuilder: discord.ActionRowBuilder as never,
+						TextInputBuilder: discord.TextInputBuilder as never,
+					},
+					params,
+				);
 			},
 		};
 	}
@@ -1006,6 +1231,74 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 	};
 
 	/**
+	 * Normalize a SELECT-menu press into the same callback-inbound shape a button
+	 * press uses (Fix 3a), but carrying the chosen `values`. The select's custom_id
+	 * IS a general token (the central pipeline surfaces the values in the turn
+	 * text). For an ENTITY select the raw values are Discord ids — they're prefixed
+	 * with the select's kind (`user:` / `role:` / `channel:` / `mentionable:`) so
+	 * the agent can tell what kind of id it received; a STRING select's values are
+	 * the option values verbatim.
+	 */
+	const normalizeSelect = (interaction: DiscordInteractionLike, kind: DiscordSelectSpec["kind"]): DiscordInboundMessage | null => {
+		const value = typeof interaction.customId === "string" ? interaction.customId : "";
+		if (!value) return null;
+		const channel = typeof interaction.channelId === "string" ? interaction.channelId : typeof interaction.channel?.id === "string" ? interaction.channel.id : "";
+		const fromId = typeof interaction.user?.id === "string" ? interaction.user.id : channel;
+		if (!channel && !fromId) return null;
+		const threadId = interaction.channel && isThreadChannel(interaction.channel) ? channel : undefined;
+		const fromName = interaction.user?.username;
+		const rawValues = Array.isArray(interaction.values) ? interaction.values.filter((v): v is string => typeof v === "string") : [];
+		const prefix = kind === "string" ? "" : `${kind}:`;
+		const values = rawValues.map((v) => `${prefix}${v}`);
+		return {
+			conversationId: channel || fromId,
+			from: fromId,
+			...(fromName ? { fromName } : {}),
+			text: "",
+			chatType: interaction.guildId ? "group" : "direct",
+			...(typeof interaction.guildId === "string" ? { guildId: interaction.guildId } : {}),
+			...(threadId ? { threadId } : {}),
+			callbackQuery: { data: value, callbackId: interaction.id ?? "", values },
+			raw: interaction,
+		};
+	};
+
+	/**
+	 * Normalize a MODAL SUBMIT into an ordinary inbound MESSAGE (Fix 3b). A filled
+	 * form is a typed turn, not a button tap, so it routes via `onMessage` carrying
+	 * the formatted `Label: value` body — the agent sees what was entered exactly as
+	 * if the person typed it. The modal entry is consumed (single-use); a missing /
+	 * expired entry yields null so the submit degrades gracefully.
+	 */
+	const normalizeModalSubmit = (interaction: DiscordInteractionLike): DiscordInboundMessage | null => {
+		const customId = typeof interaction.customId === "string" ? interaction.customId : "";
+		const modalId = decodeDiscordModalCustomId(customId);
+		if (!modalId) return null;
+		const entry = consumeDiscordModal(modalId);
+		if (!entry) {
+			safeLog("discord modal submit for an unknown/expired form — dropped", { modalId });
+			return null;
+		}
+		const channel = typeof interaction.channelId === "string" ? interaction.channelId : typeof interaction.channel?.id === "string" ? interaction.channel.id : "";
+		const fromId = typeof interaction.user?.id === "string" ? interaction.user.id : channel;
+		if (!channel && !fromId) return null;
+		const threadId = interaction.channel && isThreadChannel(interaction.channel) ? channel : undefined;
+		const fromName = interaction.user?.username;
+		const values = extractModalFieldValues(interaction as { fields?: never }, entry.fields);
+		const text = formatModalSubmissionText(entry, values);
+		return {
+			conversationId: channel || fromId,
+			from: fromId,
+			...(fromName ? { fromName } : {}),
+			text,
+			chatType: interaction.guildId ? "group" : "direct",
+			...(typeof interaction.guildId === "string" ? { guildId: interaction.guildId } : {}),
+			...(threadId ? { threadId } : {}),
+			raw: interaction,
+		};
+	};
+
+	/**
 	 * Normalize a slash-command interaction into an ordinary inbound message so the
 	 * central command map (`/help`, `/status`, …) handles it. The command name is
 	 * mapped to `/command` text.
@@ -1027,16 +1320,52 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		};
 	};
 
-	/** Handle an interactionCreate event (button press OR slash command). */
+	/**
+	 * The five select-menu type guards mapped to their kind. The first that fires
+	 * wins (exactly one is true for a given select press).
+	 */
+	const selectKindOf = (interaction: DiscordInteractionLike): DiscordSelectSpec["kind"] | null => {
+		if (typeof interaction.isStringSelectMenu === "function" && interaction.isStringSelectMenu()) return "string";
+		if (typeof interaction.isUserSelectMenu === "function" && interaction.isUserSelectMenu()) return "user";
+		if (typeof interaction.isRoleSelectMenu === "function" && interaction.isRoleSelectMenu()) return "role";
+		if (typeof interaction.isChannelSelectMenu === "function" && interaction.isChannelSelectMenu()) return "channel";
+		if (typeof interaction.isMentionableSelectMenu === "function" && interaction.isMentionableSelectMenu()) return "mentionable";
+		return null;
+	};
+
+	/** Handle an interactionCreate event (button / select / modal-submit / slash). */
 	const handleInteraction = (interaction: DiscordInteractionLike): void => {
 		try {
 			stampInboundEvent();
 			if (typeof interaction.isButton === "function" && interaction.isButton()) {
+				// A button whose custom_id is a `modal:<id>` marker OPENS a modal instead
+				// of routing a turn (Fix 3b). Otherwise ack silently + route the press.
+				const customId = typeof interaction.customId === "string" ? interaction.customId : "";
+				if (isDiscordModalCustomId(customId)) {
+					void openModalForTrigger(interaction, customId);
+					return;
+				}
 				// Ack the press silently first so Discord doesn't show "interaction
 				// failed"; then route the normalized inbound.
 				void interaction.deferUpdate?.().catch(() => {});
 				const normalized = normalizeButton(interaction);
 				if (normalized) args.onCallbackQuery?.(normalized);
+				return;
+			}
+			const selectKind = selectKindOf(interaction);
+			if (selectKind) {
+				// A select press is acked silently (no visible change) then routed like a
+				// button press, carrying the chosen values (Fix 3a).
+				void interaction.deferUpdate?.().catch(() => {});
+				const normalized = normalizeSelect(interaction, selectKind);
+				if (normalized) args.onCallbackQuery?.(normalized);
+				return;
+			}
+			if (typeof interaction.isModalSubmit === "function" && interaction.isModalSubmit()) {
+				// Ack the submit so the form closes; route the filled form as a turn (Fix 3b).
+				void interaction.deferUpdate?.().catch(() => {});
+				const normalized = normalizeModalSubmit(interaction);
+				if (normalized) args.onMessage(normalized);
 				return;
 			}
 			if (typeof interaction.isChatInputCommand === "function" && interaction.isChatInputCommand()) {
@@ -1049,6 +1378,31 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 			}
 		} catch (err) {
 			safeLog("discord interaction handler error", { error: err instanceof Error ? err.message : String(err) });
+		}
+	};
+
+	/**
+	 * Open the modal a modal-trigger button references (Fix 3b). Looks up the
+	 * (non-consuming) registry entry, builds the discord.js modal via the injected
+	 * builders, and calls `interaction.showModal`. A missing entry / absent builder
+	 * is acked-silently so the client doesn't hang. The entry is NOT consumed here —
+	 * consumption happens on submit so the modal stays openable until then.
+	 */
+	const openModalForTrigger = async (interaction: DiscordInteractionLike, customId: string): Promise<void> => {
+		try {
+			const modalId = decodeDiscordModalCustomId(customId);
+			const entry = modalId ? getDiscordModal(modalId) : undefined;
+			if (!entry || typeof interaction.showModal !== "function" || typeof resolvedBuilders.buildModal !== "function") {
+				// Nothing to show — ack silently so the press doesn't read as failed.
+				void interaction.deferUpdate?.().catch(() => {});
+				if (modalId && !entry) safeLog("discord modal trigger for an unknown/expired form", { modalId });
+				return;
+			}
+			const modal = resolvedBuilders.buildModal({ modalId, title: entry.title, entry });
+			await interaction.showModal(modal);
+		} catch (err) {
+			safeLog("discord showModal failed", { error: err instanceof Error ? err.message : String(err) });
+			void interaction.deferUpdate?.().catch(() => {});
 		}
 	};
 
@@ -1274,9 +1628,33 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 	const sendInteractive: DiscordConnection["sendInteractive"] = async (channel, text, rows, opts) => {
 		try {
 			const ch = await resolveSendChannel(channel, opts?.threadId);
-			const components = resolvedBuilders.buildComponentRows(rows);
-			const options: DiscordSendOptions = { content: text, components, allowedMentions: safeDiscordAllowedMentions() };
-			if (opts?.silent) options.flags = MESSAGE_FLAG_SUPPRESS_NOTIFICATIONS;
+			// Components V2 (Fix 3c): when any row is a V2 container, the WHOLE message
+			// is V2 — the IsComponentsV2 flag is set and plain `content` is forbidden
+			// (text must live inside a V2 text block). When no V2 row is present the
+			// classic button/select path is byte-identical to before (plain content +
+			// no flag).
+			const hasV2 = rows.some((row) => isDiscordV2MessageSpec(row));
+			let effectiveRows = rows;
+			if (hasV2 && text && text.trim()) {
+				// Prepend the message text as a leading TextDisplay block inside the FIRST
+				// V2 container so the V2 message still shows the body (it can't use content).
+				effectiveRows = rows.map((row) => {
+					if (isDiscordV2MessageSpec(row)) {
+						return { ...row, blocks: [{ type: "text", text } as DiscordBlockSpec, ...row.blocks] };
+					}
+					return row;
+				});
+			}
+			const components = resolvedBuilders.buildComponentRows(effectiveRows);
+			const options: DiscordSendOptions = { components, allowedMentions: safeDiscordAllowedMentions() };
+			if (hasV2) {
+				// A V2 message carries no plain content; the flag tells Discord to render
+				// the component tree. SuppressNotifications (silent) ORs in alongside it.
+				options.flags = DISCORD_FLAG_IS_COMPONENTS_V2 | (opts?.silent ? MESSAGE_FLAG_SUPPRESS_NOTIFICATIONS : 0);
+			} else {
+				options.content = text;
+				if (opts?.silent) options.flags = MESSAGE_FLAG_SUPPRESS_NOTIFICATIONS;
+			}
 			if (opts?.replyToMessageId && !opts?.threadId) {
 				options.reply = { messageReference: opts.replyToMessageId, failIfNotExists: false };
 			}

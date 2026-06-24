@@ -31,6 +31,8 @@
  */
 
 import { GENERAL_CALLBACK_PREFIX } from "../general-callback.js";
+import { registerDiscordModal, type DiscordModalRegistration } from "./modal-registry.js";
+import { buildDiscordModalCustomId } from "./modals.js";
 
 /** Discord caps a component `custom_id` at 100 chars. */
 export const DISCORD_CUSTOM_ID_MAX_CHARS = 100;
@@ -66,6 +68,114 @@ export interface DiscordButtonSpec {
 
 /** One action row — up to 5 buttons. */
 export type DiscordActionRow = DiscordButtonSpec[];
+
+/* ───────────────────────── select-menu specs (Fix 3a) ───────────────────────── */
+
+/** Discord ComponentType values for the five select-menu kinds (mirror discord.js). */
+export const DISCORD_SELECT_COMPONENT_TYPE = {
+	string: 3,
+	user: 5,
+	role: 6,
+	mentionable: 7,
+	channel: 8,
+} as const;
+
+/** The five select-menu kinds Brigade can emit. */
+export type DiscordSelectKind = "string" | "user" | "role" | "channel" | "mentionable";
+
+/** One option of a STRING select (entity selects have no static options). */
+export interface DiscordSelectOption {
+	/** Option label shown to the user. */
+	label: string;
+	/** Opaque value delivered back on selection (NOT the customId; the row's id routes). */
+	value: string;
+	/** Optional sublabel under the option. */
+	description?: string;
+}
+
+/**
+ * A serializable select-menu row spec (the connection turns it into a discord.js
+ * `*SelectMenuBuilder` wrapped in its OWN `ActionRowBuilder` — a select must be
+ * alone in its row). Like a general button, the select's `customId` carries a
+ * {@link GENERAL_CALLBACK_PREFIX} token so a selection routes through the SAME
+ * central general-callback path a button press does, just carrying `values`.
+ */
+export interface DiscordSelectSpec {
+	/** Discriminator marking this row as a select (not a button grid). */
+	readonly row: "select";
+	/** Which select kind to render. */
+	kind: DiscordSelectKind;
+	/** Opaque codec payload carried in `custom_id` (already general-prefixed + ≤ 100 chars). */
+	customId: string;
+	/** Placeholder shown before a choice is made. */
+	placeholder?: string;
+	/** Min number of selections (Discord default 1). */
+	minValues?: number;
+	/** Max number of selections (Discord default 1). */
+	maxValues?: number;
+	/** STRING-select options (required + non-empty for `kind: "string"`; ignored otherwise). */
+	options?: DiscordSelectOption[];
+}
+
+/** True when a `buildComponentRows` entry is a select-row marker (vs a button grid). */
+export function isDiscordSelectSpec(row: unknown): row is DiscordSelectSpec {
+	return typeof row === "object" && row !== null && (row as { row?: unknown }).row === "select";
+}
+
+/** Discord select placeholder cap (chars). */
+const DISCORD_SELECT_PLACEHOLDER_MAX = 150;
+/** Discord string-select option label/description caps (chars). */
+const DISCORD_SELECT_OPTION_LABEL_MAX = 100;
+const DISCORD_SELECT_OPTION_DESC_MAX = 100;
+
+/**
+ * Build a select-row marker from a high-level spec. The token is namespaced with
+ * {@link GENERAL_CALLBACK_PREFIX} (exactly like a general button) + sanitized; a
+ * token that overflows the 100-char budget OR a `string` select with no usable
+ * option yields `null` (the caller falls back to a plain message rather than ship
+ * a select that decodes to the wrong action / renders empty). Placeholder +
+ * option text are capped to Discord's limits.
+ */
+export function buildDiscordSelectRow(spec: {
+	kind: DiscordSelectKind;
+	customIdToken: string;
+	placeholder?: string;
+	minValues?: number;
+	maxValues?: number;
+	options?: DiscordSelectOption[];
+}): DiscordSelectSpec | null {
+	const token = (spec?.customIdToken ?? "").trim();
+	if (!token) return null;
+	const prefixed = sanitizeDiscordCustomId(`${GENERAL_CALLBACK_PREFIX}${token}`);
+	if (!prefixed || prefixed.length > DISCORD_CUSTOM_ID_MAX_CHARS) return null;
+
+	let options: DiscordSelectOption[] | undefined;
+	if (spec.kind === "string") {
+		const shaped: DiscordSelectOption[] = [];
+		for (const opt of spec.options ?? []) {
+			const label = (opt?.label ?? "").trim();
+			const value = (opt?.value ?? "").trim();
+			if (!label || !value) continue;
+			const out: DiscordSelectOption = {
+				label: label.slice(0, DISCORD_SELECT_OPTION_LABEL_MAX),
+				value,
+			};
+			const desc = (opt?.description ?? "").trim();
+			if (desc) out.description = desc.slice(0, DISCORD_SELECT_OPTION_DESC_MAX);
+			shaped.push(out);
+		}
+		if (shaped.length === 0) return null; // a string select with no usable option renders empty
+		options = shaped;
+	}
+
+	const out: DiscordSelectSpec = { row: "select", kind: spec.kind, customId: prefixed };
+	const placeholder = (spec.placeholder ?? "").trim();
+	if (placeholder) out.placeholder = placeholder.slice(0, DISCORD_SELECT_PLACEHOLDER_MAX);
+	if (typeof spec.minValues === "number" && Number.isFinite(spec.minValues)) out.minValues = spec.minValues;
+	if (typeof spec.maxValues === "number" && Number.isFinite(spec.maxValues)) out.maxValues = spec.maxValues;
+	if (options) out.options = options;
+	return out;
+}
 
 /** One button spec before it's shaped + validated. */
 export interface DiscordButtonInput {
@@ -159,4 +269,29 @@ export function buildDiscordButtonRows(grid: Array<Array<{ text: string; data: s
 	}
 	if (buttons.length === 0) return null;
 	return chunkIntoRows(buttons);
+}
+
+/* ───────────────────────── modal-trigger button (Fix 3b) ───────────────────────── */
+
+/**
+ * Register a modal definition + build the BUTTON that opens it. The button is a
+ * normal component whose `custom_id` is a `modal:<modalId>` marker (NOT a general
+ * token): on press the connection recognizes the marker and calls `showModal`
+ * instead of routing a turn. Returns the button spec + the minted modal id (so a
+ * caller can correlate). Returns `null` when the label is empty or the marker
+ * overflows the custom_id budget (never the case for a short generated id, but
+ * guarded for symmetry with the other builders).
+ */
+export function buildDiscordModalTriggerButton(params: {
+	label: string;
+	registration: DiscordModalRegistration;
+	style?: DiscordButtonStyleValue;
+}): { button: DiscordButtonSpec; modalId: string } | null {
+	const label = (params?.label ?? "").trim();
+	if (!label) return null;
+	const modalId = registerDiscordModal(params.registration);
+	const customId = buildDiscordModalCustomId(modalId);
+	const btn = toButton({ text: label, value: customId, style: params.style ?? DISCORD_BUTTON_STYLE.Primary });
+	if (!btn) return null;
+	return { button: btn, modalId };
 }

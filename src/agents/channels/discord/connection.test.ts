@@ -204,6 +204,7 @@ function makeFakeClient(over: FakeClientOver = {}): FakeClient {
 const fakeBuilders: DiscordBuilders = {
 	buildAttachment: (path, name) => ({ attachment: path, name }),
 	buildComponentRows: (rows) => rows.map((row) => ({ components: row })),
+	buildModal: (params) => ({ modal: params }),
 };
 
 /** Boot a connection against a fake client, returning the harness + collected inbounds. */
@@ -622,6 +623,120 @@ describe("connectDiscord — interactions", () => {
 		assert.equal(h.messages.length, 1);
 		assert.equal(h.messages[0]?.text, "/status");
 	});
+
+	it("routes a STRING select press as a callbackQuery carrying values (Fix 3a)", async () => {
+		const h = await boot();
+		let deferred = false;
+		h.client.emit("interactionCreate", {
+			isButton: () => false,
+			isStringSelectMenu: () => true,
+			isChatInputCommand: () => false,
+			customId: "g:pick",
+			id: "i2",
+			channelId: "C1",
+			guildId: "G1",
+			values: ["a"],
+			user: { id: "U1", username: "alex" },
+			deferUpdate: async () => {
+				deferred = true;
+			},
+		});
+		assert.equal(h.callbacks.length, 1);
+		assert.equal(h.callbacks[0]?.callbackQuery?.data, "g:pick");
+		assert.deepEqual(h.callbacks[0]?.callbackQuery?.values, ["a"]);
+		assert.equal(deferred, true);
+	});
+
+	it("a USER select prefixes the chosen ids with user: (Fix 3a)", async () => {
+		const h = await boot();
+		h.client.emit("interactionCreate", {
+			isButton: () => false,
+			isUserSelectMenu: () => true,
+			customId: "g:whoping",
+			id: "i3",
+			channelId: "C1",
+			values: ["U1", "U2"],
+			user: { id: "U9", username: "alex" },
+			deferUpdate: async () => {},
+		});
+		assert.deepEqual(h.callbacks[0]?.callbackQuery?.values, ["user:U1", "user:U2"]);
+	});
+
+	it("a modal-trigger button calls showModal (NOT a turn) (Fix 3b)", async () => {
+		const h = await boot();
+		const { buildDiscordModalTriggerButton } = await import("./components.js");
+		const { __resetDiscordModalRegistryForTest } = await import("./modal-registry.js");
+		__resetDiscordModalRegistryForTest();
+		const built = buildDiscordModalTriggerButton({
+			label: "Open",
+			registration: { title: "Form", fields: [{ id: "f1", label: "Name" }] },
+		});
+		assert.ok(built);
+		let shown: unknown;
+		let routedTurn = false;
+		h.client.emit("interactionCreate", {
+			isButton: () => true,
+			customId: built!.button.customId,
+			id: "i4",
+			channelId: "C1",
+			user: { id: "U1", username: "alex" },
+			showModal: async (m: unknown) => {
+				shown = m;
+			},
+			deferUpdate: async () => {},
+		});
+		await tick();
+		assert.ok(shown, "showModal was called");
+		assert.equal(h.callbacks.length, 0, "no callbackQuery turn for a modal trigger");
+		assert.equal(routedTurn, false);
+	});
+
+	it("a modal submit routes a turn whose text carries labels + values (Fix 3b)", async () => {
+		const h = await boot();
+		const { buildDiscordModalTriggerButton } = await import("./components.js");
+		const { __resetDiscordModalRegistryForTest } = await import("./modal-registry.js");
+		const { buildDiscordModalCustomId } = await import("./modals.js");
+		__resetDiscordModalRegistryForTest();
+		const built = buildDiscordModalTriggerButton({
+			label: "Open",
+			registration: { title: "Form", fields: [{ id: "f1", label: "Name" }, { id: "f2", label: "Message" }] },
+		});
+		h.client.emit("interactionCreate", {
+			isButton: () => false,
+			isModalSubmit: () => true,
+			customId: buildDiscordModalCustomId(built!.modalId),
+			id: "i5",
+			channelId: "C1",
+			guildId: "G1",
+			user: { id: "U1", username: "alex" },
+			fields: {
+				getTextInputValue: (id: string) => (id === "f1" ? "Ada" : "hello"),
+			},
+			deferUpdate: async () => {},
+		});
+		assert.equal(h.messages.length, 1);
+		assert.match(h.messages[0]?.text ?? "", /\[form\]/);
+		assert.match(h.messages[0]?.text ?? "", /Name: Ada/);
+		assert.match(h.messages[0]?.text ?? "", /Message: hello/);
+	});
+
+	it("an expired/missing modal submit degrades gracefully (no turn) (Fix 3b)", async () => {
+		const h = await boot();
+		const { buildDiscordModalCustomId } = await import("./modals.js");
+		const { __resetDiscordModalRegistryForTest } = await import("./modal-registry.js");
+		__resetDiscordModalRegistryForTest();
+		h.client.emit("interactionCreate", {
+			isButton: () => false,
+			isModalSubmit: () => true,
+			customId: buildDiscordModalCustomId("ghost"),
+			id: "i6",
+			channelId: "C1",
+			user: { id: "U1", username: "alex" },
+			fields: { getTextInputValue: () => "" },
+			deferUpdate: async () => {},
+		});
+		assert.equal(h.messages.length, 0, "an unknown modal submit is dropped");
+	});
 });
 
 describe("connectDiscord — outbound", () => {
@@ -676,6 +791,38 @@ describe("connectDiscord — outbound", () => {
 		await h.conn.sendInteractive("C1", "choose", [[{ label: "Yes", customId: "g:yes", style: 2 }]]);
 		assert.ok(Array.isArray(h.client.sent[0]?.options.components));
 		assert.equal(h.client.sent[0]?.options.components?.length, 1);
+	});
+
+	it("a plain button sendInteractive does NOT set the V2 flag (regression guard) (Fix 3c)", async () => {
+		const h = await boot();
+		await h.conn.sendInteractive("C1", "choose", [[{ label: "Yes", customId: "g:yes", style: 2 }]]);
+		assert.equal(h.client.sent[0]?.options.flags, undefined, "classic button path stays content + no flag");
+		assert.equal(h.client.sent[0]?.options.content, "choose");
+	});
+
+	it("a V2-block message sets the IsComponentsV2 flag + moves text into a block (Fix 3c)", async () => {
+		const h = await boot();
+		const { buildDiscordV2Message } = await import("./component-blocks.js");
+		const v2 = buildDiscordV2Message({
+			blocks: [{ type: "section", texts: ["body line"] }],
+			accentColor: 0x5865f2,
+		});
+		assert.ok(v2);
+		await h.conn.sendInteractive("C1", "Heading", [v2!]);
+		const opts = h.client.sent[0]?.options;
+		assert.equal(opts?.flags, 1 << 15, "IsComponentsV2 flag set (32768)");
+		assert.equal(opts?.content, undefined, "a V2 message carries no plain content");
+		// The pass-through builder echoes the rows; the leading text was prepended as a block.
+		const row = (opts?.components?.[0] as { components?: { blocks?: Array<{ type: string }> } })?.components;
+		assert.equal(row?.blocks?.[0]?.type, "text", "message text became a leading V2 text block");
+	});
+
+	it("a silent V2 message ORs SuppressNotifications alongside the V2 flag (Fix 3c)", async () => {
+		const h = await boot();
+		const { buildDiscordV2Message } = await import("./component-blocks.js");
+		const v2 = buildDiscordV2Message({ blocks: [{ type: "text", text: "hi" }] });
+		await h.conn.sendInteractive("C1", "", [v2!], { silent: true });
+		assert.equal(h.client.sent[0]?.options.flags, (1 << 15) | (1 << 12));
 	});
 
 	it("sendMedia builds an attachment + uploads it", async () => {

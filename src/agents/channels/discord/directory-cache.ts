@@ -13,7 +13,7 @@
  * display-name / `username#discriminator`). So the bot can mention back anyone
  * it has recently seen, with zero extra REST calls.
  *
- * Shape mirrors the Brigade-native intent of OpenClaw's `directory-cache.ts`:
+ * Shape:
  *   - keyed by account id (a two-account bot must never cross handles);
  *   - an LRU bounded at {@link DISCORD_DIRECTORY_CACHE_MAX} entries per account
  *     (re-inserting a hit moves it to the most-recent slot);
