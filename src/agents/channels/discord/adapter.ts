@@ -47,16 +47,26 @@ import {
 	discordStreamThrottleMs,
 	discordSurfaceReasoning,
 	listDiscordAccountIds,
+	resolveDiscordAutoThread,
 	resolveDiscordBotToken,
+	resolveDiscordPresence,
 	resolveDiscordProxyUrl,
 	DISCORD_CHANNEL_ID,
 	DISCORD_DEFAULT_ACCOUNT_ID,
+	type ResolvedDiscordPresence,
 } from "./account-config.js";
 import { resolveDiscordApprover } from "./approval-authorize.js";
 import { buildDiscordApprovalMessage } from "./approval-native.js";
 import { buildDiscordButtonRows } from "./components.js";
 import { buildDiscordCommandManifest } from "./command-menu.js";
-import { connectDiscord, type ConnectDiscordArgs, type DiscordConnection, type DiscordInboundMessage } from "./connection.js";
+import {
+	connectDiscord,
+	sanitizeThreadName,
+	type ConnectDiscordArgs,
+	type DiscordConnection,
+	type DiscordInboundMessage,
+	type DiscordPresencePayload,
+} from "./connection.js";
 import { resolveDiscordHandle } from "./directory-cache.js";
 import { createDraftStream } from "./draft-stream.js";
 import { discordTextIsEmpty, markdownToDiscord, rewriteKnownMentions } from "./format.js";
@@ -64,6 +74,32 @@ import { splitDiscordReasoning } from "./reasoning-lane.js";
 
 /** Discord's per-message text limit (chars) for chunked sends. */
 const DISCORD_TEXT_LIMIT = 2_000;
+
+/**
+ * Map a resolved presence config into the discord.js `PresenceData` payload the
+ * connection applies on (re)connect (Phase 5). A `custom` activity (type 4)
+ * carries its text in the `state` field (Discord renders custom status from the
+ * state); every other type uses `name`. A `streaming` activity (type 1) adds the
+ * `url`. Returns `null` when no presence is configured.
+ */
+export function mapDiscordPresencePayload(presence: ResolvedDiscordPresence | null): DiscordPresencePayload | null {
+	if (!presence) return null;
+	const payload: DiscordPresencePayload = { status: presence.status };
+	if (presence.activityTypeCode !== undefined) {
+		const isCustom = presence.activityTypeCode === 4;
+		const text = presence.activityText ?? "";
+		const activity: { name: string; type: number; url?: string; state?: string } = {
+			// A custom activity needs a non-empty `name` per Discord; the visible text
+			// rides in `state`. Other types put the text in `name`.
+			name: isCustom ? "Custom Status" : text,
+			type: presence.activityTypeCode,
+		};
+		if (isCustom && text) activity.state = text;
+		if (presence.activityTypeCode === 1 && presence.activityUrl) activity.url = presence.activityUrl;
+		payload.activities = [activity];
+	}
+	return payload;
+}
 
 /** Adapter construction options — all optional for back-compat. */
 export interface CreateDiscordAdapterOptions {
@@ -106,6 +142,59 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 	let connected = false;
 	let tokenInvalid = false;
 
+	/**
+	 * Cheap SYNCHRONOUS gate: should this inbound trigger autoThread creation? True
+	 * only when the feature is on, the message isn't already in a thread, and it's
+	 * a guild text message carrying text + the ids needed to anchor a thread. Keeps
+	 * the non-autoThread inbound path fully synchronous.
+	 */
+	const shouldAutoThread = (msg: DiscordInboundMessage): boolean => {
+		if (msg.threadId) return false; // already in a thread
+		const cfg = lastConfig;
+		if (!cfg || !connection) return false;
+		if (!resolveDiscordAutoThread(cfg).enabled) return false;
+		// Guild text message only (a DM has no guildId; a reaction/callback carries no text).
+		return Boolean(
+			(msg.guildId ?? "").trim() &&
+				(msg.conversationId ?? "").trim() &&
+				(msg.messageId ?? "").trim() &&
+				(msg.text ?? "").trim(),
+		);
+	};
+
+	/**
+	 * Phase 5 autoThread: create a thread off an inbound guild text message and
+	 * return the new thread id (caller guards with {@link shouldAutoThread}).
+	 * Returns the message's existing `threadId` (undefined) on any failure so the
+	 * reply stays un-threaded.
+	 *
+	 * Thread naming: `"first-message"` uses the inbound's first line; `"generated"`
+	 * would use an LLM-titled name, but Brigade has no simple-completion helper —
+	 * so `"generated"` FALLS BACK to the first-message name here (no completion
+	 * runtime is built).
+	 */
+	const maybeAutoThread = async (msg: DiscordInboundMessage): Promise<string | undefined> => {
+		const existing = msg.threadId;
+		const cfg = lastConfig;
+		if (!cfg || !connection) return existing;
+		const auto = resolveDiscordAutoThread(cfg);
+		const channelId = (msg.conversationId ?? "").trim();
+		const messageId = (msg.messageId ?? "").trim();
+		const text = (msg.text ?? "").trim();
+		// Name source: first-message (or generated → fallback to first-message until
+		// a completion runtime exists).
+		const name = sanitizeThreadName(text, messageId);
+		try {
+			const created = await connection.createThreadFromMessage(channelId, messageId, {
+				name,
+				autoArchiveMinutes: auto.autoArchiveMinutes,
+			});
+			return created ?? existing;
+		} catch {
+			return existing;
+		}
+	};
+
 	const adapter: DiscordAdapter = {
 		id: DISCORD_CHANNEL_ID,
 		label: "Discord",
@@ -141,9 +230,12 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 			// The native slash-command manifest, derived from Brigade's central
 			// channel commands; registered right after the connection is live (below).
 			const commandManifest = buildDiscordCommandManifest(buildBundledCommands(adapter));
+			// Resolve the optional bot presence to apply on (re)connect (Phase 5).
+			const presencePayload = mapDiscordPresencePayload(resolveDiscordPresence(cfg));
 			const conn = await connectImpl({
 				botToken,
 				...(proxyUrl ? { proxyUrl } : {}),
+				...(presencePayload ? { presence: presencePayload } : {}),
 				accountId,
 				log: ctx.log,
 				onConnected: () => {
@@ -159,33 +251,47 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 					ctx.onLoggedOut?.();
 				},
 				onMessage: (msg) => {
-					void ctx.onInbound({
-						channel: DISCORD_CHANNEL_ID,
-						accountId,
-						conversationId: msg.conversationId,
-						messageId: msg.messageId,
-						messageTimestampMs: msg.messageTimestampMs,
-						from: msg.from,
-						fromName: msg.fromName,
-						text: msg.text,
-						chatType: msg.chatType,
-						isGroup: msg.chatType === "group",
-						threadId: msg.threadId,
-						// Discord routes on guildId + member role ids (NOT teamId — that
-						// is Slack's workspace tier; setting it would risk colliding with
-						// a Slack team binding).
-						guildId: msg.guildId,
-						memberRoleIds: msg.memberRoleIds,
-						mentions: msg.mentions,
-						replyTo: msg.replyTo,
-						// Edit provenance rides through so the central pipeline / agent see
-						// "this was an edit".
-						...(msg.edited ? { edited: true } : {}),
-						// Deferred media thunk rides through untouched — the pipeline
-						// resolves it only after the access gate admits the sender.
-						resolveMedia: msg.resolveMedia,
-						raw: msg.raw,
-					});
+					// Build the inbound with a resolved thread id. The dispatch is
+					// SYNCHRONOUS when no thread needs creating (the common path, unchanged
+					// behavior); only autoThread creation defers to a microtask.
+					const dispatch = (threadId: string | undefined): void => {
+						void ctx.onInbound({
+							channel: DISCORD_CHANNEL_ID,
+							accountId,
+							conversationId: msg.conversationId,
+							messageId: msg.messageId,
+							messageTimestampMs: msg.messageTimestampMs,
+							from: msg.from,
+							fromName: msg.fromName,
+							text: msg.text,
+							chatType: msg.chatType,
+							isGroup: msg.chatType === "group",
+							threadId,
+							// Discord routes on guildId + member role ids (NOT teamId — that
+							// is Slack's workspace tier; setting it would risk colliding with
+							// a Slack team binding).
+							guildId: msg.guildId,
+							memberRoleIds: msg.memberRoleIds,
+							mentions: msg.mentions,
+							replyTo: msg.replyTo,
+							// Edit provenance rides through so the central pipeline / agent see
+							// "this was an edit".
+							...(msg.edited ? { edited: true } : {}),
+							// Deferred media thunk rides through untouched — the pipeline
+							// resolves it only after the access gate admits the sender.
+							resolveMedia: msg.resolveMedia,
+							raw: msg.raw,
+						});
+					};
+					// Phase 5 autoThread: when enabled (and this is a fresh guild text
+					// message), spawn a thread off the message and route the reply into it.
+					// `shouldAutoThread` is a cheap synchronous gate so the non-autoThread
+					// path stays fully synchronous.
+					if (shouldAutoThread(msg)) {
+						void maybeAutoThread(msg).then(dispatch).catch(() => dispatch(msg.threadId));
+					} else {
+						dispatch(msg.threadId);
+					}
 				},
 				// Inbound reaction → synthesise a short note and route it through the
 				// SAME inbound pipeline as a normal message so the access gate + routing

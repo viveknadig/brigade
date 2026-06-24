@@ -187,6 +187,17 @@ export interface DiscordInboundMessage {
  * with zero network — the runtime path builds a real `Client` and it
  * structurally satisfies this shape.
  */
+/**
+ * The discord.js `PresenceData` shape the connection sets via
+ * `client.user.setPresence(...)`. `status` is the online dot; `activities` is at
+ * most one activity row (name + numeric `ActivityType` + optional `url` for a
+ * streaming activity + optional `state` for a custom activity).
+ */
+export interface DiscordPresencePayload {
+	status?: "online" | "idle" | "dnd" | "invisible";
+	activities?: Array<{ name: string; type: number; url?: string; state?: string }>;
+}
+
 export interface DiscordClientLike {
 	/** Subscribe a Gateway event handler (`messageCreate`, `interactionCreate`, …). */
 	on(event: string, handler: (...args: never[]) => unknown): unknown;
@@ -195,8 +206,12 @@ export interface DiscordClientLike {
 	login(token: string): Promise<string>;
 	/** Tear down the connection + websocket. */
 	destroy(): Promise<void> | void;
-	/** The bot user once ready (carries `.id` + `.username`), else null. */
-	user: { id?: string; username?: string } | null;
+	/**
+	 * The bot user once ready (carries `.id` + `.username`), else null. discord.js
+	 * exposes `setPresence(data)` on `client.user` once the Gateway is ready — used
+	 * to apply the configured presence/activity (Phase 5).
+	 */
+	user: { id?: string; username?: string; setPresence?: (data: DiscordPresencePayload) => unknown } | null;
 	/** REST handle for application-command registration + raw calls. */
 	rest?: { put(route: unknown, options?: { body?: unknown }): Promise<unknown> };
 	/** Resolve a channel by id (used by outbound to fetch the send target). */
@@ -267,6 +282,16 @@ export interface DiscordSentMessageLike {
 	edit(options: DiscordSendOptions | string): Promise<DiscordSentMessageLike>;
 	delete(): Promise<unknown>;
 	react(emoji: string): Promise<unknown>;
+	/**
+	 * Start a thread off this message (Phase 5 autoThread). discord.js
+	 * `message.startThread({ name, autoArchiveDuration })` returns the created
+	 * `ThreadChannel` (carrying `.id`). Optional — a minimal fake can omit it.
+	 */
+	startThread?: (options: { name: string; autoArchiveDuration?: number }) => Promise<{ id?: string }>;
+	/** Some discord.js versions surface an already-created thread on the message. */
+	thread?: { id?: string } | null;
+	/** True when a thread already hangs off this message. */
+	hasThread?: boolean;
 	/** Pin this message (Fix 2e). */
 	pin?: () => Promise<unknown>;
 	/** Unpin this message (Fix 2e). */
@@ -366,6 +391,29 @@ function deriveForumThreadName(text: string): string {
  */
 export function safeDiscordAllowedMentions(): DiscordAllowedMentions {
 	return { parse: ["users", "roles"], repliedUser: false };
+}
+
+/**
+ * Sanitize a string into a Discord thread name (Phase 5 autoThread): take the
+ * first non-empty line, strip user/role/channel mention markup, collapse
+ * whitespace, and truncate to Discord's 100-char limit. Falls back to
+ * `"Thread <id>"` when nothing usable remains.
+ */
+export function sanitizeThreadName(raw: string, fallbackId: string): string {
+	const firstLine = (raw ?? "")
+		.split(/\r?\n/)
+		.map((l) => l.trim())
+		.find((l) => l.length > 0);
+	const cleaned = (firstLine ?? "")
+		.replace(/<@!?\d+>/g, "") // user mentions
+		.replace(/<@&\d+>/g, "") // role mentions
+		.replace(/<#\d+>/g, "") // channel mentions
+		.replace(/\s+/g, " ")
+		.trim();
+	const base = cleaned || `Thread ${fallbackId}`;
+	// Truncate to 100 UTF-16 code units (Discord's hard cap).
+	const truncated = base.length > 100 ? base.slice(0, 100).trim() : base;
+	return truncated || `Thread ${fallbackId}`;
 }
 
 /**
@@ -481,6 +529,25 @@ export interface ConnectDiscordArgs {
 	buildersFactory?: () => DiscordBuilders;
 	/** TEST SEAM: skip the real backoff sleep so reconnect tests run instantly. */
 	sleepImpl?: (ms: number) => Promise<void>;
+	/**
+	 * Bot presence/activity to apply once the Gateway reaches READY (Phase 5). When
+	 * set, the connection calls `client.user.setPresence(...)` on every
+	 * (re)connect. Omitted → Discord's default presence (unchanged).
+	 */
+	presence?: DiscordPresencePayload | null;
+	/**
+	 * TEST SEAM: override how presence is applied. Production calls
+	 * `client.user.setPresence(payload)`; tests inject this to assert the mapped
+	 * activity payload without a real client. Receives the resolved payload.
+	 */
+	setPresenceImpl?: (client: DiscordClientLike, payload: DiscordPresencePayload) => void;
+	/**
+	 * READY-deadline in ms (Phase 5 reliability). After `login()` resolves the
+	 * connection waits this long for `clientReady`; if it never fires the socket is
+	 * destroyed and the supervise loop re-enters with backoff (an opened-but-never-
+	 * READY socket is not trusted). Default ~20s; ≤0 disables the watchdog.
+	 */
+	readyTimeoutMs?: number;
 }
 
 export interface DiscordConnection {
@@ -532,6 +599,24 @@ export interface DiscordConnection {
 	setComposing(channel: string, state: "composing" | "paused"): Promise<void>;
 	/** Read-receipt no-op (Discord bots can't mark-read). */
 	markRead(): Promise<void>;
+	/**
+	 * Apply (or re-apply) a bot presence/activity to the live client (Phase 5).
+	 * No-op when the client isn't ready or no payload is given. Used both by the
+	 * on-ready auto-apply and by a live `set-presence` re-application.
+	 */
+	applyPresence(payload?: DiscordPresencePayload | null): void;
+	/**
+	 * Create a thread off an existing message (`message.startThread` / the REST
+	 * `POST /channels/{id}/messages/{id}/threads`) and return its id (Phase 5
+	 * autoThread). On a create-race (another actor already threaded the message)
+	 * it best-effort refetches the message and returns the existing thread id.
+	 * Returns `null` when the thread can't be created.
+	 */
+	createThreadFromMessage(
+		channelId: string,
+		messageId: string,
+		opts: { name: string; autoArchiveMinutes?: number },
+	): Promise<string | null>;
 	/** Disconnect the Gateway + tear down. */
 	close(): Promise<void>;
 }
@@ -896,6 +981,33 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 	let reconnectAttempts = 0;
 	let client: DiscordClientLike | null = null;
 	let loopPromise: Promise<void> | null = null;
+	// READY-gating (Phase 5): a socket can `login()` (open) yet never reach the
+	// `clientReady` handshake. `ready` is the trustworthy "fully up" flag the
+	// presence apply + the watchdog gate on.
+	let ready = false;
+
+	// Resolved presence to (re)apply on every READY (Phase 5). `null` → leave
+	// Discord's default presence untouched.
+	const presencePayload: DiscordPresencePayload | null = args.presence ?? null;
+	const setPresenceImpl =
+		args.setPresenceImpl ??
+		((c: DiscordClientLike, payload: DiscordPresencePayload): void => {
+			c.user?.setPresence?.(payload);
+		});
+	/** Apply (or re-apply) a presence payload to the live client. Best-effort. */
+	const applyPresence = (payload?: DiscordPresencePayload | null): void => {
+		const c = client;
+		const p = payload === undefined ? presencePayload : payload;
+		if (!c || !p) return;
+		try {
+			setPresenceImpl(c, p);
+		} catch (err) {
+			safeLog("discord presence apply failed", { error: err instanceof Error ? err.message : String(err) });
+		}
+	};
+
+	// READY watchdog (Phase 5): default ~20s deadline; ≤0 disables it.
+	const readyTimeoutMs = typeof args.readyTimeoutMs === "number" ? args.readyTimeoutMs : 20_000;
 
 	// Dedupe inbound events by id — a redelivered event after a reconnect must not
 	// double-run the agent. Per-connection lifetime.
@@ -1456,15 +1568,26 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 
 	/* ── bootstrap + supervise ── */
 
-	/** Build the client, wire events, login, cache identity. */
+	/**
+	 * Build the client, wire events, login, cache identity, and WAIT for the
+	 * Gateway to reach READY (Phase 5). A socket can `login()` (open) yet never
+	 * fire `clientReady`; we don't trust such a socket. When `readyTimeoutMs > 0`
+	 * and READY hasn't fired by the deadline we destroy the client and throw so the
+	 * supervise loop reconnects. On READY we apply the configured presence.
+	 */
 	const startOnce = async (): Promise<void> => {
 		const c = buildClient(args.botToken);
 		client = c;
+		ready = false;
 		wireClient(c);
 		// `clientReady` fires once the Gateway handshake + initial guild sync settle.
 		c.once("clientReady", (() => {
 			selfId = typeof c.user?.id === "string" ? c.user.id : null;
 			selfName = typeof c.user?.username === "string" ? c.user.username : null;
+			ready = true;
+			cancelReadyWatchdog();
+			// Apply the configured presence once the client is fully ready.
+			applyPresence();
 		}) as never);
 		// login() rejects on an invalid token (terminal); resolves once the Gateway
 		// is identifying. We treat a resolved login as connected and read the cached
@@ -1472,6 +1595,48 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		await c.login(args.botToken);
 		selfId = selfId ?? (typeof c.user?.id === "string" ? c.user.id : null);
 		selfName = selfName ?? (typeof c.user?.username === "string" ? c.user.username : null);
+		// Arm the READY watchdog (Phase 5, NON-blocking): a socket can open
+		// (`login()` resolved) yet never fire `clientReady`. If that's still the case
+		// after the deadline, destroy the client + re-enter the supervise loop so we
+		// don't trust a half-open socket. `clientReady` cancels it. `startOnce`
+		// returns immediately so the adapter's start() never blocks on READY.
+		armReadyWatchdog(c);
+	};
+
+	/* ── READY watchdog (Phase 5) ── */
+	let readyTimer: ReturnType<typeof setTimeout> | undefined;
+	const cancelReadyWatchdog = (): void => {
+		if (readyTimer) {
+			clearTimeout(readyTimer);
+			readyTimer = undefined;
+		}
+	};
+	const armReadyWatchdog = (c: DiscordClientLike): void => {
+		cancelReadyWatchdog();
+		if (readyTimeoutMs <= 0 || ready || closed) return;
+		readyTimer = setTimeout(() => {
+			readyTimer = undefined;
+			// READY arrived in the meantime / we tore down / the token died — nothing to do.
+			if (ready || closed || tokenInvalid || client !== c) return;
+			safeLog("discord gateway opened but did not reach READY within deadline — destroying + reconnecting", {
+				account: accountId,
+				deadlineMs: readyTimeoutMs,
+			});
+			connected = false;
+			// Re-enter the supervise loop on a fresh tick (destroy + reconnect with backoff).
+			void (async () => {
+				await teardownClient();
+				if (closed || tokenInvalid) return;
+				reconnectAttempts += 1;
+				const delay = discordBackoffDelay(reconnectAttempts);
+				await sleep(delay);
+				if (closed || tokenInvalid) return;
+				loopPromise = superviseLoop().catch((err) => {
+					safeLog("discord supervise loop crashed", { error: err instanceof Error ? err.message : String(err) });
+				});
+			})();
+		}, readyTimeoutMs);
+		if (typeof (readyTimer as { unref?: () => void }).unref === "function") (readyTimer as { unref: () => void }).unref();
 	};
 
 	/**
@@ -1524,6 +1689,7 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 	const teardownClient = async (): Promise<void> => {
 		const c = client;
 		client = null;
+		ready = false;
 		if (c) {
 			try {
 				await c.destroy();
@@ -1778,9 +1944,52 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		}
 	};
 
+	/**
+	 * Create a thread off an existing message (Phase 5 autoThread). Fetches the
+	 * channel + message, calls `message.startThread(...)`, and returns the new
+	 * thread id. On a create-race (the message already has a thread — Discord
+	 * rejects a second `startThread`) it returns the existing thread id. Returns
+	 * `null` on any failure so the caller falls back to an un-threaded reply.
+	 */
+	const createThreadFromMessage: DiscordConnection["createThreadFromMessage"] = async (channelId, messageId, opts) => {
+		try {
+			const c = requireLive();
+			const ch = await c.channels.fetch(channelId);
+			if (!ch || typeof ch.messages?.fetch !== "function") return null;
+			const message = await ch.messages.fetch(messageId);
+			if (!message) return null;
+			// Already threaded → reuse (avoids the "already has a thread" reject).
+			if (message.hasThread && message.thread?.id) return message.thread.id;
+			if (typeof message.startThread !== "function") return null;
+			const created = await message.startThread({
+				name: opts.name,
+				...(typeof opts.autoArchiveMinutes === "number" ? { autoArchiveDuration: opts.autoArchiveMinutes } : {}),
+			});
+			const id = typeof created?.id === "string" ? created.id : "";
+			return id || null;
+		} catch (err) {
+			safeLog("discord createThreadFromMessage failed", {
+				channelId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			// Create-race: another actor may have threaded the message already.
+			try {
+				const c = client;
+				const ch = c ? await c.channels.fetch(channelId) : null;
+				const message = ch && typeof ch.messages?.fetch === "function" ? await ch.messages.fetch(messageId) : null;
+				if (message?.thread?.id) return message.thread.id;
+			} catch {
+				/* refetch also failed — give up */
+			}
+			return null;
+		}
+	};
+
 	const close: DiscordConnection["close"] = async () => {
 		closed = true;
 		connected = false;
+		ready = false;
+		cancelReadyWatchdog();
 		await teardownClient();
 		try {
 			await Promise.race([
@@ -1797,7 +2006,10 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		selfName: () => selfName,
 		connectedAt: () => connectedAtMs,
 		lastEventAt: () => lastEventAtMs,
-		isConnected: () => connected,
+		// `connected` is only set after startOnce resolves, which (when the watchdog
+		// is enabled) requires READY — so connected already implies the Gateway is
+		// fully up. The `|| ready` keeps the flag honest if the watchdog is disabled.
+		isConnected: () => connected && (ready || readyTimeoutMs <= 0),
 		isTokenInvalid: () => tokenInvalid,
 		sendText,
 		sendInteractive,
@@ -1811,6 +2023,8 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		registerCommands,
 		setComposing,
 		markRead: async () => {},
+		applyPresence,
+		createThreadFromMessage,
 		close,
 	};
 }

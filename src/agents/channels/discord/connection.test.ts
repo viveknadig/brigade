@@ -67,6 +67,8 @@ interface FakeClient extends DiscordClientLike {
 	pins: string[];
 	unpins: string[];
 	threadsCreated: Array<{ channelId: string; options: { name: string; message: { content?: string; flags?: number } } }>;
+	presenceCalls: unknown[];
+	startThreadCalls: Array<{ messageId: string; name: string; autoArchiveDuration?: number }>;
 	emit(event: string, ...payload: unknown[]): void;
 	ready(): void;
 }
@@ -82,6 +84,10 @@ interface FakeClientOver {
 	channelType?: number;
 	/** When set, `channel.send()` rejects with this error (send-error-decode tests). */
 	sendError?: unknown;
+	/** When set, a fetched message reports an existing thread (autoThread create-race). */
+	existingThreadId?: string;
+	/** When true, the fetched message has no `startThread` (can't create a thread). */
+	noStartThread?: boolean;
 }
 
 function makeFakeClient(over: FakeClientOver = {}): FakeClient {
@@ -93,8 +99,17 @@ function makeFakeClient(over: FakeClientOver = {}): FakeClient {
 	const pins: string[] = [];
 	const unpins: string[] = [];
 	const threadsCreated: Array<{ channelId: string; options: { name: string; message: { content?: string; flags?: number } } }> = [];
+	const presenceCalls: unknown[] = [];
+	const startThreadCalls: Array<{ messageId: string; name: string; autoArchiveDuration?: number }> = [];
 	let sendSeq = 0;
-	const userObj: { id?: string; username?: string } = { id: "BOT", username: "brigadebot" };
+	const userObj: { id?: string; username?: string; setPresence?: (data: unknown) => unknown } = {
+		id: "BOT",
+		username: "brigadebot",
+		setPresence: (data) => {
+			presenceCalls.push(data);
+			return undefined;
+		},
+	};
 
 	const makeMessage = (id: string): DiscordSentMessageLike => ({
 		id,
@@ -121,6 +136,15 @@ function makeFakeClient(over: FakeClientOver = {}): FakeClient {
 		reactions: {
 			cache: new Map((over.messageReactions ?? []).map((r, i) => [String(i), { ...r, users: { remove: async () => undefined } }])),
 		},
+		...(over.existingThreadId ? { hasThread: true, thread: { id: over.existingThreadId } } : {}),
+		...(over.noStartThread
+			? {}
+			: {
+					async startThread(options: { name: string; autoArchiveDuration?: number }) {
+						startThreadCalls.push({ messageId: id, name: options.name, autoArchiveDuration: options.autoArchiveDuration });
+						return { id: `nthread-${id}` };
+					},
+				}),
 	});
 
 	const isForum = over.channelType === 15 || over.channelType === 16;
@@ -161,6 +185,8 @@ function makeFakeClient(over: FakeClientOver = {}): FakeClient {
 		pins,
 		unpins,
 		threadsCreated,
+		presenceCalls,
+		startThreadCalls,
 		user: userObj,
 		...(over.restPut ? { rest: { put: over.restPut } } : {}),
 		channels: {
@@ -992,5 +1018,98 @@ describe("connectDiscord — pin / unpin (Fix 2e)", () => {
 		const h = await boot();
 		await h.conn.unpinMessage("C1", "m9");
 		assert.deepEqual(h.client.unpins, ["m9"]);
+	});
+});
+
+describe("connectDiscord — presence (Phase 5)", () => {
+	it("applies the configured presence on clientReady", async () => {
+		const payload = { status: "dnd" as const, activities: [{ name: "lofi", type: 2 }] };
+		const h = await boot({}, { presence: payload });
+		// boot() already fired client.ready() → presence applied once.
+		assert.equal(h.client.presenceCalls.length, 1);
+		assert.deepEqual(h.client.presenceCalls[0], payload);
+	});
+
+	it("does NOT call setPresence when no presence is configured", async () => {
+		const h = await boot();
+		assert.equal(h.client.presenceCalls.length, 0);
+	});
+
+	it("applyPresence re-applies a payload on demand", async () => {
+		const h = await boot();
+		h.conn.applyPresence({ status: "idle", activities: [{ name: "again", type: 0 }] });
+		assert.equal(h.client.presenceCalls.length, 1);
+		assert.deepEqual(h.client.presenceCalls[0], { status: "idle", activities: [{ name: "again", type: 0 }] });
+	});
+
+	it("uses an injected setPresenceImpl seam when provided", async () => {
+		const seen: unknown[] = [];
+		const payload = { status: "online" as const };
+		const h = await boot({}, { presence: payload, setPresenceImpl: (_c, p) => seen.push(p) });
+		void h;
+		assert.deepEqual(seen, [payload]);
+	});
+});
+
+describe("connectDiscord — createThreadFromMessage (Phase 5 autoThread)", () => {
+	it("creates a thread off a message and returns its id", async () => {
+		const h = await boot();
+		const id = await h.conn.createThreadFromMessage("C1", "m42", { name: "My Thread", autoArchiveMinutes: 1440 });
+		assert.equal(id, "nthread-m42");
+		assert.equal(h.client.startThreadCalls.length, 1);
+		assert.deepEqual(h.client.startThreadCalls[0], { messageId: "m42", name: "My Thread", autoArchiveDuration: 1440 });
+	});
+
+	it("reuses an existing thread on a create-race", async () => {
+		const h = await boot({ existingThreadId: "existing-99" });
+		const id = await h.conn.createThreadFromMessage("C1", "m1", { name: "x" });
+		assert.equal(id, "existing-99");
+		// No startThread attempted — the message already had a thread.
+		assert.equal(h.client.startThreadCalls.length, 0);
+	});
+
+	it("returns null when the message can't start a thread", async () => {
+		const h = await boot({ noStartThread: true });
+		const id = await h.conn.createThreadFromMessage("C1", "m1", { name: "x" });
+		assert.equal(id, null);
+	});
+});
+
+describe("connectDiscord — READY watchdog (Phase 5)", () => {
+	it("destroys + reconnects when clientReady never fires within the deadline", async () => {
+		// Boot WITHOUT firing ready, a tiny deadline + a no-op sleep so the
+		// watchdog fires fast and the reconnect runs immediately.
+		const client = makeFakeClient();
+		let connectedCount = 0;
+		const conn = await connectDiscord({
+			botToken: "tok-secret.aaa.bbb",
+			accountId: "default",
+			log: () => {},
+			onConnected: () => {
+				connectedCount += 1;
+			},
+			onMessage: () => {},
+			clientFactory: () => client,
+			buildersFactory: () => fakeBuilders,
+			sleepImpl: async () => {},
+			readyTimeoutMs: 5,
+		});
+		const firstLoginCount = client.loginCalls;
+		// Wait past the watchdog deadline; it should destroy the client + reconnect.
+		await new Promise((r) => setTimeout(r, 40));
+		await tick();
+		assert.ok(client.destroyed >= 1, "watchdog should have destroyed the un-ready client");
+		assert.ok(client.loginCalls > firstLoginCount, "watchdog should have re-logged in");
+		await conn.close();
+	});
+
+	it("a normal clientReady cancels the watchdog (no reconnect)", async () => {
+		const h = await boot({}, { readyTimeoutMs: 5 });
+		const loginsAfterReady = h.client.loginCalls;
+		const destroyedAfterReady = h.client.destroyed;
+		// boot() fired client.ready() → watchdog cancelled. Wait past the deadline.
+		await new Promise((r) => setTimeout(r, 40));
+		assert.equal(h.client.loginCalls, loginsAfterReady, "no reconnect after a clean ready");
+		assert.equal(h.client.destroyed, destroyedAfterReady, "no destroy after a clean ready");
 	});
 });

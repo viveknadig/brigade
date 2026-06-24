@@ -25,15 +25,19 @@
  * 404 / rate-limit / unknown-resource) into an operator-readable message via the
  * `DiscordRestError` carried up from the helper.
  *
- * `set-presence` is deliberately NOT implemented here: presence is a Gateway
- * (websocket) operation, not a REST one — a self-contained REST tool can't reach
- * the live discord.js client to set it. It is documented for Phase 5's presence
- * work (write `channels.discord.presence` + apply on (re)connect in connection.ts).
+ * `set-presence` (Phase 5) is the ONE action that is NOT a REST call: presence
+ * is a Gateway (websocket) operation, and this self-contained REST tool holds no
+ * live discord.js client handle. The clean path chosen here is CONFIG-WRITE — it
+ * persists `channels.discord.presence` via `mutateConfigAtomic`, and the live
+ * connection applies that presence on its next (re)connect (it re-reads the
+ * resolved presence on every start). This keeps the tool stateless + air-gap-
+ * safe and avoids reaching across module boundaries into the running gateway.
  */
 
 import { Type } from "typebox";
 
 import { loadConfig } from "../../core/config.js";
+import { mutateConfigAtomic, type BrigadeConfig } from "../../config/io.js";
 import {
 	DISCORD_DEFAULT_ACCOUNT_ID,
 	resolveDiscordBotToken,
@@ -139,10 +143,12 @@ const DiscordActionParams = Type.Object({
 			Type.Literal("kick"),
 			Type.Literal("timeout"),
 			Type.Literal("untimeout"),
+			// presence (Gateway op — persisted to config, applied on (re)connect)
+			Type.Literal("set-presence"),
 		],
 		{
 			description:
-				"The Discord guild action to run. Messaging: send, send-embed, poll, sticker, read-messages, list-reactions, remove-reaction, thread-create, list-threads, search-messages. Guild-admin: channel-create/edit/delete/move, category-create/edit/delete, role-list/add/remove/info, member-info, emoji-list/upload, event-list/create. Moderation: ban, unban, kick, timeout, untimeout.",
+				"The Discord guild action to run. Messaging: send, send-embed, poll, sticker, read-messages, list-reactions, remove-reaction, thread-create, list-threads, search-messages. Guild-admin: channel-create/edit/delete/move, category-create/edit/delete, role-list/add/remove/info, member-info, emoji-list/upload, event-list/create. Moderation: ban, unban, kick, timeout, untimeout. Presence: set-presence (persists channels.discord.presence; applied on next (re)connect).",
 		},
 	),
 	accountId: Type.Optional(
@@ -219,6 +225,29 @@ const DiscordActionParams = Type.Object({
 	reason: Type.Optional(Type.String({ description: "Audit-log reason for the moderation action.", maxLength: 512 })),
 	deleteMessageDays: Type.Optional(Type.Number({ description: "ban: purge the user's messages from the last N days (0–7)." })),
 	durationMinutes: Type.Optional(Type.Number({ description: "timeout: minutes to silence the member (1–40320 = 28 days)." })),
+
+	// presence (set-presence)
+	status: Type.Optional(
+		Type.Union(
+			[Type.Literal("online"), Type.Literal("idle"), Type.Literal("dnd"), Type.Literal("invisible")],
+			{ description: "set-presence: the bot's online dot." },
+		),
+	),
+	activityType: Type.Optional(
+		Type.Union(
+			[
+				Type.Literal("playing"),
+				Type.Literal("streaming"),
+				Type.Literal("listening"),
+				Type.Literal("watching"),
+				Type.Literal("custom"),
+				Type.Literal("competing"),
+			],
+			{ description: "set-presence: the activity row kind (custom uses the status state line; streaming uses activityUrl)." },
+		),
+	),
+	activityText: Type.Optional(Type.String({ description: "set-presence: the activity text (the 'Playing …' / status line).", maxLength: 128 })),
+	activityUrl: Type.Optional(Type.String({ description: "set-presence (streaming): the Twitch/YouTube stream URL.", maxLength: 512 })),
 });
 
 interface DiscordActionResult {
@@ -254,6 +283,41 @@ export interface MakeDiscordActionToolOptions {
 	resolveToken?: (accountId: string) => string;
 	/** Inject fetch (tests). Defaults to global fetch in the REST helpers. */
 	fetchImpl?: typeof fetch;
+	/**
+	 * Inject the config mutator (tests). Production uses `mutateConfigAtomic`.
+	 * Used by `set-presence`, which persists `channels.discord.presence` so the
+	 * live connection applies it on next (re)connect.
+	 */
+	mutateConfig?: (mutate: (current: BrigadeConfig) => BrigadeConfig) => Promise<BrigadeConfig>;
+}
+
+/**
+ * Persist a presence block under `channels.discord.presence` (single-account) or
+ * `channels.discord.accounts[id].presence` (when the account exists in the
+ * accounts list). Returns the written presence object. Pure config edit — the
+ * live connection re-reads + applies it on next (re)connect.
+ */
+function writeDiscordPresence(
+	current: BrigadeConfig,
+	accountId: string,
+	presence: Record<string, unknown>,
+): BrigadeConfig {
+	const cfg = current as { channels?: Record<string, unknown> };
+	const channels = { ...(cfg.channels ?? {}) } as Record<string, unknown>;
+	const discord = { ...((channels.discord as Record<string, unknown>) ?? {}) };
+	const accounts = Array.isArray(discord.accounts) ? (discord.accounts as Array<Record<string, unknown>>) : undefined;
+	const accountEntry = accounts?.find((a) => typeof a?.id === "string" && a.id.trim() === accountId);
+	if (accountEntry) {
+		// Per-account presence.
+		discord.accounts = accounts!.map((a) =>
+			a === accountEntry ? { ...a, presence } : a,
+		);
+	} else {
+		// Single-account / top-level presence.
+		discord.presence = presence;
+	}
+	channels.discord = discord;
+	return { ...(current as object), channels } as BrigadeConfig;
 }
 
 export function makeDiscordActionTool(
@@ -290,6 +354,35 @@ export function makeDiscordActionTool(
 				jsonResult({ action, ok: false, message } satisfies DiscordActionResult) as AgentToolResult<DiscordActionResult>;
 
 			const accountId = (args.accountId ?? "").trim() || DISCORD_DEFAULT_ACCOUNT_ID;
+
+			// set-presence is a CONFIG write (Gateway op applied on next (re)connect),
+			// not a REST call — handle it before the live-token guard since it never
+			// touches Discord directly.
+			if (action === "set-presence") {
+				const status = args.status;
+				const activityType = args.activityType;
+				const activityText = (args.activityText ?? "").trim();
+				const activityUrl = (args.activityUrl ?? "").trim();
+				if (!status && !activityType && !activityText) {
+					return fail("set-presence requires at least a `status` or an `activityType` + `activityText`.");
+				}
+				const presence: Record<string, unknown> = {};
+				if (status) presence.status = status;
+				if (activityType) presence.activityType = activityType;
+				if (activityText) presence.activityText = activityText;
+				if (activityType === "streaming" && activityUrl) presence.activityUrl = activityUrl;
+				const mutate = opts.mutateConfig ?? ((m) => mutateConfigAtomic(m));
+				try {
+					await mutate((current) => writeDiscordPresence(current, accountId, presence));
+				} catch (err) {
+					return fail(`set-presence failed to persist config: ${err instanceof Error ? err.message : String(err)}`);
+				}
+				return ok(
+					"Saved Discord presence — it applies on the bot's next (re)connect.",
+					presence,
+				);
+			}
+
 			const token = resolveToken(accountId);
 			if (!token) {
 				return fail(

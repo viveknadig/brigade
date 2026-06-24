@@ -10,7 +10,9 @@ export {
 export {
 	listDiscordAccountIds,
 	resolveDiscordAccount,
+	resolveDiscordAutoThread,
 	resolveDiscordBotToken,
+	resolveDiscordPresence,
 	resolveDiscordProxyUrl,
 	discordChannelEnabled,
 	discordLiveStreamEnabled,
@@ -23,8 +25,13 @@ export {
 	DISCORD_BOT_TOKEN_ENV_VAR,
 	DISCORD_CHANNEL_ID,
 	DISCORD_DEFAULT_ACCOUNT_ID,
+	type DiscordAutoThreadNameMode,
+	type DiscordPresenceActivityType,
+	type DiscordPresenceStatus,
 	type DiscordReactionNotificationMode,
 	type ResolvedDiscordAccount,
+	type ResolvedDiscordAutoThread,
+	type ResolvedDiscordPresence,
 } from "./account-config.js";
 export {
 	buildDiscordApprovalMessage,
@@ -54,9 +61,11 @@ export {
 	discordBackoffDelay,
 	isDiscordUnauthorized,
 	redactDiscordToken,
+	sanitizeThreadName,
 	type ConnectDiscordArgs,
 	type DiscordConnection,
 	type DiscordInboundMessage,
+	type DiscordPresencePayload,
 } from "./connection.js";
 export {
 	downloadDiscordAttachment,
@@ -69,9 +78,32 @@ export { createDiscordPlugin, type DiscordPluginDeps, type DiscordPluginHandle }
 export {
 	probeDiscord,
 	decodeMessageContentIntent,
+	decodePrivilegedIntents,
 	MESSAGE_CONTENT_DISABLED_WARNING,
+	type DiscordPrivilegedIntents,
 	type DiscordProbeResult,
 	type DiscordProbeBot,
 	type MessageContentIntentState,
+	type PrivilegedIntentState,
 } from "./probe.js";
+export { listDiscordGuilds, type DiscordGuildSummary } from "./guilds.js";
+export {
+	listDiscordDirectoryPeers,
+	listDiscordDirectoryGroups,
+	type DiscordDirectoryEntry,
+	type DiscordDirectoryQuery,
+} from "./directory-live.js";
+export {
+	auditDiscordChannelPermissions,
+	type DiscordChannelPermissionResult,
+	type DiscordPermissionAuditResult,
+} from "./permission-audit.js";
+export { collectDiscordStatusIssues, type DiscordStatusAccount } from "./status-issues.js";
+export { collectDiscordSecurityAuditFindings } from "./security-audit.js";
+export {
+	isDiscordMutableAllowEntry,
+	scanDiscordNumericIdHazards,
+	type DiscordNumericIdHazard,
+} from "./security-doctor.js";
+export { collectConfiguredDiscordChannelIds, type DiscordProbeWithAudit } from "./plugin.js";
 export { discordModule } from "./module.js";

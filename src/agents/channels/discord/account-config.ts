@@ -102,6 +102,23 @@ interface DiscordChannelConfigSlot {
 	 */
 	surfaceReasoning?: boolean;
 	/**
+	 * Bot presence / activity applied on (re)connect (Phase 5). Optional — when
+	 * unset the bot keeps Discord's default presence. `status` is the online dot;
+	 * `activityType` + `activityText` render the "Playing …" / "Listening to …"
+	 * line (a `custom` type uses `activityText` as the status STATE line; a
+	 * `streaming` type uses `activityUrl`). See {@link resolveDiscordPresence}.
+	 */
+	presence?: DiscordPresenceConfigSlot;
+	/**
+	 * Auto-create a thread off an inbound guild text message and route the reply
+	 * into it (Phase 5). Default OFF. `autoThreadName` picks the new thread's name
+	 * source; `autoArchiveDuration` is the idle minutes before Discord archives it
+	 * (60 / 1440 / 4320 / 10080).
+	 */
+	autoThread?: boolean;
+	autoThreadName?: DiscordAutoThreadNameMode;
+	autoArchiveDuration?: number;
+	/**
 	 * Which inbound reaction-adds notify the agent as a turn (default `"own"`):
 	 *   - `"off"`       — never (reactions are ignored entirely);
 	 *   - `"own"`       — only reactions on a message the BOT itself authored;
@@ -115,6 +132,68 @@ interface DiscordChannelConfigSlot {
 
 /** Reaction-notification gating modes (see `channels.discord.reactionNotifications`). */
 export type DiscordReactionNotificationMode = "off" | "own" | "all" | "allowlist";
+
+/** Bot online-dot status (`channels.discord.presence.status`). */
+export type DiscordPresenceStatus = "online" | "idle" | "dnd" | "invisible";
+
+/** Activity row kind (`channels.discord.presence.activityType`). */
+export type DiscordPresenceActivityType =
+	| "playing"
+	| "streaming"
+	| "listening"
+	| "watching"
+	| "custom"
+	| "competing";
+
+/** How an auto-thread is named (`channels.discord.autoThreadName`). */
+export type DiscordAutoThreadNameMode = "generated" | "first-message";
+
+/** Raw `channels.discord.presence` config shape (all fields optional). */
+interface DiscordPresenceConfigSlot {
+	status?: DiscordPresenceStatus;
+	activityType?: DiscordPresenceActivityType;
+	activityText?: string;
+	activityUrl?: string;
+	[key: string]: unknown;
+}
+
+/**
+ * Resolved presence applied on (re)connect. `activityType` is the discord.js
+ * `ActivityType` numeric enum value (playing=0, streaming=1, listening=2,
+ * watching=3, custom=4, competing=5); `activityText` is the activity name (the
+ * STATE line for a custom activity); `activityUrl` rides only on a streaming
+ * activity. `null` when no presence is configured.
+ */
+export interface ResolvedDiscordPresence {
+	status: DiscordPresenceStatus;
+	activityType?: DiscordPresenceActivityType;
+	activityTypeCode?: number;
+	activityText?: string;
+	activityUrl?: string;
+}
+
+/** Resolved auto-thread policy (`channels.discord.autoThread*`). */
+export interface ResolvedDiscordAutoThread {
+	enabled: boolean;
+	/** Thread name source. `"generated"` falls back to first-message until a completion runtime exists. */
+	nameMode: DiscordAutoThreadNameMode;
+	/** Idle minutes before Discord auto-archives the thread (60 / 1440 / 4320 / 10080). */
+	autoArchiveMinutes: number;
+}
+
+/** discord.js `ActivityType` numeric codes, keyed by the config string. */
+const ACTIVITY_TYPE_CODE: Record<DiscordPresenceActivityType, number> = {
+	playing: 0,
+	streaming: 1,
+	listening: 2,
+	watching: 3,
+	custom: 4,
+	competing: 5,
+};
+
+/** Valid auto-archive durations Discord accepts (minutes). */
+const AUTO_ARCHIVE_DURATIONS = new Set([60, 1440, 4320, 10080]);
+const DEFAULT_AUTO_ARCHIVE_MINUTES = 1440;
 
 /** Resolved per-account info — what the adapter runtime reads. */
 export interface ResolvedDiscordAccount {
@@ -348,6 +427,65 @@ export function discordThreadIdleTtlMs(cfg: BrigadeConfig): number | null {
 	const mult: Record<string, number> = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000, ms: 1 };
 	const factor = mult[unit] ?? 1;
 	return n * factor;
+}
+
+/* ───────────────────────── presence / auto-thread config ───────────────────────── */
+
+/**
+ * Resolve the bot presence to apply on (re)connect, or `null` when none is
+ * configured (`channels.discord.presence` absent / empty → keep Discord's
+ * default). A `status`-only block (no activity) still resolves so the operator
+ * can set just the online dot. An invalid `status` / `activityType` is dropped
+ * (degrades to the default), never throwing. The activity type is mapped to its
+ * discord.js `ActivityType` numeric code here so the connection stays
+ * discord.js-agnostic.
+ */
+export function resolveDiscordPresence(cfg: BrigadeConfig): ResolvedDiscordPresence | null {
+	const slot = discordChannelConfig(cfg)?.presence;
+	if (!slot || typeof slot !== "object") return null;
+	const statusRaw = typeof slot.status === "string" ? slot.status.trim().toLowerCase() : "";
+	const status: DiscordPresenceStatus =
+		statusRaw === "online" || statusRaw === "idle" || statusRaw === "dnd" || statusRaw === "invisible"
+			? statusRaw
+			: "online";
+	const activityText = typeof slot.activityText === "string" ? slot.activityText.trim() : "";
+	const activityTypeRaw =
+		typeof slot.activityType === "string" ? (slot.activityType.trim().toLowerCase() as DiscordPresenceActivityType) : undefined;
+	const activityType =
+		activityTypeRaw && activityTypeRaw in ACTIVITY_TYPE_CODE ? activityTypeRaw : undefined;
+	const activityUrl = typeof slot.activityUrl === "string" ? slot.activityUrl.trim() : "";
+	// Nothing meaningful configured (no status, no activity) → no presence.
+	const hasStatus = statusRaw !== "";
+	const hasActivity = activityText !== "" || activityType !== undefined;
+	if (!hasStatus && !hasActivity) return null;
+	const resolved: ResolvedDiscordPresence = { status };
+	if (hasActivity) {
+		// An activity row needs at least a type; default to `custom` (the status
+		// STATE line) when only text was given.
+		const type = activityType ?? "custom";
+		resolved.activityType = type;
+		resolved.activityTypeCode = ACTIVITY_TYPE_CODE[type];
+		if (activityText) resolved.activityText = activityText;
+		if (type === "streaming" && activityUrl) resolved.activityUrl = activityUrl;
+	}
+	return resolved;
+}
+
+/**
+ * Resolve the auto-thread policy (`channels.discord.autoThread*`). Returns a
+ * resolved view with `enabled` false when the feature is off (the default). The
+ * name mode defaults to `"first-message"`; `autoArchiveDuration` is clamped to
+ * one of Discord's accepted values (60 / 1440 / 4320 / 10080), defaulting to
+ * 1440 (24h).
+ */
+export function resolveDiscordAutoThread(cfg: BrigadeConfig): ResolvedDiscordAutoThread {
+	const slot = discordChannelConfig(cfg);
+	const enabled = slot?.autoThread === true;
+	const nameRaw = typeof slot?.autoThreadName === "string" ? slot.autoThreadName.trim().toLowerCase() : "";
+	const nameMode: DiscordAutoThreadNameMode = nameRaw === "generated" ? "generated" : "first-message";
+	const rawDuration = typeof slot?.autoArchiveDuration === "number" ? Math.round(slot.autoArchiveDuration) : NaN;
+	const autoArchiveMinutes = AUTO_ARCHIVE_DURATIONS.has(rawDuration) ? rawDuration : DEFAULT_AUTO_ARCHIVE_MINUTES;
+	return { enabled, nameMode, autoArchiveMinutes };
 }
 
 export {

@@ -8,7 +8,9 @@ import {
 	listDiscordAccountIds,
 	maskProxyUrl,
 	resolveDiscordAccount,
+	resolveDiscordAutoThread,
 	resolveDiscordBotToken,
+	resolveDiscordPresence,
 	resolveDiscordProxyUrl,
 	stripBotPrefix,
 } from "./account-config.js";
@@ -132,5 +134,70 @@ describe("discord account-config — proxy resolution", () => {
 		assert.equal(maskProxyUrl("http://user:pass@p.local:8080/path"), "http://p.local:8080");
 		assert.equal(maskProxyUrl(""), "");
 		assert.equal(maskProxyUrl("not a url"), "<masked>");
+	});
+});
+
+describe("discord account-config — presence (Phase 5)", () => {
+	it("no presence block → null", () => {
+		assert.equal(resolveDiscordPresence(cfg({ enabled: true })), null);
+		assert.equal(resolveDiscordPresence(cfg({ enabled: true, presence: {} })), null);
+	});
+
+	it("status-only presence resolves", () => {
+		const p = resolveDiscordPresence(cfg({ enabled: true, presence: { status: "dnd" } }));
+		assert.deepEqual(p, { status: "dnd" });
+	});
+
+	it("maps an activity type to its discord.js numeric code", () => {
+		const p = resolveDiscordPresence(cfg({ enabled: true, presence: { activityType: "listening", activityText: "lofi" } }));
+		assert.equal(p?.status, "online"); // default
+		assert.equal(p?.activityType, "listening");
+		assert.equal(p?.activityTypeCode, 2);
+		assert.equal(p?.activityText, "lofi");
+	});
+
+	it("custom activity (type 4) carries text; defaults to custom when only text given", () => {
+		const p = resolveDiscordPresence(cfg({ enabled: true, presence: { activityText: "thinking" } }));
+		assert.equal(p?.activityTypeCode, 4);
+		assert.equal(p?.activityText, "thinking");
+	});
+
+	it("streaming activity keeps the url; non-streaming drops it", () => {
+		const stream = resolveDiscordPresence(
+			cfg({ enabled: true, presence: { activityType: "streaming", activityText: "live", activityUrl: "https://twitch.tv/x" } }),
+		);
+		assert.equal(stream?.activityTypeCode, 1);
+		assert.equal(stream?.activityUrl, "https://twitch.tv/x");
+		const playing = resolveDiscordPresence(
+			cfg({ enabled: true, presence: { activityType: "playing", activityText: "game", activityUrl: "https://twitch.tv/x" } }),
+		);
+		assert.equal(playing?.activityUrl, undefined);
+	});
+
+	it("invalid status / type degrade to defaults", () => {
+		const p = resolveDiscordPresence(cfg({ enabled: true, presence: { status: "bogus", activityType: "nope", activityText: "x" } }));
+		assert.equal(p?.status, "online");
+		assert.equal(p?.activityTypeCode, 4); // unknown type → custom default
+	});
+});
+
+describe("discord account-config — autoThread (Phase 5)", () => {
+	it("disabled by default", () => {
+		const a = resolveDiscordAutoThread(cfg({ enabled: true }));
+		assert.equal(a.enabled, false);
+		assert.equal(a.nameMode, "first-message");
+		assert.equal(a.autoArchiveMinutes, 1440);
+	});
+
+	it("enabled with a generated name + valid duration", () => {
+		const a = resolveDiscordAutoThread(cfg({ enabled: true, autoThread: true, autoThreadName: "generated", autoArchiveDuration: 60 }));
+		assert.equal(a.enabled, true);
+		assert.equal(a.nameMode, "generated");
+		assert.equal(a.autoArchiveMinutes, 60);
+	});
+
+	it("invalid duration clamps to the 1440 default", () => {
+		const a = resolveDiscordAutoThread(cfg({ enabled: true, autoThread: true, autoArchiveDuration: 99 }));
+		assert.equal(a.autoArchiveMinutes, 1440);
 	});
 });

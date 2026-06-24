@@ -37,8 +37,28 @@ const DEFAULT_PROBE_TIMEOUT_MS = 8_000;
 const FLAG_MESSAGE_CONTENT = 1 << 18;
 const FLAG_MESSAGE_CONTENT_LIMITED = 1 << 19;
 
-/** Decoded state of the privileged MESSAGE CONTENT intent. */
+/**
+ * Application-flag bits for the other two privileged intents. GUILD MEMBERS
+ * (`1<<14` full / `1<<15` limited) is needed to receive member-join / role
+ * events + populate the member list; PRESENCE (`1<<12` full / `1<<13` limited)
+ * is needed to read member presence. Neither set means the intent is DISABLED.
+ */
+const FLAG_GUILD_MEMBERS = 1 << 14;
+const FLAG_GUILD_MEMBERS_LIMITED = 1 << 15;
+const FLAG_PRESENCE = 1 << 12;
+const FLAG_PRESENCE_LIMITED = 1 << 13;
+
+/** Decoded state of a privileged gateway intent. */
 export type MessageContentIntentState = "enabled" | "limited" | "disabled";
+/** Alias — every privileged intent decodes to the same tri-state. */
+export type PrivilegedIntentState = MessageContentIntentState;
+
+/** All three privileged intents decoded from the application flags. */
+export interface DiscordPrivilegedIntents {
+	messageContent: PrivilegedIntentState;
+	guildMembers: PrivilegedIntentState;
+	presence: PrivilegedIntentState;
+}
 
 /**
  * Decode the MESSAGE CONTENT intent state from an application `flags` bitfield.
@@ -51,6 +71,28 @@ export function decodeMessageContentIntent(flags: unknown): MessageContentIntent
 	if ((flags & FLAG_MESSAGE_CONTENT) !== 0) return "enabled";
 	if ((flags & FLAG_MESSAGE_CONTENT_LIMITED) !== 0) return "limited";
 	return "disabled";
+}
+
+/** Decode one intent's enabled/limited/disabled state from its two flag bits. */
+function decodeIntentState(flags: number, enabledBit: number, limitedBit: number): PrivilegedIntentState {
+	if ((flags & enabledBit) !== 0) return "enabled";
+	if ((flags & limitedBit) !== 0) return "limited";
+	return "disabled";
+}
+
+/**
+ * Decode ALL three privileged gateway intents (message content, guild members,
+ * presence) from an application `flags` bitfield. Returns `undefined` when
+ * `flags` isn't a finite number (the flags fetch was skipped / failed) so
+ * callers don't warn on missing data.
+ */
+export function decodePrivilegedIntents(flags: unknown): DiscordPrivilegedIntents | undefined {
+	if (typeof flags !== "number" || !Number.isFinite(flags)) return undefined;
+	return {
+		messageContent: decodeIntentState(flags, FLAG_MESSAGE_CONTENT, FLAG_MESSAGE_CONTENT_LIMITED),
+		guildMembers: decodeIntentState(flags, FLAG_GUILD_MEMBERS, FLAG_GUILD_MEMBERS_LIMITED),
+		presence: decodeIntentState(flags, FLAG_PRESENCE, FLAG_PRESENCE_LIMITED),
+	};
 }
 
 /** Operator-facing warning surfaced when the MESSAGE CONTENT intent is disabled. */
@@ -100,6 +142,13 @@ export interface DiscordProbeResult {
 	 * flip the intent toggle.
 	 */
 	messageContentWarning?: string;
+	/**
+	 * Full decode of ALL three privileged gateway intents (message content, guild
+	 * members, presence). `undefined` when the flags check was skipped / failed.
+	 * `messageContentIntent` above is kept for back-compat; this carries the other
+	 * two so diagnostics can flag a disabled GUILD MEMBERS / PRESENCE intent too.
+	 */
+	privilegedIntents?: DiscordPrivilegedIntents;
 }
 
 export interface DiscordProbeArgs {
@@ -117,11 +166,11 @@ export interface DiscordProbeArgs {
  * known good). A failed fetch / non-ok / unparseable body returns `undefined` so
  * the probe NEVER fails on it — the intent state is observability, not health.
  */
-async function probeMessageContentIntent(
+async function probePrivilegedIntents(
 	doFetch: typeof fetch,
 	token: string,
 	signal: AbortSignal,
-): Promise<MessageContentIntentState | undefined> {
+): Promise<DiscordPrivilegedIntents | undefined> {
 	try {
 		const res = await doFetch(DISCORD_APP_URL, {
 			method: "GET",
@@ -130,7 +179,7 @@ async function probeMessageContentIntent(
 		});
 		if (!res.ok) return undefined;
 		const body = (await res.json()) as { flags?: unknown };
-		return decodeMessageContentIntent(body?.flags);
+		return decodePrivilegedIntents(body?.flags);
 	} catch {
 		return undefined;
 	}
@@ -186,9 +235,10 @@ export async function probeDiscord(args: DiscordProbeArgs): Promise<DiscordProbe
 				elapsedMs,
 			};
 		}
-		// Token is good — best-effort decode the MESSAGE CONTENT intent (never fails
-		// the probe). Reuses the same abort signal/timeout window as the identity call.
-		const messageContentIntent = await probeMessageContentIntent(doFetch, token, controller.signal);
+		// Token is good — best-effort decode ALL privileged intents (never fails the
+		// probe). Reuses the same abort signal/timeout window as the identity call.
+		const privilegedIntents = await probePrivilegedIntents(doFetch, token, controller.signal);
+		const messageContentIntent = privilegedIntents?.messageContent;
 		return {
 			ok: true,
 			status: res.status,
@@ -198,6 +248,7 @@ export async function probeDiscord(args: DiscordProbeArgs): Promise<DiscordProbe
 				...(typeof body?.username === "string" ? { name: body.username } : {}),
 				...(typeof body?.discriminator === "string" && body.discriminator !== "0" ? { discriminator: body.discriminator } : {}),
 			},
+			...(privilegedIntents ? { privilegedIntents } : {}),
 			...(messageContentIntent ? { messageContentIntent } : {}),
 			...(messageContentIntent === "disabled" ? { messageContentWarning: MESSAGE_CONTENT_DISABLED_WARNING } : {}),
 		};

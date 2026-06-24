@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 
 import type { BrigadeConfig } from "../../../config/io.js";
 import type { ChannelStartContext, InboundMessage } from "../sdk.js";
-import { createDiscordAdapter, DISCORD_CAPABILITIES, buildReactionNote, type DiscordAdapter } from "./adapter.js";
+import { createDiscordAdapter, mapDiscordPresencePayload, DISCORD_CAPABILITIES, buildReactionNote, type DiscordAdapter } from "./adapter.js";
 import type { ConnectDiscordArgs, DiscordConnection } from "./connection.js";
 import { __resetDiscordDirectoryCacheForTest, rememberDiscordUser } from "./directory-cache.js";
 
@@ -21,6 +21,8 @@ interface FakeConnCalls {
 	pins: Array<{ channel: string; messageId: string }>;
 	unpins: Array<{ channel: string; messageId: string }>;
 	registered: Array<unknown[]>;
+	presenceApplied: Array<unknown>;
+	threadsCreated: Array<{ channelId: string; messageId: string; name: string; autoArchiveMinutes?: number }>;
 }
 
 interface FakeConnHandle {
@@ -28,14 +30,14 @@ interface FakeConnHandle {
 	calls: FakeConnCalls;
 }
 
-function makeFakeConnectImpl(): {
+function makeFakeConnectImpl(opts: { createdThreadId?: string | null } = {}): {
 	connectImpl: (a: ConnectDiscordArgs) => Promise<DiscordConnection>;
 	handle: () => FakeConnHandle | null;
 } {
 	let handle: FakeConnHandle | null = null;
 	const connectImpl = async (args: ConnectDiscordArgs): Promise<DiscordConnection> => {
 		const state = { connected: true, tokenInvalid: false };
-		const calls: FakeConnCalls = { sentText: [], sentInteractive: [], edits: [], deletes: [], reactions: [], reactionsCleared: [], pins: [], unpins: [], registered: [] };
+		const calls: FakeConnCalls = { sentText: [], sentInteractive: [], edits: [], deletes: [], reactions: [], reactionsCleared: [], pins: [], unpins: [], registered: [], presenceApplied: [], threadsCreated: [] };
 		let seq = 0;
 		const conn: DiscordConnection = {
 			selfId: () => "BOT",
@@ -76,6 +78,13 @@ function makeFakeConnectImpl(): {
 			},
 			setComposing: async () => {},
 			markRead: async () => {},
+			applyPresence: (payload) => {
+				calls.presenceApplied.push(payload);
+			},
+			createThreadFromMessage: async (channelId, messageId, o) => {
+				calls.threadsCreated.push({ channelId, messageId, name: o.name, autoArchiveMinutes: o.autoArchiveMinutes });
+				return opts.createdThreadId === undefined ? `thread-${messageId}` : opts.createdThreadId;
+			},
 			close: async () => {
 				state.connected = false;
 			},
@@ -405,5 +414,128 @@ describe("DISCORD_CAPABILITIES + helpers", () => {
 	it("buildReactionNote wraps emoji names in colons (custom emoji → name only)", () => {
 		assert.equal(buildReactionNote(["tada"], "90", "Sam"), "Sam reacted :tada: to message 90.");
 		assert.equal(buildReactionNote(["partyblob:111"], "90", "Sam"), "Sam reacted :partyblob: to message 90.");
+	});
+});
+
+/** Settle the deferred autoThread dispatch (a microtask hop). */
+async function settle(): Promise<void> {
+	await new Promise((r) => setTimeout(r, 0));
+	await new Promise((r) => setTimeout(r, 0));
+}
+
+describe("createDiscordAdapter — autoThread (Phase 5)", () => {
+	it("creates a thread off a guild message + routes the reply into it", async () => {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createDiscordAdapter({ connectImpl });
+		a.isConfigured(enabledCfg({ autoThread: true }), {});
+		const received: InboundMessage[] = [];
+		await a.start(makeStartCtx((m) => received.push(m)));
+		handle()!.args.onMessage({
+			conversationId: "C1",
+			from: "U2",
+			text: "Please help with billing",
+			chatType: "group",
+			guildId: "G1",
+			messageId: "55",
+			raw: {},
+		});
+		await settle();
+		assert.equal(received.length, 1);
+		// The reply threadId is the created thread; conversationId stays the parent.
+		assert.equal(received[0]?.threadId, "thread-55");
+		assert.equal(received[0]?.conversationId, "C1");
+		const created = handle()!.calls.threadsCreated;
+		assert.equal(created.length, 1);
+		assert.equal(created[0]?.channelId, "C1");
+		assert.equal(created[0]?.messageId, "55");
+		assert.equal(created[0]?.name, "Please help with billing");
+	});
+
+	it("a message already in a thread is left untouched", async () => {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createDiscordAdapter({ connectImpl });
+		a.isConfigured(enabledCfg({ autoThread: true }), {});
+		const received: InboundMessage[] = [];
+		await a.start(makeStartCtx((m) => received.push(m)));
+		handle()!.args.onMessage({
+			conversationId: "C1",
+			from: "U2",
+			text: "in a thread already",
+			chatType: "group",
+			guildId: "G1",
+			messageId: "60",
+			threadId: "existing-thread",
+			raw: {},
+		});
+		await settle();
+		assert.equal(received[0]?.threadId, "existing-thread");
+		assert.equal(handle()!.calls.threadsCreated.length, 0);
+	});
+
+	it("does NOT autoThread when the feature is off (synchronous dispatch)", async () => {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createDiscordAdapter({ connectImpl });
+		a.isConfigured(enabledCfg(), {}); // autoThread not set
+		const received: InboundMessage[] = [];
+		await a.start(makeStartCtx((m) => received.push(m)));
+		handle()!.args.onMessage({
+			conversationId: "C1",
+			from: "U2",
+			text: "no thread please",
+			chatType: "group",
+			guildId: "G1",
+			messageId: "70",
+			raw: {},
+		});
+		// Synchronous when off — no microtask hop needed.
+		assert.equal(received.length, 1);
+		assert.equal(received[0]?.threadId, undefined);
+		assert.equal(handle()!.calls.threadsCreated.length, 0);
+	});
+
+	it("does NOT autoThread a DM (no guildId)", async () => {
+		const { connectImpl, handle } = makeFakeConnectImpl();
+		const a = createDiscordAdapter({ connectImpl });
+		a.isConfigured(enabledCfg({ autoThread: true }), {});
+		const received: InboundMessage[] = [];
+		await a.start(makeStartCtx((m) => received.push(m)));
+		handle()!.args.onMessage({
+			conversationId: "DM1",
+			from: "U2",
+			text: "hi via dm",
+			chatType: "direct",
+			messageId: "80",
+			raw: {},
+		});
+		assert.equal(received.length, 1);
+		assert.equal(handle()!.calls.threadsCreated.length, 0);
+	});
+});
+
+describe("mapDiscordPresencePayload (Phase 5)", () => {
+	it("null in → null out", () => {
+		assert.equal(mapDiscordPresencePayload(null), null);
+	});
+
+	it("status-only → no activities", () => {
+		assert.deepEqual(mapDiscordPresencePayload({ status: "idle" }), { status: "idle" });
+	});
+
+	it("a custom activity carries text in `state` with a placeholder name", () => {
+		const p = mapDiscordPresencePayload({ status: "online", activityType: "custom", activityTypeCode: 4, activityText: "thinking" });
+		assert.deepEqual(p, { status: "online", activities: [{ name: "Custom Status", type: 4, state: "thinking" }] });
+	});
+
+	it("a non-custom activity puts text in `name`; streaming keeps the url", () => {
+		const watch = mapDiscordPresencePayload({ status: "dnd", activityType: "watching", activityTypeCode: 3, activityText: "the logs" });
+		assert.deepEqual(watch, { status: "dnd", activities: [{ name: "the logs", type: 3 }] });
+		const stream = mapDiscordPresencePayload({
+			status: "online",
+			activityType: "streaming",
+			activityTypeCode: 1,
+			activityText: "live",
+			activityUrl: "https://twitch.tv/x",
+		});
+		assert.deepEqual(stream, { status: "online", activities: [{ name: "live", type: 1, url: "https://twitch.tv/x" }] });
 	});
 });

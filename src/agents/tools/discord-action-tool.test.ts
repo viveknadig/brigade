@@ -201,3 +201,68 @@ describe("discord_action — registry assembly gate", () => {
 		assert.equal(names.includes("discord_action"), true);
 	});
 });
+
+describe("discord_action — set-presence (Phase 5)", () => {
+	it("persists channels.discord.presence and reports success", async () => {
+		let written: unknown;
+		const tool = makeDiscordActionTool({
+			resolveToken: () => "TESTTOKEN",
+			mutateConfig: async (m) => {
+				written = m({ channels: { discord: { enabled: true } } } as never);
+				return written as never;
+			},
+		});
+		const res = (await tool.execute("c", {
+			action: "set-presence",
+			status: "dnd",
+			activityType: "watching",
+			activityText: "the logs",
+		} as never)) as { details: { ok: boolean; message: string; data?: unknown } };
+		assert.equal(res.details.ok, true);
+		assert.match(res.details.message, /next \(re\)connect/);
+		const presence = (written as { channels: { discord: { presence?: Record<string, unknown> } } }).channels.discord.presence;
+		assert.deepEqual(presence, { status: "dnd", activityType: "watching", activityText: "the logs" });
+	});
+
+	it("streaming presence keeps the url", async () => {
+		let written: unknown;
+		const tool = makeDiscordActionTool({
+			resolveToken: () => "TESTTOKEN",
+			mutateConfig: async (m) => {
+				written = m({ channels: { discord: { enabled: true } } } as never);
+				return written as never;
+			},
+		});
+		await tool.execute("c", {
+			action: "set-presence",
+			activityType: "streaming",
+			activityText: "live",
+			activityUrl: "https://twitch.tv/x",
+		} as never);
+		const presence = (written as { channels: { discord: { presence?: Record<string, unknown> } } }).channels.discord.presence;
+		assert.equal(presence?.activityUrl, "https://twitch.tv/x");
+	});
+
+	it("writes per-account presence when the account exists in accounts[]", async () => {
+		let written: unknown;
+		const tool = makeDiscordActionTool({
+			resolveToken: () => "TESTTOKEN",
+			mutateConfig: async (m) => {
+				written = m({
+					channels: { discord: { enabled: true, accounts: [{ id: "labs", botToken: "x" }] } },
+				} as never);
+				return written as never;
+			},
+		});
+		await tool.execute("c", { action: "set-presence", accountId: "labs", status: "idle" } as never);
+		const accounts = (written as { channels: { discord: { accounts: Array<{ id: string; presence?: unknown }> } } }).channels.discord.accounts;
+		assert.deepEqual(accounts[0]?.presence, { status: "idle" });
+	});
+
+	it("fails cleanly when nothing to set", async () => {
+		const tool = makeDiscordActionTool({ resolveToken: () => "TESTTOKEN", mutateConfig: async (m) => m({} as never) });
+		const res = (await tool.execute("c", { action: "set-presence" } as never)) as { details: { ok: boolean; message: string } };
+		assert.equal(res.details.ok, false);
+		assert.match(res.details.message, /requires at least/);
+	});
+});
