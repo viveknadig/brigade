@@ -144,11 +144,14 @@ function restartAndReport(run: CommandRunner, source: boolean, root: string, opt
 		out(`${chalk.green("✓")}\n${chalk.green("✓ Brigade updated + gateway restarted — running the latest code.")}\n`);
 		return 0;
 	}
-	out(`${chalk.yellow("⚠ nothing to restart")}\n`);
+	out(`${chalk.yellow("⚠ no background service to restart")}\n`);
 	out(
 		`${chalk.green("✓ Brigade updated.")} To load the new code, ${chalk.bold("restart your gateway")} — ` +
-			`if you run it in the foreground, stop it and start it again. ` +
-			`${chalk.dim("(brigade gateway restart only applies when Brigade is installed as an OS service.)")}\n`,
+			`if you run it in the foreground, stop it and start it again.\n`,
+	);
+	out(
+		`  ${chalk.dim("Tip:")} ${chalk.bold("brigade gateway install")} ${chalk.dim("registers Brigade as a background service")} — ` +
+			`${chalk.dim("then")} ${chalk.bold("brigade update")} ${chalk.dim("restarts it for you automatically.")}\n`,
 	);
 	return 0;
 }
