@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.11.2](https://github.com/spinabot/brigade/compare/brigade-v1.11.1...brigade-v1.11.2) (2026-06-25)
+
+
+### Bug Fixes
+
+* **update:** uniform cross-platform restart message + gateway-install tip ([6e00fc8](https://github.com/spinabot/brigade/commit/6e00fc8a0dced42bd09cf603642cc5e5ead669c0))
+
 ## [1.11.1](https://github.com/spinabot/brigade/compare/brigade-v1.11.0...brigade-v1.11.1) (2026-06-25)
 
 
