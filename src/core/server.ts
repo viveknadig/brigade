@@ -2254,7 +2254,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				if (usage) {
 					totalIn += usage.input ?? 0;
 					totalOut += usage.output ?? 0;
-					totalCost += usage.cost ?? 0;
+					totalCost += ((c) => (typeof c?.total === "number" && Number.isFinite(c.total) && c.total > 0 ? c.total : 0))(usage.cost as { total?: number } | undefined); // .total only; ignore the -1 sentinel of an unpriced model
 				}
 			}
 			// Keep the between-turns snapshot caches (message count, context
