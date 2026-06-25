@@ -24,18 +24,20 @@
 </p>
 
 <p align="center">
-  🩸💥 <strong>NEW in v1.9.0 — <code>brigade bloody benchmark</code></strong> 💥🩸
+  🩸💥 <strong>B³ — Brigade Bloody Benchmark</strong> 💥🩸<br/>
+  <sub><strong>NEW in v1.9.0</strong> · the one command that throws your crew to the wolves (lovingly)</sub>
 </p>
+
 <p align="center">
-  <em>One command. Your whole crew, <strong>live to the world.</strong></em><br/>
-  It drags your localhost gateway out into daylight — HTTPS at the edge, no account, no setup. It
-  defaults to an anonymous <strong>Cloudflare</strong> quick-tunnel, but the providers are pluggable
-  and <strong>fully open-source</strong>: point it at <code>bore</code>, <code>frp</code>,
-  <code>sish</code>, or your own self-hosted relay — no proprietary cloud required. A private access
-  key is minted and <strong>handled for you</strong>: you never see it, and anyone who stumbles onto
-  the URL just bleeds out on a <code>401</code>. 🩸
-  <br/>
-  Too squeamish for the name? It also answers to the polite <code>brigade expose</code>.
+  <strong><em>Three B's. One bloody command. Your crew — loose on the open internet.</em></strong>
+</p>
+
+<p align="center">
+  <strong>Brigade</strong> is your crew. <strong>Bloody</strong> is what you do to it — fling it into the open with no net, down a red-hot tunnel to the wild. <strong>Benchmark</strong> is the punchline: the only test that ever mattered isn't a lab, it's <em>strangers poking your agents at 3&nbsp;a.m.</em> Survive that, and you've shipped.
+</p>
+
+<p align="center">
+  Under the hood it's tame — HTTPS at the edge, no account, no setup. Cloudflare by default, or bring your own relay (<code>bore</code> · <code>frp</code> · <code>sish</code>, all open-source). A secret key rides along <strong>invisibly</strong>: you never see it, and gate-crashers just bleed out on a <code>401</code>. Not feeling the name? It also answers to the buttoned-up <code>brigade expose</code>. 🩸
 </p>
 
 <p align="center">
