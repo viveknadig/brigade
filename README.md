@@ -28,9 +28,12 @@
 </p>
 <p align="center">
   <em>One command. Your whole crew, <strong>live to the world.</strong></em><br/>
-  It drags your localhost gateway out into daylight through a blood-red Cloudflare tunnel — HTTPS at
-  the edge, no account, no setup. A private access key is minted and <strong>handled for you</strong>:
-  you never see it, and anyone who stumbles onto the URL just bleeds out on a <code>401</code>. 🩸
+  It drags your localhost gateway out into daylight — HTTPS at the edge, no account, no setup. It
+  defaults to an anonymous <strong>Cloudflare</strong> quick-tunnel, but the providers are pluggable
+  and <strong>fully open-source</strong>: point it at <code>bore</code>, <code>frp</code>,
+  <code>sish</code>, or your own self-hosted relay — no proprietary cloud required. A private access
+  key is minted and <strong>handled for you</strong>: you never see it, and anyone who stumbles onto
+  the URL just bleeds out on a <code>401</code>. 🩸
   <br/>
   Too squeamish for the name? It also answers to the polite <code>brigade expose</code>.
 </p>
