@@ -32,6 +32,7 @@ import {
 	extensionOf,
 	parsePageRange,
 	modelLikelySeesImages,
+	DEFAULT_IMAGE_MAX_BYTES,
 	type AnalyzeMediaDetails,
 	type MakeAnalyzeMediaToolOptions,
 } from "./analyze-media-tool.js";
@@ -67,7 +68,10 @@ function toolWithBytes(
 
 /** A media-understanding config whose key set is exactly `keyed`. */
 function muCfg(keyed: Array<"google" | "anthropic">): MediaUnderstandingConfig {
-	return { resolveKey: (p) => (keyed.includes(p) ? `key-${p}` : "") };
+	return {
+		resolveKey: (p) =>
+			keyed.includes(p as "google" | "anthropic") ? `key-${p}` : "",
+	};
 }
 
 /** A stub `runMediaUnderstanding` that records the request and returns canned text. */
@@ -600,5 +604,234 @@ describe("analyze_media — local path guard (real guard)", () => {
 		const r = (await tool.execute("c1", { source: target })) as Result;
 		assert.equal(r.details.ok, true);
 		assert.match(textOf(r), /Local Heading/);
+	});
+});
+
+/* ─────────── convex-mode inbound media root (the Convex break fix) ─────────── */
+
+describe("analyze_media — convex-mode OS-cache channel root is allowed", () => {
+	let cacheRoot: string;
+	let prevCacheDir: string | undefined;
+	before(() => {
+		cacheRoot = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-oscache-"));
+		// `resolveOsCacheDir()` honours BRIGADE_CACHE_DIR — point it at our temp so
+		// the allowed-root computation includes a dir we control. This simulates
+		// convex mode, where inbound channel media lands under
+		// `resolveOsCacheDir()/channels/<id>/...` (and BlueBubbles under
+		// `resolveOsCacheDir()/bluebubbles/...`) instead of ~/.brigade.
+		prevCacheDir = process.env.BRIGADE_CACHE_DIR;
+		process.env.BRIGADE_CACHE_DIR = cacheRoot;
+	});
+	after(() => {
+		if (prevCacheDir === undefined) delete process.env.BRIGADE_CACHE_DIR;
+		else process.env.BRIGADE_CACHE_DIR = prevCacheDir;
+		try {
+			fs.rmSync(cacheRoot, { recursive: true, force: true });
+		} catch {
+			/* ignore */
+		}
+	});
+
+	it("reads inbound WhatsApp media under the OS cache (simulated convex inbound)", async () => {
+		// A workspace dir that is NOT the cache root, proving the file is allowed by
+		// the NEW OS-cache root, not by the workspace/cwd roots.
+		const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-ws2-"));
+		const mediaDir = path.join(cacheRoot, "channels", "whatsapp", "media", "2026-06-25");
+		fs.mkdirSync(mediaDir, { recursive: true });
+		const target = path.join(mediaDir, "msg123.html");
+		fs.writeFileSync(
+			target,
+			"<html><body><h1>Inbound Attachment</h1><p>Body content that is sufficiently long to keep.</p></body></html>",
+		);
+		const tool = makeAnalyzeMediaTool({ workspaceDir: workspace, cwd: workspace });
+		const r = (await tool.execute("c1", { source: target })) as Result;
+		assert.equal(r.details.ok, true, "OS-cache channel media must be allowed in convex mode");
+		assert.match(textOf(r), /Inbound Attachment/);
+		fs.rmSync(workspace, { recursive: true, force: true });
+	});
+
+	it("reads inbound BlueBubbles media under the OS cache", async () => {
+		const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-ws3-"));
+		const mediaDir = path.join(cacheRoot, "bluebubbles", "acct1", "inbound-media");
+		fs.mkdirSync(mediaDir, { recursive: true });
+		const target = path.join(mediaDir, "att.html");
+		fs.writeFileSync(
+			target,
+			"<html><body><h1>iMessage Photo Caption</h1><p>Body content long enough for the extractor.</p></body></html>",
+		);
+		const tool = makeAnalyzeMediaTool({ workspaceDir: workspace, cwd: workspace });
+		const r = (await tool.execute("c1", { source: target })) as Result;
+		assert.equal(r.details.ok, true);
+		assert.match(textOf(r), /iMessage Photo Caption/);
+		fs.rmSync(workspace, { recursive: true, force: true });
+	});
+
+	it("still refuses a secret file even inside the OS cache root", async () => {
+		// Widening to the OS cache must NOT bypass the media-path guard.
+		const target = path.join(cacheRoot, ".env");
+		fs.writeFileSync(target, "SECRET=1");
+		const tool = makeAnalyzeMediaTool();
+		await assert.rejects(
+			() => tool.execute("c1", { source: target, kind: "html" }),
+			(err: unknown) => /sensitive|refus/i.test((err as Error).message),
+		);
+	});
+});
+
+/* ─────────────────────────── audio (#6) ─────────────────────────── */
+
+describe("analyze_media — audio", () => {
+	it("detects audio by extension + MIME", () => {
+		assert.equal(detectKind({ source: "/a/voice.mp3" }), "audio");
+		assert.equal(detectKind({ source: "/a/note.m4a" }), "audio");
+		assert.equal(detectKind({ source: "/a/clip.flac" }), "audio");
+		assert.equal(detectKind({ source: "https://x.com/dl", mime: "audio/ogg" }), "audio");
+		// .ogg defaults to audio (voice notes); explicit override still works.
+		assert.equal(detectKind({ source: "/a/voice.ogg" }), "audio");
+	});
+
+	it("routes an .ogg voice note to audio understanding and returns TEXT", async () => {
+		const { run, calls } = stubRunner("Transcript: see you at 5pm.", "google", "gemini-2.5-flash");
+		const tool = toolWithBytes(Buffer.from([1, 2, 3]), undefined, undefined, {
+			mediaUnderstandingConfig: muCfg(["google"]),
+			runMediaUnderstanding: run,
+		});
+		const r = (await tool.execute("c1", { source: "/ws/voice.ogg", question: "what time?" })) as Result;
+		assert.equal(r.details.ok, true);
+		assert.equal(r.details.returned, "text");
+		assert.equal(r.details.kind, "audio");
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0]?.kind, "audio");
+		assert.equal(calls[0]?.mimeType, "audio/ogg");
+		assert.match(textOf(r), /Transcript: see you at 5pm/);
+		assert.match(textOf(r), /EXTERNAL_UNTRUSTED_CONTENT/);
+	});
+
+	it("routes an .m4a source by explicit kind and derives the MIME", async () => {
+		const { run, calls } = stubRunner("audio summary", "google");
+		const tool = toolWithBytes(Buffer.from([0]), undefined, undefined, {
+			mediaUnderstandingConfig: muCfg(["google"]),
+			runMediaUnderstanding: run,
+		});
+		await tool.execute("c1", { source: "/ws/note.m4a" });
+		assert.equal(calls[0]?.kind, "audio");
+		assert.equal(calls[0]?.mimeType, "audio/mp4");
+	});
+
+	it("with NO capable key → clear 'configure a key' message (returned: none)", async () => {
+		const tool = toolWithBytes(Buffer.from([1]), "audio/ogg", undefined, {
+			mediaUnderstandingConfig: muCfg([]),
+		});
+		const r = (await tool.execute("c1", { source: "/ws/voice.ogg" })) as Result;
+		assert.equal(r.details.ok, false);
+		assert.equal(r.details.returned, "none");
+		assert.equal(r.details.kind, "audio");
+		assert.match(textOf(r), /audio/i);
+	});
+});
+
+/* ───────────── text-only model image via the Pi path (multi-provider #5) ───────────── */
+
+describe("analyze_media — text-only image via the Pi path (any provider)", () => {
+	it("understands an image with ONLY an OpenAI-style key (no google/anthropic)", async () => {
+		// Real runMediaUnderstanding (not stubbed) so the actual selection → Pi
+		// routing is exercised through the tool. The config has NO google/anthropic
+		// key, but a wired Pi path with an image-capable OpenAI model + a piComplete
+		// stub — proving image understanding now covers every configured provider.
+		const piConfig: MediaUnderstandingConfig = {
+			resolveKey: (p) => (p === "openai" ? "sk-openai" : ""),
+			resolveModel: (provider) =>
+				provider === "openai"
+					? { provider, id: "gpt-4o", input: ["text", "image"] }
+					: undefined,
+			listKeyedProviders: () => ["openai"],
+			piComplete: async () => "A bar chart trending upward.",
+		};
+		const tool = toolWithBytes(Buffer.from([1, 2, 3, 4]), "image/png", {
+			imageInput: false,
+			modelId: "text-only-model",
+		}, {
+			mediaUnderstandingConfig: piConfig,
+		});
+		const r = (await tool.execute("c1", { source: "/ws/chart.png", question: "trend?" })) as Result;
+		assert.equal(imageBlocks(r).length, 0, "no image block for a text-only model");
+		assert.equal(r.details.returned, "text");
+		assert.equal(r.details.ok, true);
+		assert.equal(r.details.provider, "pi");
+		assert.match(textOf(r), /A bar chart trending upward/);
+		assert.match(textOf(r), /EXTERNAL_UNTRUSTED_CONTENT/);
+	});
+
+	it("BUG-1: text-only model + provider HTTP failure → actionable guidance", async () => {
+		const run = async (): Promise<RunMediaUnderstandingResult> => {
+			throw new Error("Anthropic error: HTTP 503");
+		};
+		const tool = toolWithBytes(Buffer.from([1, 2, 3]), "image/png", {
+			imageInput: false,
+			modelId: "text-only-model",
+		}, {
+			mediaUnderstandingConfig: muCfg(["anthropic"]),
+			runMediaUnderstanding: run,
+		});
+		const r = (await tool.execute("c1", { source: "/ws/pic.png" })) as Result;
+		assert.equal(r.details.ok, false);
+		assert.equal(r.details.returned, "none");
+		// The failure now carries the transport error AND a "do this next" hint.
+		assert.match(textOf(r), /HTTP 503/);
+		assert.match(textOf(r), /vision-capable model|media-understanding provider key/i);
+	});
+});
+
+/* ─────────── video provider-override message (#4a) ─────────── */
+
+describe("analyze_media — video with anthropic override", () => {
+	it("says anthropic cannot do video (not a generic Gemini-key message)", async () => {
+		const tool = toolWithBytes(Buffer.from([0, 0, 0]), "video/mp4", undefined, {
+			mediaUnderstandingConfig: muCfg(["anthropic", "google"]),
+		});
+		const r = (await tool.execute("c1", {
+			source: "/ws/clip.mp4",
+			provider: "anthropic",
+		})) as Result;
+		assert.equal(r.details.ok, false);
+		assert.equal(r.details.returned, "none");
+		assert.match(textOf(r), /Anthropic cannot analyze video|no video ingestion/i);
+	});
+});
+
+/* ─────────── image byte-cap re-check on a late-detected image (#4b) ─────────── */
+
+describe("analyze_media — image cap re-applied for an extension-less image URL", () => {
+	it("re-trims to the image cap when the kind is only known via MIME", async () => {
+		// An extension-less URL that returns image/png with bytes > the image cap.
+		// Up-front `looksImage` is false (no extension), so it is fetched under the
+		// larger doc cap; after MIME detection the image cap must be re-applied.
+		const big = Buffer.alloc(DEFAULT_IMAGE_MAX_BYTES + 10_000, 7);
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { modelId: "claude-opus-4-8" }, // vision-capable → image block
+			acquireUrl: async () => ({ bytes: big, mime: "image/png", truncated: false }),
+		});
+		const r = (await tool.execute("c1", { source: "https://x.com/download" })) as Result;
+		const imgs = imageBlocks(r);
+		assert.equal(imgs.length, 1);
+		// The returned image was re-trimmed to the image cap (base64 of the cap).
+		const expectedBytes = big.subarray(0, DEFAULT_IMAGE_MAX_BYTES);
+		assert.equal(imgs[0]?.data, expectedBytes.toString("base64"));
+		assert.equal(r.details.truncated, true);
+		assert.equal(r.details.bytes, DEFAULT_IMAGE_MAX_BYTES);
+	});
+
+	it("does NOT re-trim when maxBytes was raised explicitly", async () => {
+		const big = Buffer.alloc(DEFAULT_IMAGE_MAX_BYTES + 5_000, 3);
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { modelId: "claude-opus-4-8" },
+			acquireUrl: async () => ({ bytes: big, mime: "image/png", truncated: false }),
+		});
+		const r = (await tool.execute("c1", {
+			source: "https://x.com/download",
+			maxBytes: DEFAULT_IMAGE_MAX_BYTES + 5_000,
+		})) as Result;
+		const imgs = imageBlocks(r);
+		assert.equal(imgs[0]?.data, big.toString("base64"), "full bytes kept when maxBytes raised");
 	});
 });

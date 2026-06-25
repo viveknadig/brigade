@@ -629,13 +629,21 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       spawnedKeys,
     },
     // Resolved turn-model context so `analyze_media` knows whether the active
-    // model can consume an IMAGE block (text-only model → it returns a clear
-    // "switch to a vision model" note instead of an unviewable block).
+    // model can consume an IMAGE block (text-only model → it understands the
+    // image via a provider, or returns a clear "switch to a vision model" note
+    // instead of an unviewable block). `imageInput` is the AUTHORITATIVE
+    // capability flag read straight off the resolved Pi `Model.input`
+    // (`("text"|"image")[]`) — `analyze_media`'s `modelLikelySeesImages` honours
+    // it first, so the text-only-vs-vision routing is trustworthy instead of
+    // regex-guessing the model id.
     ...((args.provider !== undefined || args.modelId !== undefined)
       ? {
           modelContext: {
             ...(args.provider !== undefined ? { provider: args.provider } : {}),
             ...(args.modelId !== undefined ? { modelId: args.modelId } : {}),
+            ...(modelSupportsImageInput(model) !== undefined
+              ? { imageInput: modelSupportsImageInput(model) }
+              : {}),
           },
         }
       : {}),
@@ -2293,6 +2301,21 @@ function buildModelRegistry(authStorage: unknown, modelsFile: string): unknown {
     return Registry.create(authStorage, modelsFile);
   }
   return new Registry(authStorage, modelsFile);
+}
+
+/**
+ * Read the resolved Pi `Model.input` (`("text"|"image")[]`) to decide whether
+ * the active turn model can consume an IMAGE content block. Returns `true` /
+ * `false` when the model object carries an `input` array, or `undefined` when
+ * the shape is unknown (so `analyze_media` falls back to its id heuristic
+ * instead of asserting a wrong answer). Defensive: `model` is typed `unknown`
+ * here because the never-miss resolver returns a loose object. Exported for a
+ * focused unit test.
+ */
+export function modelSupportsImageInput(model: unknown): boolean | undefined {
+  const input = (model as { input?: unknown } | null | undefined)?.input;
+  if (!Array.isArray(input)) return undefined;
+  return input.includes("image");
 }
 
 // Both flags must clear for the turn to be considered done. prompt() is

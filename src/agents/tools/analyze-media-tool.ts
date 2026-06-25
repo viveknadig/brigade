@@ -44,12 +44,19 @@
  * ─────────────────────────────────────────────────────────────────────────
  *   • image (png/jpg/jpeg/webp/gif/bmp/heic/heif): when the CURRENT model is
  *     vision-capable, returned as an IMAGE block so the model sees it (cheap —
- *     no extra call). When the current model is text-only AND an understanding
- *     provider key is configured, the tool routes the image to that provider
- *     and returns the resulting TEXT (so vision works on any model). HEIC/HEIF
- *     cannot be transcoded without a native dep, so they are passed through
- *     with their declared mime — most providers reject HEIC, so the tool warns.
- *     Capped by `maxBytes`.
+ *     no extra call). When the current model is text-only, the tool routes the
+ *     image to a vision-capable provider and returns the resulting TEXT — via
+ *     the Pi SDK against ANY keyed provider with an image-capable model
+ *     (OpenAI / OpenRouter / Groq / xAI / Mistral / Ollama / …), or the bespoke
+ *     google/anthropic REST adapters — so vision works on any model + any
+ *     configured provider. HEIC/HEIF cannot be transcoded without a native dep,
+ *     so they are passed through with their declared mime — most providers
+ *     reject HEIC, so the tool warns. Capped by `maxBytes`.
+ *   • audio (mp3/wav/m4a/ogg/oga/flac/aac/opus): routed to the media-
+ *     understanding subsystem (Gemini inline today; the Pi path when a provider
+ *     whose model accepts audio is keyed) and the TEXT transcription / summary
+ *     is returned, so voice notes work. Needs a capable key; with none the tool
+ *     returns a clear "configure a key" message.
  *   • pdf: when an understanding provider key is configured, the PDF is sent
  *     NATIVELY (Anthropic `document` block — OCRs scanned pages + reads layout;
  *     or Gemini inline) and the provider's TEXT answer is returned, so scanned
@@ -86,7 +93,12 @@ import { Type, type Static } from "typebox";
 import { guardedFetch, SsrfBlockedError } from "../../infra/net/fetch-guard.js";
 import { validateOutboundMediaPath } from "../../security/media-path-guard.js";
 import { wrapWebContent } from "../../security/external-content.js";
-import { resolveCacheDir, resolveStateDir, DEFAULT_AGENT_ID } from "../../config/paths.js";
+import {
+	resolveCacheDir,
+	resolveOsCacheDir,
+	resolveStateDir,
+	DEFAULT_AGENT_ID,
+} from "../../config/paths.js";
 import {
 	runMediaUnderstanding as defaultRunMediaUnderstanding,
 	MediaUnderstandingUnavailableError,
@@ -120,7 +132,7 @@ const FETCH_TIMEOUT_MS = 45_000;
 
 /* ─────────────────────────── kind detection ─────────────────────────── */
 
-export type MediaKind = "image" | "pdf" | "docx" | "pptx" | "xlsx" | "html" | "video";
+export type MediaKind = "image" | "pdf" | "docx" | "pptx" | "xlsx" | "html" | "video" | "audio";
 
 /** Extension → kind. Lowercase, no leading dot. */
 const EXT_KIND: Record<string, MediaKind> = {
@@ -150,6 +162,17 @@ const EXT_KIND: Record<string, MediaKind> = {
 	avi: "video",
 	mpeg: "video",
 	mpg: "video",
+	// audio (voice notes + clips). `.webm`/`.ogg` are ambiguous (audio OR video);
+	// they map to video above — the model can pass an explicit `kind:"audio"`, or
+	// a URL's `audio/*` MIME re-routes to audio via `kindFromMime`.
+	mp3: "audio",
+	wav: "audio",
+	m4a: "audio",
+	oga: "audio",
+	ogg: "audio",
+	flac: "audio",
+	aac: "audio",
+	opus: "audio",
 };
 
 /** MIME prefix/exact → kind, consulted when the extension is ambiguous (URLs). */
@@ -158,6 +181,7 @@ function kindFromMime(mime: string | undefined): MediaKind | undefined {
 	const m = mime.split(";")[0]?.trim().toLowerCase() ?? "";
 	if (m.startsWith("image/")) return "image";
 	if (m.startsWith("video/")) return "video";
+	if (m.startsWith("audio/")) return "audio";
 	if (m === "application/pdf") return "pdf";
 	if (m === "text/html" || m === "application/xhtml+xml") return "html";
 	if (
@@ -227,6 +251,27 @@ function videoMimeFromExt(ext: string): string {
 	}
 }
 
+/** Audio mime from extension — used when a local audio file has no declared MIME. */
+function audioMimeFromExt(ext: string): string {
+	switch (ext) {
+		case "wav":
+			return "audio/wav";
+		case "m4a":
+			return "audio/mp4";
+		case "aac":
+			return "audio/aac";
+		case "flac":
+			return "audio/flac";
+		case "oga":
+		case "ogg":
+			return "audio/ogg";
+		case "opus":
+			return "audio/opus";
+		default:
+			return "audio/mpeg";
+	}
+}
+
 /**
  * Resolve the kind. Explicit `kind` override wins; else extension; else MIME
  * (URL responses). Returns undefined when nothing matches (unsupported).
@@ -245,7 +290,8 @@ export function detectKind(args: {
 			k === "pptx" ||
 			k === "xlsx" ||
 			k === "html" ||
-			k === "video"
+			k === "video" ||
+			k === "audio"
 		) {
 			return k;
 		}
@@ -260,7 +306,7 @@ export function detectKind(args: {
 const AnalyzeMediaParams = Type.Object({
 	source: Type.String({
 		description:
-			"Local file PATH or http(s) URL to analyze. Images, PDF, DOCX, PPTX, XLSX, HTML, and video are auto-detected by extension/MIME.",
+			"Local file PATH or http(s) URL to analyze. Images, PDF, DOCX, PPTX, XLSX, HTML, audio (voice notes), and video are auto-detected by extension/MIME.",
 	}),
 	question: Type.Optional(
 		Type.String({
@@ -313,10 +359,11 @@ const AnalyzeMediaParams = Type.Object({
 				Type.Literal("xlsx"),
 				Type.Literal("html"),
 				Type.Literal("video"),
+				Type.Literal("audio"),
 			],
 			{
 				description:
-					"Optional override of the auto-detected kind (use when the extension/MIME is wrong or missing).",
+					"Optional override of the auto-detected kind (use when the extension/MIME is wrong or missing). Use \"audio\" for a voice note whose extension is ambiguous (e.g. .ogg/.webm).",
 			},
 		),
 	),
@@ -412,12 +459,33 @@ function allowedLocalRoots(opts: { workspaceDir?: string; cwd?: string }): strin
 		/* ignore */
 	}
 	// The state dir's media/cache subtree is where inbound attachments + generated
-	// media land; allow it so the model can analyze a file it just received.
+	// media land in FILESYSTEM mode; allow it so the model can analyze a file it
+	// just received.
 	try {
 		add(path.join(resolveStateDir(), "channels"));
 		add(path.join(resolveStateDir(), "cache"));
 		add(path.join(resolveStateDir(), "captures"));
 		add(path.join(resolveStateDir(), "workspace"));
+	} catch {
+		/* ignore */
+	}
+	// In CONVEX mode inbound channel media relocates OUT of ~/.brigade to the OS
+	// cache dir (the channel media resolvers write to
+	// `resolveOsCacheDir()/channels/<id>/...` — see channels/whatsapp/media.ts;
+	// other channels mirror this). BlueBubbles writes inbound media to
+	// `resolveOsCacheDir()/bluebubbles/<acct>/inbound-media` in BOTH modes
+	// (connection.ts). Without these roots, a perfectly valid "analyze the photo
+	// I just sent" fails in convex mode. `resolveCacheDir()` already returns the
+	// OS cache root in convex mode, but adding `resolveOsCacheDir()` (+ the two
+	// channel subtrees) explicitly covers filesystem-mode BlueBubbles and any
+	// pre-context window where the mode peek hasn't settled. The media-path guard
+	// (`validateOutboundMediaPath`) still independently refuses secrets / system
+	// files / credential dirs, so widening to the machine-local cache is safe.
+	try {
+		const osCache = resolveOsCacheDir();
+		add(osCache);
+		add(path.join(osCache, "channels"));
+		add(path.join(osCache, "bluebubbles"));
 	} catch {
 		/* ignore */
 	}
@@ -832,9 +900,9 @@ export function makeAnalyzeMediaTool(
 		// they run for EVERY sender regardless of owner status.
 		ownerOnly: false,
 		description: [
-			"Understand a local file or URL: images, PDF, DOCX, PPTX, XLSX, HTML, and video (auto-detected by extension/MIME).",
+			"Understand a local file or URL: images, PDF, DOCX, PPTX, XLSX, HTML, audio (voice notes), and video (auto-detected by extension/MIME).",
 			"Pass `source` (a local path or http(s) URL) and a `question` describing what to analyze.",
-			"Images are shown to a vision model (or understood via a provider on a text-only model); PDF is read natively when a provider key is configured (scanned PDFs work) else extracted to text; DOCX/PPTX/XLSX/HTML are extracted to text/markdown; VIDEO is understood via a Google/Gemini key.",
+			"Images are shown to a vision model (or, on a text-only model, understood via any configured provider with an image-capable model); PDF is read natively when a provider key is configured (scanned PDFs work) else extracted to text; DOCX/PPTX/XLSX/HTML are extracted to text/markdown; AUDIO is transcribed/summarized; VIDEO is understood via a Google/Gemini key.",
 			"Use `pages` to limit a PDF/PPTX range (e.g. \"1-5\"). Use this instead of bash/curl — it applies the SSRF guard for URLs and the path guard for local files.",
 		].join(" "),
 		parameters: AnalyzeMediaParams,
@@ -890,9 +958,29 @@ export function makeAnalyzeMediaTool(
 					...(acquired.mime ? { mimeType: acquired.mime } : {}),
 					bytes: acquired.bytes.length,
 					message:
-						"Unsupported or undetectable media type. Supported: image (png/jpg/jpeg/webp/gif/bmp/heic), pdf, docx, pptx, xlsx, html, video. " +
+						"Unsupported or undetectable media type. Supported: image (png/jpg/jpeg/webp/gif/bmp/heic), pdf, docx, pptx, xlsx, html, audio, video. " +
 						"Pass an explicit `kind` if the extension/MIME is missing.",
 				});
+			}
+
+			// Minor (4b): an extension-less URL only revealed itself as an image
+			// via its `image/*` content-type — AFTER it was fetched under the
+			// larger DOC byte cap (because `looksImage` was false up-front). Image
+			// blocks are the most token-expensive to ship, so re-apply the tighter
+			// image cap now that the kind is known, unless the caller raised
+			// `maxBytes` explicitly. Re-trims in place (no re-fetch). Other kinds
+			// keep the doc cap they were fetched under.
+			if (
+				kind === "image" &&
+				!looksImage &&
+				args.maxBytes === undefined &&
+				acquired.bytes.length > DEFAULT_IMAGE_MAX_BYTES
+			) {
+				acquired = {
+					bytes: acquired.bytes.subarray(0, DEFAULT_IMAGE_MAX_BYTES),
+					...(acquired.mime ? { mime: acquired.mime } : {}),
+					truncated: true,
+				};
 			}
 
 			// Dispatch per kind.
@@ -912,6 +1000,17 @@ export function makeAnalyzeMediaTool(
 					});
 				case "video":
 					return handleVideo({
+						source,
+						sourceType,
+						bytes: acquired.bytes,
+						mime: acquired.mime,
+						question,
+						...(args.provider ? { provider: args.provider } : {}),
+						...(args.model ? { model: args.model } : {}),
+						...(signal ? { signal } : {}),
+					});
+				case "audio":
+					return handleAudio({
 						source,
 						sourceType,
 						bytes: acquired.bytes,
@@ -973,6 +1072,12 @@ export function makeAnalyzeMediaTool(
 		signal?: AbortSignal;
 		/** Extra leading note prepended to the returned text (e.g. why provider was used). */
 		note?: string;
+		/**
+		 * Extra actionable guidance appended to a provider HTTP-FAILURE message
+		 * (NOT the unavailable/no-key case). Lets a caller turn a bare transport
+		 * error into a "do this next" hint specific to the modality + situation.
+		 */
+		failureGuidance?: string;
 	}): Promise<
 		| { ok: true; result: AgentToolResult<AnalyzeMediaDetails> }
 		| { ok: false; unavailable: true; message: string }
@@ -990,7 +1095,7 @@ export function makeAnalyzeMediaTool(
 				...(p.model ? { model: p.model } : {}),
 				...(p.signal ? { signal: p.signal } : {}),
 			});
-			const promptText = buildPromptText(p.question, p.kind === "audio" ? "video" : p.kind);
+			const promptText = buildPromptText(p.question, p.kind);
 			// The provider's answer is derived from operator-pointed media but can
 			// still echo injected instructions (a hostile document/video caption),
 			// so wrap it in the untrusted-content envelope like extracted text.
@@ -1004,7 +1109,7 @@ export function makeAnalyzeMediaTool(
 						ok: true,
 						source: p.source,
 						sourceType: p.sourceType,
-						kind: p.kind === "audio" ? "video" : (p.kind as MediaKind),
+						kind: p.kind as MediaKind,
 						mimeType: p.mimeType,
 						bytes: p.bytes.length,
 						returned: "text",
@@ -1019,16 +1124,17 @@ export function makeAnalyzeMediaTool(
 			}
 			// Provider HTTP / processing failure — clean failure result.
 			const msg = err instanceof Error ? err.message : String(err);
+			const guidance = p.failureGuidance ? ` ${p.failureGuidance}` : "";
 			return {
 				ok: false,
 				unavailable: false,
 				result: failure({
 					source: p.source,
 					sourceType: p.sourceType,
-					kind: p.kind === "audio" ? "video" : (p.kind as MediaKind),
+					kind: p.kind as MediaKind,
 					mimeType: p.mimeType,
 					bytes: p.bytes.length,
-					message: `Provider media-understanding call failed: ${msg}`,
+					message: `Provider media-understanding call failed: ${msg}.${guidance}`,
 				}),
 			};
 		}
@@ -1077,6 +1183,11 @@ export function makeAnalyzeMediaTool(
 				...(p.model ? { model: p.model } : {}),
 				...(p.signal ? { signal: p.signal } : {}),
 				note: "The current model is text-only, so the image was understood by a vision-capable provider and the description is below.",
+				// BUG-1: when the current model is text-only AND a provider key exists
+				// BUT the provider HTTP call fails, a bare transport error leaves the
+				// model with no next step. Tell it exactly what unblocks the image.
+				failureGuidance:
+					"To read this image, the turn needs either a vision-capable model (e.g. a Claude / GPT-4o / Gemini model) or a working media-understanding provider key — check the configured key/quota and retry, or switch models.",
 			});
 			if (viaProvider.ok) return viaProvider.result;
 			if (!viaProvider.unavailable) return viaProvider.result; // provider HTTP failure
@@ -1144,6 +1255,28 @@ export function makeAnalyzeMediaTool(
 		// Pi's content channel can't carry video, so we call a video-capable
 		// provider DIRECTLY (Gemini via the Files API) and return its TEXT.
 		const mimeType = p.mime?.split(";")[0]?.trim().toLowerCase() || videoMimeFromExt(extensionOf(p.source));
+		// Minor (4a): an explicit `provider:"anthropic"` override can't do video —
+		// Anthropic has no video ingestion. Say so crisply instead of letting the
+		// generic "needs a Gemini key" / capable-check message stand in for it.
+		if (p.provider === "anthropic") {
+			const promptText = buildPromptText(p.question, "video");
+			const message =
+				"Anthropic cannot analyze video — it has no video ingestion. Video understanding needs a Google/Gemini key. " +
+				"Drop the `provider` override (or set it to \"google\") and configure a Gemini key.";
+			return {
+				content: [{ type: "text", text: `${promptText}\n\n${message}` }],
+				details: {
+					ok: false,
+					source: p.source,
+					sourceType: p.sourceType,
+					kind: "video",
+					mimeType,
+					bytes: p.bytes.length,
+					returned: "none",
+					message,
+				},
+			};
+		}
 		const viaProvider = await understandViaProvider({
 			kind: "video",
 			source: p.source,
@@ -1166,6 +1299,55 @@ export function makeAnalyzeMediaTool(
 				source: p.source,
 				sourceType: p.sourceType,
 				kind: "video",
+				mimeType,
+				bytes: p.bytes.length,
+				returned: "none",
+				message: viaProvider.message,
+			},
+		};
+	}
+
+	/**
+	 * Audio handler (voice notes + clips). Pi's content channel can't carry
+	 * audio, so we route to the media-understanding subsystem (Gemini inline
+	 * today; the Pi path when a provider whose model accepts audio is keyed) and
+	 * return its TEXT transcription / summary. With no capable key, a clear
+	 * "configure a key" message.
+	 */
+	async function handleAudio(p: {
+		source: string;
+		sourceType: "url" | "path";
+		bytes: Buffer;
+		mime?: string;
+		question: string;
+		provider?: "google" | "anthropic";
+		model?: string;
+		signal?: AbortSignal;
+	}): Promise<AgentToolResult<AnalyzeMediaDetails>> {
+		const mimeType =
+			p.mime?.split(";")[0]?.trim().toLowerCase() || audioMimeFromExt(extensionOf(p.source));
+		const viaProvider = await understandViaProvider({
+			kind: "audio",
+			source: p.source,
+			sourceType: p.sourceType,
+			bytes: p.bytes,
+			mimeType,
+			question: p.question,
+			...(p.provider ? { provider: p.provider } : {}),
+			...(p.model ? { model: p.model } : {}),
+			...(p.signal ? { signal: p.signal } : {}),
+		});
+		if (viaProvider.ok) return viaProvider.result;
+		if (!viaProvider.unavailable) return viaProvider.result; // provider HTTP failure
+		// No capable key — clear, actionable message.
+		const promptText = buildPromptText(p.question, "audio");
+		return {
+			content: [{ type: "text", text: `${promptText}\n\n${viaProvider.message}` }],
+			details: {
+				ok: false,
+				source: p.source,
+				sourceType: p.sourceType,
+				kind: "audio",
 				mimeType,
 				bytes: p.bytes.length,
 				returned: "none",
@@ -1374,7 +1556,9 @@ function buildPromptText(question: string, kind: MediaKind): string {
 			? "the image below"
 			: kind === "video"
 				? "the video referenced below"
-				: `the extracted ${kind} content below`;
+				: kind === "audio"
+					? "the audio referenced below"
+					: `the extracted ${kind} content below`;
 	if (question) return `Analyze ${what} and answer this:\n${question}`;
 	return `Analyze ${what} and describe / summarize what it contains.`;
 }
