@@ -86,6 +86,121 @@ describe("createIMessageAdapter", () => {
 		assert.equal(h?.ok, false);
 		if (h && !h.ok) assert.equal(h.kind, "starting");
 	});
+
+	// Fix 2 — selfId() surfaces the configured selfHandle for the group mention gate.
+	it("selfId() returns the normalised selfHandle after start", async () => {
+		const conn = fakeConnection();
+		const adapter = createIMessageAdapter({ connectImpl: async () => conn });
+		const cfgWithSelf = { channels: { imessage: { enabled: true, selfHandle: "+1 555 123 4567" } } } as never;
+		adapter.isConfigured(cfgWithSelf);
+		await adapter.start(startCtx(async () => {}));
+		assert.equal(adapter.selfId?.(), "15551234567");
+	});
+
+	it("selfId() is undefined when no selfHandle is configured", async () => {
+		const conn = fakeConnection();
+		const adapter = createIMessageAdapter({ connectImpl: async () => conn });
+		adapter.isConfigured(cfg);
+		await adapter.start(startCtx(async () => {}));
+		assert.equal(adapter.selfId?.(), undefined);
+	});
+
+	// Fixes 2 & 9 — mentions[] forwarded + history context prepended to the body.
+	it("forwards mentions[] and prepends the history context block", async () => {
+		const captured: ConnectIMessageArgs[] = [];
+		const conn = fakeConnection();
+		const adapter = createIMessageAdapter({
+			connectImpl: async (args) => {
+				captured.push(args);
+				return conn;
+			},
+		});
+		const received: InboundMessage[] = [];
+		adapter.isConfigured(cfg);
+		await adapter.start(startCtx(async (m) => void received.push(m)));
+		const args = captured[0];
+		assert.ok(args);
+		args.onMessage({
+			conversationId: "chat:7",
+			from: "+1999",
+			text: "current message",
+			isGroup: true,
+			mentions: ["15551234567"],
+			historyContext: "[recent conversation context]\nAlice: earlier\n[end context]",
+			raw: {},
+		});
+		assert.equal(received.length, 1);
+		assert.deepEqual(received[0]?.mentions, ["15551234567"]);
+		assert.ok(received[0]?.text.startsWith("[recent conversation context]"));
+		assert.ok(received[0]?.text.includes("current message"));
+	});
+
+	// Fix 10 — config-driven textChunkLimit is honoured.
+	it("honours a config-driven textChunkLimit when chunking", async () => {
+		const conn = fakeConnection();
+		const adapter = createIMessageAdapter({ connectImpl: async () => conn });
+		const cfgSmall = { channels: { imessage: { enabled: true, textChunkLimit: 20 } } } as never;
+		adapter.isConfigured(cfgSmall);
+		await adapter.start(startCtx(async () => {}));
+		await adapter.sendText("+1555", "a".repeat(50));
+		assert.ok(conn.sentText.length >= 2, "long text split into multiple chunks at the small limit");
+		for (const s of conn.sentText) assert.ok(s.text.length <= 20, `chunk len ${s.text.length} <= 20`);
+	});
+
+	// Fix 10 — chunkMode "newline" delivers one message per line.
+	it("chunkMode 'newline' sends one message per non-empty line", async () => {
+		const conn = fakeConnection();
+		const adapter = createIMessageAdapter({ connectImpl: async () => conn });
+		const cfgNl = { channels: { imessage: { enabled: true, chunkMode: "newline" } } } as never;
+		adapter.isConfigured(cfgNl);
+		await adapter.start(startCtx(async () => {}));
+		await adapter.sendText("+1555", "line one\nline two\n\nline three");
+		assert.equal(conn.sentText.length, 3);
+		assert.deepEqual(
+			conn.sentText.map((s) => s.text),
+			["line one", "line two", "line three"],
+		);
+	});
+});
+
+// Fix 8 — setup wizard builds config incl. dmPolicy + allowFrom + selfHandle.
+describe("createIMessageAdapter — setup wizard (Fix 8)", () => {
+	it("prompts cliPath + dmPolicy + allowFrom + selfHandle and builds the config", () => {
+		const adapter = createIMessageAdapter();
+		const setup = adapter.setup;
+		assert.ok(setup);
+		const keys = setup!.credentialKeys.map((k) => k.key);
+		assert.deepEqual(keys, ["cliPath", "dmPolicy", "allowFrom", "selfHandle"]);
+		// The cliPath prompt carries the Full-Disk-Access + Automation guidance.
+		const cliPrompt = setup!.credentialKeys.find((k) => k.key === "cliPath")?.prompt ?? "";
+		assert.match(cliPrompt, /Full Disk Access/i);
+		assert.match(cliPrompt, /Automation/i);
+		// dmPolicy validation rejects junk.
+		assert.equal(setup!.validateInput?.("dmPolicy", "nonsense"), "dmPolicy must be one of: pairing, allowlist, open, disabled.");
+		assert.equal(setup!.validateInput?.("dmPolicy", "allowlist"), null);
+		// buildAccountConfig assembles a full block.
+		const out = setup!.buildAccountConfig!({
+			cliPath: "/opt/imsg",
+			dmPolicy: "allowlist",
+			allowFrom: "+15555550123, user@example.com",
+			selfHandle: "+15551234567",
+		});
+		assert.equal(out.enabled, true);
+		assert.equal(out.cliPath, "/opt/imsg");
+		assert.equal(out.dmPolicy, "allowlist");
+		assert.deepEqual(out.allowFrom, ["+15555550123", "user@example.com"]);
+		assert.equal(out.selfHandle, "+15551234567");
+	});
+
+	it("omits dmPolicy when left at the pairing default and skips empty allowFrom/selfHandle", () => {
+		const adapter = createIMessageAdapter();
+		const out = adapter.setup!.buildAccountConfig!({ cliPath: "", dmPolicy: "pairing", allowFrom: "", selfHandle: "" });
+		assert.equal(out.dmPolicy, undefined);
+		assert.equal(out.allowFrom, undefined);
+		assert.equal(out.selfHandle, undefined);
+		assert.equal(out.cliPath, undefined);
+		assert.equal(out.enabled, true);
+	});
 });
 
 describe("IMessageRpcClient (test-env guard)", () => {

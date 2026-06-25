@@ -34,11 +34,13 @@ import {
 	type DmPolicy,
 	evaluateAccess,
 	formatAllowFrom,
+	type GroupToolPolicyConfig,
 	readAllowFrom,
 	readChannelOwner,
 	readGroupAllowFrom,
 	readPendingPairings,
 	removeAllowFrom,
+	resolveChannelGroupToolsPolicy,
 	revokePairingCode,
 	upsertPairingRequest,
 } from "./access-control/index.js";
@@ -276,6 +278,14 @@ export type RunChannelTurnFn = (args: {
 	senderIsOwner?: boolean;
 	channelApprovalRoute?: ChannelApprovalRoute;
 	/**
+	 * OPTIONAL per-group/per-sender tool allow/deny policy resolved for THIS turn
+	 * (only set for a group message whose `channels.<ch>.groups.<id>` config
+	 * restricts/expands tools). The gateway's turn runner narrows the agent's
+	 * toolset to this when present; unset → the agent's normal toolset (unchanged
+	 * for every existing channel + every DM). See `access-control/group-tool-policy.ts`.
+	 */
+	toolPolicy?: GroupToolPolicyConfig;
+	/**
 	 * OPTIONAL live-streaming delta sink. When the pipeline wants progressive
 	 * delivery (the adapter advertises `beginReplyStream` AND the channel is
 	 * configured to stream), it passes this; the gateway forwards the
@@ -295,6 +305,8 @@ export interface PendingDispatch {
 	agentId: string;
 	senderIsOwner: boolean;
 	channelApprovalRoute: ChannelApprovalRoute;
+	/** Per-group/per-sender tool policy for this turn (group messages only). */
+	toolPolicy?: GroupToolPolicyConfig;
 }
 
 /** Bundled built-in channel commands an operator can DM to admin the bot. */
@@ -649,6 +661,21 @@ export async function runChannelInboundPipeline(
 					mentioned,
 					addressed,
 				});
+		// Per-group / per-sender tool policy (group messages only). Resolved here
+		// from `channels.<ch>.groups.<conversationId>` config so the turn runner can
+		// narrow the agent's toolset for THIS group/sender. Undefined for DMs and
+		// for any group without a configured policy (no behaviour change). Mutations
+		// remain owner-gated downstream; this only scopes the available toolset.
+		const groupToolPolicy: GroupToolPolicyConfig | undefined = isGroup
+			? resolveChannelGroupToolsPolicy({
+					cfg,
+					channel: adapter.id,
+					groupId: msg.conversationId,
+					...(aclAccountId ? { accountId: aclAccountId } : {}),
+					senderId: fromId,
+					...(msg.fromName ? { senderName: msg.fromName } : {}),
+				})
+			: undefined;
 		// Keep the active-conversation window alive on every admitted group turn,
 		// so an ongoing back-and-forth doesn't require re-tagging.
 		if (isGroup && decision.kind === "allow") stampGroupFollowUp(fuKey);
@@ -998,6 +1025,7 @@ export async function runChannelInboundPipeline(
 					agentId: resolvedAgentId,
 					senderIsOwner,
 					channelApprovalRoute,
+					...(groupToolPolicy ? { toolPolicy: groupToolPolicy } : {}),
 					timer: setTimeout(() => void flushDispatch(ctx, dispatchKey), debounceMs),
 				});
 			}
@@ -1041,6 +1069,7 @@ export async function runChannelInboundPipeline(
 			...(msg.messageId !== undefined ? { replyToId: msg.messageId } : {}),
 			senderIsOwner,
 			channelApprovalRoute,
+			...(groupToolPolicy ? { toolPolicy: groupToolPolicy } : {}),
 		});
 	} catch (err) {
 		const errMsg = err instanceof Error ? err.message : String(err);
@@ -1076,6 +1105,8 @@ export async function runChannelInboundPipeline(
 			replyToId?: string;
 			senderIsOwner?: boolean;
 			channelApprovalRoute?: ChannelApprovalRoute;
+			/** Per-group/per-sender tool policy for this turn (group messages only). */
+			toolPolicy?: GroupToolPolicyConfig;
 		},
 	): Promise<void> {
 		const controller = new AbortController();
@@ -1140,6 +1171,7 @@ export async function runChannelInboundPipeline(
 				...(a.channelApprovalRoute !== undefined
 					? { channelApprovalRoute: a.channelApprovalRoute }
 					: {}),
+				...(a.toolPolicy ? { toolPolicy: a.toolPolicy } : {}),
 				...(onReplyDelta ? { onReplyDelta } : {}),
 			});
 		} catch (err) {
@@ -1355,6 +1387,7 @@ export async function runChannelInboundPipeline(
 				...(replyToId !== undefined ? { replyToId } : {}),
 				senderIsOwner: slot.senderIsOwner,
 				channelApprovalRoute: slot.channelApprovalRoute,
+				...(slot.toolPolicy ? { toolPolicy: slot.toolPolicy } : {}),
 			});
 		} catch (err) {
 			log.warn("debounced dispatch failed", {

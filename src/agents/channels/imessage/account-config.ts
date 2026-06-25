@@ -50,6 +50,14 @@ const DEFAULT_REGION = "US";
 const DEFAULT_MEDIA_MAX_MB = 16;
 /** Default RPC probe / request timeout (ms). */
 export const DEFAULT_IMESSAGE_PROBE_TIMEOUT_MS = 10_000;
+/** Default per-message outbound text chunk size (chars). iMessage's practical limit. */
+export const DEFAULT_IMESSAGE_TEXT_CHUNK_LIMIT = 4_000;
+/**
+ * Default rolling-history depth for an untagged GROUP message (0 = off). iMessage
+ * delivers one notification per message with no thread context, so the monitor
+ * keeps the last N seen group messages and prepends them as context.
+ */
+export const DEFAULT_IMESSAGE_HISTORY_LIMIT = 0;
 
 /** Default macOS Messages attachment root inbound media may be read from. */
 export const DEFAULT_IMESSAGE_ATTACHMENT_ROOTS: readonly string[] = [
@@ -65,6 +73,9 @@ const SECRET_REF_PATTERN = /^\$\{([A-Z_][A-Z0-9_]*)\}$/;
 /** Outbound send service. `auto` lets the bridge pick iMessage vs SMS. */
 export type IMessageService = "imessage" | "sms" | "auto";
 
+/** Outbound chunk strategy. `length` = pack to the char limit (default); `newline` = prefer line breaks. */
+export type IMessageChunkMode = "length" | "newline";
+
 /** Raw shape of one entry under `channels.imessage.accounts`. */
 interface IMessageAccountEntry {
 	id?: string;
@@ -77,6 +88,14 @@ interface IMessageAccountEntry {
 	probeTimeoutMs?: number;
 	attachmentRoots?: string[];
 	remoteAttachmentRoots?: string[];
+	remoteHost?: string;
+	selfHandle?: string;
+	includeAttachments?: boolean;
+	defaultTo?: string;
+	historyLimit?: number;
+	dmHistoryLimit?: number;
+	textChunkLimit?: number;
+	chunkMode?: string;
 	[key: string]: unknown;
 }
 
@@ -91,6 +110,14 @@ interface IMessageChannelConfigSlot {
 	probeTimeoutMs?: number;
 	attachmentRoots?: string[];
 	remoteAttachmentRoots?: string[];
+	remoteHost?: string;
+	selfHandle?: string;
+	includeAttachments?: boolean;
+	defaultTo?: string;
+	historyLimit?: number;
+	dmHistoryLimit?: number;
+	textChunkLimit?: number;
+	chunkMode?: string;
 	accounts?: IMessageAccountEntry[];
 	/** Idle TTL (ms / duration string) after which idle thread sessions are reaped. */
 	threadIdleTtlMs?: number | string;
@@ -113,6 +140,31 @@ export interface ResolvedIMessageAccount {
 	mediaMaxBytes: number;
 	/** RPC probe / request timeout (ms). */
 	probeTimeoutMs: number;
+	/**
+	 * The bot's OWN iMessage handle (normalised — digits for a phone, lower-case
+	 * for an email). When set, a group message whose text names this handle gets a
+	 * populated `mentions[]` so the central pipeline's group requireMention gate
+	 * can fire. Empty when unset (group mention-gating then can't match the bot).
+	 */
+	selfHandle: string;
+	/**
+	 * Remote host (`user@host` / `host`) when the `imsg` bridge runs on a DIFFERENT
+	 * machine than the gateway. When set, inbound attachments are SCP-copied from
+	 * the remote root to a local temp before resolution. Empty for a same-host setup.
+	 */
+	remoteHost: string;
+	/** When false, skip inbound media resolution entirely (text-only ingest). Default true. */
+	includeAttachments: boolean;
+	/** Default outbound recipient when a send omits an explicit target. Empty when unset. */
+	defaultTo: string;
+	/** Rolling-history depth for an untagged GROUP message (0 = off). */
+	historyLimit: number;
+	/** Rolling-history depth for an untagged DM (0 = off). */
+	dmHistoryLimit: number;
+	/** Per-message outbound text chunk size (chars). */
+	textChunkLimit: number;
+	/** Outbound chunk strategy. */
+	chunkMode: IMessageChunkMode;
 	verbose: boolean;
 }
 
@@ -275,6 +327,126 @@ export function resolveIMessageProbeTimeoutMs(cfg: BrigadeConfig, accountId?: st
 	return typeof raw === "number" && raw > 0 ? raw : DEFAULT_IMESSAGE_PROBE_TIMEOUT_MS;
 }
 
+/**
+ * Normalise a handle for self/mention matching: an email lower-cases; a phone
+ * keeps only its digits (so `+1 (555) 123-4567` and `15551234567` compare equal).
+ * Returns "" for an empty input. Mirrors BlueBubbles' `normalizeBlueBubblesSelfHandle`.
+ */
+export function normalizeIMessageSelfHandle(raw: string | undefined): string {
+	const trimmed = (raw ?? "").trim();
+	if (!trimmed) return "";
+	if (trimmed.includes("@")) return trimmed.toLowerCase();
+	const digits = trimmed.replace(/[^0-9]/g, "");
+	return digits || trimmed.toLowerCase();
+}
+
+/**
+ * Resolve the bot's own handle for an account (per-account `selfHandle` wins over
+ * the top-level slot), normalised. Empty when unset.
+ */
+export function resolveIMessageSelfHandle(
+	cfg: BrigadeConfig,
+	accountId?: string | null,
+	env: NodeJS.ProcessEnv = process.env,
+): string {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = imessageChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	const raw = resolveStringRef(entry?.selfHandle, env) || resolveStringRef(slot?.selfHandle, env);
+	return normalizeIMessageSelfHandle(raw);
+}
+
+/**
+ * Resolve the REMOTE host (`user@host` / `host`) for an account when the `imsg`
+ * bridge runs on a different machine. Per-account → top-level → "". Returns the
+ * raw configured value; the SCP layer safety-validates it.
+ */
+export function resolveIMessageRemoteHost(
+	cfg: BrigadeConfig,
+	accountId?: string | null,
+	env: NodeJS.ProcessEnv = process.env,
+): string {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = imessageChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	return resolveStringRef(entry?.remoteHost, env) || resolveStringRef(slot?.remoteHost, env);
+}
+
+/**
+ * Resolve whether inbound media should be resolved at all. Per-account →
+ * top-level → DEFAULT TRUE (resolve media). Setting `includeAttachments:false`
+ * opts a noisy / privacy-sensitive account out of inbound media resolution.
+ */
+export function resolveIMessageIncludeAttachments(cfg: BrigadeConfig, accountId?: string | null): boolean {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = imessageChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	if (typeof entry?.includeAttachments === "boolean") return entry.includeAttachments;
+	if (typeof slot?.includeAttachments === "boolean") return slot.includeAttachments;
+	return true;
+}
+
+/** Resolve the default outbound recipient (per-account → top-level → ""). */
+export function resolveIMessageDefaultTo(
+	cfg: BrigadeConfig,
+	accountId?: string | null,
+	env: NodeJS.ProcessEnv = process.env,
+): string {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = imessageChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	return resolveStringRef(entry?.defaultTo, env) || resolveStringRef(slot?.defaultTo, env);
+}
+
+/** Coerce a non-negative integer history limit (per-account → top-level → fallback). */
+function resolveHistoryLimit(
+	entryVal: unknown,
+	slotVal: unknown,
+	fallback: number,
+): number {
+	const pick = typeof entryVal === "number" ? entryVal : typeof slotVal === "number" ? slotVal : fallback;
+	return Number.isFinite(pick) && pick > 0 ? Math.floor(pick) : 0;
+}
+
+/** Resolve the rolling-history depth for an untagged GROUP message (0 = off). */
+export function resolveIMessageHistoryLimit(cfg: BrigadeConfig, accountId?: string | null): number {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = imessageChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	return resolveHistoryLimit(entry?.historyLimit, slot?.historyLimit, DEFAULT_IMESSAGE_HISTORY_LIMIT);
+}
+
+/** Resolve the rolling-history depth for an untagged DM (0 = off). */
+export function resolveIMessageDmHistoryLimit(cfg: BrigadeConfig, accountId?: string | null): number {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = imessageChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	return resolveHistoryLimit(entry?.dmHistoryLimit, slot?.dmHistoryLimit, DEFAULT_IMESSAGE_HISTORY_LIMIT);
+}
+
+/** Resolve the per-message outbound text chunk size (chars). */
+export function resolveIMessageTextChunkLimit(cfg: BrigadeConfig, accountId?: string | null): number {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = imessageChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	const raw = typeof entry?.textChunkLimit === "number" ? entry.textChunkLimit : slot?.textChunkLimit;
+	return typeof raw === "number" && raw > 0 ? Math.floor(raw) : DEFAULT_IMESSAGE_TEXT_CHUNK_LIMIT;
+}
+
+/** Coerce a loose `chunkMode` string to the typed union (defaults to `length`). */
+export function coerceIMessageChunkMode(raw: unknown): IMessageChunkMode {
+	const v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+	return v === "newline" ? "newline" : "length";
+}
+
+/** Resolve the outbound chunk strategy (per-account → top-level → `length`). */
+export function resolveIMessageChunkMode(cfg: BrigadeConfig, accountId?: string | null): IMessageChunkMode {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = imessageChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	return coerceIMessageChunkMode(entry?.chunkMode ?? slot?.chunkMode);
+}
+
 /** Resolve a per-account view of the config (defaults filled in). */
 export function resolveIMessageAccount(
 	cfg: BrigadeConfig,
@@ -305,6 +477,14 @@ export function resolveIMessageAccount(
 		region,
 		mediaMaxBytes: Math.round(mediaMaxMb * 1024 * 1024),
 		probeTimeoutMs: resolveIMessageProbeTimeoutMs(cfg, id),
+		selfHandle: resolveIMessageSelfHandle(cfg, id, env),
+		remoteHost: resolveIMessageRemoteHost(cfg, id, env),
+		includeAttachments: resolveIMessageIncludeAttachments(cfg, id),
+		defaultTo: resolveIMessageDefaultTo(cfg, id, env),
+		historyLimit: resolveIMessageHistoryLimit(cfg, id),
+		dmHistoryLimit: resolveIMessageDmHistoryLimit(cfg, id),
+		textChunkLimit: resolveIMessageTextChunkLimit(cfg, id),
+		chunkMode: resolveIMessageChunkMode(cfg, id),
 		verbose: slot?.verbose === true,
 	};
 }

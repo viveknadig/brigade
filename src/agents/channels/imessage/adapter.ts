@@ -37,8 +37,10 @@ import {
 	listIMessageAccountIds,
 	resolveIMessageAccount,
 	resolveIMessageCliPath,
+	DEFAULT_IMESSAGE_TEXT_CHUNK_LIMIT,
 	IMESSAGE_CHANNEL_ID,
 	IMESSAGE_DEFAULT_ACCOUNT_ID,
+	type IMessageChunkMode,
 } from "./account-config.js";
 import {
 	connectIMessage,
@@ -48,8 +50,8 @@ import {
 } from "./connection.js";
 import { markdownToIMessageText } from "./format.js";
 
-/** iMessage's practical per-message text limit for chunked sends. */
-const IMESSAGE_TEXT_LIMIT = 4_000;
+/** iMessage's practical per-message text limit for chunked sends (default; config can override). */
+const IMESSAGE_TEXT_LIMIT = DEFAULT_IMESSAGE_TEXT_CHUNK_LIMIT;
 
 /** iMessage capabilities — DMs + groups, media + reply; no edit/unsend/reactions via the bridge. */
 export const IMESSAGE_CAPABILITIES: ChannelCapabilities = {
@@ -74,6 +76,20 @@ async function loadStartConfig(): Promise<BrigadeConfig> {
 	return loadConfig() as unknown as BrigadeConfig;
 }
 
+/**
+ * For `chunkMode: "newline"`, break an already-limit-bounded chunk into one piece
+ * per line (dropping blank lines), so each non-empty line is delivered as its own
+ * message. A line longer than `limit` is left intact (the caller already bounded
+ * the chunk to `limit`, so this only ever sub-divides). Returns the original
+ * chunk in a single-element array when it has no internal line breaks.
+ */
+function splitChunkByNewline(chunk: string, limit: number): string[] {
+	void limit;
+	const lines = chunk.split("\n").map((l) => l.trimEnd());
+	const out = lines.filter((l) => l.trim().length > 0);
+	return out.length > 0 ? out : [chunk];
+}
+
 export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): ChannelAdapter {
 	const accountId = opts.accountId?.trim() || IMESSAGE_DEFAULT_ACCOUNT_ID;
 	const connectImpl = opts.connectImpl ?? connectIMessage;
@@ -87,6 +103,11 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 	// round-trip the subprocess.
 	let connected = false;
 	let closedReason: string | null = null;
+	// Captured from the resolved account at start() so the inbound/outbound paths
+	// don't re-resolve config per message.
+	let selfHandle = "";
+	let textChunkLimit = IMESSAGE_TEXT_LIMIT;
+	let chunkMode: IMessageChunkMode = "length";
 
 	const adapter: ChannelAdapter = {
 		id: IMESSAGE_CHANNEL_ID,
@@ -109,6 +130,9 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 		async start(ctx: ChannelStartContext): Promise<void> {
 			const cfg = lastConfig ?? (await loadStartConfig());
 			const account = resolveIMessageAccount(cfg, accountId, lastEnv);
+			selfHandle = account.selfHandle;
+			textChunkLimit = account.textChunkLimit;
+			chunkMode = account.chunkMode;
 			try {
 				const conn = await connectImpl({
 					account,
@@ -128,6 +152,9 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 						ctx.onLoggedOut?.();
 					},
 					onMessage: (msg: IMessageInboundMessage) => {
+						// Prepend the rolling-history context block (untagged group msg) to
+						// the body so the agent replies INTO the conversation.
+						const body = msg.historyContext ? `${msg.historyContext}\n\n${msg.text}` : msg.text;
 						void ctx.onInbound({
 							channel: IMESSAGE_CHANNEL_ID,
 							accountId,
@@ -136,9 +163,11 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 							...(msg.createdAtMs !== undefined ? { messageTimestampMs: msg.createdAtMs } : {}),
 							from: msg.from,
 							...(msg.fromName !== undefined ? { fromName: msg.fromName } : {}),
-							text: msg.text,
+							text: body,
 							chatType: msg.isGroup ? "group" : "direct",
 							isGroup: msg.isGroup,
+							// Bot-handle mentions (group requireMention gate fires on these).
+							...(msg.mentions && msg.mentions.length > 0 ? { mentions: msg.mentions } : {}),
 							...(msg.replyTo ? { replyTo: msg.replyTo } : {}),
 							// Deferred media thunk rides through untouched — the pipeline
 							// resolves it only after the access gate admits the sender.
@@ -181,8 +210,15 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 		async sendText(conversationId: string, text: string, opts?: OutboundSendOptions): Promise<{ messageId?: string } | void> {
 			if (!connection) throw new Error("iMessage channel is not started");
 			// Chunk on the raw markdown (so fences/paragraphs aren't shredded), then
-			// plain-text-ify each chunk and send.
-			const chunks = chunkText(text, { limit: IMESSAGE_TEXT_LIMIT });
+			// plain-text-ify each chunk and send. The chunk size is config-driven
+			// (`textChunkLimit`); `chunkMode: "newline"` additionally breaks each chunk
+			// on single line boundaries (one message per line), where `length` (default)
+			// packs lines to the limit.
+			const limit = textChunkLimit > 0 ? textChunkLimit : IMESSAGE_TEXT_LIMIT;
+			let chunks = chunkText(text, { limit });
+			if (chunkMode === "newline") {
+				chunks = chunks.flatMap((chunk) => splitChunkByNewline(chunk, limit));
+			}
 			let first = true;
 			let lastMessageId: string | undefined;
 			for (const chunk of chunks) {
@@ -203,8 +239,11 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 			return sent.messageId ? { messageId: sent.messageId } : undefined;
 		},
 
+		// The bot's own iMessage handle (when the operator configured
+		// `channels.imessage.selfHandle`) — lets the central pipeline's group
+		// mention-gating match `msg.mentions` against the bot. Undefined when unset.
 		selfId(): string | undefined {
-			return undefined;
+			return selfHandle || undefined;
 		},
 
 		connectedAt(): number | null {
@@ -216,27 +255,66 @@ export function createIMessageAdapter(opts: CreateIMessageAdapterOptions = {}): 
 		// "account" label and ownership is NOT bootstrapped from a separate bot.
 		pairing: { idLabel: "account" as const },
 
-		// The `imsg` binary path is the only "credential" — `brigade channels add`
-		// prompts for it (default "imsg" on PATH). Messages.app sign-in is the real
-		// auth and can't be configured here.
+		// iMessage has no bot token — the `imsg` binary path + Messages.app sign-in
+		// are the auth. `brigade channels add imessage` walks: cliPath → dmPolicy →
+		// allowFrom → selfHandle. The first prompt carries the macOS-permissions
+		// completion note (Full Disk Access + Automation) since the central setup
+		// surface has no separate "completion note" hook.
 		setup: {
 			credentialKeys: [
 				{
 					key: "cliPath",
 					prompt:
-						"Path to the `imsg` CLI binary (leave blank to use `imsg` on PATH). Requires Messages.app signed in on this Mac.",
+						"Path to the `imsg` CLI binary (leave blank to use `imsg` on PATH). " +
+						"Requires Messages.app signed in on this Mac, and the terminal/app running `imsg` must be granted " +
+						"macOS Full Disk Access (to read the Messages chat.db) + Automation permission for Messages " +
+						"(System Settings → Privacy & Security). Tip: list chats with `imsg chats --limit 20`.",
 					secret: false,
 					envVar: "IMSG_CLI_PATH",
 				},
+				{
+					key: "dmPolicy",
+					prompt:
+						"Who may DM this account? pairing (owner + approved; strangers challenged — default) / " +
+						"allowlist (only allowFrom) / open (anyone) / disabled (drop all DMs). Leave blank for pairing.",
+					secret: false,
+				},
+				{
+					key: "allowFrom",
+					prompt:
+						"Allowlist of senders for allowlist mode — handles or chat targets, comma-separated " +
+						"(e.g. +15555550123, user@example.com, chat_id:123). Leave blank for none.",
+					secret: false,
+				},
+				{
+					key: "selfHandle",
+					prompt:
+						"This bot's OWN iMessage handle (phone or email) — used so a group message naming the bot " +
+						"counts as a mention for the group requireMention gate. Leave blank to skip.",
+					secret: false,
+				},
 			],
 			validateInput(key: string, value: string): string | null {
-				if (key === "cliPath" && value.trim() && /\s$/.test(value)) return "Path must not end with whitespace.";
+				const v = value.trim();
+				if (key === "cliPath" && v && /\s$/.test(value)) return "Path must not end with whitespace.";
+				if (key === "dmPolicy" && v && !["pairing", "allowlist", "open", "disabled"].includes(v.toLowerCase())) {
+					return "dmPolicy must be one of: pairing, allowlist, open, disabled.";
+				}
 				return null;
 			},
 			buildAccountConfig(values: Record<string, string>): Record<string, unknown> {
 				const out: Record<string, unknown> = { enabled: true };
 				const cliPath = (values.cliPath ?? "").trim();
 				if (cliPath) out.cliPath = cliPath;
+				const dmPolicy = (values.dmPolicy ?? "").trim().toLowerCase();
+				if (dmPolicy && dmPolicy !== "pairing") out.dmPolicy = dmPolicy;
+				const allowFrom = (values.allowFrom ?? "")
+					.split(/[\n,]+/g)
+					.map((s) => s.trim())
+					.filter(Boolean);
+				if (allowFrom.length > 0) out.allowFrom = allowFrom;
+				const selfHandleVal = (values.selfHandle ?? "").trim();
+				if (selfHandleVal) out.selfHandle = selfHandleVal;
 				return out;
 			},
 		},

@@ -52,6 +52,7 @@ import {
 	resolveIMessageAccount,
 	resolveIMessageCliPath,
 	resolveIMessageDbPath,
+	resolveIMessageDefaultTo,
 	resolveIMessageProbeTimeoutMs,
 	IMESSAGE_CHANNEL_ID,
 	IMESSAGE_DEFAULT_ACCOUNT_ID,
@@ -217,8 +218,11 @@ export function createIMessagePlugin(deps: IMessagePluginDeps): IMessagePluginHa
 				const accountId = params.target.accountId || IMESSAGE_DEFAULT_ACCOUNT_ID;
 				const runtime = accountRuntimes.get(accountId);
 				if (!runtime) return { ok: false, error: `imessage account "${accountId}" is not running` };
+				// Fall back to the configured default recipient when no target was given.
+				const to = params.target.to?.trim() || resolveIMessageDefaultTo(deps.loadConfig(), accountId);
+				if (!to) return { ok: false, error: `imessage send needs a recipient (no target and no defaultTo set)` };
 				try {
-					const sent = await runtime.adapter.sendText(params.target.to, params.text, { accountId });
+					const sent = await runtime.adapter.sendText(to, params.text, { accountId });
 					return {
 						ok: true,
 						...(sent && typeof sent === "object" && sent.messageId !== undefined ? { messageId: sent.messageId } : {}),
@@ -233,8 +237,10 @@ export function createIMessagePlugin(deps: IMessagePluginDeps): IMessagePluginHa
 				if (!runtime || !runtime.adapter.sendMedia) {
 					return { ok: false, error: `imessage account "${accountId}" cannot send media right now` };
 				}
+				const to = params.target.to?.trim() || resolveIMessageDefaultTo(deps.loadConfig(), accountId);
+				if (!to) return { ok: false, error: `imessage send needs a recipient (no target and no defaultTo set)` };
 				try {
-					await runtime.adapter.sendMedia(params.target.to, {
+					await runtime.adapter.sendMedia(to, {
 						kind: (params.mediaType as never) ?? "document",
 						path: params.mediaUrl,
 						...(params.caption !== undefined ? { caption: params.caption } : {}),

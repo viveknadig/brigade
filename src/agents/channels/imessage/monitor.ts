@@ -144,7 +144,35 @@ export interface NormalizedIMessage {
 	createdAtMs?: number;
 	replyTo?: { messageId?: string; body?: string; from?: string };
 	attachments?: IMessageRawAttachment[];
+	/**
+	 * Handles mentioned in this message. iMessage has no @-mention metadata, so
+	 * this is populated only for a GROUP message when the bot's own `selfHandle`
+	 * appears in the text — which is what lets the central pipeline's group
+	 * requireMention gate fire. Unset when there's no match (or in DMs).
+	 */
+	mentions?: string[];
 	raw: IMessagePayload;
+}
+
+/**
+ * Detect whether the bot's own `selfHandle` is named in `text`. iMessage carries
+ * no @-mention metadata, so "mention" = the handle appearing in the message body.
+ * A phone handle matches on its digit-run inside the text's digits; an email
+ * matches case-insensitively. `selfHandle` is expected pre-normalised (digits for
+ * a phone, lower-case for an email — see `normalizeIMessageSelfHandle`). Returns
+ * the matched self handle in an array, or undefined when there's no match (so the
+ * field stays unset). Mirrors BlueBubbles' `detectBlueBubblesMentions`.
+ */
+export function detectIMessageMentions(text: string, selfHandle: string | undefined): string[] | undefined {
+	const handle = (selfHandle ?? "").trim();
+	if (!handle || !text) return undefined;
+	if (handle.includes("@")) {
+		return text.toLowerCase().includes(handle.toLowerCase()) ? [handle] : undefined;
+	}
+	// Phone: compare digit-runs so "+1 (555) 123-4567" in text matches "15551234567".
+	const handleDigits = handle.replace(/[^0-9]/g, "");
+	if (handleDigits.length >= 5 && text.replace(/[^0-9]/g, "").includes(handleDigits)) return [handle];
+	return undefined;
 }
 
 /** Build the stable conversation id for a payload (group → chat scope, DM → sender). */
@@ -155,8 +183,12 @@ export function conversationIdFor(payload: IMessagePayload): string {
 	return (payload.sender ?? "").trim();
 }
 
-/** Normalize a parsed payload into the inbound shape. */
-export function normalizeIMessageMessage(payload: IMessagePayload): NormalizedIMessage {
+/**
+ * Normalize a parsed payload into the inbound shape. When `selfHandle` is given
+ * and this is a GROUP message naming the bot, `mentions[]` is populated so the
+ * central group requireMention gate can fire.
+ */
+export function normalizeIMessageMessage(payload: IMessagePayload, selfHandle?: string): NormalizedIMessage {
 	const isGroup = Boolean(payload.is_group) || typeof payload.chat_id === "number";
 	const createdAtMs = payload.created_at ? Date.parse(payload.created_at) : NaN;
 	const messageId = payload.guid?.trim() || (typeof payload.id === "number" ? String(payload.id) : undefined);
@@ -180,6 +212,11 @@ export function normalizeIMessageMessage(payload: IMessagePayload): NormalizedIM
 			...(payload.reply_to_text ? { body: payload.reply_to_text } : {}),
 			...(payload.reply_to_sender ? { from: payload.reply_to_sender } : {}),
 		};
+	}
+	// Self-mention detection (group gating) — only meaningful in groups.
+	if (isGroup) {
+		const mentions = detectIMessageMentions(out.text, selfHandle);
+		if (mentions) out.mentions = mentions;
 	}
 	return out;
 }
@@ -316,16 +353,69 @@ const REFLECTION_PATTERNS: ReadonlyArray<{ label: string; re: RegExp }> = [
 	{ label: "final-tag", re: /<\s*\/?\s*final\b[^<>]*>/i },
 ];
 
+/** A `[start, end)` byte-index span of fenced or inline code inside a string. */
+interface CodeRegion {
+	start: number;
+	end: number;
+}
+
+/**
+ * Find the code regions (fenced ``` / ~~~ blocks + inline backtick spans) in
+ * `text`. A reflection match that falls INSIDE one of these is a legit quoted
+ * sample, not a leaked assistant marker, so the guard ignores it. Ported byte-
+ * faithfully from the upstream `findCodeRegions`.
+ */
+export function findCodeRegions(text: string): CodeRegion[] {
+	const regions: CodeRegion[] = [];
+
+	const fencedRe = /(^|\n)(```|~~~)[^\n]*\n[\s\S]*?(?:\n\2|$)/g;
+	for (const match of text.matchAll(fencedRe)) {
+		const start = (match.index ?? 0) + (match[1]?.length ?? 0);
+		regions.push({ start, end: start + match[0].length - (match[1]?.length ?? 0) });
+	}
+
+	const inlineRe = /`+[^`]+`+/g;
+	for (const match of text.matchAll(inlineRe)) {
+		const start = match.index ?? 0;
+		const end = start + match[0].length;
+		const insideFenced = regions.some((r) => start >= r.start && end <= r.end);
+		if (!insideFenced) regions.push({ start, end });
+	}
+
+	regions.sort((a, b) => a.start - b.start);
+	return regions;
+}
+
+/** True when byte-index `pos` falls inside one of the code regions. */
+export function isInsideCode(pos: number, regions: CodeRegion[]): boolean {
+	return regions.some((r) => pos >= r.start && pos < r.end);
+}
+
+/** True when `re` matches `text` at a position OUTSIDE every code region. */
+function hasMatchOutsideCode(text: string, re: RegExp): boolean {
+	const codeRegions = findCodeRegions(text);
+	const globalRe = new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`);
+	for (const match of text.matchAll(globalRe)) {
+		const start = match.index ?? -1;
+		if (start >= 0 && !isInsideCode(start, codeRegions)) return true;
+	}
+	return false;
+}
+
 /**
  * Detect inbound text carrying assistant-internal markers (outbound metadata
  * that leaked into the channel and bounced back). Returns the matched labels.
+ *
+ * A marker that appears INSIDE a fenced/inline code span is a legitimately
+ * quoted code sample (e.g. someone pasting `<final>` inside a ``` fence) and is
+ * NOT treated as a reflection — only matches OUTSIDE code count.
  */
 export function detectReflectedContent(text: string): { isReflection: boolean; matchedLabels: string[] } {
 	const src = text ?? "";
 	if (!src.trim()) return { isReflection: false, matchedLabels: [] };
 	const matchedLabels: string[] = [];
 	for (const { label, re } of REFLECTION_PATTERNS) {
-		if (re.test(src)) matchedLabels.push(label);
+		if (hasMatchOutsideCode(src, re)) matchedLabels.push(label);
 	}
 	return { isReflection: matchedLabels.length > 0, matchedLabels };
 }
@@ -406,7 +496,12 @@ export type InboundDecision =
  * Loop-related drops feed the rate limiter; a rate-limited conversation drops a
  * dispatch before it fires.
  */
-export function decideInbound(state: MonitorState, accountId: string, payload: IMessagePayload): InboundDecision {
+export function decideInbound(
+	state: MonitorState,
+	accountId: string,
+	payload: IMessagePayload,
+	selfHandle?: string,
+): InboundDecision {
 	const sender = (payload.sender ?? "").trim();
 	if (!sender && typeof payload.chat_id !== "number") return { kind: "drop", reason: "missing sender" };
 
@@ -486,5 +581,5 @@ export function decideInbound(state: MonitorState, accountId: string, payload: I
 		return { kind: "drop", reason: "loop rate-limited" };
 	}
 
-	return { kind: "dispatch", message: normalizeIMessageMessage(payload) };
+	return { kind: "dispatch", message: normalizeIMessageMessage(payload, selfHandle) };
 }

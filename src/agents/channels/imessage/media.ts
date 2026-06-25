@@ -23,6 +23,7 @@ import path from "node:path";
 // contract types come from the channel SDK barrel so the channel is built
 // entirely on `../sdk.js`.
 import { validateOutboundMediaPath, type InboundMediaAttachment, type OutboundMedia } from "../sdk.js";
+import { scpCopyRemoteAttachment, type ScpCopyArgs } from "./remote-attachments.js";
 
 /** Brigade media kinds an attachment can be. */
 type MediaKind = OutboundMedia["kind"];
@@ -91,23 +92,39 @@ export function inferOutboundMediaKind(media: OutboundMedia): MediaKind {
 	return kindFromExt(media.path);
 }
 
-/** True when a resolved on-disk path lives under one of the allowed roots. */
+/** Normalise a path's separators to `/` for cross-platform root comparison. */
+function toPosixish(p: string): string {
+	return p.replace(/\\/g, "/");
+}
+
+/**
+ * True when a resolved on-disk path lives under one of the allowed roots.
+ *
+ * Roots are POSIX-style macOS paths (the bridge reports paths from a Mac), so
+ * matching is done on forward-slash-normalised strings — NOT `path.resolve`,
+ * which on Windows would drive-root a leading-slash path and flip the separators
+ * (breaking the glob-tail check). A wildcard segment in a root (e.g. the user
+ * segment in /Users/<wildcard>/Library/Messages/Attachments) matches any single
+ * path segment.
+ */
 export function isUnderAllowedRoot(filePath: string, roots: readonly string[]): boolean {
-	const target = path.resolve(filePath);
+	const target = toPosixish((filePath ?? "").trim());
+	if (!target) return false;
+	const targetSegs = target.split("/").filter(Boolean);
 	for (const root of roots) {
-		const r = root.trim();
+		const r = toPosixish(root.trim());
 		if (!r) continue;
-		// A glob root (`/Users/*/Library/...`) matches by its non-glob prefix.
-		const globIdx = r.indexOf("*");
-		if (globIdx >= 0) {
-			const prefix = path.resolve(r.slice(0, globIdx).replace(/[\\/]+$/, ""));
-			// Match the segment before the glob, then require the Attachments tail.
-			const tail = r.slice(globIdx + 1).replace(/^[\\/]+/, "");
-			if (target.startsWith(prefix) && (!tail || target.includes(tail.split("*")[0] ?? tail))) return true;
-			continue;
+		const rootSegs = r.split("/").filter(Boolean);
+		if (rootSegs.length === 0 || targetSegs.length < rootSegs.length) continue;
+		let matched = true;
+		for (let i = 0; i < rootSegs.length; i++) {
+			if (rootSegs[i] === "*") continue;
+			if (rootSegs[i] !== targetSegs[i]) {
+				matched = false;
+				break;
+			}
 		}
-		const resolvedRoot = path.resolve(r);
-		if (target === resolvedRoot || target.startsWith(resolvedRoot + path.sep)) return true;
+		if (matched) return true;
 	}
 	return false;
 }
@@ -141,6 +158,64 @@ export function resolveInboundAttachments(
 			path: p,
 			...(mimeType ? { mimeType } : {}),
 			fileName: path.basename(p),
+		});
+	}
+	return out;
+}
+
+/** Options for {@link resolveInboundAttachmentsRemote}. */
+export interface RemoteInboundAttachmentArgs {
+	/** Validated remote host (`user@host` / `host`). */
+	remoteHost: string;
+	/** Allowed REMOTE attachment roots the remote `original_path` must live under. */
+	remoteRoots: readonly string[];
+	/** TEST SEAM: the scp runner + temp-dir factory used by the copy. */
+	scpRunner?: ScpCopyArgs["scpRunner"];
+	mkdtempImpl?: ScpCopyArgs["mkdtempImpl"];
+	/** Best-effort log for a dropped / failed remote attachment. */
+	log?: (msg: string) => void;
+}
+
+/**
+ * Remote-host variant of {@link resolveInboundAttachments}: the `imsg` bridge runs
+ * on a DIFFERENT machine, so each attachment's `original_path` is a REMOTE path.
+ * For each non-missing attachment whose remote path lives under an allowed remote
+ * root, SCP-copy it to a local temp file, then build the attachment pointing at
+ * the LOCAL copy (so the agent's `read` works). A copy failure drops just that
+ * attachment. Returns [] when nothing resolved.
+ */
+export async function resolveInboundAttachmentsRemote(
+	raw: RawInboundAttachment[] | null | undefined,
+	args: RemoteInboundAttachmentArgs,
+): Promise<InboundMediaAttachment[]> {
+	if (!Array.isArray(raw)) return [];
+	const out: InboundMediaAttachment[] = [];
+	for (const att of raw) {
+		if (!att || att.missing === true) continue;
+		const remotePath = (att.original_path ?? "").trim();
+		if (!remotePath) continue;
+		if (args.remoteRoots.length > 0 && !isUnderAllowedRoot(remotePath, args.remoteRoots)) {
+			args.log?.(`dropping inbound attachment outside allowed remote roots: ${remotePath}`);
+			continue;
+		}
+		let localPath: string;
+		try {
+			localPath = await scpCopyRemoteAttachment({
+				remoteHost: args.remoteHost,
+				remotePath,
+				...(args.scpRunner ? { scpRunner: args.scpRunner } : {}),
+				...(args.mkdtempImpl ? { mkdtempImpl: args.mkdtempImpl } : {}),
+			});
+		} catch (err) {
+			args.log?.(`failed to fetch remote attachment ${remotePath}: ${err instanceof Error ? err.message : String(err)}`);
+			continue;
+		}
+		const mimeType = (att.mime_type ?? "").trim() || undefined;
+		out.push({
+			kind: mimeType ? kindFromMime(mimeType) : kindFromExt(remotePath),
+			path: localPath,
+			...(mimeType ? { mimeType } : {}),
+			fileName: path.basename(remotePath),
 		});
 	}
 	return out;

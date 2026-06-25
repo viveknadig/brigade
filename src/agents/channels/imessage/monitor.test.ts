@@ -4,7 +4,10 @@ import { describe, it } from "node:test";
 import {
 	createMonitorState,
 	decideInbound,
+	detectIMessageMentions,
 	detectReflectedContent,
+	findCodeRegions,
+	isInsideCode,
 	normalizeIMessageMessage,
 	parseIMessageNotification,
 	stripLengthPrefixedText,
@@ -69,6 +72,36 @@ describe("normalizeIMessageMessage", () => {
 		const n = normalizeIMessageMessage({ sender: "+1555", text: "hi", guid: "G-1", id: 3 });
 		assert.equal(n.messageId, "G-1");
 	});
+
+	// Fix 2 — group requireMention: populate mentions[] when the bot's handle is named.
+	it("populates mentions[] when a group message names the bot's selfHandle", () => {
+		const n = normalizeIMessageMessage(
+			{ sender: "+1999", text: "hey 15551234567 take a look", chat_id: 7, is_group: true },
+			"15551234567",
+		);
+		assert.deepEqual(n.mentions, ["15551234567"]);
+	});
+
+	it("leaves mentions unset when a group message does NOT name the bot", () => {
+		const n = normalizeIMessageMessage(
+			{ sender: "+1999", text: "just chatting", chat_id: 7, is_group: true },
+			"15551234567",
+		);
+		assert.equal(n.mentions, undefined);
+	});
+
+	it("never sets mentions for a DM even when the handle appears (DM unaffected)", () => {
+		const n = normalizeIMessageMessage({ sender: "+1999", text: "ping 15551234567" }, "15551234567");
+		assert.equal(n.isGroup, false);
+		assert.equal(n.mentions, undefined);
+	});
+
+	it("decideInbound dispatches a group mention with mentions[] populated", () => {
+		const state = createMonitorState();
+		const d = decideInbound(state, "acct", { sender: "+1999", text: "yo 15551234567", chat_id: 9, is_group: true }, "15551234567");
+		assert.equal(d.kind, "dispatch");
+		if (d.kind === "dispatch") assert.deepEqual(d.message.mentions, ["15551234567"]);
+	});
 });
 
 describe("detectReflectedContent", () => {
@@ -77,6 +110,61 @@ describe("detectReflectedContent", () => {
 	});
 	it("does not flag normal text", () => {
 		assert.equal(detectReflectedContent("hello there").isReflection, false);
+	});
+
+	// Fix 1 — code-fence skip: a marker quoted INSIDE code is legit, not a reflection.
+	it("does NOT flag a <final> tag inside a fenced code block", () => {
+		const msg = "look at this snippet:\n```html\n<final>answer</final>\n```\nthoughts?";
+		assert.equal(detectReflectedContent(msg).isReflection, false);
+	});
+
+	it("does NOT flag a #+#+ separator inside an inline code span", () => {
+		assert.equal(detectReflectedContent("the delimiter `#+#+#` is internal").isReflection, false);
+	});
+
+	it("STILL flags a bare <final> reflection outside any code", () => {
+		const out = detectReflectedContent("here is the <final>leaked answer</final> oops");
+		assert.equal(out.isReflection, true);
+		assert.ok(out.matchedLabels.includes("final-tag"));
+	});
+
+	it("flags when a marker appears both inside AND outside a fence (outside wins)", () => {
+		const msg = "```\n<final>quoted</final>\n```\nand a real <final>leak</final>";
+		assert.equal(detectReflectedContent(msg).isReflection, true);
+	});
+});
+
+describe("findCodeRegions / isInsideCode", () => {
+	it("locates a fenced block and reports a position inside it", () => {
+		const text = "intro\n```\nsecret <final>\n```\ntail";
+		const regions = findCodeRegions(text);
+		assert.ok(regions.length >= 1);
+		const finalIdx = text.indexOf("<final>");
+		assert.equal(isInsideCode(finalIdx, regions), true);
+		// The leading "intro" is outside code.
+		assert.equal(isInsideCode(0, regions), false);
+	});
+
+	it("locates an inline code span", () => {
+		const text = "use `<final>` here";
+		const regions = findCodeRegions(text);
+		const idx = text.indexOf("<final>");
+		assert.equal(isInsideCode(idx, regions), true);
+	});
+});
+
+describe("detectIMessageMentions", () => {
+	it("matches a phone self-handle by digit-run (formatting-insensitive)", () => {
+		assert.deepEqual(detectIMessageMentions("hey +1 (555) 123-4567 can you help", "15551234567"), ["15551234567"]);
+	});
+	it("matches an email self-handle case-insensitively", () => {
+		assert.deepEqual(detectIMessageMentions("ping Bot@Example.com pls", "bot@example.com"), ["bot@example.com"]);
+	});
+	it("returns undefined when the handle is absent", () => {
+		assert.equal(detectIMessageMentions("nobody here", "15551234567"), undefined);
+	});
+	it("returns undefined when no self-handle is configured", () => {
+		assert.equal(detectIMessageMentions("anything", undefined), undefined);
 	});
 });
 

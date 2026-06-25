@@ -2,6 +2,14 @@
 
 export { evaluateAccess, type EvaluateAccessArgs } from "./policy.js";
 export {
+	resolveChannelGroupToolsPolicy,
+	resolveToolsBySender,
+	type GroupToolPolicyConfig,
+	type GroupToolPolicyBySenderConfig,
+	type GroupToolPolicySender,
+	type ChannelGroupToolConfig,
+} from "./group-tool-policy.js";
+export {
 	formatAllowFrom,
 	type AllowFromEntry,
 	type FormatAllowFromOptions,
