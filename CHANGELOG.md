@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.0](https://github.com/spinabot/brigade/compare/brigade-v1.8.0...brigade-v1.9.0) (2026-06-25)
+
+
+### Features
+
+* **expose:** brigade expose / bloody benchmark — one-command public tunnel ([1cb466b](https://github.com/spinabot/brigade/commit/1cb466b98ed865c574837bc349e78bbb04fd4c57))
+
 ## [1.8.0](https://github.com/spinabot/brigade/compare/brigade-v1.7.0...brigade-v1.8.0) (2026-06-25)
 
 
