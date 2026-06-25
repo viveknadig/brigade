@@ -94,6 +94,12 @@ import {
 	discordThreadIdleTtlMs,
 } from "../agents/channels/discord/account-config.js";
 import { createDiscordPlugin, type DiscordPluginHandle } from "../agents/channels/discord/plugin.js";
+import {
+	listIMessageAccountIds,
+	imessageChannelEnabled,
+	imessageThreadIdleTtlMs,
+} from "../agents/channels/imessage/account-config.js";
+import { createIMessagePlugin, type IMessagePluginHandle } from "../agents/channels/imessage/plugin.js";
 import { createPluginChannelManagerFacade } from "../agents/channels/plugin-channel-manager-facade.js";
 import type { ChannelPlugin } from "../agents/channels/types.plugin.js";
 import {
@@ -2017,7 +2023,12 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					// `loadConfig` is synchronous + cheap; reading fresh keeps the TTL
 					// live across config reloads without threading a mutable holder.
 					const cfg = loadConfig() as never;
-					return telegramThreadIdleTtlMs(cfg) ?? slackThreadIdleTtlMs(cfg) ?? discordThreadIdleTtlMs(cfg);
+					return (
+						telegramThreadIdleTtlMs(cfg) ??
+						slackThreadIdleTtlMs(cfg) ??
+						discordThreadIdleTtlMs(cfg) ??
+						imessageThreadIdleTtlMs(cfg)
+					);
 				} catch {
 					return null;
 				}
@@ -5305,14 +5316,20 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		const discordAccounts = discordChannelEnabled(cfg as never)
 			? listDiscordAccountIds(cfg as never)
 			: [];
+		const imessageAccounts = imessageChannelEnabled(cfg as never)
+			? listIMessageAccountIds(cfg as never)
+			: [];
 		const wantWhatsAppMulti = whatsappAccounts.length > 1;
 		const wantTelegramMulti = telegramAccounts.length > 1;
 		const wantSlackMulti = slackAccounts.length > 1;
 		const wantDiscordMulti = discordAccounts.length > 1;
-		if (wantWhatsAppMulti || wantTelegramMulti || wantSlackMulti || wantDiscordMulti) {
+		const wantIMessageMulti = imessageAccounts.length > 1;
+		if (wantWhatsAppMulti || wantTelegramMulti || wantSlackMulti || wantDiscordMulti || wantIMessageMulti) {
 			// Fresh list each (re)start so a reload doesn't accumulate stale plugins.
 			bundledChannelPlugins = [];
-			const facadeHandles: Array<WhatsAppPluginHandle | TelegramPluginHandle | SlackPluginHandle | DiscordPluginHandle> = [];
+			const facadeHandles: Array<
+				WhatsAppPluginHandle | TelegramPluginHandle | SlackPluginHandle | DiscordPluginHandle | IMessagePluginHandle
+			> = [];
 			const multiAccountSummary: string[] = [];
 			if (wantWhatsAppMulti) {
 				const whatsappPlugin = createWhatsAppPlugin({
@@ -5361,6 +5378,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				bundledChannelPlugins.push(discordPlugin);
 				facadeHandles.push(discordPlugin);
 				multiAccountSummary.push(`discord x${discordAccounts.length}`);
+			}
+			if (wantIMessageMulti) {
+				const imessagePlugin = createIMessagePlugin({
+					defaultAgentId: agentId,
+					loadConfig: () => cfg as never,
+					runTurn: (turn) => runGatewayTurn(turn),
+				});
+				bundledChannelPlugins.push(imessagePlugin);
+				facadeHandles.push(imessagePlugin);
+				multiAccountSummary.push(`imessage x${imessageAccounts.length}`);
 			}
 			const pluginById = new Map(bundledChannelPlugins.map((p) => [p.id, p] as const));
 			// Register each constructed plugin's `meta` + its `messaging`/`security`

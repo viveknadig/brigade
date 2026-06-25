@@ -63,10 +63,27 @@ export const DISCORD_CHANNEL_META: ChannelMeta = {
 	markdownCapable: true,
 };
 
+/**
+ * iMessage channel metadata. iMessage has NO rich markup (plain text only), so
+ * it is NOT markdown-capable — the assembler's markdown gate strips formatting
+ * for this channel. Driven by the `imsg` CLI as a JSON-RPC subprocess.
+ */
+export const IMESSAGE_CHANNEL_META: ChannelMeta = {
+	id: "imessage",
+	label: "iMessage",
+	selectionLabel: "iMessage",
+	docsPath: "channels/imessage",
+	blurb: "Drive native iMessage via the imsg CLI; DM/group chat over Messages.app.",
+	order: 50,
+	aliases: ["imsg"],
+	markdownCapable: false,
+};
+
 /** Every bundled channel meta, in declaration order. The registry seeds from this. */
 export const BUNDLED_CHANNEL_METAS: readonly ChannelMeta[] = [
 	WHATSAPP_CHANNEL_META,
 	TELEGRAM_CHANNEL_META,
 	SLACK_CHANNEL_META,
 	DISCORD_CHANNEL_META,
+	IMESSAGE_CHANNEL_META,
 ];

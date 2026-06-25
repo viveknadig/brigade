@@ -1,0 +1,120 @@
+import { strict as assert } from "node:assert";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, it } from "node:test";
+
+import type { IMessageRpcLike } from "./client.js";
+import { sendMessageIMessage } from "./send.js";
+
+/** A fake RPC client that records the last `send` params and returns a canned result. */
+class FakeRpcClient implements IMessageRpcLike {
+	lastMethod: string | null = null;
+	lastParams: Record<string, unknown> | null = null;
+	stopped = false;
+	constructor(private readonly result: Record<string, unknown> = { message_id: "M-1" }) {}
+	async start(): Promise<void> {}
+	async stop(): Promise<void> {
+		this.stopped = true;
+	}
+	async request<T = unknown>(method: string, params?: unknown): Promise<T> {
+		this.lastMethod = method;
+		this.lastParams = (params ?? {}) as Record<string, unknown>;
+		return this.result as T;
+	}
+	async waitForClose(): Promise<void> {}
+}
+
+describe("sendMessageIMessage", () => {
+	it("sends to a phone handle with default auto service", async () => {
+		const client = new FakeRpcClient();
+		const res = await sendMessageIMessage("+15551234567", "hello", { client });
+		assert.equal(res.messageId, "M-1");
+		assert.equal(res.sentText, "hello");
+		assert.equal(client.lastMethod, "send");
+		assert.equal(client.lastParams?.to, "+15551234567");
+		assert.equal(client.lastParams?.service, "auto");
+		assert.equal(client.lastParams?.text, "hello");
+		// An injected client is NOT stopped by send.
+		assert.equal(client.stopped, false);
+	});
+
+	it("inherits the service from a service-prefixed handle", async () => {
+		const client = new FakeRpcClient();
+		await sendMessageIMessage("sms:+15551234567", "hi", { client });
+		assert.equal(client.lastParams?.service, "sms");
+		assert.equal(client.lastParams?.to, "+15551234567");
+	});
+
+	it("routes a chat_id target to the chat_id param", async () => {
+		const client = new FakeRpcClient();
+		await sendMessageIMessage("chat_id:42", "yo", { client });
+		assert.equal(client.lastParams?.chat_id, 42);
+		assert.equal(client.lastParams?.to, undefined);
+	});
+
+	it("routes a chat_guid target", async () => {
+		const client = new FakeRpcClient();
+		await sendMessageIMessage("chat_guid:G-1", "yo", { client });
+		assert.equal(client.lastParams?.chat_guid, "G-1");
+	});
+
+	it("routes a chat_identifier target", async () => {
+		const client = new FakeRpcClient();
+		await sendMessageIMessage("chat_identifier:ID-1", "yo", { client });
+		assert.equal(client.lastParams?.chat_identifier, "ID-1");
+	});
+
+	it("opts.chatId wins over the `to` string", async () => {
+		const client = new FakeRpcClient();
+		await sendMessageIMessage("+15551234567", "yo", { client, chatId: 9 });
+		assert.equal(client.lastParams?.chat_id, 9);
+		assert.equal(client.lastParams?.to, undefined);
+	});
+
+	it("includes a sanitized reply_to", async () => {
+		const client = new FakeRpcClient();
+		await sendMessageIMessage("+15551234567", "re", { client, replyToId: "  msg[1]  " });
+		assert.equal(client.lastParams?.reply_to, "msg1");
+	});
+
+	it("flattens a markdown table to plain text", async () => {
+		const client = new FakeRpcClient();
+		const table = "| a | b |\n| --- | --- |\n| 1 | 2 |";
+		await sendMessageIMessage("+15551234567", table, { client });
+		const sent = String(client.lastParams?.text ?? "");
+		assert.ok(!sent.includes("---"), "separator row dropped");
+		assert.ok(sent.includes("a | b"), "header flattened");
+		assert.ok(sent.includes("1 | 2"), "row flattened");
+	});
+
+	it("attaches media + emits a <media:kind> placeholder when text is empty", async () => {
+		const dir = mkdtempSync(path.join(os.tmpdir(), "imsg-media-"));
+		const file = path.join(dir, "pic.png");
+		writeFileSync(file, "x");
+		const client = new FakeRpcClient();
+		const res = await sendMessageIMessage("+15551234567", "", { client, mediaPath: file });
+		assert.equal(client.lastParams?.file, path.resolve(file));
+		assert.equal(client.lastParams?.text, "<media:image>");
+		assert.equal(res.sentText, "<media:image>");
+	});
+
+	it("throws when neither text nor media is provided", async () => {
+		const client = new FakeRpcClient();
+		await assert.rejects(() => sendMessageIMessage("+15551234567", "", { client }), /requires text or media/);
+	});
+
+	it("constructs + stops a client via the injected factory when none is passed", async () => {
+		const created = new FakeRpcClient();
+		const res = await sendMessageIMessage("+15551234567", "hi", {
+			createClient: async () => created,
+		});
+		assert.equal(res.messageId, "M-1");
+		// A client WE created is stopped in the finally.
+		assert.equal(created.stopped, true);
+	});
+
+	afterEach(() => {
+		/* tmp dirs are left for the OS to reap; no global state to reset */
+	});
+});
