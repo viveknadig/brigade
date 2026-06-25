@@ -82,6 +82,26 @@ export function listDiscordSubagentThreadBindings(): DiscordSubagentThreadBindin
 }
 
 /**
+ * Drop any binding pointing at a given thread id (Fix 6). The THREAD_UPDATE
+ * archive listener only knows the thread id (not the child session key), so it
+ * forgets by thread id to prevent a leaked binding when a thread is archived.
+ * Returns the number of bindings dropped (0 when none matched).
+ */
+export function forgetDiscordSubagentThreadBindingByThreadId(threadId: string | undefined | null): number {
+	const id = threadId?.trim();
+	if (!id) return 0;
+	const state = getState();
+	let dropped = 0;
+	for (const [key, binding] of state.byChildSessionKey) {
+		if (binding.threadId === id) {
+			state.byChildSessionKey.delete(key);
+			dropped += 1;
+		}
+	}
+	return dropped;
+}
+
+/**
  * Startup reconcile: drop any binding whose child session is no longer known to
  * the spawn registry (the run completed + was archived across a reload). Cheap —
  * a Map walk. Returns the number dropped. Never deletes the thread itself.

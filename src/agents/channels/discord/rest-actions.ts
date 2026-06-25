@@ -152,7 +152,10 @@ export async function discordRestRequest(
 		Authorization: `Bot ${token}`,
 		"content-type": "application/json",
 	};
-	if (input.reason) headers["X-Audit-Log-Reason"] = input.reason;
+	// X-Audit-Log-Reason must be Latin1/percent-encoded — a raw reason with an emoji,
+	// accent, or newline (e.g. "spam 🚫", "Belästigung") makes `fetch` throw
+	// `TypeError: invalid header value`, which would fail the whole moderation action.
+	if (input.reason) headers["X-Audit-Log-Reason"] = encodeURIComponent(input.reason);
 
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -244,6 +247,41 @@ export async function resolveSendChannelId(to: string, opts: DiscordRestOptions)
 /** SUPPRESS_NOTIFICATIONS message flag (1 << 12) — silences the @-ping. */
 const DISCORD_SUPPRESS_NOTIFICATIONS_FLAG = 1 << 12;
 
+/**
+ * The wire-shape `allowed_mentions` Discord expects (snake_case). Mirrors the
+ * connection-path {@link safeDiscordAllowedMentions}: `parse` whitelists which
+ * mention CLASSES notify; omitting `"everyone"` is what kills the `@everyone` /
+ * `@here` mass-ping vector.
+ */
+export interface DiscordRestAllowedMentions {
+	parse?: Array<"users" | "roles" | "everyone">;
+	users?: string[];
+	roles?: string[];
+	replied_user?: boolean;
+}
+
+/**
+ * The SAFE default `allowed_mentions` applied to every REST send body. Matches the
+ * connection-path safety: `parse: ["users", "roles"]` lets explicit `<@id>` /
+ * `<@&roleid>` mentions ping, while the absence of `"everyone"` means an
+ * `@everyone` / `@here` that slipped into the content renders as inert text and
+ * pings no one. A fresh object per call so a send can't mutate the shared default.
+ */
+export function safeRestAllowedMentions(): DiscordRestAllowedMentions {
+	return { parse: ["users", "roles"] };
+}
+
+/**
+ * Resolve the `allowed_mentions` for a REST send body. Defaults to the safe
+ * everyone-excluding shape; an explicit caller override (opt-in) is passed through
+ * verbatim so a deliberate, owner-authorized broadcast can still set `everyone`.
+ */
+function resolveRestAllowedMentions(
+	override?: DiscordRestAllowedMentions,
+): DiscordRestAllowedMentions {
+	return override ?? safeRestAllowedMentions();
+}
+
 export async function sendMessage(
 	params: {
 		to: string;
@@ -258,6 +296,12 @@ export async function sendMessage(
 		 * `content` — the caller moves text into TextDisplay blocks.
 		 */
 		flags?: number;
+		/**
+		 * Opt-in `allowed_mentions` override. Omit for the SAFE default (users + roles,
+		 * NO everyone) so `@everyone` in `content` can't mass-ping; pass an explicit
+		 * shape only for a deliberate, owner-authorized broadcast.
+		 */
+		allowedMentions?: DiscordRestAllowedMentions;
 	},
 	opts: DiscordRestOptions,
 ): Promise<unknown> {
@@ -271,6 +315,7 @@ export async function sendMessage(
 		body.components = params.components;
 	}
 	if (params.replyTo) body.message_reference = { message_id: params.replyTo };
+	body.allowed_mentions = resolveRestAllowedMentions(params.allowedMentions);
 	let flags = typeof params.flags === "number" && Number.isFinite(params.flags) ? params.flags : 0;
 	if (params.silent) flags |= DISCORD_SUPPRESS_NOTIFICATIONS_FLAG;
 	if (flags) body.flags = flags;
@@ -284,11 +329,16 @@ export async function sendMessage(
 }
 
 export async function sendEmbed(
-	params: { to: string; embed: DiscordEmbedSpec; content?: string },
+	params: { to: string; embed: DiscordEmbedSpec; content?: string; allowedMentions?: DiscordRestAllowedMentions },
 	opts: DiscordRestOptions,
 ): Promise<unknown> {
 	return sendMessage(
-		{ to: params.to, ...(params.content ? { content: params.content } : {}), embeds: [params.embed] },
+		{
+			to: params.to,
+			...(params.content ? { content: params.content } : {}),
+			embeds: [params.embed],
+			...(params.allowedMentions ? { allowedMentions: params.allowedMentions } : {}),
+		},
 		opts,
 	);
 }
@@ -300,18 +350,20 @@ export async function sendPoll(
 		answers: string[];
 		durationHours?: number;
 		allowMultiselect?: boolean;
+		allowedMentions?: DiscordRestAllowedMentions;
 	},
 	opts: DiscordRestOptions,
 ): Promise<unknown> {
 	const channelId = await resolveSendChannelId(params.to, opts);
 	const answers = params.answers.slice(0, 10).map((text) => ({ poll_media: { text } }));
-	const body = {
+	const body: Record<string, unknown> = {
 		poll: {
 			question: { text: params.question },
 			answers,
 			duration: params.durationHours && params.durationHours > 0 ? params.durationHours : 24,
 			allow_multiselect: params.allowMultiselect === true,
 		},
+		allowed_mentions: resolveRestAllowedMentions(params.allowedMentions),
 	};
 	return discordRestRequest(
 		{ method: "POST", path: `/channels/${channelId}/messages`, body },
@@ -320,12 +372,13 @@ export async function sendPoll(
 }
 
 export async function sendSticker(
-	params: { to: string; stickerIds: string[]; content?: string },
+	params: { to: string; stickerIds: string[]; content?: string; allowedMentions?: DiscordRestAllowedMentions },
 	opts: DiscordRestOptions,
 ): Promise<unknown> {
 	const channelId = await resolveSendChannelId(params.to, opts);
 	const body: Record<string, unknown> = { sticker_ids: params.stickerIds.slice(0, 3) };
 	if (params.content) body.content = params.content;
+	body.allowed_mentions = resolveRestAllowedMentions(params.allowedMentions);
 	return discordRestRequest(
 		{ method: "POST", path: `/channels/${channelId}/messages`, body },
 		opts,

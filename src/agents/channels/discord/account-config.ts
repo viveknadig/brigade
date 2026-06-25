@@ -68,6 +68,11 @@ interface DiscordAccountEntry {
 	botToken?: string;
 	/** Per-account proxy URL (`http(s)://[user:pass@]host:port`). `${VAR}`-resolved. */
 	proxy?: string;
+	/**
+	 * Per-account bot presence / activity (Phase 5). Overrides the top-level
+	 * `channels.discord.presence` for this account; see {@link resolveDiscordPresence}.
+	 */
+	presence?: DiscordPresenceConfigSlot;
 	[key: string]: unknown;
 }
 
@@ -439,9 +444,21 @@ export function discordThreadIdleTtlMs(cfg: BrigadeConfig): number | null {
  * (degrades to the default), never throwing. The activity type is mapped to its
  * discord.js `ActivityType` numeric code here so the connection stays
  * discord.js-agnostic.
+ *
+ * Multi-account aware (mirrors the other per-account resolvers): the per-account
+ * `accounts[id].presence` wins, falling back to the top-level
+ * `channels.discord.presence`. Without this fallback a per-account
+ * `set-presence` write was a silent no-op (it read only the top-level slot).
  */
-export function resolveDiscordPresence(cfg: BrigadeConfig): ResolvedDiscordPresence | null {
-	const slot = discordChannelConfig(cfg)?.presence;
+export function resolveDiscordPresence(
+	cfg: BrigadeConfig,
+	accountId?: string | null,
+): ResolvedDiscordPresence | null {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const entry = findAccountEntry(cfg, id);
+	const slot =
+		(entry?.presence && typeof entry.presence === "object" ? entry.presence : undefined) ??
+		discordChannelConfig(cfg)?.presence;
 	if (!slot || typeof slot !== "object") return null;
 	const statusRaw = typeof slot.status === "string" ? slot.status.trim().toLowerCase() : "";
 	const status: DiscordPresenceStatus =

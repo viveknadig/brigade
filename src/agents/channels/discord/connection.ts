@@ -79,6 +79,7 @@ import {
 } from "./inbound-extras.js";
 import { buildDiscordAttachment, downloadDiscordAttachment } from "./media.js";
 import { isDiscordUserMessageType, resolveDiscordSystemEvent } from "./system-events.js";
+import { forgetDiscordSubagentThreadBindingByThreadId } from "./subagent-thread-binding-store.js";
 
 /* ───────────────────────── reconnect backoff ───────────────────────── */
 // Shares the neutral `nextBackoffDelay` curve with every other channel (see
@@ -357,6 +358,22 @@ export interface DiscordSendOptions {
  */
 const CHANNEL_TYPE_GUILD_FORUM = 15;
 const CHANNEL_TYPE_GUILD_MEDIA = 16;
+const CHANNEL_TYPE_GUILD_VOICE = 2;
+const CHANNEL_TYPE_GUILD_STAGE_VOICE = 13;
+
+/**
+ * Channel types where a message-thread can't be started (Fix 6). Forum/Media
+ * channels only host posts (their own threads), and Voice/Stage channels have no
+ * message-thread surface — `message.startThread(...)` 400s on all of them. The
+ * auto-thread path guards on these to avoid a wasteful failed REST call + a noisy
+ * error log (it already falls back to an un-threaded reply).
+ */
+const THREAD_UNSUPPORTED_CHANNEL_TYPES = new Set<number>([
+	CHANNEL_TYPE_GUILD_FORUM,
+	CHANNEL_TYPE_GUILD_MEDIA,
+	CHANNEL_TYPE_GUILD_VOICE,
+	CHANNEL_TYPE_GUILD_STAGE_VOICE,
+]);
 
 /** `MessageFlags.SuppressNotifications` (1 << 12) — a silent send (Fix 2c). */
 const MESSAGE_FLAG_SUPPRESS_NOTIFICATIONS = 1 << 12;
@@ -1518,6 +1535,30 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		}
 	};
 
+	/**
+	 * Handle a THREAD_UPDATE (Fix 6). When a thread transitions INTO the archived
+	 * state (was not archived, now is), drop any sub-agent thread binding pointing
+	 * at it so an archived thread doesn't leak a binding. discord.js hands the old +
+	 * new `ThreadChannel`; we read `.archived` off each (a partial may omit `old`,
+	 * in which case we act on the new archived state alone). No-op for any other
+	 * thread update (rename, lock, slow-mode, …).
+	 */
+	const handleThreadArchive = (oldThread: unknown, newThread: unknown): void => {
+		const next = newThread as { id?: unknown; archived?: unknown } | null | undefined;
+		const prev = oldThread as { archived?: unknown } | null | undefined;
+		const threadId = typeof next?.id === "string" ? next.id : "";
+		if (!threadId) return;
+		const nowArchived = next?.archived === true;
+		const wasArchived = prev?.archived === true;
+		// Only act on the not-archived → archived transition (or when we have no prior
+		// state to compare and it's archived now).
+		if (!nowArchived || wasArchived) return;
+		const dropped = forgetDiscordSubagentThreadBindingByThreadId(threadId);
+		if (dropped > 0) {
+			safeLog("discord thread archived — dropped sub-agent thread binding", { threadId, dropped });
+		}
+	};
+
 	/* ── event wiring ── */
 
 	const wireClient = (c: DiscordClientLike): void => {
@@ -1532,6 +1573,17 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		c.on("messageDelete", (() => {
 			// A deleted message carries no routable content — just stamp liveness.
 			stampInboundEvent();
+		}) as never);
+		// THREAD_UPDATE (Fix 6): when a thread transitions to archived, best-effort
+		// drop any sub-agent thread binding for it so an archived thread doesn't leak
+		// a binding. Fully guarded — a malformed/partial payload is a no-op.
+		c.on("threadUpdate", ((oldThread: unknown, newThread: unknown) => {
+			stampInboundEvent(); // thread state change is still gateway traffic (liveness)
+			try {
+				handleThreadArchive(oldThread, newThread);
+			} catch {
+				/* never let a thread-update payload break the listener */
+			}
 		}) as never);
 		c.on("messageReactionAdd", ((reaction: never, user: never) => handleReactionAdd(reaction, user)) as never);
 		c.on("messageReactionRemove", ((reaction: never, user: never) => handleReactionRemove(reaction, user)) as never);
@@ -1956,6 +2008,13 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 			const c = requireLive();
 			const ch = await c.channels.fetch(channelId);
 			if (!ch || typeof ch.messages?.fetch !== "function") return null;
+			// Forum/Media/Voice channels reject `startThread` (they have no
+			// message-thread surface). Skip SILENTLY (Fix 6) — the caller falls back
+			// to an un-threaded reply, and we suppress the noisy known-unsupported error.
+			const channelType = (ch as { type?: number }).type;
+			if (typeof channelType === "number" && THREAD_UNSUPPORTED_CHANNEL_TYPES.has(channelType)) {
+				return null;
+			}
 			const message = await ch.messages.fetch(messageId);
 			if (!message) return null;
 			// Already threaded → reuse (avoids the "already has a thread" reject).

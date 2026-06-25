@@ -15,6 +15,11 @@ import {
 	type DiscordSentMessageLike,
 } from "./connection.js";
 import { __resetDiscordDirectoryCacheForTest, resolveDiscordHandle } from "./directory-cache.js";
+import {
+	getDiscordSubagentThreadBinding,
+	rememberDiscordSubagentThreadBinding,
+	resetDiscordSubagentThreadBindingsForTests,
+} from "./subagent-thread-binding-store.js";
 
 /* ─────────────────────── fake discord client harness ─────────────────────── */
 
@@ -1072,6 +1077,71 @@ describe("connectDiscord — createThreadFromMessage (Phase 5 autoThread)", () =
 		const h = await boot({ noStartThread: true });
 		const id = await h.conn.createThreadFromMessage("C1", "m1", { name: "x" });
 		assert.equal(id, null);
+	});
+
+	it("skips silently on a Forum channel (no startThread attempt) — Fix 6", async () => {
+		// A Forum channel (type 15) rejects startThread; the guard skips it before
+		// the wasteful failed REST call, returning null so the caller falls back.
+		const h = await boot({ channelType: 15 });
+		const id = await h.conn.createThreadFromMessage("C1", "m1", { name: "x" });
+		assert.equal(id, null);
+		assert.equal(h.client.startThreadCalls.length, 0, "no startThread attempted on a forum channel");
+	});
+
+	it("skips silently on a Voice channel (no startThread attempt) — Fix 6", async () => {
+		const h = await boot({ channelType: 2 });
+		const id = await h.conn.createThreadFromMessage("C1", "m1", { name: "x" });
+		assert.equal(id, null);
+		assert.equal(h.client.startThreadCalls.length, 0, "no startThread attempted on a voice channel");
+	});
+});
+
+describe("connectDiscord — THREAD_UPDATE archive listener (Fix 6)", () => {
+	it("drops the sub-agent thread binding when a thread transitions to archived", async () => {
+		resetDiscordSubagentThreadBindingsForTests();
+		try {
+			rememberDiscordSubagentThreadBinding({
+				childSessionKey: "agent:scout:subagent:a:thread:T-arch",
+				threadId: "T-arch",
+				parentChannelId: "C-1",
+				accountId: "default",
+				agentId: "scout",
+				boundAt: Date.now(),
+			});
+			const h = await boot();
+			// not-archived → archived transition drops the binding.
+			h.client.emit("threadUpdate", { id: "T-arch", archived: false }, { id: "T-arch", archived: true });
+			assert.equal(
+				getDiscordSubagentThreadBinding("agent:scout:subagent:a:thread:T-arch"),
+				undefined,
+				"binding dropped on archive",
+			);
+		} finally {
+			resetDiscordSubagentThreadBindingsForTests();
+		}
+	});
+
+	it("leaves the binding intact for a non-archive thread update (rename/lock)", async () => {
+		resetDiscordSubagentThreadBindingsForTests();
+		try {
+			rememberDiscordSubagentThreadBinding({
+				childSessionKey: "agent:scout:subagent:b:thread:T-keep",
+				threadId: "T-keep",
+				parentChannelId: "C-1",
+				accountId: "default",
+				agentId: "scout",
+				boundAt: Date.now(),
+			});
+			const h = await boot();
+			// archived stays false → no drop.
+			h.client.emit("threadUpdate", { id: "T-keep", archived: false }, { id: "T-keep", archived: false });
+			assert.ok(
+				getDiscordSubagentThreadBinding("agent:scout:subagent:b:thread:T-keep"),
+				"binding intact for a non-archive update",
+			);
+		} finally {
+			resetDiscordSubagentThreadBindingsForTests();
+		}
 	});
 });
 

@@ -179,6 +179,28 @@ describe("discord account-config — presence (Phase 5)", () => {
 		assert.equal(p?.status, "online");
 		assert.equal(p?.activityTypeCode, 4); // unknown type → custom default
 	});
+
+	it("resolves the per-account presence for that account (Bug 2)", () => {
+		const c = cfg({
+			enabled: true,
+			presence: { status: "online" }, // top-level default
+			accounts: [
+				{ id: "main", presence: { status: "dnd" } },
+				{ id: "labs" }, // no per-account presence
+			],
+		});
+		// The per-account presence wins for that account...
+		assert.deepEqual(resolveDiscordPresence(c, "main"), { status: "dnd" });
+		// ...and an account without its own presence falls back to the top-level.
+		assert.deepEqual(resolveDiscordPresence(c, "labs"), { status: "online" });
+	});
+
+	it("top-level presence still resolves for the default account (Bug 2 fallback)", () => {
+		const c = cfg({ enabled: true, presence: { status: "idle" } });
+		assert.deepEqual(resolveDiscordPresence(c, "default"), { status: "idle" });
+		// No accountId argument also reads the top-level (back-compat).
+		assert.deepEqual(resolveDiscordPresence(c), { status: "idle" });
+	});
 });
 
 describe("discord account-config — autoThread (Phase 5)", () => {

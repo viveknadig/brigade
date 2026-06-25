@@ -23,6 +23,7 @@ import {
 	sendEmbed,
 	sendMessage,
 	sendPoll,
+	sendSticker,
 	timeout,
 } from "./rest-actions.js";
 
@@ -70,7 +71,7 @@ describe("rest-actions — messaging", () => {
 		const call = rec.calls[0]!;
 		assert.equal(call.method, "POST");
 		assert.match(call.url, /\/api\/v10\/channels\/555\/messages$/);
-		assert.deepEqual(call.body, { content: "hi there" });
+		assert.deepEqual(call.body, { content: "hi there", allowed_mentions: { parse: ["users", "roles"] } });
 		assert.equal(call.headers.Authorization, "Bot AAA");
 	});
 
@@ -110,6 +111,37 @@ describe("rest-actions — messaging", () => {
 		assert.deepEqual(body.poll.answers, [{ poll_media: { text: "A" } }, { poll_media: { text: "B" } }]);
 		assert.equal(body.poll.duration, 12);
 		assert.equal(body.poll.allow_multiselect, true);
+	});
+
+	it("every REST send sets safe allowed_mentions (no everyone) — @everyone can't mass-ping (Bug 3)", async () => {
+		const rec = recordFetch();
+		// send with @everyone in content
+		await sendMessage({ to: "555", content: "@everyone hi" }, { token: TOKEN, fetchImpl: rec.fetch });
+		const sendBody = rec.calls[0]!.body as { allowed_mentions?: { parse?: string[] } };
+		assert.deepEqual(sendBody.allowed_mentions, { parse: ["users", "roles"] });
+		assert.ok(!sendBody.allowed_mentions?.parse?.includes("everyone"), "everyone must be excluded");
+
+		// poll
+		const recPoll = recordFetch();
+		await sendPoll({ to: "555", question: "Q", answers: ["A"] }, { token: TOKEN, fetchImpl: recPoll.fetch });
+		const pollBody = recPoll.calls[0]!.body as { allowed_mentions?: { parse?: string[] } };
+		assert.deepEqual(pollBody.allowed_mentions, { parse: ["users", "roles"] });
+
+		// sticker
+		const recSticker = recordFetch();
+		await sendSticker({ to: "555", stickerIds: ["s1"] }, { token: TOKEN, fetchImpl: recSticker.fetch });
+		const stickerBody = recSticker.calls[0]!.body as { allowed_mentions?: { parse?: string[] } };
+		assert.deepEqual(stickerBody.allowed_mentions, { parse: ["users", "roles"] });
+	});
+
+	it("an explicit allowedMentions override is passed through (opt-in broadcast)", async () => {
+		const rec = recordFetch();
+		await sendMessage(
+			{ to: "555", content: "@everyone", allowedMentions: { parse: ["everyone"] } },
+			{ token: TOKEN, fetchImpl: rec.fetch },
+		);
+		const body = rec.calls[0]!.body as { allowed_mentions?: { parse?: string[] } };
+		assert.deepEqual(body.allowed_mentions, { parse: ["everyone"] });
 	});
 
 	it("readMessages GETs with a limit capped at 50", async () => {
@@ -158,6 +190,20 @@ describe("rest-actions — moderation", () => {
 		assert.match(call.url, /\/guilds\/g1\/bans\/u1$/);
 		assert.deepEqual(call.body, { delete_message_seconds: 2 * 86_400 });
 		assert.equal(call.headers["X-Audit-Log-Reason"], "spam");
+	});
+
+	it("a non-ASCII audit reason is percent-encoded so fetch can't throw on the header (Bug 1)", async () => {
+		const rec = recordFetch({ status: 204 });
+		// An emoji / accent / newline in a raw header value makes fetch throw
+		// `TypeError: invalid header value`; encodeURIComponent makes it Latin1-safe.
+		await ban(
+			{ guildId: "g1", userId: "u1", reason: "spam 🚫 Belästigung" },
+			{ token: TOKEN, fetchImpl: rec.fetch },
+		);
+		const header = rec.calls[0]!.headers["X-Audit-Log-Reason"];
+		assert.equal(header, encodeURIComponent("spam 🚫 Belästigung"));
+		// The header value must be pure ASCII (no raw multi-byte / control chars).
+		assert.ok(/^[\x00-\x7F]*$/.test(header!), "encoded header is ASCII-safe");
 	});
 
 	it("timeout PATCHes the member with a future communication_disabled_until", async () => {

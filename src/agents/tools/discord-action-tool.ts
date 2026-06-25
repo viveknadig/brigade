@@ -73,6 +73,7 @@ import {
 	sendMessage,
 	sendPoll,
 	sendSticker,
+	stickerUpload,
 	threadCreate,
 	timeout,
 	unban,
@@ -289,6 +290,7 @@ const DiscordActionParams = Type.Object({
 			Type.Literal("member-info"),
 			Type.Literal("emoji-list"),
 			Type.Literal("emoji-upload"),
+			Type.Literal("sticker-upload"),
 			Type.Literal("event-list"),
 			Type.Literal("event-create"),
 			// moderation
@@ -302,7 +304,7 @@ const DiscordActionParams = Type.Object({
 		],
 		{
 			description:
-				"The Discord guild action to run. Messaging: send, send-embed, poll, sticker, read-messages, list-reactions, remove-reaction, thread-create, list-threads, search-messages. Guild-admin: channel-create/edit/delete/move, category-create/edit/delete, role-list/add/remove/info, member-info, emoji-list/upload, event-list/create. Moderation: ban, unban, kick, timeout, untimeout. Presence: set-presence (persists channels.discord.presence; applied on next (re)connect).",
+				"The Discord guild action to run. Messaging: send, send-embed, poll, sticker, read-messages, list-reactions, remove-reaction, thread-create, list-threads, search-messages. Guild-admin: channel-create/edit/delete/move, category-create/edit/delete, role-list/add/remove/info, member-info, emoji-list/upload, sticker-upload, event-list/create. Moderation: ban, unban, kick, timeout, untimeout. Presence: set-presence (persists channels.discord.presence; applied on next (re)connect).",
 		},
 	),
 	accountId: Type.Optional(
@@ -342,6 +344,10 @@ const DiscordActionParams = Type.Object({
 	emoji: Type.Optional(Type.String({ description: "Reaction emoji — raw unicode, or `name:id` for a custom emoji.", maxLength: 128 })),
 	emojiName: Type.Optional(Type.String({ description: "emoji-upload: the new emoji's name.", maxLength: 64 })),
 	emojiImage: Type.Optional(Type.String({ description: "emoji-upload: a data URI (data:image/png;base64,…) for the emoji image.", maxLength: 600_000 })),
+		stickerName: Type.Optional(Type.String({ description: "sticker-upload: the new sticker name.", maxLength: 30 })),
+		stickerDescription: Type.Optional(Type.String({ description: "sticker-upload: the sticker description.", maxLength: 100 })),
+		stickerTags: Type.Optional(Type.String({ description: "sticker-upload: autocomplete/suggestion tags (a related unicode emoji or short keywords).", maxLength: 200 })),
+		stickerImage: Type.Optional(Type.String({ description: "sticker-upload: a data URI (data:image/png;base64,... PNG/APNG, or application/json for Lottie) for the sticker file.", maxLength: 600_000 })),
 
 	// reads / search
 	limit: Type.Optional(Type.Number({ description: "read-messages (≤50) / list-reactions (≤50) / search-messages (≤25) cap." })),
@@ -434,6 +440,23 @@ export function capDiscordData(value: unknown, maxChars = MAX_DATA_CHARS): unkno
 		note: `Result truncated at ${maxChars} chars — narrow the request (a lower limit) and try again.`,
 		preview: s.slice(0, maxChars),
 	};
+}
+
+/**
+ * Decode a `data:<mime>;base64,<payload>` URI into raw bytes + the MIME type, for
+ * the multipart sticker upload (which needs the file bytes, not a JSON image
+ * string like emoji-upload). Returns null when the input isn't a base64 data URI.
+ */
+export function decodeStickerDataUri(input: string): { bytes: Uint8Array; contentType: string } | null {
+	const m = /^data:([^;,]+);base64,(.+)$/s.exec((input ?? "").trim());
+	if (!m || !m[1] || !m[2]) return null;
+	try {
+		const bytes = new Uint8Array(Buffer.from(m[2], "base64"));
+		if (bytes.length === 0) return null;
+		return { bytes, contentType: m[1].trim() };
+	} catch {
+		return null;
+	}
 }
 
 /* ───────────────────────────── tool factory ───────────────────────────── */
@@ -888,6 +911,26 @@ export function makeDiscordActionTool(
 						if (!image) return missing("emojiImage");
 						const data = await emojiUpload({ guildId, name, image }, rest);
 						return ok(`Uploaded emoji "${name}".`, data);
+					}
+					case "sticker-upload": {
+						const guildId = need(args.guildId, "guildId");
+						if (!guildId) return missing("guildId");
+						const name = need(args.stickerName, "stickerName");
+						if (!name) return missing("stickerName");
+						const description = (args.stickerDescription ?? "").trim();
+						const tags = need(args.stickerTags, "stickerTags");
+						if (!tags) return missing("stickerTags");
+						const image = need(args.stickerImage, "stickerImage");
+						if (!image) return missing("stickerImage");
+						const decoded = decodeStickerDataUri(image);
+						if (!decoded) {
+							return fail("sticker-upload `stickerImage` must be a base64 data URI (data:image/png;base64,…).");
+						}
+						const data = await stickerUpload(
+							{ guildId, name, description, tags, file: decoded.bytes, contentType: decoded.contentType },
+							rest,
+						);
+						return ok(`Uploaded sticker "${name}".`, data);
 					}
 					case "event-list": {
 						const guildId = need(args.guildId, "guildId");

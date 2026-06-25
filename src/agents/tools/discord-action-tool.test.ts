@@ -112,6 +112,36 @@ describe("discord_action — dispatch to the right helper", () => {
 		assert.equal(details.ok, true);
 		assert.match(calls[calls.length - 1]!.url, /\/channels\/555\/messages$/);
 	});
+
+	it("sticker-upload POSTs the guild stickers endpoint (multipart) — Fix 6", async () => {
+		// A 1px PNG data URI → decoded to bytes and uploaded as multipart/form-data.
+		const png =
+			"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+		const { details, calls } = await run({
+			action: "sticker-upload",
+			guildId: "g1",
+			stickerName: "blob",
+			stickerDescription: "a blob",
+			stickerTags: "blob",
+			stickerImage: png,
+		});
+		assert.equal(details.ok, true, `sticker-upload should succeed: ${details.message}`);
+		const call = calls[calls.length - 1]!;
+		assert.equal(call.method, "POST");
+		assert.match(call.url, /\/guilds\/g1\/stickers$/);
+	});
+
+	it("sticker-upload rejects a non-data-URI image cleanly (ok:false, no throw)", async () => {
+		const { details } = await run({
+			action: "sticker-upload",
+			guildId: "g1",
+			stickerName: "blob",
+			stickerTags: "blob",
+			stickerImage: "not-a-data-uri",
+		});
+		assert.equal(details.ok, false);
+		assert.match(details.message, /data URI|base64/i);
+	});
 });
 
 /* ─────────────── typed interactive components (Fix A1) ─────────────── */

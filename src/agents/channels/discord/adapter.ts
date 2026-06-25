@@ -231,7 +231,7 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 			// channel commands; registered right after the connection is live (below).
 			const commandManifest = buildDiscordCommandManifest(buildBundledCommands(adapter));
 			// Resolve the optional bot presence to apply on (re)connect (Phase 5).
-			const presencePayload = mapDiscordPresencePayload(resolveDiscordPresence(cfg));
+			const presencePayload = mapDiscordPresencePayload(resolveDiscordPresence(cfg, accountId));
 			const conn = await connectImpl({
 				botToken,
 				...(proxyUrl ? { proxyUrl } : {}),

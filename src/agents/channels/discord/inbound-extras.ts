@@ -168,6 +168,13 @@ export interface DiscordMessageLike {
 	 */
 	reference?: { messageId?: string | null; channelId?: string | null; guildId?: string | null; type?: number | null } | null;
 	messageReference?: { messageId?: string | null; type?: number | null } | null;
+	/**
+	 * The resolved reply-parent message, when discord.js already cached it (it sends
+	 * the referenced message inline with a Gateway MESSAGE_CREATE for a reply). Lets
+	 * the reply-context resolve the parent's author SYNCHRONOUSLY — so a guild
+	 * reply-to-bot is admitted even if the async body-backfill fetch later fails.
+	 */
+	referencedMessage?: DiscordMessageLike | null;
 	/** First embed's title/description fold into the assembled text when content is empty. */
 	embeds?: DiscordEmbedLike[] | null;
 	/** Stickers on the message — a `<sticker: name>` placeholder + a downloaded asset. */
@@ -465,8 +472,18 @@ export function discordThreadId(message: Pick<DiscordMessageLike, "channel" | "c
  * inline that message's text — so the context surfaces the parent message id and
  * leaves `body` undefined (the connection can fetch the parent if it needs the
  * excerpt). Returns undefined for a non-reply.
+ *
+ * When discord.js already resolved the reply parent (`message.referencedMessage`,
+ * which rides inline on a Gateway reply MESSAGE_CREATE), the parent's author id is
+ * captured SYNCHRONOUSLY into `from`. This matters because the central pipeline's
+ * group-addressing `isReplyToBot` depends on `replyTo.from === selfId` — if `from`
+ * were populated ONLY by the async body-backfill (connection.ts), a guild
+ * reply-to-bot whose backfill fetch failed would lose its implicit-mention
+ * admission and be dropped. The async backfill still fills `body` (the excerpt).
  */
-export function extractDiscordReplyContext(message: Pick<DiscordMessageLike, "reference" | "messageReference">): InboundReplyContext | undefined {
+export function extractDiscordReplyContext(
+	message: Pick<DiscordMessageLike, "reference" | "messageReference" | "referencedMessage">,
+): InboundReplyContext | undefined {
 	// A FORWARD (reference kind 1) also carries a `reference.messageId`, but it's a
 	// forward — its content rides in the snapshot, not a quoted reply. Don't surface
 	// it as reply context (the assembled text already carries the forwarded block).
@@ -474,7 +491,12 @@ export function extractDiscordReplyContext(message: Pick<DiscordMessageLike, "re
 	const ref = message.reference;
 	const id = ref?.messageId;
 	if (typeof id !== "string" || !id) return undefined;
-	return { messageId: id };
+	const out: InboundReplyContext = { messageId: id };
+	// Synchronously resolve the parent author from the already-cached referenced
+	// message when discord.js handed one — no async fetch needed.
+	const parentAuthorId = message.referencedMessage?.author?.id;
+	if (typeof parentAuthorId === "string" && parentAuthorId) out.from = parentAuthorId;
+	return out;
 }
 
 /* ───────────────────────── mentions ───────────────────────── */

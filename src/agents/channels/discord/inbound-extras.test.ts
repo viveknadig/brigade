@@ -140,6 +140,21 @@ describe("extractDiscordReplyContext", () => {
 		assert.equal(extractDiscordReplyContext({ reference: null }), undefined);
 		assert.equal(extractDiscordReplyContext({}), undefined);
 	});
+
+	it("sets replyTo.from synchronously from the cached referencedMessage author (Bug 4)", () => {
+		// discord.js inlines the resolved reply parent on `referencedMessage`. The
+		// parent's author id must be captured SYNCHRONOUSLY so the central
+		// `isReplyToBot` admission works even if the async body-backfill fetch fails.
+		const ctx = extractDiscordReplyContext({
+			reference: { messageId: "parent1" },
+			referencedMessage: { id: "parent1", author: { id: "BOT-SELF" } },
+		});
+		assert.deepEqual(ctx, { messageId: "parent1", from: "BOT-SELF" });
+	});
+
+	it("omits from when no referenced message is resolved yet (backfill fills it later)", () => {
+		assert.deepEqual(extractDiscordReplyContext({ reference: { messageId: "parent2" } }), { messageId: "parent2" });
+	});
 });
 
 describe("extractDiscordMemberRoleIds", () => {
