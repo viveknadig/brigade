@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
+import { stickerToAttachment } from "./inbound-extras.js";
 import { buildDiscordAttachment, downloadDiscordAttachment, isAllowedDiscordAttachmentUrl, withDiscordRetry } from "./media.js";
 
 describe("withDiscordRetry", () => {
@@ -89,6 +90,24 @@ describe("downloadDiscordAttachment", () => {
 			}) as unknown as typeof fetch,
 		});
 		assert.equal(seenRedirect, "manual");
+	});
+
+	it("downloads a sticker built from the sticker CDN (Fix 1a — passes the SSRF allowlist)", async () => {
+		// media.discordapp.net is already an allowed Discord CDN host, so a sticker
+		// attachment built by stickerToAttachment downloads through the same path.
+		const sticker = stickerToAttachment({ id: "777", name: "wave", format: 1 });
+		assert.ok(sticker);
+		let fetchedUrl: string | undefined;
+		const out = await downloadDiscordAttachment({
+			attachment: sticker!,
+			fetchImpl: (async (url: string) => {
+				fetchedUrl = url;
+				return new Response("PNGBYTES", { status: 200 });
+			}) as unknown as typeof fetch,
+		});
+		assert.equal(fetchedUrl, "https://media.discordapp.net/stickers/777.png");
+		assert.ok(out, "the sticker download should produce a saved media descriptor");
+		assert.equal(out?.kind, "image");
 	});
 });
 

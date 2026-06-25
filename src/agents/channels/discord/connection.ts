@@ -40,8 +40,30 @@ import {
 	type OutboundMedia,
 } from "../sdk.js";
 import { maskProxyUrl } from "./account-config.js";
-import { type DiscordActionRow } from "./components.js";
 import {
+	isDiscordSelectSpec,
+	type DiscordActionRow,
+	type DiscordSelectSpec,
+} from "./components.js";
+import {
+	DISCORD_FLAG_IS_COMPONENTS_V2,
+	DISCORD_BUTTON_STYLE_LINK,
+	isDiscordLinkButton,
+	isDiscordV2MessageSpec,
+	type DiscordBlockSpec,
+	type DiscordV2MessageSpec,
+} from "./component-blocks.js";
+import {
+	buildDiscordModal,
+	decodeDiscordModalCustomId,
+	extractModalFieldValues,
+	formatModalSubmissionText,
+	isDiscordModalCustomId,
+} from "./modals.js";
+import { consumeDiscordModal, getDiscordModal, type DiscordModalEntry } from "./modal-registry.js";
+import { rememberDiscordUser } from "./directory-cache.js";
+import {
+	assembleDiscordText,
 	buildDiscordSenderName,
 	discordChannelType,
 	discordThreadId,
@@ -49,7 +71,6 @@ import {
 	extractDiscordMemberRoleIds,
 	extractDiscordMentions,
 	extractDiscordReplyContext,
-	extractDiscordText,
 	hasInboundMedia,
 	isThreadChannel,
 	resolveInboundAttachments,
@@ -57,6 +78,8 @@ import {
 	type DiscordMessageLike,
 } from "./inbound-extras.js";
 import { buildDiscordAttachment, downloadDiscordAttachment } from "./media.js";
+import { isDiscordUserMessageType, resolveDiscordSystemEvent } from "./system-events.js";
+import { forgetDiscordSubagentThreadBindingByThreadId } from "./subagent-thread-binding-store.js";
 
 /* ───────────────────────── reconnect backoff ───────────────────────── */
 // Shares the neutral `nextBackoffDelay` curve with every other channel (see
@@ -137,17 +160,22 @@ export interface DiscordInboundMessage {
 	 * press rather than a typed message. `data` is the opaque payload the pressed
 	 * button declared at send time (an approval-callback codec string OR a
 	 * general-prefixed token); `callbackId` is the interaction id (so the press
-	 * can be acked). Undefined for ordinary messages.
+	 * can be acked). `values` carries the chosen value(s) when the press came from
+	 * a SELECT menu (entity selects prefix ids: `user:` / `role:` / `channel:` /
+	 * `mentionable:`); a plain button press carries no `values`. Undefined for
+	 * ordinary messages.
 	 */
-	callbackQuery?: { data: string; callbackId: string };
+	callbackQuery?: { data: string; callbackId: string; values?: string[] };
 	/** True when this inbound is a message edit (text carries the NEW text). */
 	edited?: boolean;
 	/**
 	 * Inbound reaction context — present ONLY when this inbound is a reaction-add.
 	 * `emojis` are the newly-added reaction emoji name(s); `targetMessageId` is the
-	 * message they landed on. Undefined for typed messages.
+	 * message they landed on; `targetAuthorId` is the author of the reacted message
+	 * (so the adapter can gate `reactionNotifications: "own"`). Undefined for typed
+	 * messages.
 	 */
-	reaction?: { emojis: string[]; targetMessageId: string };
+	reaction?: { emojis: string[]; targetMessageId: string; targetAuthorId?: string };
 	/** Raw discord.js object (for adapters that need more). */
 	raw: unknown;
 }
@@ -160,6 +188,17 @@ export interface DiscordInboundMessage {
  * with zero network — the runtime path builds a real `Client` and it
  * structurally satisfies this shape.
  */
+/**
+ * The discord.js `PresenceData` shape the connection sets via
+ * `client.user.setPresence(...)`. `status` is the online dot; `activities` is at
+ * most one activity row (name + numeric `ActivityType` + optional `url` for a
+ * streaming activity + optional `state` for a custom activity).
+ */
+export interface DiscordPresencePayload {
+	status?: "online" | "idle" | "dnd" | "invisible";
+	activities?: Array<{ name: string; type: number; url?: string; state?: string }>;
+}
+
 export interface DiscordClientLike {
 	/** Subscribe a Gateway event handler (`messageCreate`, `interactionCreate`, …). */
 	on(event: string, handler: (...args: never[]) => unknown): unknown;
@@ -168,8 +207,12 @@ export interface DiscordClientLike {
 	login(token: string): Promise<string>;
 	/** Tear down the connection + websocket. */
 	destroy(): Promise<void> | void;
-	/** The bot user once ready (carries `.id` + `.username`), else null. */
-	user: { id?: string; username?: string } | null;
+	/**
+	 * The bot user once ready (carries `.id` + `.username`), else null. discord.js
+	 * exposes `setPresence(data)` on `client.user` once the Gateway is ready — used
+	 * to apply the configured presence/activity (Phase 5).
+	 */
+	user: { id?: string; username?: string; setPresence?: (data: DiscordPresencePayload) => unknown } | null;
 	/** REST handle for application-command registration + raw calls. */
 	rest?: { put(route: unknown, options?: { body?: unknown }): Promise<unknown> };
 	/** Resolve a channel by id (used by outbound to fetch the send target). */
@@ -185,6 +228,12 @@ export interface DiscordClientLike {
 /** The outbound surface a resolved channel exposes (send / typing). */
 export interface DiscordSendChannelLike {
 	id?: string;
+	/**
+	 * discord.js `ChannelType` enum value. A `GuildForum` (15) / `GuildMedia` (16)
+	 * channel REJECTS a plain `.send()` — the outbound path must open a thread
+	 * (forum post) instead (Fix 2b).
+	 */
+	type?: number;
 	/** True for a text-capable channel (guild text, DM, thread). */
 	isTextBased?: () => boolean;
 	/**
@@ -193,6 +242,14 @@ export interface DiscordSendChannelLike {
 	 * sent message (carrying `.id`).
 	 */
 	send(options: DiscordSendOptions): Promise<DiscordSentMessageLike>;
+	/**
+	 * Thread manager — present on forum/media/text channels. `create` opens a new
+	 * thread; for a forum/media channel it MUST carry a starter `message` (Discord
+	 * rejects an empty forum post). Used by the forum auto-thread path (Fix 2b).
+	 */
+	threads?: {
+		create(options: DiscordThreadCreateOptions): Promise<DiscordThreadCreateResult>;
+	};
 	/** Fetch a message in this channel by id (for edit / delete / react). */
 	messages?: {
 		fetch(id: string): Promise<DiscordSentMessageLike | null>;
@@ -201,12 +258,45 @@ export interface DiscordSendChannelLike {
 	sendTyping?: () => Promise<unknown>;
 }
 
+/** Forum/media post creation options (the subset the connection sets). */
+export interface DiscordThreadCreateOptions {
+	/** Thread title (Discord caps at 100 chars). */
+	name: string;
+	/** Starter message — REQUIRED for a forum/media post. */
+	message: { content?: string; flags?: number };
+}
+
+/**
+ * The created thread handle. discord.js returns a `ThreadChannel` carrying its
+ * own `.id` and (on a forum post) the starter `.lastMessage` / a fetchable
+ * starter message; we read whichever id is available.
+ */
+export interface DiscordThreadCreateResult {
+	id?: string;
+	/** Some discord.js versions expose the starter message directly. */
+	lastMessage?: { id?: string } | null;
+}
+
 /** A sent / fetched message handle the outbound path acts on. */
 export interface DiscordSentMessageLike {
 	id?: string;
 	edit(options: DiscordSendOptions | string): Promise<DiscordSentMessageLike>;
 	delete(): Promise<unknown>;
 	react(emoji: string): Promise<unknown>;
+	/**
+	 * Start a thread off this message (Phase 5 autoThread). discord.js
+	 * `message.startThread({ name, autoArchiveDuration })` returns the created
+	 * `ThreadChannel` (carrying `.id`). Optional — a minimal fake can omit it.
+	 */
+	startThread?: (options: { name: string; autoArchiveDuration?: number }) => Promise<{ id?: string }>;
+	/** Some discord.js versions surface an already-created thread on the message. */
+	thread?: { id?: string } | null;
+	/** True when a thread already hangs off this message. */
+	hasThread?: boolean;
+	/** Pin this message (Fix 2e). */
+	pin?: () => Promise<unknown>;
+	/** Unpin this message (Fix 2e). */
+	unpin?: () => Promise<unknown>;
 	/** The bot's own reactions live under `.reactions.cache`; used by removeOwnReactions. */
 	reactions?: {
 		cache?: Map<string, DiscordReactionLike> | Iterable<DiscordReactionLike>;
@@ -251,6 +341,60 @@ export interface DiscordSendOptions {
 	files?: unknown[];
 	reply?: { messageReference: string; failIfNotExists: boolean };
 	allowedMentions?: DiscordAllowedMentions;
+	/**
+	 * Message flags bitfield. The connection sets `MessageFlags.SuppressNotifications`
+	 * (1 << 12 = 4096) for a silent send (Fix 2c) so the recipient gets no push/ping.
+	 */
+	flags?: number;
+}
+
+/* ───────────────────────── channel-type + flag constants ───────────────────────── */
+
+/**
+ * discord.js `ChannelType` values for forum/media channels (Fix 2b). A plain
+ * `.send()` to these is REJECTED — the connection opens a thread (forum post)
+ * instead. Hardcoded so the connection never has to import the discord.js enum on
+ * the (injected-fake) test path; the values are stable wire constants.
+ */
+const CHANNEL_TYPE_GUILD_FORUM = 15;
+const CHANNEL_TYPE_GUILD_MEDIA = 16;
+const CHANNEL_TYPE_GUILD_VOICE = 2;
+const CHANNEL_TYPE_GUILD_STAGE_VOICE = 13;
+
+/**
+ * Channel types where a message-thread can't be started (Fix 6). Forum/Media
+ * channels only host posts (their own threads), and Voice/Stage channels have no
+ * message-thread surface — `message.startThread(...)` 400s on all of them. The
+ * auto-thread path guards on these to avoid a wasteful failed REST call + a noisy
+ * error log (it already falls back to an un-threaded reply).
+ */
+const THREAD_UNSUPPORTED_CHANNEL_TYPES = new Set<number>([
+	CHANNEL_TYPE_GUILD_FORUM,
+	CHANNEL_TYPE_GUILD_MEDIA,
+	CHANNEL_TYPE_GUILD_VOICE,
+	CHANNEL_TYPE_GUILD_STAGE_VOICE,
+]);
+
+/** `MessageFlags.SuppressNotifications` (1 << 12) — a silent send (Fix 2c). */
+const MESSAGE_FLAG_SUPPRESS_NOTIFICATIONS = 1 << 12;
+
+/** Discord thread titles are capped at 100 chars. */
+const DISCORD_THREAD_NAME_LIMIT = 100;
+
+/** True for a forum / media channel (which rejects a plain `.send()`). */
+function isForumLikeChannel(channel: DiscordSendChannelLike): boolean {
+	return channel.type === CHANNEL_TYPE_GUILD_FORUM || channel.type === CHANNEL_TYPE_GUILD_MEDIA;
+}
+
+/**
+ * Derive a forum-post thread name from the first non-empty line of the body,
+ * trimmed to {@link DISCORD_THREAD_NAME_LIMIT}. Falls back to a timestamp stub
+ * when the body is empty so the post always has a title.
+ */
+function deriveForumThreadName(text: string): string {
+	const firstLine = (text ?? "").split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+	const name = firstLine.slice(0, DISCORD_THREAD_NAME_LIMIT).trim();
+	return name || new Date().toISOString().slice(0, 16);
 }
 
 /**
@@ -266,12 +410,53 @@ export function safeDiscordAllowedMentions(): DiscordAllowedMentions {
 	return { parse: ["users", "roles"], repliedUser: false };
 }
 
+/**
+ * Sanitize a string into a Discord thread name (Phase 5 autoThread): take the
+ * first non-empty line, strip user/role/channel mention markup, collapse
+ * whitespace, and truncate to Discord's 100-char limit. Falls back to
+ * `"Thread <id>"` when nothing usable remains.
+ */
+export function sanitizeThreadName(raw: string, fallbackId: string): string {
+	const firstLine = (raw ?? "")
+		.split(/\r?\n/)
+		.map((l) => l.trim())
+		.find((l) => l.length > 0);
+	const cleaned = (firstLine ?? "")
+		.replace(/<@!?\d+>/g, "") // user mentions
+		.replace(/<@&\d+>/g, "") // role mentions
+		.replace(/<#\d+>/g, "") // channel mentions
+		.replace(/\s+/g, " ")
+		.trim();
+	const base = cleaned || `Thread ${fallbackId}`;
+	// Truncate to 100 UTF-16 code units (Discord's hard cap).
+	const truncated = base.length > 100 ? base.slice(0, 100).trim() : base;
+	return truncated || `Thread ${fallbackId}`;
+}
+
+/**
+ * A `buildComponentRows` entry: a classic BUTTON row (an array of button specs),
+ * a SELECT-row marker (Fix 3a — alone in its ActionRow), or a Components-V2
+ * container marker (Fix 3c). The builders dispatch on shape: an array → buttons,
+ * `{ row: "select" }` → a select menu, `{ row: "v2" }` → a V2 container.
+ */
+export type DiscordComponentRow = DiscordActionRow | DiscordSelectSpec | DiscordV2MessageSpec;
+
 /** The builders the connection needs from discord.js (injected for tests). */
 export interface DiscordBuilders {
 	/** Wrap `{ path, name }` into an `AttachmentBuilder`-shaped object. */
 	buildAttachment(path: string, name: string): unknown;
-	/** Turn a serializable button-row grid into discord.js `ActionRowBuilder[]`. */
-	buildComponentRows(rows: DiscordActionRow[]): unknown[];
+	/**
+	 * Turn a serializable component-row list into discord.js builder objects. A
+	 * button row → `ActionRowBuilder<ButtonBuilder>`; a select marker → an
+	 * `ActionRowBuilder<*SelectMenuBuilder>`; a V2 marker → a `ContainerBuilder`.
+	 */
+	buildComponentRows(rows: DiscordComponentRow[]): unknown[];
+	/**
+	 * Build a discord.js `ModalBuilder` from a registered modal entry (Fix 3b).
+	 * Optional — a build that never opens modals (or a minimal test fake) can omit
+	 * it; the connection guards its absence.
+	 */
+	buildModal?(params: { modalId: string; title: string; entry: DiscordModalEntry }): unknown;
 }
 
 /** A discord.js Interaction (the subset Brigade reads). */
@@ -279,10 +464,20 @@ export interface DiscordInteractionLike {
 	/** True for a button press (`isButton()`); a command interaction sets `isChatInputCommand()`. */
 	isButton?: () => boolean;
 	isChatInputCommand?: () => boolean;
-	/** The button's `custom_id` (button interactions). */
+	/** Select-menu type guards (Fix 3a) — exactly one is true for a select press. */
+	isStringSelectMenu?: () => boolean;
+	isUserSelectMenu?: () => boolean;
+	isRoleSelectMenu?: () => boolean;
+	isChannelSelectMenu?: () => boolean;
+	isMentionableSelectMenu?: () => boolean;
+	/** True for a modal submission (Fix 3b). */
+	isModalSubmit?: () => boolean;
+	/** The component's `custom_id` (button / select / modal interactions). */
 	customId?: string;
 	/** Slash-command name (command interactions). */
 	commandName?: string;
+	/** The chosen value(s) on a select press (raw ids/values; entity selects carry ids). */
+	values?: string[];
 	/** The interaction id (acked via the reply/deferUpdate path). */
 	id?: string;
 	channelId?: string;
@@ -291,8 +486,12 @@ export interface DiscordInteractionLike {
 	user?: { id?: string; username?: string; globalName?: string | null };
 	member?: { nickname?: string | null } | null;
 	message?: { id?: string };
+	/** Modal-submit field accessor (Fix 3b) — `getTextInputValue(id)` yields a value. */
+	fields?: { getTextInputValue?: (customId: string) => string; fields?: unknown };
 	/** Ack a button press silently (no visible change). */
 	deferUpdate?: () => Promise<unknown>;
+	/** Open a modal in response to a button press (Fix 3b). */
+	showModal?: (modal: unknown) => Promise<unknown>;
 	/** Ack a slash command with an ephemeral ack. */
 	reply?: (options: unknown) => Promise<unknown>;
 	deferReply?: (options?: unknown) => Promise<unknown>;
@@ -347,6 +546,25 @@ export interface ConnectDiscordArgs {
 	buildersFactory?: () => DiscordBuilders;
 	/** TEST SEAM: skip the real backoff sleep so reconnect tests run instantly. */
 	sleepImpl?: (ms: number) => Promise<void>;
+	/**
+	 * Bot presence/activity to apply once the Gateway reaches READY (Phase 5). When
+	 * set, the connection calls `client.user.setPresence(...)` on every
+	 * (re)connect. Omitted → Discord's default presence (unchanged).
+	 */
+	presence?: DiscordPresencePayload | null;
+	/**
+	 * TEST SEAM: override how presence is applied. Production calls
+	 * `client.user.setPresence(payload)`; tests inject this to assert the mapped
+	 * activity payload without a real client. Receives the resolved payload.
+	 */
+	setPresenceImpl?: (client: DiscordClientLike, payload: DiscordPresencePayload) => void;
+	/**
+	 * READY-deadline in ms (Phase 5 reliability). After `login()` resolves the
+	 * connection waits this long for `clientReady`; if it never fires the socket is
+	 * destroyed and the supervise loop re-enters with backoff (an opened-but-never-
+	 * READY socket is not trusted). Default ~20s; ≤0 disables the watchdog.
+	 */
+	readyTimeoutMs?: number;
 }
 
 export interface DiscordConnection {
@@ -369,12 +587,15 @@ export interface DiscordConnection {
 	/** Send a single text message. Returns the posted message's id. */
 	sendText(channel: string, text: string, opts?: DiscordSendTextOpts): Promise<{ messageId: string }>;
 	/**
-	 * Send a message carrying component button `rows` (the native approval prompt /
-	 * general buttons). `text` is the message content; `rows` is a serializable
-	 * button grid the builders turn into ActionRows. Text is sent verbatim (no
-	 * markdown pass) so the caller controls formatting.
+	 * Send a message carrying component `rows` — button grids (the native approval
+	 * prompt / general buttons), SELECT-menu markers (Fix 3a), and/or a
+	 * Components-V2 container marker (Fix 3c). `text` is the message content; the
+	 * builders turn each row into the matching discord.js component. Text is sent
+	 * verbatim (no markdown pass) so the caller controls formatting. When a V2
+	 * container is present the `IsComponentsV2` flag is set and the text moves into
+	 * a V2 text block (a V2 message cannot carry plain `content`).
 	 */
-	sendInteractive(channel: string, text: string, rows: DiscordActionRow[], opts?: DiscordSendTextOpts): Promise<{ messageId: string }>;
+	sendInteractive(channel: string, text: string, rows: DiscordComponentRow[], opts?: DiscordSendTextOpts): Promise<{ messageId: string }>;
 	/** Upload a media attachment via an AttachmentBuilder. */
 	sendMedia(channel: string, media: OutboundMedia, opts?: DiscordSendMediaOpts): Promise<void>;
 	/** React to a previous message with an emoji (unicode or `name:id` custom). */
@@ -385,12 +606,34 @@ export interface DiscordConnection {
 	editMessageText(channel: string, messageId: string, text: string): Promise<void>;
 	/** Delete a message. */
 	deleteMessage(channel: string, messageId: string): Promise<void>;
+	/** Pin a message in a channel (Fix 2e). */
+	pinMessage(channel: string, messageId: string): Promise<void>;
+	/** Unpin a previously-pinned message (Fix 2e). */
+	unpinMessage(channel: string, messageId: string): Promise<void>;
 	/** Register the bot's application (slash) commands. Best-effort. */
 	registerCommands(commands: unknown[]): Promise<void>;
 	/** Show typing in a channel (Discord clears it after ~10s or on the next send). */
 	setComposing(channel: string, state: "composing" | "paused"): Promise<void>;
 	/** Read-receipt no-op (Discord bots can't mark-read). */
 	markRead(): Promise<void>;
+	/**
+	 * Apply (or re-apply) a bot presence/activity to the live client (Phase 5).
+	 * No-op when the client isn't ready or no payload is given. Used both by the
+	 * on-ready auto-apply and by a live `set-presence` re-application.
+	 */
+	applyPresence(payload?: DiscordPresencePayload | null): void;
+	/**
+	 * Create a thread off an existing message (`message.startThread` / the REST
+	 * `POST /channels/{id}/messages/{id}/threads`) and return its id (Phase 5
+	 * autoThread). On a create-race (another actor already threaded the message)
+	 * it best-effort refetches the message and returns the existing thread id.
+	 * Returns `null` when the thread can't be created.
+	 */
+	createThreadFromMessage(
+		channelId: string,
+		messageId: string,
+		opts: { name: string; autoArchiveMinutes?: number },
+	): Promise<string | null>;
 	/** Disconnect the Gateway + tear down. */
 	close(): Promise<void>;
 }
@@ -400,11 +643,15 @@ export interface DiscordSendTextOpts {
 	threadId?: string;
 	/** Native reply target — the message id to reply under. */
 	replyToMessageId?: string;
+	/** Suppress the recipient's notification (SuppressNotifications flag) (Fix 2c). */
+	silent?: boolean;
 }
 
 export interface DiscordSendMediaOpts {
 	/** Thread id to upload into. */
 	threadId?: string;
+	/** Suppress the recipient's notification (SuppressNotifications flag) (Fix 2c). */
+	silent?: boolean;
 }
 
 /* ───────────────────────── error classification ───────────────────────── */
@@ -432,6 +679,41 @@ export function isDiscordUnauthorized(err: unknown): boolean {
 	return /invalid token|incorrect login|disallowed intents|used disallowed intents/i.test(errorText(err));
 }
 
+/* ───────────────────────── structured send-error decode (Fix 2d) ───────────────────────── */
+
+/** Discord JSON error code: the bot lacks permission to act in the channel. */
+const DISCORD_ERR_MISSING_PERMISSIONS = 50013;
+/** Discord JSON error code: cannot send messages to this user (DM blocked / disabled). */
+const DISCORD_ERR_CANNOT_SEND_TO_USER = 50007;
+
+/** Pull the numeric Discord error `code` off a thrown discord.js error, if any. */
+function discordErrorCode(err: unknown): number | undefined {
+	if (!err || typeof err !== "object") return undefined;
+	const e = err as { code?: unknown; rawError?: { code?: unknown } };
+	const candidate = e.code !== undefined ? e.code : e.rawError?.code;
+	if (typeof candidate === "number") return candidate;
+	if (typeof candidate === "string" && /^\d+$/.test(candidate)) return Number(candidate);
+	return undefined;
+}
+
+/**
+ * Turn a raw discord.js send error into an operator-readable one for the two
+ * actionable cases (Fix 2d). A 50013 (Missing Permissions) and a 50007
+ * (cannot-send-to-user / DM blocked) each map to a specific remediation hint;
+ * every other error is rethrown VERBATIM so nothing is masked. Wrapped around the
+ * three send fns so `adapter.handleAction`'s catch surfaces the decoded message.
+ */
+function decodeDiscordSendError(err: unknown): Error {
+	const code = discordErrorCode(err);
+	if (code === DISCORD_ERR_MISSING_PERMISSIONS) {
+		return new Error("Missing permission to post in this channel (need View Channel + Send Messages).");
+	}
+	if (code === DISCORD_ERR_CANNOT_SEND_TO_USER) {
+		return new Error("Can't DM this user — they've blocked the bot or disabled DMs.");
+	}
+	return err instanceof Error ? err : new Error(typeof err === "string" ? err : String(err));
+}
+
 /** Strip a Discord token out of a string before it logs. */
 export function redactDiscordToken(text: string, ...tokens: string[]): string {
 	if (!text) return text;
@@ -443,6 +725,153 @@ export function redactDiscordToken(text: string, ...tokens: string[]): string {
 	// plausible token fragment even if the exact token differs.
 	out = out.replace(/[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{20,}/g, "<redacted>");
 	return out;
+}
+
+/* ───────────────────────── discord.js component builders (Fix 3a / 3c) ───────────────────────── */
+
+/** The discord.js namespace (lazy-imported); typed loosely so the static import never pulls the runtime. */
+type DiscordModule = typeof import("discord.js");
+
+/**
+ * Build the discord.js `ActionRowBuilder` wrapping ONE select menu (Fix 3a). The
+ * `kind` picks the builder; a STRING select adds its options, an entity select
+ * (user/role/channel/mentionable) carries none. Placeholder + min/max are set
+ * when present.
+ */
+function buildSelectActionRow(discord: DiscordModule, spec: DiscordSelectSpec): unknown {
+	const applyCommon = (menu: {
+		setCustomId(id: string): unknown;
+		setPlaceholder?(p: string): unknown;
+		setMinValues?(n: number): unknown;
+		setMaxValues?(n: number): unknown;
+	}): void => {
+		menu.setCustomId(spec.customId);
+		if (spec.placeholder && typeof menu.setPlaceholder === "function") menu.setPlaceholder(spec.placeholder);
+		if (typeof spec.minValues === "number" && typeof menu.setMinValues === "function") menu.setMinValues(spec.minValues);
+		if (typeof spec.maxValues === "number" && typeof menu.setMaxValues === "function") menu.setMaxValues(spec.maxValues);
+	};
+	let menu: unknown;
+	switch (spec.kind) {
+		case "user": {
+			const m = new discord.UserSelectMenuBuilder();
+			applyCommon(m as never);
+			menu = m;
+			break;
+		}
+		case "role": {
+			const m = new discord.RoleSelectMenuBuilder();
+			applyCommon(m as never);
+			menu = m;
+			break;
+		}
+		case "channel": {
+			const m = new discord.ChannelSelectMenuBuilder();
+			applyCommon(m as never);
+			menu = m;
+			break;
+		}
+		case "mentionable": {
+			const m = new discord.MentionableSelectMenuBuilder();
+			applyCommon(m as never);
+			menu = m;
+			break;
+		}
+		case "string":
+		default: {
+			const s = new discord.StringSelectMenuBuilder();
+			applyCommon(s as never);
+			const options = (spec.options ?? []).map((o) => {
+				const opt = new discord.StringSelectMenuOptionBuilder().setLabel(o.label).setValue(o.value);
+				if (o.description) opt.setDescription(o.description);
+				return opt;
+			});
+			if (options.length > 0) s.addOptions(...options);
+			menu = s;
+			break;
+		}
+	}
+	const row = new discord.ActionRowBuilder();
+	(row as { addComponents(c: unknown): unknown }).addComponents(menu);
+	return row;
+}
+
+/** Map ONE V2 block spec to its discord.js builder (Fix 3c). */
+function buildV2Block(discord: DiscordModule, block: DiscordBlockSpec): unknown {
+	switch (block.type) {
+		case "text":
+			return new discord.TextDisplayBuilder().setContent(block.text);
+		case "section": {
+			const section = new discord.SectionBuilder();
+			(section as { addTextDisplayComponents(...c: unknown[]): unknown }).addTextDisplayComponents(
+				...block.texts.map((t) => new discord.TextDisplayBuilder().setContent(t)),
+			);
+			if (block.accessory?.kind === "thumbnail") {
+				(section as { setThumbnailAccessory(c: unknown): unknown }).setThumbnailAccessory(
+					new discord.ThumbnailBuilder().setURL(block.accessory.url),
+				);
+			} else if (block.accessory?.kind === "button") {
+				(section as { setButtonAccessory(c: unknown): unknown }).setButtonAccessory(buildV2Button(discord, block.accessory.button));
+			}
+			return section;
+		}
+		case "separator": {
+			const sep = new discord.SeparatorBuilder();
+			if (typeof block.divider === "boolean") (sep as { setDivider(b: boolean): unknown }).setDivider(block.divider);
+			if (block.spacing) {
+				const spacing = block.spacing === "large" ? 2 : 1;
+				(sep as { setSpacing(n: number): unknown }).setSpacing(spacing);
+			}
+			return sep;
+		}
+		case "actions": {
+			const row = new discord.ActionRowBuilder();
+			(row as { addComponents(...c: unknown[]): unknown }).addComponents(...block.buttons.map((b) => buildV2Button(discord, b)));
+			return row;
+		}
+		case "media-gallery": {
+			const gallery = new discord.MediaGalleryBuilder();
+			(gallery as { addItems(...i: unknown[]): unknown }).addItems(
+				...block.items.map((it) => {
+					const item = new discord.MediaGalleryItemBuilder().setURL(it.url);
+					if (it.description) item.setDescription(it.description);
+					if (typeof it.spoiler === "boolean") item.setSpoiler(it.spoiler);
+					return item;
+				}),
+			);
+			return gallery;
+		}
+		case "file": {
+			const file = new discord.FileBuilder().setURL(block.url);
+			if (typeof block.spoiler === "boolean") file.setSpoiler(block.spoiler);
+			return file;
+		}
+		default:
+			return new discord.TextDisplayBuilder().setContent("");
+	}
+}
+
+/** Build a V2 button (a link button when it has a url, else an interactive button). */
+function buildV2Button(discord: DiscordModule, b: { label: string; url?: string; customId?: string; style?: number }): unknown {
+	if (isDiscordLinkButton(b as never)) {
+		return new discord.ButtonBuilder().setLabel(b.label).setStyle(DISCORD_BUTTON_STYLE_LINK as never).setURL((b as { url: string }).url);
+	}
+	return new discord.ButtonBuilder().setLabel(b.label).setCustomId((b as { customId: string }).customId).setStyle((b.style ?? 2) as never);
+}
+
+/** Build the discord.js `ContainerBuilder` for a Components-V2 message (Fix 3c). */
+function buildV2Container(discord: DiscordModule, spec: DiscordV2MessageSpec): unknown {
+	const container = new discord.ContainerBuilder();
+	if (typeof spec.accentColor === "number") (container as { setAccentColor(n: number): unknown }).setAccentColor(spec.accentColor);
+	for (const block of spec.blocks) {
+		const built = buildV2Block(discord, block);
+		if (block.type === "section") (container as { addSectionComponents(...c: unknown[]): unknown }).addSectionComponents(built);
+		else if (block.type === "separator") (container as { addSeparatorComponents(...c: unknown[]): unknown }).addSeparatorComponents(built);
+		else if (block.type === "actions") (container as { addActionRowComponents(...c: unknown[]): unknown }).addActionRowComponents(built);
+		else if (block.type === "media-gallery") (container as { addMediaGalleryComponents(...c: unknown[]): unknown }).addMediaGalleryComponents(built);
+		else if (block.type === "file") (container as { addFileComponents(...c: unknown[]): unknown }).addFileComponents(built);
+		else (container as { addTextDisplayComponents(...c: unknown[]): unknown }).addTextDisplayComponents(built);
+	}
+	return container;
 }
 
 /* ───────────────────────── the connection ───────────────────────── */
@@ -475,7 +904,8 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		buildClient = (botToken: string) => factory(botToken, proxyUrl || undefined);
 		builders ??= {
 			buildAttachment: (p: string, name: string) => ({ attachment: p, name }),
-			buildComponentRows: (rows: DiscordActionRow[]) => rows.map((row) => ({ components: row })),
+			buildComponentRows: (rows: DiscordComponentRow[]) => rows.map((row) => ({ components: row })),
+			buildModal: (params: { modalId: string; title: string; entry: DiscordModalEntry }) => ({ modal: params }),
 		};
 	} else {
 		const discord = await import("discord.js");
@@ -518,8 +948,17 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 			buildAttachment(p: string, name: string): unknown {
 				return new discord.AttachmentBuilder(p, { name });
 			},
-			buildComponentRows(rows: DiscordActionRow[]): unknown[] {
+			buildComponentRows(rows: DiscordComponentRow[]): unknown[] {
 				return rows.map((row) => {
+					// SELECT row (Fix 3a) — alone in its ActionRow; the kind picks the builder.
+					if (isDiscordSelectSpec(row)) {
+						return buildSelectActionRow(discord, row);
+					}
+					// Components-V2 container (Fix 3c) — a single ContainerBuilder of blocks.
+					if (isDiscordV2MessageSpec(row)) {
+						return buildV2Container(discord, row);
+					}
+					// Classic BUTTON row (unchanged byte-for-byte behavior).
 					const r = new discord.ActionRowBuilder<import("discord.js").ButtonBuilder>();
 					for (const b of row) {
 						r.addComponents(
@@ -528,6 +967,16 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 					}
 					return r;
 				});
+			},
+			buildModal(params: { modalId: string; title: string; entry: DiscordModalEntry }): unknown {
+				return buildDiscordModal(
+					{
+						ModalBuilder: discord.ModalBuilder as never,
+						ActionRowBuilder: discord.ActionRowBuilder as never,
+						TextInputBuilder: discord.TextInputBuilder as never,
+					},
+					params,
+				);
 			},
 		};
 	}
@@ -549,6 +998,33 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 	let reconnectAttempts = 0;
 	let client: DiscordClientLike | null = null;
 	let loopPromise: Promise<void> | null = null;
+	// READY-gating (Phase 5): a socket can `login()` (open) yet never reach the
+	// `clientReady` handshake. `ready` is the trustworthy "fully up" flag the
+	// presence apply + the watchdog gate on.
+	let ready = false;
+
+	// Resolved presence to (re)apply on every READY (Phase 5). `null` → leave
+	// Discord's default presence untouched.
+	const presencePayload: DiscordPresencePayload | null = args.presence ?? null;
+	const setPresenceImpl =
+		args.setPresenceImpl ??
+		((c: DiscordClientLike, payload: DiscordPresencePayload): void => {
+			c.user?.setPresence?.(payload);
+		});
+	/** Apply (or re-apply) a presence payload to the live client. Best-effort. */
+	const applyPresence = (payload?: DiscordPresencePayload | null): void => {
+		const c = client;
+		const p = payload === undefined ? presencePayload : payload;
+		if (!c || !p) return;
+		try {
+			setPresenceImpl(c, p);
+		} catch (err) {
+			safeLog("discord presence apply failed", { error: err instanceof Error ? err.message : String(err) });
+		}
+	};
+
+	// READY watchdog (Phase 5): default ~20s deadline; ≤0 disables it.
+	const readyTimeoutMs = typeof args.readyTimeoutMs === "number" ? args.readyTimeoutMs : 20_000;
 
 	// Dedupe inbound events by id — a redelivered event after a reconnect must not
 	// double-run the agent. Per-connection lifetime.
@@ -576,12 +1052,49 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		return { user: (id) => users.get(id) };
 	};
 
+	/**
+	 * Prime the account's handle→id directory cache (Fix 2a) from an inbound: the
+	 * message author plus every resolved `<@…>` mention. This is what later lets
+	 * the outbound path rewrite a plain `@handle` the agent typed into a real
+	 * `<@id>` ping. Best-effort + side-effect-only — never throws into normalize.
+	 */
+	const primeDirectoryFromMessage = (message: DiscordMessageLike): void => {
+		try {
+			const author = message.author;
+			if (author && typeof author.id === "string") {
+				rememberDiscordUser(accountId, {
+					id: author.id,
+					username: author.username ?? undefined,
+					displayName: (author.globalName ?? author.displayName ?? undefined) as string | undefined,
+				});
+			}
+			const mentionUsers = (message.mentions as { users?: Iterable<{ id?: string; username?: string; globalName?: string | null; displayName?: string }> } | undefined)?.users;
+			if (mentionUsers) {
+				const iter = mentionUsers instanceof Map ? mentionUsers.values() : mentionUsers;
+				for (const u of iter) {
+					if (typeof u?.id !== "string") continue;
+					rememberDiscordUser(accountId, {
+						id: u.id,
+						username: u.username ?? undefined,
+						displayName: (u.globalName ?? u.displayName ?? undefined) as string | undefined,
+					});
+				}
+			}
+		} catch {
+			/* directory priming is best-effort */
+		}
+	};
+
 	/** Normalize a discord.js message into the deferred-media inbound shape. */
 	const normalize = (message: DiscordMessageLike, opts?: { edited?: boolean }): DiscordInboundMessage | null => {
 		const channelId = typeof message.channelId === "string" ? message.channelId : typeof message.channel?.id === "string" ? message.channel.id : "";
 		if (!channelId) return null;
+		primeDirectoryFromMessage(message);
 		const resolve = resolveLookups(message);
-		const text = extractDiscordText(message, resolve);
+		// Assembled text: content leads, with an embed-title/description fallback when
+		// content is empty, plus appended `<sticker: …>` + `[Forwarded from …]` blocks
+		// so an embed-only / sticker-only / forwarded message isn't dropped as empty.
+		const text = assembleDiscordText(message, resolve);
 		const chatType = discordChannelType(message);
 		const threadId = discordThreadId(message);
 		const mentions = extractDiscordMentions(message, selfId ?? undefined);
@@ -638,8 +1151,53 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		return false;
 	};
 
-	/** Handle a messageCreate / messageUpdate event. */
-	const handleMessage = (message: DiscordMessageLike, opts?: { edited?: boolean }): void => {
+	/**
+	 * Best-effort resolve the parent of a reply into `replyTo.body` (+ `from`).
+	 * Discord doesn't inline the replied-to text, so we fetch it: `fetchReference()`
+	 * first (discord.js resolves the reference directly), then `channel.messages.fetch(id)`
+	 * as a fallback. The body is the parent's assembled text (token-expanded), hard-capped.
+	 * Mutates `normalized.replyTo` in place. Fully guarded — any error leaves the
+	 * `{ messageId }`-only context untouched so delivery never blocks/fails.
+	 */
+	const backfillReplyBody = async (message: DiscordMessageLike, normalized: DiscordInboundMessage): Promise<void> => {
+		const refId = message.reference?.messageId;
+		if (!normalized.replyTo || normalized.replyTo.body || typeof refId !== "string" || !refId) return;
+		try {
+			let parent: DiscordMessageLike | null = null;
+			if (typeof message.fetchReference === "function") {
+				parent = await message.fetchReference();
+			}
+			if (!parent && typeof message.channel?.messages?.fetch === "function") {
+				parent = await message.channel.messages.fetch(refId);
+			}
+			if (!parent) return;
+			const body = assembleDiscordText(parent, resolveLookups(parent)).replace(/\n/g, " ").slice(0, 300);
+			const from = typeof parent.author?.id === "string" ? parent.author.id : undefined;
+			if (body || from) {
+				normalized.replyTo = {
+					...normalized.replyTo,
+					...(body ? { body } : {}),
+					...(from ? { from } : {}),
+				};
+			}
+		} catch (err) {
+			safeLog("discord reply-parent backfill failed", { error: err instanceof Error ? err.message : String(err) });
+		}
+	};
+
+	/**
+	 * Handle a messageCreate / messageUpdate event.
+	 *
+	 * ASYNC because of three best-effort REST hydrations (all guarded, all
+	 * post-`normalize`, mirroring the Slack thread-backfill pattern):
+	 *   - reply-parent backfill → fills `replyTo.body` so the agent sees what was
+	 *     replied to (Fix 1b);
+	 *   - system events (joins / pins / boosts / thread-created …) → synthesize a
+	 *     concise note as the inbound text so the agent learns the event (Fix 1c);
+	 *   - empty-payload hydration → re-pull a late / proxied empty-content message
+	 *     once and re-assemble before bailing (Fix 1d).
+	 */
+	const handleMessage = async (message: DiscordMessageLike, opts?: { edited?: boolean }): Promise<void> => {
 		try {
 			stampInboundEvent();
 			// Skip the bot's own messages (echoes) — a bot must never reply to itself.
@@ -653,8 +1211,65 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 			const editStamp = opts?.edited && typeof message.editedTimestamp === "number" ? message.editedTimestamp : "";
 			const key = opts?.edited ? `edit:${id}:${editStamp}` : id;
 			if (!eventDedupe.claim(key)) return; // already seen
-			const normalized = normalize(message, opts);
+
+			// SYSTEM event (join / pin / boost / thread-created …): no user content, so
+			// synthesize a concise note as the inbound text and route it (no debounce).
+			// An UNMAPPED system type yields null → drop it. Checked BEFORE normalize so
+			// a content-less system message isn't treated as an empty user message.
+			if (!isDiscordUserMessageType(message.type)) {
+				const channelId = typeof message.channelId === "string" ? message.channelId : typeof message.channel?.id === "string" ? message.channel.id : "";
+				const note = resolveDiscordSystemEvent(message, channelId);
+				if (!note) return; // unmapped system type — drop
+				const normalized = normalize(message, opts);
+				if (!normalized) return;
+				normalized.text = note;
+				args.onMessage(normalized);
+				lastInboundChannel.add(normalized.conversationId);
+				return;
+			}
+
+			let normalized = normalize(message, opts);
 			if (!normalized) return;
+
+			// Does this message need any async REST hydration? (Empty-payload re-pull OR
+			// reply-parent backfill.) When NOTHING async applies — the common case — we
+			// deliver SYNCHRONOUSLY so callers see the inbound on the same tick.
+			const needsHydration = !normalized.text.trim() && !hasInboundMedia(message) && typeof message.fetch === "function";
+			const refId = message.reference?.messageId;
+			const needsReplyBackfill =
+				!!normalized.replyTo &&
+				!normalized.replyTo.body &&
+				typeof refId === "string" &&
+				!!refId &&
+				(typeof message.fetchReference === "function" || typeof message.channel?.messages?.fetch === "function");
+
+			if (!needsHydration && !needsReplyBackfill) {
+				args.onMessage(normalized);
+				lastInboundChannel.add(normalized.conversationId);
+				return;
+			}
+
+			// Empty-payload hydration (Fix 1d): the MESSAGE CONTENT intent can deliver a
+			// late / proxied payload with empty content + no media. Best-effort re-pull
+			// the message once, re-assemble, and only bail if STILL empty.
+			if (needsHydration) {
+				try {
+					const refetched = await message.fetch!();
+					if (refetched && typeof refetched === "object") {
+						const renorm = normalize(refetched, opts);
+						if (renorm && (renorm.text.trim() || renorm.resolveMedia)) {
+							normalized = renorm;
+							message = refetched;
+						}
+					}
+				} catch (err) {
+					safeLog("discord empty-payload hydration failed", { error: err instanceof Error ? err.message : String(err) });
+				}
+			}
+
+			// Reply-parent backfill (Fix 1b): fill `replyTo.body` from the parent message.
+			await backfillReplyBody(message, normalized);
+
 			args.onMessage(normalized);
 			lastInboundChannel.add(normalized.conversationId);
 		} catch (err) {
@@ -682,6 +1297,8 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		if (user?.bot === true) return null; // ignore other bots' reactions
 		const fromName = user?.username;
 		const guildId = typeof msg?.guildId === "string" ? msg.guildId : undefined;
+		// Author of the REACTED message — lets the adapter gate `reactionNotifications: "own"`.
+		const targetAuthorId = typeof msg?.author?.id === "string" ? msg.author.id : undefined;
 		return {
 			conversationId: channel,
 			from: fromId,
@@ -689,7 +1306,7 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 			text: "",
 			chatType: msg?.guildId ? "group" : "direct",
 			...(guildId ? { guildId } : {}),
-			reaction: { emojis: [emoji], targetMessageId: target },
+			reaction: { emojis: [emoji], targetMessageId: target, ...(targetAuthorId ? { targetAuthorId } : {}) },
 			raw: { reaction, user },
 		};
 	};
@@ -743,6 +1360,74 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 	};
 
 	/**
+	 * Normalize a SELECT-menu press into the same callback-inbound shape a button
+	 * press uses (Fix 3a), but carrying the chosen `values`. The select's custom_id
+	 * IS a general token (the central pipeline surfaces the values in the turn
+	 * text). For an ENTITY select the raw values are Discord ids — they're prefixed
+	 * with the select's kind (`user:` / `role:` / `channel:` / `mentionable:`) so
+	 * the agent can tell what kind of id it received; a STRING select's values are
+	 * the option values verbatim.
+	 */
+	const normalizeSelect = (interaction: DiscordInteractionLike, kind: DiscordSelectSpec["kind"]): DiscordInboundMessage | null => {
+		const value = typeof interaction.customId === "string" ? interaction.customId : "";
+		if (!value) return null;
+		const channel = typeof interaction.channelId === "string" ? interaction.channelId : typeof interaction.channel?.id === "string" ? interaction.channel.id : "";
+		const fromId = typeof interaction.user?.id === "string" ? interaction.user.id : channel;
+		if (!channel && !fromId) return null;
+		const threadId = interaction.channel && isThreadChannel(interaction.channel) ? channel : undefined;
+		const fromName = interaction.user?.username;
+		const rawValues = Array.isArray(interaction.values) ? interaction.values.filter((v): v is string => typeof v === "string") : [];
+		const prefix = kind === "string" ? "" : `${kind}:`;
+		const values = rawValues.map((v) => `${prefix}${v}`);
+		return {
+			conversationId: channel || fromId,
+			from: fromId,
+			...(fromName ? { fromName } : {}),
+			text: "",
+			chatType: interaction.guildId ? "group" : "direct",
+			...(typeof interaction.guildId === "string" ? { guildId: interaction.guildId } : {}),
+			...(threadId ? { threadId } : {}),
+			callbackQuery: { data: value, callbackId: interaction.id ?? "", values },
+			raw: interaction,
+		};
+	};
+
+	/**
+	 * Normalize a MODAL SUBMIT into an ordinary inbound MESSAGE (Fix 3b). A filled
+	 * form is a typed turn, not a button tap, so it routes via `onMessage` carrying
+	 * the formatted `Label: value` body — the agent sees what was entered exactly as
+	 * if the person typed it. The modal entry is consumed (single-use); a missing /
+	 * expired entry yields null so the submit degrades gracefully.
+	 */
+	const normalizeModalSubmit = (interaction: DiscordInteractionLike): DiscordInboundMessage | null => {
+		const customId = typeof interaction.customId === "string" ? interaction.customId : "";
+		const modalId = decodeDiscordModalCustomId(customId);
+		if (!modalId) return null;
+		const entry = consumeDiscordModal(modalId);
+		if (!entry) {
+			safeLog("discord modal submit for an unknown/expired form — dropped", { modalId });
+			return null;
+		}
+		const channel = typeof interaction.channelId === "string" ? interaction.channelId : typeof interaction.channel?.id === "string" ? interaction.channel.id : "";
+		const fromId = typeof interaction.user?.id === "string" ? interaction.user.id : channel;
+		if (!channel && !fromId) return null;
+		const threadId = interaction.channel && isThreadChannel(interaction.channel) ? channel : undefined;
+		const fromName = interaction.user?.username;
+		const values = extractModalFieldValues(interaction as { fields?: never }, entry.fields);
+		const text = formatModalSubmissionText(entry, values);
+		return {
+			conversationId: channel || fromId,
+			from: fromId,
+			...(fromName ? { fromName } : {}),
+			text,
+			chatType: interaction.guildId ? "group" : "direct",
+			...(typeof interaction.guildId === "string" ? { guildId: interaction.guildId } : {}),
+			...(threadId ? { threadId } : {}),
+			raw: interaction,
+		};
+	};
+
+	/**
 	 * Normalize a slash-command interaction into an ordinary inbound message so the
 	 * central command map (`/help`, `/status`, …) handles it. The command name is
 	 * mapped to `/command` text.
@@ -764,16 +1449,52 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		};
 	};
 
-	/** Handle an interactionCreate event (button press OR slash command). */
+	/**
+	 * The five select-menu type guards mapped to their kind. The first that fires
+	 * wins (exactly one is true for a given select press).
+	 */
+	const selectKindOf = (interaction: DiscordInteractionLike): DiscordSelectSpec["kind"] | null => {
+		if (typeof interaction.isStringSelectMenu === "function" && interaction.isStringSelectMenu()) return "string";
+		if (typeof interaction.isUserSelectMenu === "function" && interaction.isUserSelectMenu()) return "user";
+		if (typeof interaction.isRoleSelectMenu === "function" && interaction.isRoleSelectMenu()) return "role";
+		if (typeof interaction.isChannelSelectMenu === "function" && interaction.isChannelSelectMenu()) return "channel";
+		if (typeof interaction.isMentionableSelectMenu === "function" && interaction.isMentionableSelectMenu()) return "mentionable";
+		return null;
+	};
+
+	/** Handle an interactionCreate event (button / select / modal-submit / slash). */
 	const handleInteraction = (interaction: DiscordInteractionLike): void => {
 		try {
 			stampInboundEvent();
 			if (typeof interaction.isButton === "function" && interaction.isButton()) {
+				// A button whose custom_id is a `modal:<id>` marker OPENS a modal instead
+				// of routing a turn (Fix 3b). Otherwise ack silently + route the press.
+				const customId = typeof interaction.customId === "string" ? interaction.customId : "";
+				if (isDiscordModalCustomId(customId)) {
+					void openModalForTrigger(interaction, customId);
+					return;
+				}
 				// Ack the press silently first so Discord doesn't show "interaction
 				// failed"; then route the normalized inbound.
 				void interaction.deferUpdate?.().catch(() => {});
 				const normalized = normalizeButton(interaction);
 				if (normalized) args.onCallbackQuery?.(normalized);
+				return;
+			}
+			const selectKind = selectKindOf(interaction);
+			if (selectKind) {
+				// A select press is acked silently (no visible change) then routed like a
+				// button press, carrying the chosen values (Fix 3a).
+				void interaction.deferUpdate?.().catch(() => {});
+				const normalized = normalizeSelect(interaction, selectKind);
+				if (normalized) args.onCallbackQuery?.(normalized);
+				return;
+			}
+			if (typeof interaction.isModalSubmit === "function" && interaction.isModalSubmit()) {
+				// Ack the submit so the form closes; route the filled form as a turn (Fix 3b).
+				void interaction.deferUpdate?.().catch(() => {});
+				const normalized = normalizeModalSubmit(interaction);
+				if (normalized) args.onMessage(normalized);
 				return;
 			}
 			if (typeof interaction.isChatInputCommand === "function" && interaction.isChatInputCommand()) {
@@ -789,18 +1510,80 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		}
 	};
 
+	/**
+	 * Open the modal a modal-trigger button references (Fix 3b). Looks up the
+	 * (non-consuming) registry entry, builds the discord.js modal via the injected
+	 * builders, and calls `interaction.showModal`. A missing entry / absent builder
+	 * is acked-silently so the client doesn't hang. The entry is NOT consumed here —
+	 * consumption happens on submit so the modal stays openable until then.
+	 */
+	const openModalForTrigger = async (interaction: DiscordInteractionLike, customId: string): Promise<void> => {
+		try {
+			const modalId = decodeDiscordModalCustomId(customId);
+			const entry = modalId ? getDiscordModal(modalId) : undefined;
+			if (!entry || typeof interaction.showModal !== "function" || typeof resolvedBuilders.buildModal !== "function") {
+				// Nothing to show — ack silently so the press doesn't read as failed.
+				void interaction.deferUpdate?.().catch(() => {});
+				if (modalId && !entry) safeLog("discord modal trigger for an unknown/expired form", { modalId });
+				return;
+			}
+			const modal = resolvedBuilders.buildModal({ modalId, title: entry.title, entry });
+			await interaction.showModal(modal);
+		} catch (err) {
+			safeLog("discord showModal failed", { error: err instanceof Error ? err.message : String(err) });
+			void interaction.deferUpdate?.().catch(() => {});
+		}
+	};
+
+	/**
+	 * Handle a THREAD_UPDATE (Fix 6). When a thread transitions INTO the archived
+	 * state (was not archived, now is), drop any sub-agent thread binding pointing
+	 * at it so an archived thread doesn't leak a binding. discord.js hands the old +
+	 * new `ThreadChannel`; we read `.archived` off each (a partial may omit `old`,
+	 * in which case we act on the new archived state alone). No-op for any other
+	 * thread update (rename, lock, slow-mode, …).
+	 */
+	const handleThreadArchive = (oldThread: unknown, newThread: unknown): void => {
+		const next = newThread as { id?: unknown; archived?: unknown } | null | undefined;
+		const prev = oldThread as { archived?: unknown } | null | undefined;
+		const threadId = typeof next?.id === "string" ? next.id : "";
+		if (!threadId) return;
+		const nowArchived = next?.archived === true;
+		const wasArchived = prev?.archived === true;
+		// Only act on the not-archived → archived transition (or when we have no prior
+		// state to compare and it's archived now).
+		if (!nowArchived || wasArchived) return;
+		const dropped = forgetDiscordSubagentThreadBindingByThreadId(threadId);
+		if (dropped > 0) {
+			safeLog("discord thread archived — dropped sub-agent thread binding", { threadId, dropped });
+		}
+	};
+
 	/* ── event wiring ── */
 
 	const wireClient = (c: DiscordClientLike): void => {
-		c.on("messageCreate", ((message: DiscordMessageLike) => handleMessage(message)) as never);
+		// handleMessage is async (it does best-effort REST hydration for reply bodies /
+		// empty payloads); it self-guards every path, so the promise is voided here.
+		c.on("messageCreate", ((message: DiscordMessageLike) => void handleMessage(message)) as never);
 		c.on("messageUpdate", ((_old: unknown, updated: DiscordMessageLike) => {
 			// messageUpdate fires for non-content edits too (embeds resolving, pins);
 			// only route when there's content to act on.
-			if (updated && typeof updated === "object") handleMessage(updated, { edited: true });
+			if (updated && typeof updated === "object") void handleMessage(updated, { edited: true });
 		}) as never);
 		c.on("messageDelete", (() => {
 			// A deleted message carries no routable content — just stamp liveness.
 			stampInboundEvent();
+		}) as never);
+		// THREAD_UPDATE (Fix 6): when a thread transitions to archived, best-effort
+		// drop any sub-agent thread binding for it so an archived thread doesn't leak
+		// a binding. Fully guarded — a malformed/partial payload is a no-op.
+		c.on("threadUpdate", ((oldThread: unknown, newThread: unknown) => {
+			stampInboundEvent(); // thread state change is still gateway traffic (liveness)
+			try {
+				handleThreadArchive(oldThread, newThread);
+			} catch {
+				/* never let a thread-update payload break the listener */
+			}
 		}) as never);
 		c.on("messageReactionAdd", ((reaction: never, user: never) => handleReactionAdd(reaction, user)) as never);
 		c.on("messageReactionRemove", ((reaction: never, user: never) => handleReactionRemove(reaction, user)) as never);
@@ -837,15 +1620,26 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 
 	/* ── bootstrap + supervise ── */
 
-	/** Build the client, wire events, login, cache identity. */
+	/**
+	 * Build the client, wire events, login, cache identity, and WAIT for the
+	 * Gateway to reach READY (Phase 5). A socket can `login()` (open) yet never
+	 * fire `clientReady`; we don't trust such a socket. When `readyTimeoutMs > 0`
+	 * and READY hasn't fired by the deadline we destroy the client and throw so the
+	 * supervise loop reconnects. On READY we apply the configured presence.
+	 */
 	const startOnce = async (): Promise<void> => {
 		const c = buildClient(args.botToken);
 		client = c;
+		ready = false;
 		wireClient(c);
 		// `clientReady` fires once the Gateway handshake + initial guild sync settle.
 		c.once("clientReady", (() => {
 			selfId = typeof c.user?.id === "string" ? c.user.id : null;
 			selfName = typeof c.user?.username === "string" ? c.user.username : null;
+			ready = true;
+			cancelReadyWatchdog();
+			// Apply the configured presence once the client is fully ready.
+			applyPresence();
 		}) as never);
 		// login() rejects on an invalid token (terminal); resolves once the Gateway
 		// is identifying. We treat a resolved login as connected and read the cached
@@ -853,6 +1647,48 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		await c.login(args.botToken);
 		selfId = selfId ?? (typeof c.user?.id === "string" ? c.user.id : null);
 		selfName = selfName ?? (typeof c.user?.username === "string" ? c.user.username : null);
+		// Arm the READY watchdog (Phase 5, NON-blocking): a socket can open
+		// (`login()` resolved) yet never fire `clientReady`. If that's still the case
+		// after the deadline, destroy the client + re-enter the supervise loop so we
+		// don't trust a half-open socket. `clientReady` cancels it. `startOnce`
+		// returns immediately so the adapter's start() never blocks on READY.
+		armReadyWatchdog(c);
+	};
+
+	/* ── READY watchdog (Phase 5) ── */
+	let readyTimer: ReturnType<typeof setTimeout> | undefined;
+	const cancelReadyWatchdog = (): void => {
+		if (readyTimer) {
+			clearTimeout(readyTimer);
+			readyTimer = undefined;
+		}
+	};
+	const armReadyWatchdog = (c: DiscordClientLike): void => {
+		cancelReadyWatchdog();
+		if (readyTimeoutMs <= 0 || ready || closed) return;
+		readyTimer = setTimeout(() => {
+			readyTimer = undefined;
+			// READY arrived in the meantime / we tore down / the token died — nothing to do.
+			if (ready || closed || tokenInvalid || client !== c) return;
+			safeLog("discord gateway opened but did not reach READY within deadline — destroying + reconnecting", {
+				account: accountId,
+				deadlineMs: readyTimeoutMs,
+			});
+			connected = false;
+			// Re-enter the supervise loop on a fresh tick (destroy + reconnect with backoff).
+			void (async () => {
+				await teardownClient();
+				if (closed || tokenInvalid) return;
+				reconnectAttempts += 1;
+				const delay = discordBackoffDelay(reconnectAttempts);
+				await sleep(delay);
+				if (closed || tokenInvalid) return;
+				loopPromise = superviseLoop().catch((err) => {
+					safeLog("discord supervise loop crashed", { error: err instanceof Error ? err.message : String(err) });
+				});
+			})();
+		}, readyTimeoutMs);
+		if (typeof (readyTimer as { unref?: () => void }).unref === "function") (readyTimer as { unref: () => void }).unref();
 	};
 
 	/**
@@ -905,6 +1741,7 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 	const teardownClient = async (): Promise<void> => {
 		const c = client;
 		client = null;
+		ready = false;
 		if (c) {
 			try {
 				await c.destroy();
@@ -954,47 +1791,112 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		const targetId = threadId || channel;
 		const ch = await c.channels.fetch(targetId);
 		if (!ch) throw new Error(`Discord: channel ${targetId} not found`);
-		if (typeof ch.isTextBased === "function" && !ch.isTextBased()) {
+		// A forum / media channel reports `isTextBased() === false` but IS a valid
+		// send target — the post is created as a thread (Fix 2b). So we only reject
+		// genuinely non-text channels (voice/category/…) that aren't forum-like.
+		if (typeof ch.isTextBased === "function" && !ch.isTextBased() && !isForumLikeChannel(ch)) {
 			throw new Error(`Discord: channel ${targetId} is not text-based`);
 		}
 		return ch;
 	};
 
-	const sendText: DiscordConnection["sendText"] = async (channel, text, opts) => {
-		const ch = await resolveSendChannel(channel, opts?.threadId);
-		// SAFE allowed-mentions on EVERY send: explicit user/role pings still notify,
-		// but a stray `@everyone`/`@here` (agent text or prompt injection) can't
-		// mass-ping, and a reply won't ping the author it answers.
-		const options: DiscordSendOptions = { content: text, allowedMentions: safeDiscordAllowedMentions() };
-		// Native reply target — reply under the message being answered (only when not
-		// threading, since a thread send is already scoped).
-		if (opts?.replyToMessageId && !opts?.threadId) {
-			options.reply = { messageReference: opts.replyToMessageId, failIfNotExists: false };
+	/**
+	 * Post a message to a resolved channel, auto-creating a forum/media thread when
+	 * the target is a `GuildForum`/`GuildMedia` channel (Fix 2b) — those reject a
+	 * plain `.send()`. The thread name is derived from the first non-empty content
+	 * line. Returns the created message's id. Used by every text-ish send path.
+	 */
+	const postToChannel = async (ch: DiscordSendChannelLike, options: DiscordSendOptions): Promise<{ messageId: string }> => {
+		if (isForumLikeChannel(ch)) {
+			if (typeof ch.threads?.create !== "function") {
+				throw new Error("Discord: forum/media channel cannot create a thread (missing threads.create)");
+			}
+			const name = deriveForumThreadName(options.content ?? "");
+			const message: { content?: string; flags?: number } = {};
+			if (options.content !== undefined) message.content = options.content;
+			if (options.flags !== undefined) message.flags = options.flags;
+			const created = await ch.threads.create({ name, message });
+			const messageId = typeof created.lastMessage?.id === "string" ? created.lastMessage.id : typeof created.id === "string" ? created.id : "";
+			return { messageId };
 		}
 		const sent = await ch.send(options);
 		return { messageId: typeof sent.id === "string" ? sent.id : "" };
+	};
+
+	const sendText: DiscordConnection["sendText"] = async (channel, text, opts) => {
+		try {
+			const ch = await resolveSendChannel(channel, opts?.threadId);
+			// SAFE allowed-mentions on EVERY send: explicit user/role pings still notify,
+			// but a stray `@everyone`/`@here` (agent text or prompt injection) can't
+			// mass-ping, and a reply won't ping the author it answers.
+			const options: DiscordSendOptions = { content: text, allowedMentions: safeDiscordAllowedMentions() };
+			// Silent send — suppress the recipient's notification (Fix 2c).
+			if (opts?.silent) options.flags = MESSAGE_FLAG_SUPPRESS_NOTIFICATIONS;
+			// Native reply target — reply under the message being answered (only when not
+			// threading, since a thread send is already scoped).
+			if (opts?.replyToMessageId && !opts?.threadId) {
+				options.reply = { messageReference: opts.replyToMessageId, failIfNotExists: false };
+			}
+			return await postToChannel(ch, options);
+		} catch (err) {
+			throw decodeDiscordSendError(err);
+		}
 	};
 
 	const sendInteractive: DiscordConnection["sendInteractive"] = async (channel, text, rows, opts) => {
-		const ch = await resolveSendChannel(channel, opts?.threadId);
-		const components = resolvedBuilders.buildComponentRows(rows);
-		const options: DiscordSendOptions = { content: text, components, allowedMentions: safeDiscordAllowedMentions() };
-		if (opts?.replyToMessageId && !opts?.threadId) {
-			options.reply = { messageReference: opts.replyToMessageId, failIfNotExists: false };
+		try {
+			const ch = await resolveSendChannel(channel, opts?.threadId);
+			// Components V2 (Fix 3c): when any row is a V2 container, the WHOLE message
+			// is V2 — the IsComponentsV2 flag is set and plain `content` is forbidden
+			// (text must live inside a V2 text block). When no V2 row is present the
+			// classic button/select path is byte-identical to before (plain content +
+			// no flag).
+			const hasV2 = rows.some((row) => isDiscordV2MessageSpec(row));
+			let effectiveRows = rows;
+			if (hasV2 && text && text.trim()) {
+				// Prepend the message text as a leading TextDisplay block inside the FIRST
+				// V2 container so the V2 message still shows the body (it can't use content).
+				effectiveRows = rows.map((row) => {
+					if (isDiscordV2MessageSpec(row)) {
+						return { ...row, blocks: [{ type: "text", text } as DiscordBlockSpec, ...row.blocks] };
+					}
+					return row;
+				});
+			}
+			const components = resolvedBuilders.buildComponentRows(effectiveRows);
+			const options: DiscordSendOptions = { components, allowedMentions: safeDiscordAllowedMentions() };
+			if (hasV2) {
+				// A V2 message carries no plain content; the flag tells Discord to render
+				// the component tree. SuppressNotifications (silent) ORs in alongside it.
+				options.flags = DISCORD_FLAG_IS_COMPONENTS_V2 | (opts?.silent ? MESSAGE_FLAG_SUPPRESS_NOTIFICATIONS : 0);
+			} else {
+				options.content = text;
+				if (opts?.silent) options.flags = MESSAGE_FLAG_SUPPRESS_NOTIFICATIONS;
+			}
+			if (opts?.replyToMessageId && !opts?.threadId) {
+				options.reply = { messageReference: opts.replyToMessageId, failIfNotExists: false };
+			}
+			const sent = await ch.send(options);
+			return { messageId: typeof sent.id === "string" ? sent.id : "" };
+		} catch (err) {
+			throw decodeDiscordSendError(err);
 		}
-		const sent = await ch.send(options);
-		return { messageId: typeof sent.id === "string" ? sent.id : "" };
 	};
 
 	const sendMedia: DiscordConnection["sendMedia"] = async (channel, media, opts) => {
-		const ch = await resolveSendChannel(channel, opts?.threadId);
-		// validateOutboundMediaPath runs inside buildDiscordAttachment (throws on a
-		// refused path).
-		const att = buildDiscordAttachment(media);
-		const file = resolvedBuilders.buildAttachment(att.path, att.name);
-		const options: DiscordSendOptions = { files: [file], allowedMentions: safeDiscordAllowedMentions() };
-		if (att.caption) options.content = att.caption;
-		await ch.send(options);
+		try {
+			const ch = await resolveSendChannel(channel, opts?.threadId);
+			// validateOutboundMediaPath runs inside buildDiscordAttachment (throws on a
+			// refused path).
+			const att = buildDiscordAttachment(media);
+			const file = resolvedBuilders.buildAttachment(att.path, att.name);
+			const options: DiscordSendOptions = { files: [file], allowedMentions: safeDiscordAllowedMentions() };
+			if (opts?.silent) options.flags = MESSAGE_FLAG_SUPPRESS_NOTIFICATIONS;
+			if (att.caption) options.content = att.caption;
+			await ch.send(options);
+		} catch (err) {
+			throw decodeDiscordSendError(err);
+		}
 	};
 
 	const fetchMessage = async (channel: string, messageId: string): Promise<DiscordSentMessageLike> => {
@@ -1014,6 +1916,18 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 	const deleteMessage: DiscordConnection["deleteMessage"] = async (channel, messageId) => {
 		const msg = await fetchMessage(channel, messageId);
 		await msg.delete();
+	};
+
+	const pinMessage: DiscordConnection["pinMessage"] = async (channel, messageId) => {
+		const msg = await fetchMessage(channel, messageId);
+		if (typeof msg.pin !== "function") throw new Error("Discord: message cannot be pinned");
+		await msg.pin();
+	};
+
+	const unpinMessage: DiscordConnection["unpinMessage"] = async (channel, messageId) => {
+		const msg = await fetchMessage(channel, messageId);
+		if (typeof msg.unpin !== "function") throw new Error("Discord: message cannot be unpinned");
+		await msg.unpin();
 	};
 
 	const react: DiscordConnection["react"] = async (channel, messageId, emoji) => {
@@ -1082,9 +1996,59 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		}
 	};
 
+	/**
+	 * Create a thread off an existing message (Phase 5 autoThread). Fetches the
+	 * channel + message, calls `message.startThread(...)`, and returns the new
+	 * thread id. On a create-race (the message already has a thread — Discord
+	 * rejects a second `startThread`) it returns the existing thread id. Returns
+	 * `null` on any failure so the caller falls back to an un-threaded reply.
+	 */
+	const createThreadFromMessage: DiscordConnection["createThreadFromMessage"] = async (channelId, messageId, opts) => {
+		try {
+			const c = requireLive();
+			const ch = await c.channels.fetch(channelId);
+			if (!ch || typeof ch.messages?.fetch !== "function") return null;
+			// Forum/Media/Voice channels reject `startThread` (they have no
+			// message-thread surface). Skip SILENTLY (Fix 6) — the caller falls back
+			// to an un-threaded reply, and we suppress the noisy known-unsupported error.
+			const channelType = (ch as { type?: number }).type;
+			if (typeof channelType === "number" && THREAD_UNSUPPORTED_CHANNEL_TYPES.has(channelType)) {
+				return null;
+			}
+			const message = await ch.messages.fetch(messageId);
+			if (!message) return null;
+			// Already threaded → reuse (avoids the "already has a thread" reject).
+			if (message.hasThread && message.thread?.id) return message.thread.id;
+			if (typeof message.startThread !== "function") return null;
+			const created = await message.startThread({
+				name: opts.name,
+				...(typeof opts.autoArchiveMinutes === "number" ? { autoArchiveDuration: opts.autoArchiveMinutes } : {}),
+			});
+			const id = typeof created?.id === "string" ? created.id : "";
+			return id || null;
+		} catch (err) {
+			safeLog("discord createThreadFromMessage failed", {
+				channelId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			// Create-race: another actor may have threaded the message already.
+			try {
+				const c = client;
+				const ch = c ? await c.channels.fetch(channelId) : null;
+				const message = ch && typeof ch.messages?.fetch === "function" ? await ch.messages.fetch(messageId) : null;
+				if (message?.thread?.id) return message.thread.id;
+			} catch {
+				/* refetch also failed — give up */
+			}
+			return null;
+		}
+	};
+
 	const close: DiscordConnection["close"] = async () => {
 		closed = true;
 		connected = false;
+		ready = false;
+		cancelReadyWatchdog();
 		await teardownClient();
 		try {
 			await Promise.race([
@@ -1101,7 +2065,10 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		selfName: () => selfName,
 		connectedAt: () => connectedAtMs,
 		lastEventAt: () => lastEventAtMs,
-		isConnected: () => connected,
+		// `connected` is only set after startOnce resolves, which (when the watchdog
+		// is enabled) requires READY — so connected already implies the Gateway is
+		// fully up. The `|| ready` keeps the flag honest if the watchdog is disabled.
+		isConnected: () => connected && (ready || readyTimeoutMs <= 0),
 		isTokenInvalid: () => tokenInvalid,
 		sendText,
 		sendInteractive,
@@ -1110,9 +2077,13 @@ export async function connectDiscord(args: ConnectDiscordArgs): Promise<DiscordC
 		removeOwnReactions,
 		editMessageText,
 		deleteMessage,
+		pinMessage,
+		unpinMessage,
 		registerCommands,
 		setComposing,
 		markRead: async () => {},
+		applyPresence,
+		createThreadFromMessage,
 		close,
 	};
 }

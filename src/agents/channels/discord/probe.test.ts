@@ -1,7 +1,13 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { decodeMessageContentIntent, MESSAGE_CONTENT_DISABLED_WARNING, probeDiscord } from "./probe.js";
+import { decodeMessageContentIntent, decodePrivilegedIntents, MESSAGE_CONTENT_DISABLED_WARNING, probeDiscord } from "./probe.js";
+
+// Application-flag bits (Discord's actual values).
+const FLAG_PRESENCE = 1 << 12;
+const FLAG_GUILD_MEMBERS = 1 << 14;
+const FLAG_GUILD_MEMBERS_LIMITED = 1 << 15;
+const FLAG_MESSAGE_CONTENT = 1 << 18;
 
 /** Build a fake fetch returning a canned response. */
 function fakeFetch(opts: { ok?: boolean; status?: number; json?: unknown; throwErr?: Error }): typeof fetch {
@@ -145,5 +151,51 @@ describe("probeDiscord — MESSAGE CONTENT intent (Fix 3)", () => {
 		const res = await probeDiscord({ token: "AAA", fetchImpl: fakeFetchWithFlags({ appNotOk: true }) });
 		assert.equal(res.ok, true);
 		assert.equal(res.messageContentIntent, undefined);
+	});
+});
+
+describe("decodePrivilegedIntents (Phase 5)", () => {
+	it("decodes all three intents from flags", () => {
+		// message content enabled (1<<18), guild members limited (1<<15), presence disabled.
+		const flags = FLAG_MESSAGE_CONTENT | FLAG_GUILD_MEMBERS_LIMITED;
+		const intents = decodePrivilegedIntents(flags);
+		assert.deepEqual(intents, { messageContent: "enabled", guildMembers: "limited", presence: "disabled" });
+	});
+
+	it("all enabled", () => {
+		const flags = FLAG_MESSAGE_CONTENT | FLAG_GUILD_MEMBERS | FLAG_PRESENCE;
+		assert.deepEqual(decodePrivilegedIntents(flags), {
+			messageContent: "enabled",
+			guildMembers: "enabled",
+			presence: "enabled",
+		});
+	});
+
+	it("all disabled when no bits set", () => {
+		assert.deepEqual(decodePrivilegedIntents(0), {
+			messageContent: "disabled",
+			guildMembers: "disabled",
+			presence: "disabled",
+		});
+	});
+
+	it("non-number flags → undefined", () => {
+		assert.equal(decodePrivilegedIntents(undefined), undefined);
+		assert.equal(decodePrivilegedIntents("nope"), undefined);
+	});
+
+	it("probeDiscord surfaces the full privilegedIntents decode", async () => {
+		const res = await probeDiscord({
+			token: "AAA",
+			fetchImpl: fakeFetchWithFlags({ appFlags: FLAG_MESSAGE_CONTENT | FLAG_GUILD_MEMBERS }),
+		});
+		assert.equal(res.ok, true);
+		assert.deepEqual(res.privilegedIntents, {
+			messageContent: "enabled",
+			guildMembers: "enabled",
+			presence: "disabled",
+		});
+		// Back-compat field still set.
+		assert.equal(res.messageContentIntent, "enabled");
 	});
 });

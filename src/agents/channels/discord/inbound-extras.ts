@@ -51,6 +51,50 @@ export interface DiscordAttachmentLike {
 	[key: string]: unknown;
 }
 
+/**
+ * One sticker item on a message (`message.stickers` collection, or raw
+ * `sticker_items`). Discord stickers carry an `id`, a `name`, and a
+ * `format` / `format_type` enum (1=PNG, 2=APNG, 3=Lottie, 4=GIF) that selects
+ * the CDN extension. We download them from `media.discordapp.net/stickers/<id>`.
+ */
+export interface DiscordStickerLike {
+	id?: string;
+	name?: string | null;
+	/** discord.js exposes the enum as `format`; the raw gateway payload as `format_type`. */
+	format?: number;
+	format_type?: number;
+	[key: string]: unknown;
+}
+
+/** One embed on a message (the subset Brigade folds into the assembled text). */
+export interface DiscordEmbedLike {
+	title?: string | null;
+	description?: string | null;
+	url?: string | null;
+	[key: string]: unknown;
+}
+
+/**
+ * A forwarded-message snapshot. Discord delivers a forward as a
+ * `message_snapshots` array (raw) / `messageSnapshots` (discord.js Collection),
+ * each wrapping a frozen copy of the original under `.message`. The snapshot
+ * carries the original's content, embeds, attachments, stickers, and author.
+ */
+export interface DiscordSnapshotMessageLike {
+	content?: string | null;
+	embeds?: DiscordEmbedLike[] | null;
+	attachments?: Iterable<DiscordAttachmentLike> | Map<string, DiscordAttachmentLike> | DiscordAttachmentLike[] | null;
+	stickers?: Iterable<DiscordStickerLike> | Map<string, DiscordStickerLike> | DiscordStickerLike[] | null;
+	sticker_items?: DiscordStickerLike[] | null;
+	author?: { id?: string | null; username?: string | null; globalName?: string | null; global_name?: string | null } | null;
+	[key: string]: unknown;
+}
+
+export interface DiscordSnapshotLike {
+	message?: DiscordSnapshotMessageLike | null;
+	[key: string]: unknown;
+}
+
 /** A discord.js channel (the subset Brigade reads). `isThread()`/`isDMBased()` may be absent on a fake. */
 export interface DiscordChannelLike {
 	id?: string;
@@ -60,6 +104,8 @@ export interface DiscordChannelLike {
 	isDMBased?: () => boolean;
 	/** Parent text-channel id when this channel is a thread. */
 	parentId?: string | null;
+	/** Fetch a message in this channel by id (reply-parent fallback when `fetchReference` is absent). */
+	messages?: { fetch?: (id: string) => Promise<DiscordMessageLike | null> };
 	[key: string]: unknown;
 }
 
@@ -115,13 +161,47 @@ export interface DiscordMessageLike {
 	createdTimestamp?: number;
 	/** Set when the message was edited (epoch ms), else null. */
 	editedTimestamp?: number | null;
-	/** Reply pointer — `messageId` is the message being replied to. */
-	reference?: { messageId?: string | null; channelId?: string | null; guildId?: string | null } | null;
+	/**
+	 * Reply / forward pointer. `messageId` is the referenced message; `type` is the
+	 * reference KIND — `0` (default / absent) is a reply, `1` is a forward. discord.js
+	 * also exposes the raw shape as `messageReference` with `type`.
+	 */
+	reference?: { messageId?: string | null; channelId?: string | null; guildId?: string | null; type?: number | null } | null;
+	messageReference?: { messageId?: string | null; type?: number | null } | null;
+	/**
+	 * The resolved reply-parent message, when discord.js already cached it (it sends
+	 * the referenced message inline with a Gateway MESSAGE_CREATE for a reply). Lets
+	 * the reply-context resolve the parent's author SYNCHRONOUSLY — so a guild
+	 * reply-to-bot is admitted even if the async body-backfill fetch later fails.
+	 */
+	referencedMessage?: DiscordMessageLike | null;
+	/** First embed's title/description fold into the assembled text when content is empty. */
+	embeds?: DiscordEmbedLike[] | null;
+	/** Stickers on the message — a `<sticker: name>` placeholder + a downloaded asset. */
+	stickers?: Iterable<DiscordStickerLike> | Map<string, DiscordStickerLike> | DiscordStickerLike[] | null;
+	/** Raw gateway shape of the sticker list (fallback when `.stickers` is absent). */
+	sticker_items?: DiscordStickerLike[] | null;
+	/** Forwarded-message snapshots (discord.js Collection / raw array). */
+	messageSnapshots?: Iterable<DiscordSnapshotLike> | Map<string, DiscordSnapshotLike> | DiscordSnapshotLike[] | null;
+	message_snapshots?: DiscordSnapshotLike[] | null;
 	attachments?: Iterable<DiscordAttachmentLike> | Map<string, DiscordAttachmentLike> | DiscordAttachmentLike[];
+	/**
+	 * discord.js `MessageType` enum value. `0` = Default, `19` = Reply; anything
+	 * else is a SYSTEM message (a join / pin / boost / thread-created / …). Absent
+	 * on a fake → treated as Default.
+	 */
+	type?: number;
 	/** A resolved Collection of mentioned users, or a plain array on a fake. */
 	mentions?: {
 		users?: Iterable<DiscordUserLike> | Map<string, DiscordUserLike> | DiscordUserLike[];
 	};
+	/**
+	 * Re-pull this message from the REST API (used to hydrate a late / proxied
+	 * empty-content payload). discord.js returns the refreshed Message.
+	 */
+	fetch?: () => Promise<DiscordMessageLike>;
+	/** Resolve the message this one replies to (discord.js `Message#fetchReference`). */
+	fetchReference?: () => Promise<DiscordMessageLike | null>;
 	[key: string]: unknown;
 }
 
@@ -205,6 +285,139 @@ export function extractDiscordText(
 	return expandDiscordTokens(raw, resolve).trim();
 }
 
+/* ───────────────────────── embeds / stickers / forwards (assembled text) ───────────────────────── */
+
+const FORWARD_REFERENCE_TYPE = 1;
+
+/**
+ * True when the message is a FORWARD (reference kind `1`) rather than a reply
+ * (kind `0` / absent). discord.js exposes the kind on `reference.type`; the raw
+ * gateway shape carries it on `messageReference.type`. Used so a forward isn't
+ * mistaken for a reply by the reply-context resolver.
+ */
+export function isDiscordForward(message: Pick<DiscordMessageLike, "reference" | "messageReference">): boolean {
+	const t = message.reference?.type ?? message.messageReference?.type;
+	return typeof t === "number" && t === FORWARD_REFERENCE_TYPE;
+}
+
+/** A short author label for a forwarded snapshot (globalName → username → id). */
+function snapshotAuthorLabel(author: DiscordSnapshotMessageLike["author"]): string | undefined {
+	if (!author) return undefined;
+	const display = author.globalName ?? author.global_name ?? undefined;
+	if (typeof display === "string" && display.trim()) return display.trim();
+	const username = author.username;
+	if (typeof username === "string" && username.trim()) return username.trim();
+	return typeof author.id === "string" && author.id ? author.id : undefined;
+}
+
+/**
+ * The first embed's text folded into a readable run: `title` + `description` +
+ * (a bare `url` when neither carries it). Returns "" when the message has no
+ * embed text. Pure + deterministic.
+ */
+export function extractDiscordEmbedText(message: Pick<DiscordMessageLike, "embeds">): string {
+	const embed = Array.isArray(message.embeds) ? message.embeds[0] : undefined;
+	if (!embed) return "";
+	const title = typeof embed.title === "string" ? embed.title.trim() : "";
+	const description = typeof embed.description === "string" ? embed.description.trim() : "";
+	const url = typeof embed.url === "string" ? embed.url.trim() : "";
+	const parts: string[] = [];
+	if (title) parts.push(title);
+	if (description) parts.push(description);
+	// Surface the link only when there's no title/description carrying it already.
+	if (url && parts.length === 0) parts.push(url);
+	return parts.join("\n");
+}
+
+/** The sticker items on a message (the `.stickers` collection, then raw `sticker_items`). */
+export function resolveInboundStickers(message: Pick<DiscordMessageLike, "stickers" | "sticker_items">): DiscordStickerLike[] {
+	const fromCollection = toArray(message.stickers ?? undefined).filter((s): s is DiscordStickerLike => Boolean(s) && typeof s === "object");
+	if (fromCollection.length > 0) return fromCollection;
+	const raw = Array.isArray(message.sticker_items) ? message.sticker_items : [];
+	return raw.filter((s): s is DiscordStickerLike => Boolean(s) && typeof s === "object");
+}
+
+/** A `<sticker: name>` placeholder line per sticker, joined by newlines. Returns "" when none. */
+export function extractDiscordStickerText(message: Pick<DiscordMessageLike, "stickers" | "sticker_items">): string {
+	const stickers = resolveInboundStickers(message);
+	if (stickers.length === 0) return "";
+	return stickers
+		.map((s) => {
+			const name = typeof s.name === "string" && s.name.trim() ? s.name.trim() : "sticker";
+			return `<sticker: ${name}>`;
+		})
+		.join("\n");
+}
+
+/** The forwarded-message snapshots on a message (discord.js Collection or raw array). */
+export function resolveDiscordSnapshots(message: Pick<DiscordMessageLike, "messageSnapshots" | "message_snapshots">): DiscordSnapshotLike[] {
+	const fromCollection = toArray(message.messageSnapshots ?? undefined).filter((s): s is DiscordSnapshotLike => Boolean(s) && typeof s === "object");
+	if (fromCollection.length > 0) return fromCollection;
+	const raw = Array.isArray(message.message_snapshots) ? message.message_snapshots : [];
+	return raw.filter((s): s is DiscordSnapshotLike => Boolean(s) && typeof s === "object");
+}
+
+/** The plain text of ONE forwarded snapshot's inner message (content → sticker → embed). */
+function snapshotInnerText(snap: DiscordSnapshotMessageLike, resolve?: Parameters<typeof expandDiscordTokens>[1]): string {
+	const content = typeof snap.content === "string" && !isBinaryContent(snap.content) ? expandDiscordTokens(snap.content, resolve).trim() : "";
+	const stickerText = extractDiscordStickerText(snap);
+	const embedText = extractDiscordEmbedText(snap);
+	return content || stickerText || embedText || "";
+}
+
+/**
+ * The `[Forwarded from <author>]` block(s) for any forwarded snapshots on the
+ * message. Each snapshot becomes a heading + its inner text. A forward whose
+ * snapshot has no text still surfaces the heading so the agent learns a forward
+ * happened. Returns "" when the message carries no forward snapshots.
+ */
+export function extractDiscordForwardedText(
+	message: Pick<DiscordMessageLike, "messageSnapshots" | "message_snapshots">,
+	resolve?: Parameters<typeof expandDiscordTokens>[1],
+): string {
+	const snapshots = resolveDiscordSnapshots(message);
+	if (snapshots.length === 0) return "";
+	const blocks: string[] = [];
+	for (const snap of snapshots) {
+		const inner = snap.message ?? undefined;
+		const author = inner ? snapshotAuthorLabel(inner.author) : undefined;
+		const heading = author ? `[Forwarded from ${author}]` : "[Forwarded message]";
+		const text = inner ? snapshotInnerText(inner, resolve) : "";
+		blocks.push(text ? `${heading}\n${text}` : heading);
+	}
+	return blocks.join("\n\n");
+}
+
+/**
+ * The full agent-facing text Brigade routes for a Discord message. The message
+ * `content` leads (token-expanded); when content is empty we FALL BACK to the
+ * first embed's title/description so an embed-only message isn't dropped. A
+ * `<sticker: name>` placeholder is APPENDED for any stickers, and a
+ * `[Forwarded from …]` block is APPENDED for any forwarded snapshots — so a
+ * sticker-only or forward-only message carries real text instead of "".
+ *
+ * Pure + deterministic; the connection passes a `resolve` lookup so mention
+ * tokens expand to readable names.
+ */
+export function assembleDiscordText(
+	message: Pick<DiscordMessageLike, "content" | "embeds" | "stickers" | "sticker_items" | "messageSnapshots" | "message_snapshots">,
+	resolve?: Parameters<typeof expandDiscordTokens>[1],
+): string {
+	const content = extractDiscordText(message, resolve);
+	const parts: string[] = [];
+	if (content) {
+		parts.push(content);
+	} else {
+		const embedText = extractDiscordEmbedText(message);
+		if (embedText) parts.push(embedText);
+	}
+	const stickerText = extractDiscordStickerText(message);
+	if (stickerText) parts.push(stickerText);
+	const forwardedText = extractDiscordForwardedText(message, resolve);
+	if (forwardedText) parts.push(forwardedText);
+	return parts.join("\n").trim();
+}
+
 /* ───────────────────────── chat type + thread + reply ───────────────────────── */
 
 /** Discord channel-type enum values Brigade distinguishes. */
@@ -259,12 +472,31 @@ export function discordThreadId(message: Pick<DiscordMessageLike, "channel" | "c
  * inline that message's text — so the context surfaces the parent message id and
  * leaves `body` undefined (the connection can fetch the parent if it needs the
  * excerpt). Returns undefined for a non-reply.
+ *
+ * When discord.js already resolved the reply parent (`message.referencedMessage`,
+ * which rides inline on a Gateway reply MESSAGE_CREATE), the parent's author id is
+ * captured SYNCHRONOUSLY into `from`. This matters because the central pipeline's
+ * group-addressing `isReplyToBot` depends on `replyTo.from === selfId` — if `from`
+ * were populated ONLY by the async body-backfill (connection.ts), a guild
+ * reply-to-bot whose backfill fetch failed would lose its implicit-mention
+ * admission and be dropped. The async backfill still fills `body` (the excerpt).
  */
-export function extractDiscordReplyContext(message: Pick<DiscordMessageLike, "reference">): InboundReplyContext | undefined {
+export function extractDiscordReplyContext(
+	message: Pick<DiscordMessageLike, "reference" | "messageReference" | "referencedMessage">,
+): InboundReplyContext | undefined {
+	// A FORWARD (reference kind 1) also carries a `reference.messageId`, but it's a
+	// forward — its content rides in the snapshot, not a quoted reply. Don't surface
+	// it as reply context (the assembled text already carries the forwarded block).
+	if (isDiscordForward(message)) return undefined;
 	const ref = message.reference;
 	const id = ref?.messageId;
 	if (typeof id !== "string" || !id) return undefined;
-	return { messageId: id };
+	const out: InboundReplyContext = { messageId: id };
+	// Synchronously resolve the parent author from the already-cached referenced
+	// message when discord.js handed one — no async fetch needed.
+	const parentAuthorId = message.referencedMessage?.author?.id;
+	if (typeof parentAuthorId === "string" && parentAuthorId) out.from = parentAuthorId;
+	return out;
 }
 
 /* ───────────────────────── mentions ───────────────────────── */
@@ -402,19 +634,108 @@ function isDownloadableAttachment(a: DiscordAttachmentLike): boolean {
 	return Boolean(a && (a.url || a.proxyURL));
 }
 
+/** discord.js sticker `format` / raw `format_type` enum: 1=PNG, 2=APNG, 3=Lottie, 4=GIF. */
+const STICKER_FORMAT_PNG = 1;
+const STICKER_FORMAT_APNG = 2;
+const STICKER_FORMAT_LOTTIE = 3;
+const STICKER_FORMAT_GIF = 4;
+
+/** The CDN host stickers download from — already in the SSRF host allowlist (`media.discordapp.net`). */
+const STICKER_ASSET_BASE_URL = "https://media.discordapp.net/stickers";
+
 /**
- * Cheap presence probe — does this message carry a downloadable attachment?
- * Walks `message.attachments` but never touches the network, so the connection
- * layer can DEFER the actual download until AFTER the central access gate admits
- * the sender (mirrors Slack/Telegram). Mirrors `hasInboundMedia`.
+ * The downloadable CDN URL + content-type for ONE sticker, derived from its
+ * `format` enum. PNG/APNG → `.png`, GIF → `.gif`, Lottie (vector) → `.json`
+ * (the raw Lottie animation; we don't rasterize). The host is `media.discordapp.net`,
+ * already covered by the inbound SSRF allowlist. Returns null when the sticker
+ * has no id.
  */
-export function hasInboundMedia(message: Pick<DiscordMessageLike, "attachments">): boolean {
-	return toArray(message.attachments).some(isDownloadableAttachment);
+export function stickerToAttachment(sticker: DiscordStickerLike): DiscordAttachmentLike | null {
+	const id = typeof sticker.id === "string" ? sticker.id.trim() : "";
+	if (!id) return null;
+	const format = typeof sticker.format === "number" ? sticker.format : typeof sticker.format_type === "number" ? sticker.format_type : STICKER_FORMAT_PNG;
+	const baseName = typeof sticker.name === "string" && sticker.name.trim() ? sticker.name.trim().replace(/[^A-Za-z0-9_-]/g, "_") : `sticker-${id}`;
+	let ext: string;
+	let contentType: string;
+	switch (format) {
+		case STICKER_FORMAT_GIF:
+			ext = "gif";
+			contentType = "image/gif";
+			break;
+		case STICKER_FORMAT_LOTTIE:
+			ext = "json";
+			contentType = "application/json";
+			break;
+		case STICKER_FORMAT_APNG:
+		case STICKER_FORMAT_PNG:
+		default:
+			ext = "png";
+			contentType = "image/png";
+			break;
+	}
+	return {
+		id,
+		name: `${baseName}.${ext}`,
+		url: `${STICKER_ASSET_BASE_URL}/${id}.${ext}`,
+		contentType,
+	};
 }
 
-/** The list of downloadable attachments on a message. */
-export function resolveInboundAttachments(message: Pick<DiscordMessageLike, "attachments">): DiscordAttachmentLike[] {
-	return toArray(message.attachments).filter(isDownloadableAttachment);
+/** Sticker assets on a message, mapped to downloadable attachment descriptors. */
+export function resolveInboundStickerAttachments(message: Pick<DiscordMessageLike, "stickers" | "sticker_items">): DiscordAttachmentLike[] {
+	const out: DiscordAttachmentLike[] = [];
+	for (const sticker of resolveInboundStickers(message)) {
+		const att = stickerToAttachment(sticker);
+		if (att) out.push(att);
+	}
+	return out;
+}
+
+/**
+ * Downloadable attachments carried INSIDE forwarded snapshots (attachments +
+ * stickers of each forwarded message). A forward arrives as a frozen snapshot,
+ * so its media never appears on `message.attachments` — it has to be pulled out
+ * of the snapshot.
+ */
+export function resolveForwardedAttachments(message: Pick<DiscordMessageLike, "messageSnapshots" | "message_snapshots">): DiscordAttachmentLike[] {
+	const out: DiscordAttachmentLike[] = [];
+	for (const snap of resolveDiscordSnapshots(message)) {
+		const inner = snap.message;
+		if (!inner) continue;
+		for (const a of toArray(inner.attachments ?? undefined)) {
+			if (isDownloadableAttachment(a)) out.push(a);
+		}
+		out.push(...resolveInboundStickerAttachments(inner));
+	}
+	return out;
+}
+
+/** The fields {@link hasInboundMedia} / {@link resolveInboundAttachments} read across the full media surface. */
+type DiscordMediaSurface = Pick<DiscordMessageLike, "attachments" | "stickers" | "sticker_items" | "messageSnapshots" | "message_snapshots">;
+
+/**
+ * Cheap presence probe — does this message carry ANY downloadable media? Walks
+ * direct attachments, stickers, AND forwarded-snapshot media but never touches
+ * the network, so the connection layer can DEFER the actual download until AFTER
+ * the central access gate admits the sender (mirrors Slack/Telegram).
+ */
+export function hasInboundMedia(message: DiscordMediaSurface): boolean {
+	if (toArray(message.attachments).some(isDownloadableAttachment)) return true;
+	if (resolveInboundStickers(message).length > 0) return true;
+	if (resolveForwardedAttachments(message).length > 0) return true;
+	return false;
+}
+
+/**
+ * The full list of downloadable attachments to fetch for a message: direct
+ * attachments, sticker assets (downloaded from the Discord sticker CDN), and any
+ * media carried inside forwarded snapshots.
+ */
+export function resolveInboundAttachments(message: DiscordMediaSurface): DiscordAttachmentLike[] {
+	const direct = toArray(message.attachments).filter(isDownloadableAttachment);
+	const stickers = resolveInboundStickerAttachments(message);
+	const forwarded = resolveForwardedAttachments(message);
+	return [...direct, ...stickers, ...forwarded];
 }
 
 /** True when an attachment carries the Discord voice-message flag. */

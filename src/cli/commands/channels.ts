@@ -30,6 +30,17 @@ import {
 	TELEGRAM_CHANNEL_ID,
 } from "../../agents/channels/telegram/account-config.js";
 import { probeTelegram, type TelegramProbeResult } from "../../agents/channels/telegram/probe.js";
+import {
+	DISCORD_CHANNEL_ID,
+	listDiscordAccountIds,
+	resolveDiscordBotToken,
+	probeDiscord,
+	auditDiscordChannelPermissions,
+	collectConfiguredDiscordChannelIds,
+	collectDiscordStatusIssues,
+	type DiscordStatusAccount,
+} from "../../agents/channels/discord/index.js";
+import type { ChannelStatusIssue } from "../../agents/channels/types.core.js";
 
 /* ─────────────────────────── helpers ─────────────────────────── */
 
@@ -211,6 +222,48 @@ export async function runChannelsList(opts: { json?: boolean } = {}): Promise<nu
 
 /* ─────────────────────────── status ─────────────────────────── */
 
+/**
+ * Surface a channel's structured status issues (intent / permission warnings) for
+ * `brigade channels status`. Previously `plugin.status.collectStatusIssues` +
+ * Discord's `probeAccount`/permission-audit were computed but NEVER consumed by
+ * the CLI, so the MESSAGE-CONTENT-intent warning + channel-permission errors
+ * never reached the operator. This is the central seam that wires them.
+ *
+ * Cross-channel-safe by shape: returns the central {@link ChannelStatusIssue}[]
+ * any channel can emit. Today only Discord populates it (it's the only channel
+ * with a probe + permission audit + a `collectStatusIssues` adapter); Slack /
+ * Telegram expose a `probeAccount` too but no `collectStatusIssues` adapter, so
+ * they contribute nothing here yet. Best-effort — any probe/audit error yields no
+ * issues (never fails the status command). Network-touching, so it's only run
+ * when a channel that supports it is selected.
+ */
+async function collectChannelStatusIssues(channelId: string, config: unknown): Promise<ChannelStatusIssue[]> {
+	if (channelId !== DISCORD_CHANNEL_ID) return [];
+	try {
+		const cfg = config as never;
+		const probeFetch = testHooks?.discordProbeFetch;
+		const accounts: DiscordStatusAccount[] = [];
+		for (const accountId of listDiscordAccountIds(cfg)) {
+			const token = resolveDiscordBotToken(cfg, accountId);
+			if (!token) continue;
+			const probe = await probeDiscord({ token, ...(probeFetch ? { fetchImpl: probeFetch } : {}) });
+			const account: DiscordStatusAccount = { accountId, probe };
+			const channelIds = collectConfiguredDiscordChannelIds(cfg);
+			if (probe.ok && channelIds.length > 0) {
+				try {
+					account.audit = await auditDiscordChannelPermissions(token, channelIds);
+				} catch {
+					/* never fail status on the audit */
+				}
+			}
+			accounts.push(account);
+		}
+		return collectDiscordStatusIssues(accounts);
+	} catch {
+		return [];
+	}
+}
+
 export async function runChannelsStatus(
 	args: { channel?: string },
 	opts: { json?: boolean } = {},
@@ -229,9 +282,12 @@ export async function runChannelsStatus(
 		const token = resolveTelegramBotToken(config as never, null);
 		if (token) telegramProbe = await probeTelegram({ token });
 	}
+	// Structured status issues (intent / channel-permission warnings). Previously
+	// computed but never surfaced — wired here so the operator sees them.
+	const statusIssues = await collectChannelStatusIssues(chosen.adapter.id, config);
 	if (opts.json) {
 		process.stdout.write(
-			`${JSON.stringify({ ...snap, gateway, ...(telegramProbe ? { probe: telegramProbe } : {}) }, null, 2)}\n`,
+			`${JSON.stringify({ ...snap, gateway, ...(telegramProbe ? { probe: telegramProbe } : {}), ...(statusIssues.length > 0 ? { statusIssues } : {}) }, null, 2)}\n`,
 		);
 		return 0;
 	}
@@ -254,6 +310,14 @@ export async function runChannelsStatus(
 		process.stdout.write(`  linked   : ${snap.linked ? "yes" : "no"}\n`);
 	}
 	process.stdout.write(`  gateway  : ${gateway ? "running" : "stopped"}\n`);
+	if (statusIssues.length > 0) {
+		process.stdout.write(`  issues   :\n`);
+		for (const issue of statusIssues) {
+			const tag = issue.severity === "error" ? "ERROR" : issue.severity === "warn" ? "WARN" : "INFO";
+			const who = issue.accountId && issue.accountId !== "default" ? ` [${issue.accountId}]` : "";
+			process.stdout.write(`    - ${tag}${who}: ${issue.message}\n`);
+		}
+	}
 	return 0;
 }
 
@@ -630,6 +694,8 @@ type CredentialPrompter = (key: ChannelSetupCredentialKey) => Promise<string | n
 interface ChannelsAddTestHooks {
 	channels?: ChannelAdapter[];
 	prompter?: CredentialPrompter;
+	/** Inject the fetch used by the Discord status probe (FIX 5) so the wired status path is testable offline. */
+	discordProbeFetch?: typeof fetch;
 }
 let testHooks: ChannelsAddTestHooks | undefined;
 

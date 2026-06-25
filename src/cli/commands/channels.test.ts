@@ -140,6 +140,37 @@ describe("brigade channels list / status", () => {
 		const code = await runChannelsStatus({ channel: "nope" }, { json: true });
 		assert.equal(code, 2);
 	});
+
+	it("surfaces a Discord message-content-intent status issue through the wired path (FIX 5)", async () => {
+		// Configure a Discord account with a token so the status probe runs.
+		writeFileSync(
+			join(tmpRoot, "brigade.json"),
+			JSON.stringify({ version: 2, channels: { discord: { enabled: true, botToken: "tok-test" } } }),
+		);
+		__resetConfigParseCacheForTests();
+		// Fake fetch: /users/@me OK (good token); /oauth2/applications/@me returns
+		// flags:0 → MESSAGE CONTENT intent decodes as "disabled".
+		const probeFetch = (async (url: string) => {
+			if (typeof url === "string" && url.includes("/users/@me")) {
+				return { ok: true, status: 200, json: async () => ({ id: "bot1", username: "Brig", bot: true }) } as Response;
+			}
+			// application flags endpoint: no message-content bit set
+			return { ok: true, status: 200, json: async () => ({ flags: 0 }) } as Response;
+		}) as unknown as typeof fetch;
+		__setChannelsAddTestHooksForTests({ discordProbeFetch: probeFetch });
+		try {
+			const { result, out } = await captureStdout(() => runChannelsStatus({ channel: "discord" }, { json: true }));
+			assert.equal(result, 0);
+			const parsed = JSON.parse(out) as { statusIssues?: Array<{ severity: string; message: string }> };
+			assert.ok(Array.isArray(parsed.statusIssues), "statusIssues should be surfaced");
+			assert.ok(
+				parsed.statusIssues!.some((i) => /message content intent is disabled/i.test(i.message)),
+				"the message-content-intent warning should reach the operator through the wired status path",
+			);
+		} finally {
+			__setChannelsAddTestHooksForTests(undefined);
+		}
+	});
 });
 
 /* ─────────────────────────── add (setup wizard) ─────────────────────────── */

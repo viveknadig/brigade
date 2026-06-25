@@ -74,6 +74,9 @@ import {
 } from "./account-config.js";
 import { createDiscordAdapter, DISCORD_CAPABILITIES, type DiscordAdapter } from "./adapter.js";
 import { probeDiscord, type DiscordProbeResult } from "./probe.js";
+import { auditDiscordChannelPermissions, type DiscordPermissionAuditResult } from "./permission-audit.js";
+import { collectDiscordSecurityAuditFindings } from "./security-audit.js";
+import { collectDiscordStatusIssues } from "./status-issues.js";
 
 const log = createSubsystemLogger("channels/discord/plugin");
 
@@ -106,14 +109,46 @@ export interface DiscordPluginDeps {
 	adapterFactory?: (args: { accountId: string }) => ChannelAdapter;
 }
 
+/** Probe result + optional channel-permission audit (Phase 5 diagnostics). */
+export type DiscordProbeWithAudit = DiscordProbeResult & {
+	/** Channel-permission audit for the configured guild channels, when run. */
+	permissionAudit?: DiscordPermissionAuditResult;
+};
+
 /** Operator-grade view of a per-account bot — exposed via attached helpers. */
 export interface DiscordPluginRuntimeView {
 	/** Currently-running account ids. */
 	startedAccountIds(): string[];
 	/** Look up the per-account adapter (or undefined when the account isn't started). */
 	getAdapter(accountId: string): ChannelAdapter | undefined;
-	/** Run a `/users/@me` probe for an account (for status / doctor). */
-	probeAccount(accountId: string, cfg: BrigadeConfig): Promise<DiscordProbeResult>;
+	/**
+	 * Run a `/users/@me` probe for an account (for status / doctor). Also runs the
+	 * channel-permission audit over any configured guild channels (Phase 5).
+	 */
+	probeAccount(accountId: string, cfg: BrigadeConfig): Promise<DiscordProbeWithAudit>;
+}
+
+/**
+ * Collect the numeric guild channel ids configured under
+ * `channels.discord.guilds.<guildId>.channels.<channelId>` so the permission
+ * audit knows which channels to check. Non-numeric keys are passed through too —
+ * the audit reports them as unresolved. Returns [] when none are configured.
+ */
+export function collectConfiguredDiscordChannelIds(cfg: BrigadeConfig): string[] {
+	const slot = (cfg as { channels?: Record<string, unknown> }).channels?.[DISCORD_CHANNEL_ID];
+	const guilds = slot && typeof slot === "object" ? (slot as Record<string, unknown>).guilds : undefined;
+	if (!guilds || typeof guilds !== "object") return [];
+	const ids = new Set<string>();
+	for (const guildValue of Object.values(guilds as Record<string, unknown>)) {
+		if (!guildValue || typeof guildValue !== "object") continue;
+		const channels = (guildValue as Record<string, unknown>).channels;
+		if (!channels || typeof channels !== "object") continue;
+		for (const channelKey of Object.keys(channels as Record<string, unknown>)) {
+			const key = channelKey.trim();
+			if (key) ids.add(key);
+		}
+	}
+	return [...ids];
 }
 
 /** Plugin handle with the extra per-account introspection surface attached. */
@@ -265,16 +300,30 @@ export function createDiscordPlugin(deps: DiscordPluginDeps): DiscordPluginHandl
 		capabilities: DISCORD_CAPABILITIES,
 		startedAccountIds: () => [...accountRuntimes.keys()],
 		getAdapter: (accountId: string) => accountRuntimes.get(accountId)?.adapter,
-		probeAccount: async (accountId, cfg) => {
+		probeAccount: async (accountId, cfg): Promise<DiscordProbeWithAudit> => {
 			const token = resolveDiscordBotToken(cfg, accountId);
 			const result = await probeDiscord({ token });
+			// Channel-permission audit over any configured guild channels (Phase 5).
+			// Best-effort: skipped when the token / probe failed (nothing to check
+			// against), or when no channels are configured.
+			let permissionAudit: DiscordPermissionAuditResult | undefined;
+			const channelIds = collectConfiguredDiscordChannelIds(cfg);
+			if (result.ok && token && channelIds.length > 0) {
+				try {
+					permissionAudit = await auditDiscordChannelPermissions(token, channelIds);
+				} catch {
+					/* never fail the probe on the audit */
+				}
+			}
 			// Surface the started adapter's liveness signal alongside the /users/@me
 			// reachability check (observability only — never changes `ok`).
 			const live = accountRuntimes.get(accountId)?.adapter as Partial<DiscordAdapter> | undefined;
-			if (live && typeof live.lastEventAt === "function") {
-				return { ...result, lastEventAt: live.lastEventAt() };
-			}
-			return result;
+			const lastEventAt = live && typeof live.lastEventAt === "function" ? live.lastEventAt() : undefined;
+			return {
+				...result,
+				...(lastEventAt !== undefined ? { lastEventAt } : {}),
+				...(permissionAudit ? { permissionAudit } : {}),
+			};
 		},
 		config: {
 			listAccountIds: (cfg) => listDiscordAccountIds(cfg),
@@ -358,6 +407,39 @@ export function createDiscordPlugin(deps: DiscordPluginDeps): DiscordPluginHandl
 				{ path: "channels.discord.botToken", description: "Discord bot token (single-account)" },
 				{ path: "channels.discord.accounts.*.botToken", description: "Discord bot token (per account)" },
 			],
+		},
+		// Supplementary security audit (Phase 5): warn on name-based (mutable)
+		// allow-list entries. Consumed by `brigade doctor` via the central
+		// `channel-security-registry.ts` collector.
+		security: {
+			collectAuditFindings: (ctx) =>
+				collectDiscordSecurityAuditFindings({ cfg: ctx.sourceConfig, accountId: ctx.accountId }),
+		},
+		// Structured status rollup (Phase 5): intent + permission issues. The
+		// central status surface stashes the probe/audit on each account snapshot
+		// (under `probe` / `audit`); this adapts those into Discord status issues.
+		status: {
+			collectStatusIssues: (accounts) =>
+				collectDiscordStatusIssues(
+					accounts.map((snap) => {
+						const s = snap as {
+							accountId?: unknown;
+							probe?: DiscordProbeWithAudit;
+							audit?: DiscordPermissionAuditResult;
+						};
+						return {
+							accountId: typeof s.accountId === "string" ? s.accountId : "",
+							...(s.probe ? { probe: s.probe } : {}),
+							// The audit may ride on the probe (probeAccount attaches it) or be
+							// stashed directly on the snapshot.
+							...(s.probe?.permissionAudit
+								? { audit: s.probe.permissionAudit }
+								: s.audit
+									? { audit: s.audit }
+									: {}),
+						};
+					}),
+				),
 		},
 	};
 }

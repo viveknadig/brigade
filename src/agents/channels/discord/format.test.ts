@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { discordTextIsEmpty, markdownToDiscord, DISCORD_MESSAGE_LIMIT } from "./format.js";
+import { discordTextIsEmpty, markdownToDiscord, rewriteKnownMentions, DISCORD_MESSAGE_LIMIT } from "./format.js";
 
 describe("markdownToDiscord", () => {
 	it("passes CommonMark emphasis through unchanged (Discord renders it natively)", () => {
@@ -97,6 +97,66 @@ describe("markdownToDiscord", () => {
 
 	it("exposes the 2000-char Discord message limit", () => {
 		assert.equal(DISCORD_MESSAGE_LIMIT, 2000);
+	});
+});
+
+describe("rewriteKnownMentions (Fix 2a)", () => {
+	// "alex" → snowflake "111" is the only remembered handle in these cases. A
+	// resolved id MUST be a numeric snowflake (a real Discord mention requires one).
+	const resolve = (handle: string): string | undefined => (handle.toLowerCase() === "alex" ? "111" : undefined);
+
+	it("rewrites a known @handle to its <@id> token", () => {
+		assert.equal(rewriteKnownMentions("ping @alex", resolve), "ping <@111>");
+	});
+
+	it("matches case-insensitively but emits the resolved id", () => {
+		assert.equal(rewriteKnownMentions("ping @Alex now", resolve), "ping <@111> now");
+	});
+
+	it("leaves an UNKNOWN @handle literal (never invents a ping)", () => {
+		assert.equal(rewriteKnownMentions("ping @bob", resolve), "ping @bob");
+	});
+
+	it("leaves a non-snowflake resolution literal (never emits a bad token)", () => {
+		const badResolve = (): string | undefined => "not-a-snowflake";
+		assert.equal(rewriteKnownMentions("ping @alex", badResolve), "ping @alex");
+	});
+
+	it("leaves @everyone / @here untouched even if a resolver would hit", () => {
+		const hitAll = (): string | undefined => "999";
+		assert.equal(rewriteKnownMentions("@everyone heads up", hitAll), "@everyone heads up");
+		assert.equal(rewriteKnownMentions("@here ping", hitAll), "@here ping");
+	});
+
+	it("does NOT rewrite a @handle inside an inline `code` span", () => {
+		assert.equal(rewriteKnownMentions("run `@alex` now", resolve), "run `@alex` now");
+	});
+
+	it("does NOT rewrite a @handle inside a fenced block", () => {
+		const md = ["```", "@alex", "```"].join("\n");
+		assert.equal(rewriteKnownMentions(md, resolve), md);
+	});
+
+	it("does NOT double-rewrite a handle already inside a <@…> token", () => {
+		// The `@` after `<` has no boundary char before it, so it's never a candidate.
+		assert.equal(rewriteKnownMentions("hi <@111>", resolve), "hi <@111>");
+	});
+
+	it("is a no-op when the text has no @", () => {
+		assert.equal(rewriteKnownMentions("plain text", resolve), "plain text");
+	});
+
+	it("rewrites a handle at the very start of the string", () => {
+		assert.equal(rewriteKnownMentions("@alex hi", resolve), "<@111> hi");
+	});
+
+	it("does not match an @ glued to a word (email-like)", () => {
+		assert.equal(rewriteKnownMentions("mail me at x@alex.com", resolve), "mail me at x@alex.com");
+	});
+
+	it("end-to-end through markdownToDiscord: rewrite then convert keeps the token", () => {
+		// The adapter rewrites BEFORE markdownToDiscord; the converter passes <@id> verbatim.
+		assert.equal(markdownToDiscord(rewriteKnownMentions("ping @alex", resolve)), "ping <@111>");
 	});
 });
 

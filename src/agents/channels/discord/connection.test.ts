@@ -14,8 +14,24 @@ import {
 	type DiscordSendOptions,
 	type DiscordSentMessageLike,
 } from "./connection.js";
+import { __resetDiscordDirectoryCacheForTest, resolveDiscordHandle } from "./directory-cache.js";
+import {
+	getDiscordSubagentThreadBinding,
+	rememberDiscordSubagentThreadBinding,
+	resetDiscordSubagentThreadBindingsForTests,
+} from "./subagent-thread-binding-store.js";
 
 /* ─────────────────────── fake discord client harness ─────────────────────── */
+
+/**
+ * Drain the microtask queue so an async `handleMessage` (reply-parent backfill /
+ * empty-payload hydration) settles before the assertion. A couple of awaited
+ * macrotask hops covers the chain of `await`ed fetches.
+ */
+async function tick(): Promise<void> {
+	await new Promise((r) => setTimeout(r, 0));
+	await new Promise((r) => setTimeout(r, 0));
+}
 
 type Handler = (...args: unknown[]) => unknown;
 
@@ -27,11 +43,17 @@ interface FakeMessage {
 	guildId?: string | null;
 	createdTimestamp?: number;
 	editedTimestamp?: number | null;
-	reference?: { messageId?: string | null } | null;
+	type?: number;
+	reference?: { messageId?: string | null; type?: number | null } | null;
+	embeds?: Array<{ title?: string | null; description?: string | null; url?: string | null }> | null;
+	stickers?: Array<{ id?: string; name?: string | null; format?: number }> | null;
+	messageSnapshots?: Array<{ message?: { content?: string | null; author?: { username?: string | null } } | null }> | null;
 	mentions?: { users?: Array<{ id?: string; username?: string }> };
 	attachments?: unknown[];
-	channel?: { id?: string; isThread?: () => boolean; isDMBased?: () => boolean; type?: number };
+	channel?: { id?: string; isThread?: () => boolean; isDMBased?: () => boolean; type?: number; messages?: { fetch?: (id: string) => Promise<unknown> } };
 	member?: { nickname?: string | null; roles?: { cache?: Map<string, { id?: string }> } | string[] } | null;
+	fetch?: () => Promise<unknown>;
+	fetchReference?: () => Promise<unknown>;
 }
 
 interface SentRecord {
@@ -47,6 +69,11 @@ interface FakeClient extends DiscordClientLike {
 	edits: Array<{ id: string; options: DiscordSendOptions | string }>;
 	deletes: string[];
 	reactsAdded: Array<{ id: string; emoji: string }>;
+	pins: string[];
+	unpins: string[];
+	threadsCreated: Array<{ channelId: string; options: { name: string; message: { content?: string; flags?: number } } }>;
+	presenceCalls: unknown[];
+	startThreadCalls: Array<{ messageId: string; name: string; autoArchiveDuration?: number }>;
 	emit(event: string, ...payload: unknown[]): void;
 	ready(): void;
 }
@@ -58,6 +85,14 @@ interface FakeClientOver {
 	messageReactions?: Array<{ me?: boolean; emoji?: { name?: string } }>;
 	/** Provide a rest.put spy (application-command registration). */
 	restPut?: (route: unknown, options?: { body?: unknown }) => Promise<unknown>;
+	/** discord.js ChannelType number on the resolved channel (15/16 = forum/media). */
+	channelType?: number;
+	/** When set, `channel.send()` rejects with this error (send-error-decode tests). */
+	sendError?: unknown;
+	/** When set, a fetched message reports an existing thread (autoThread create-race). */
+	existingThreadId?: string;
+	/** When true, the fetched message has no `startThread` (can't create a thread). */
+	noStartThread?: boolean;
 }
 
 function makeFakeClient(over: FakeClientOver = {}): FakeClient {
@@ -66,8 +101,20 @@ function makeFakeClient(over: FakeClientOver = {}): FakeClient {
 	const edits: FakeClient["edits"] = [];
 	const deletes: string[] = [];
 	const reactsAdded: FakeClient["reactsAdded"] = [];
+	const pins: string[] = [];
+	const unpins: string[] = [];
+	const threadsCreated: Array<{ channelId: string; options: { name: string; message: { content?: string; flags?: number } } }> = [];
+	const presenceCalls: unknown[] = [];
+	const startThreadCalls: Array<{ messageId: string; name: string; autoArchiveDuration?: number }> = [];
 	let sendSeq = 0;
-	const userObj: { id?: string; username?: string } = { id: "BOT", username: "brigadebot" };
+	const userObj: { id?: string; username?: string; setPresence?: (data: unknown) => unknown } = {
+		id: "BOT",
+		username: "brigadebot",
+		setPresence: (data) => {
+			presenceCalls.push(data);
+			return undefined;
+		},
+	};
 
 	const makeMessage = (id: string): DiscordSentMessageLike => ({
 		id,
@@ -83,17 +130,44 @@ function makeFakeClient(over: FakeClientOver = {}): FakeClient {
 			reactsAdded.push({ id, emoji });
 			return undefined;
 		},
+		async pin() {
+			pins.push(id);
+			return undefined;
+		},
+		async unpin() {
+			unpins.push(id);
+			return undefined;
+		},
 		reactions: {
 			cache: new Map((over.messageReactions ?? []).map((r, i) => [String(i), { ...r, users: { remove: async () => undefined } }])),
 		},
+		...(over.existingThreadId ? { hasThread: true, thread: { id: over.existingThreadId } } : {}),
+		...(over.noStartThread
+			? {}
+			: {
+					async startThread(options: { name: string; autoArchiveDuration?: number }) {
+						startThreadCalls.push({ messageId: id, name: options.name, autoArchiveDuration: options.autoArchiveDuration });
+						return { id: `nthread-${id}` };
+					},
+				}),
 	});
 
+	const isForum = over.channelType === 15 || over.channelType === 16;
 	const makeChannel = (channelId: string): DiscordSendChannelLike => ({
 		id: channelId,
-		isTextBased: () => true,
+		...(over.channelType !== undefined ? { type: over.channelType } : {}),
+		// A forum/media channel reports isTextBased() === false (like the real one).
+		isTextBased: () => !isForum,
 		async send(options) {
+			if (over.sendError !== undefined) throw over.sendError;
 			sent.push({ channelId, options });
 			return makeMessage(`sent-${++sendSeq}`);
+		},
+		threads: {
+			async create(options) {
+				threadsCreated.push({ channelId, options });
+				return { id: `thread-${++sendSeq}`, lastMessage: { id: `tmsg-${sendSeq}` } };
+			},
 		},
 		messages: {
 			async fetch(id) {
@@ -113,6 +187,11 @@ function makeFakeClient(over: FakeClientOver = {}): FakeClient {
 		edits,
 		deletes,
 		reactsAdded,
+		pins,
+		unpins,
+		threadsCreated,
+		presenceCalls,
+		startThreadCalls,
 		user: userObj,
 		...(over.restPut ? { rest: { put: over.restPut } } : {}),
 		channels: {
@@ -156,6 +235,7 @@ function makeFakeClient(over: FakeClientOver = {}): FakeClient {
 const fakeBuilders: DiscordBuilders = {
 	buildAttachment: (path, name) => ({ attachment: path, name }),
 	buildComponentRows: (rows) => rows.map((row) => ({ components: row })),
+	buildModal: (params) => ({ modal: params }),
 };
 
 /** Boot a connection against a fake client, returning the harness + collected inbounds. */
@@ -308,6 +388,25 @@ describe("connectDiscord — inbound messages", () => {
 		assert.ok(m.mentions?.includes("BOT"));
 	});
 
+	it("primes the directory cache from the author + resolved mentions (Fix 2a)", async () => {
+		__resetDiscordDirectoryCacheForTest();
+		const h = await boot();
+		h.client.emit(
+			"messageCreate",
+			baseMessage({
+				// Numeric snowflakes — the cache only remembers valid Discord ids.
+				author: { id: "111", bot: false, username: "alex" },
+				content: "hey <@222>",
+				mentions: { users: [{ id: "222", username: "sam" }] },
+			}),
+		);
+		await tick();
+		// Author "alex" (111) + mentioned "sam" (222) are both now resolvable on "default".
+		assert.equal(resolveDiscordHandle("default", "alex"), "111");
+		assert.equal(resolveDiscordHandle("default", "sam"), "222");
+		__resetDiscordDirectoryCacheForTest();
+	});
+
 	it("populates guildId + memberRoleIds for a guild message (Fix 1: NOT teamId)", async () => {
 		const h = await boot();
 		h.client.emit(
@@ -371,6 +470,126 @@ describe("connectDiscord — inbound messages", () => {
 		h.client.emit("messageCreate", baseMessage({ reference: { messageId: "parent1" } }));
 		assert.deepEqual(h.messages[0]?.replyTo, { messageId: "parent1" });
 	});
+
+	it("carries an embed-only message's title/description as text (Fix 1a)", async () => {
+		const h = await boot();
+		h.client.emit("messageCreate", baseMessage({ content: "", embeds: [{ title: "Release", description: "ships today" }] }));
+		assert.equal(h.messages.length, 1);
+		assert.equal(h.messages[0]?.text, "Release\nships today");
+	});
+
+	it("carries a sticker-only message as <sticker: …> text + a deferred media thunk (Fix 1a)", async () => {
+		const h = await boot();
+		h.client.emit("messageCreate", baseMessage({ content: "", stickers: [{ id: "55", name: "wave", format: 1 }] }));
+		assert.equal(h.messages.length, 1);
+		assert.equal(h.messages[0]?.text, "<sticker: wave>");
+		assert.equal(typeof h.messages[0]?.resolveMedia, "function");
+	});
+
+	it("carries a forwarded message as a [Forwarded …] block (Fix 1a)", async () => {
+		const h = await boot();
+		h.client.emit(
+			"messageCreate",
+			baseMessage({ content: "", reference: { messageId: "p", type: 1 }, messageSnapshots: [{ message: { content: "the original", author: { username: "sam" } } }] }),
+		);
+		assert.equal(h.messages.length, 1);
+		assert.equal(h.messages[0]?.text, "[Forwarded from sam]\nthe original");
+		// A forward is NOT surfaced as a reply (its content rides in the snapshot).
+		assert.equal(h.messages[0]?.replyTo, undefined);
+	});
+});
+
+describe("connectDiscord — reply-parent backfill (Fix 1b)", () => {
+	it("fills replyTo.body from fetchReference()", async () => {
+		const h = await boot();
+		h.client.emit(
+			"messageCreate",
+			baseMessage({
+				reference: { messageId: "parent1" },
+				fetchReference: async () => ({ id: "parent1", content: "the parent text", author: { id: "U7", username: "ana" } }),
+			}),
+		);
+		await tick();
+		assert.equal(h.messages.length, 1);
+		assert.equal(h.messages[0]?.replyTo?.messageId, "parent1");
+		assert.equal(h.messages[0]?.replyTo?.body, "the parent text");
+		assert.equal(h.messages[0]?.replyTo?.from, "U7");
+	});
+
+	it("falls back to channel.messages.fetch when fetchReference is absent", async () => {
+		const h = await boot();
+		h.client.emit(
+			"messageCreate",
+			baseMessage({
+				reference: { messageId: "parent2" },
+				channel: { id: "C1", messages: { fetch: async () => ({ id: "parent2", content: "from channel fetch", author: { id: "U8" } }) } },
+			}),
+		);
+		await tick();
+		assert.equal(h.messages[0]?.replyTo?.body, "from channel fetch");
+		assert.equal(h.messages[0]?.replyTo?.from, "U8");
+	});
+
+	it("degrades to messageId-only when the parent fetch throws (Fix 1b)", async () => {
+		const h = await boot();
+		h.client.emit(
+			"messageCreate",
+			baseMessage({
+				reference: { messageId: "parent3" },
+				fetchReference: async () => {
+					throw new Error("missing");
+				},
+			}),
+		);
+		await tick();
+		assert.equal(h.messages.length, 1);
+		assert.deepEqual(h.messages[0]?.replyTo, { messageId: "parent3" });
+	});
+});
+
+describe("connectDiscord — system events (Fix 1c)", () => {
+	it("routes a UserJoin (type 7) as a synthesized system note", async () => {
+		const h = await boot();
+		h.client.emit("messageCreate", baseMessage({ type: 7, content: "", author: { id: "U1", username: "sam" } }));
+		assert.equal(h.messages.length, 1);
+		assert.match(h.messages[0]?.text ?? "", /Discord system: sam joined the server/);
+	});
+
+	it("routes a pin (type 6) system note", async () => {
+		const h = await boot();
+		h.client.emit("messageCreate", baseMessage({ type: 6, content: "", author: { id: "U1", username: "sam" } }));
+		assert.match(h.messages[0]?.text ?? "", /pinned a message/);
+	});
+
+	it("drops an unmapped system type", async () => {
+		const h = await boot();
+		h.client.emit("messageCreate", baseMessage({ type: 9999, content: "", author: { id: "U1", username: "sam" } }));
+		assert.equal(h.messages.length, 0);
+	});
+});
+
+describe("connectDiscord — empty-payload hydration (Fix 1d)", () => {
+	it("re-pulls an empty-content message and delivers the hydrated text", async () => {
+		const h = await boot();
+		h.client.emit(
+			"messageCreate",
+			baseMessage({ content: "", fetch: async () => ({ id: "m1", content: "now I have text", author: { id: "U1", username: "alex" }, channelId: "C1", guildId: "G1" }) }),
+		);
+		await tick();
+		assert.equal(h.messages.length, 1);
+		assert.equal(h.messages[0]?.text, "now I have text");
+	});
+
+	it("still bails when the re-pull is also empty", async () => {
+		const h = await boot();
+		h.client.emit(
+			"messageCreate",
+			baseMessage({ content: "", fetch: async () => ({ id: "m1", content: "", author: { id: "U1" }, channelId: "C1", guildId: "G1" }) }),
+		);
+		await tick();
+		// Empty text + no media + no system note → no inbound delivered.
+		assert.equal(h.messages.filter((m) => m.text.trim().length > 0).length, 0);
+	});
 });
 
 describe("connectDiscord — reactions", () => {
@@ -378,7 +597,9 @@ describe("connectDiscord — reactions", () => {
 		const h = await boot();
 		h.client.emit("messageReactionAdd", { emoji: { name: "thumbsup" }, message: baseMessage({ id: "tgt" }) }, { id: "U9", bot: false, username: "sam" });
 		assert.equal(h.reactions.length, 1);
-		assert.deepEqual(h.reactions[0]?.reaction, { emojis: ["thumbsup"], targetMessageId: "tgt" });
+		// targetAuthorId is the reacted message's author (U1 from baseMessage), surfaced
+		// so the adapter can gate `reactionNotifications: "own"`.
+		assert.deepEqual(h.reactions[0]?.reaction, { emojis: ["thumbsup"], targetMessageId: "tgt", targetAuthorId: "U1" });
 	});
 
 	it("ignores the bot's own reaction", async () => {
@@ -432,6 +653,120 @@ describe("connectDiscord — interactions", () => {
 		});
 		assert.equal(h.messages.length, 1);
 		assert.equal(h.messages[0]?.text, "/status");
+	});
+
+	it("routes a STRING select press as a callbackQuery carrying values (Fix 3a)", async () => {
+		const h = await boot();
+		let deferred = false;
+		h.client.emit("interactionCreate", {
+			isButton: () => false,
+			isStringSelectMenu: () => true,
+			isChatInputCommand: () => false,
+			customId: "g:pick",
+			id: "i2",
+			channelId: "C1",
+			guildId: "G1",
+			values: ["a"],
+			user: { id: "U1", username: "alex" },
+			deferUpdate: async () => {
+				deferred = true;
+			},
+		});
+		assert.equal(h.callbacks.length, 1);
+		assert.equal(h.callbacks[0]?.callbackQuery?.data, "g:pick");
+		assert.deepEqual(h.callbacks[0]?.callbackQuery?.values, ["a"]);
+		assert.equal(deferred, true);
+	});
+
+	it("a USER select prefixes the chosen ids with user: (Fix 3a)", async () => {
+		const h = await boot();
+		h.client.emit("interactionCreate", {
+			isButton: () => false,
+			isUserSelectMenu: () => true,
+			customId: "g:whoping",
+			id: "i3",
+			channelId: "C1",
+			values: ["U1", "U2"],
+			user: { id: "U9", username: "alex" },
+			deferUpdate: async () => {},
+		});
+		assert.deepEqual(h.callbacks[0]?.callbackQuery?.values, ["user:U1", "user:U2"]);
+	});
+
+	it("a modal-trigger button calls showModal (NOT a turn) (Fix 3b)", async () => {
+		const h = await boot();
+		const { buildDiscordModalTriggerButton } = await import("./components.js");
+		const { __resetDiscordModalRegistryForTest } = await import("./modal-registry.js");
+		__resetDiscordModalRegistryForTest();
+		const built = buildDiscordModalTriggerButton({
+			label: "Open",
+			registration: { title: "Form", fields: [{ id: "f1", label: "Name" }] },
+		});
+		assert.ok(built);
+		let shown: unknown;
+		let routedTurn = false;
+		h.client.emit("interactionCreate", {
+			isButton: () => true,
+			customId: built!.button.customId,
+			id: "i4",
+			channelId: "C1",
+			user: { id: "U1", username: "alex" },
+			showModal: async (m: unknown) => {
+				shown = m;
+			},
+			deferUpdate: async () => {},
+		});
+		await tick();
+		assert.ok(shown, "showModal was called");
+		assert.equal(h.callbacks.length, 0, "no callbackQuery turn for a modal trigger");
+		assert.equal(routedTurn, false);
+	});
+
+	it("a modal submit routes a turn whose text carries labels + values (Fix 3b)", async () => {
+		const h = await boot();
+		const { buildDiscordModalTriggerButton } = await import("./components.js");
+		const { __resetDiscordModalRegistryForTest } = await import("./modal-registry.js");
+		const { buildDiscordModalCustomId } = await import("./modals.js");
+		__resetDiscordModalRegistryForTest();
+		const built = buildDiscordModalTriggerButton({
+			label: "Open",
+			registration: { title: "Form", fields: [{ id: "f1", label: "Name" }, { id: "f2", label: "Message" }] },
+		});
+		h.client.emit("interactionCreate", {
+			isButton: () => false,
+			isModalSubmit: () => true,
+			customId: buildDiscordModalCustomId(built!.modalId),
+			id: "i5",
+			channelId: "C1",
+			guildId: "G1",
+			user: { id: "U1", username: "alex" },
+			fields: {
+				getTextInputValue: (id: string) => (id === "f1" ? "Ada" : "hello"),
+			},
+			deferUpdate: async () => {},
+		});
+		assert.equal(h.messages.length, 1);
+		assert.match(h.messages[0]?.text ?? "", /\[form\]/);
+		assert.match(h.messages[0]?.text ?? "", /Name: Ada/);
+		assert.match(h.messages[0]?.text ?? "", /Message: hello/);
+	});
+
+	it("an expired/missing modal submit degrades gracefully (no turn) (Fix 3b)", async () => {
+		const h = await boot();
+		const { buildDiscordModalCustomId } = await import("./modals.js");
+		const { __resetDiscordModalRegistryForTest } = await import("./modal-registry.js");
+		__resetDiscordModalRegistryForTest();
+		h.client.emit("interactionCreate", {
+			isButton: () => false,
+			isModalSubmit: () => true,
+			customId: buildDiscordModalCustomId("ghost"),
+			id: "i6",
+			channelId: "C1",
+			user: { id: "U1", username: "alex" },
+			fields: { getTextInputValue: () => "" },
+			deferUpdate: async () => {},
+		});
+		assert.equal(h.messages.length, 0, "an unknown modal submit is dropped");
 	});
 });
 
@@ -489,6 +824,38 @@ describe("connectDiscord — outbound", () => {
 		assert.equal(h.client.sent[0]?.options.components?.length, 1);
 	});
 
+	it("a plain button sendInteractive does NOT set the V2 flag (regression guard) (Fix 3c)", async () => {
+		const h = await boot();
+		await h.conn.sendInteractive("C1", "choose", [[{ label: "Yes", customId: "g:yes", style: 2 }]]);
+		assert.equal(h.client.sent[0]?.options.flags, undefined, "classic button path stays content + no flag");
+		assert.equal(h.client.sent[0]?.options.content, "choose");
+	});
+
+	it("a V2-block message sets the IsComponentsV2 flag + moves text into a block (Fix 3c)", async () => {
+		const h = await boot();
+		const { buildDiscordV2Message } = await import("./component-blocks.js");
+		const v2 = buildDiscordV2Message({
+			blocks: [{ type: "section", texts: ["body line"] }],
+			accentColor: 0x5865f2,
+		});
+		assert.ok(v2);
+		await h.conn.sendInteractive("C1", "Heading", [v2!]);
+		const opts = h.client.sent[0]?.options;
+		assert.equal(opts?.flags, 1 << 15, "IsComponentsV2 flag set (32768)");
+		assert.equal(opts?.content, undefined, "a V2 message carries no plain content");
+		// The pass-through builder echoes the rows; the leading text was prepended as a block.
+		const row = (opts?.components?.[0] as { components?: { blocks?: Array<{ type: string }> } })?.components;
+		assert.equal(row?.blocks?.[0]?.type, "text", "message text became a leading V2 text block");
+	});
+
+	it("a silent V2 message ORs SuppressNotifications alongside the V2 flag (Fix 3c)", async () => {
+		const h = await boot();
+		const { buildDiscordV2Message } = await import("./component-blocks.js");
+		const v2 = buildDiscordV2Message({ blocks: [{ type: "text", text: "hi" }] });
+		await h.conn.sendInteractive("C1", "", [v2!], { silent: true });
+		assert.equal(h.client.sent[0]?.options.flags, (1 << 15) | (1 << 12));
+	});
+
 	it("sendMedia builds an attachment + uploads it", async () => {
 		const h = await boot();
 		await h.conn.sendMedia("C1", { kind: "image", path: "/tmp/pic.png", caption: "look" });
@@ -544,5 +911,275 @@ describe("connectDiscord — outbound", () => {
 		await h.conn.registerCommands([{ name: "help", description: "x", type: 1 }]);
 		assert.ok(Array.isArray(putBody));
 		assert.equal((putBody as unknown[]).length, 1);
+	});
+});
+
+describe("connectDiscord — forum auto-thread (Fix 2b)", () => {
+	it("sendText to a GuildForum channel creates a thread (not a bare send)", async () => {
+		const h = await boot({ channelType: 15 });
+		const res = await h.conn.sendText("F1", "Topic title\nbody line two");
+		// No plain send happened; a thread was created instead.
+		assert.equal(h.client.sent.length, 0);
+		assert.equal(h.client.threadsCreated.length, 1);
+		const created = h.client.threadsCreated[0];
+		// Name derived from the first non-empty line; content carried in the starter.
+		assert.equal(created?.options.name, "Topic title");
+		assert.equal(created?.options.message.content, "Topic title\nbody line two");
+		// The created message id is returned.
+		assert.ok(res.messageId.startsWith("tmsg-"));
+	});
+
+	it("sendText to a GuildMedia channel also creates a thread", async () => {
+		const h = await boot({ channelType: 16 });
+		await h.conn.sendText("M1", "Media post");
+		assert.equal(h.client.threadsCreated.length, 1);
+		assert.equal(h.client.threadsCreated[0]?.options.name, "Media post");
+	});
+
+	it("derives a thread name capped at 100 chars", async () => {
+		const h = await boot({ channelType: 15 });
+		const long = "x".repeat(200);
+		await h.conn.sendText("F1", long);
+		assert.equal(h.client.threadsCreated[0]?.options.name.length, 100);
+	});
+
+	it("a normal text channel still uses a plain send (no thread)", async () => {
+		const h = await boot();
+		await h.conn.sendText("C1", "hello");
+		assert.equal(h.client.sent.length, 1);
+		assert.equal(h.client.threadsCreated.length, 0);
+	});
+});
+
+describe("connectDiscord — silent send (Fix 2c)", () => {
+	it("a silent sendText sets the SuppressNotifications flag (4096)", async () => {
+		const h = await boot();
+		await h.conn.sendText("C1", "quietly", { silent: true });
+		assert.equal(h.client.sent[0]?.options.flags, 1 << 12);
+	});
+
+	it("a normal sendText sets no flags", async () => {
+		const h = await boot();
+		await h.conn.sendText("C1", "loudly");
+		assert.equal(h.client.sent[0]?.options.flags, undefined);
+	});
+
+	it("a silent forum post carries the flag into the thread starter", async () => {
+		const h = await boot({ channelType: 15 });
+		await h.conn.sendText("F1", "Quiet topic", { silent: true });
+		assert.equal(h.client.threadsCreated[0]?.options.message.flags, 1 << 12);
+	});
+
+	it("a silent sendInteractive + sendMedia set the flag too", async () => {
+		const h = await boot();
+		await h.conn.sendInteractive("C1", "choose", [[{ label: "Yes", customId: "g:yes", style: 2 }]], { silent: true });
+		await h.conn.sendMedia("C1", { kind: "image", path: "/tmp/pic.png", caption: "look" }, { silent: true });
+		assert.equal(h.client.sent[0]?.options.flags, 1 << 12);
+		assert.equal(h.client.sent[1]?.options.flags, 1 << 12);
+	});
+});
+
+describe("connectDiscord — structured send-error decode (Fix 2d)", () => {
+	it("a 50013 error → the missing-permission message", async () => {
+		const h = await boot({ sendError: { code: 50013, message: "Missing Permissions" } });
+		await assert.rejects(
+			() => h.conn.sendText("C1", "hi"),
+			/Missing permission to post in this channel/,
+		);
+	});
+
+	it("a 50007 error → the DM-blocked message", async () => {
+		const h = await boot({ sendError: { code: 50007, message: "Cannot send messages to this user" } });
+		await assert.rejects(() => h.conn.sendText("C1", "hi"), /Can't DM this user/);
+	});
+
+	it("an unknown code rethrows the original message", async () => {
+		const h = await boot({ sendError: new Error("some other failure") });
+		await assert.rejects(() => h.conn.sendText("C1", "hi"), /some other failure/);
+	});
+
+	it("decodes a code nested under rawError too", async () => {
+		const h = await boot({ sendError: { rawError: { code: 50013 } } });
+		await assert.rejects(() => h.conn.sendText("C1", "hi"), /Missing permission to post/);
+	});
+
+	it("a 50007 on sendInteractive is decoded the same way", async () => {
+		const h = await boot({ sendError: { code: 50007 } });
+		await assert.rejects(
+			() => h.conn.sendInteractive("C1", "x", [[{ label: "Y", customId: "g:y", style: 2 }]]),
+			/Can't DM this user/,
+		);
+	});
+});
+
+describe("connectDiscord — pin / unpin (Fix 2e)", () => {
+	it("pinMessage pins the fetched message", async () => {
+		const h = await boot();
+		await h.conn.pinMessage("C1", "m9");
+		assert.deepEqual(h.client.pins, ["m9"]);
+	});
+
+	it("unpinMessage unpins the fetched message", async () => {
+		const h = await boot();
+		await h.conn.unpinMessage("C1", "m9");
+		assert.deepEqual(h.client.unpins, ["m9"]);
+	});
+});
+
+describe("connectDiscord — presence (Phase 5)", () => {
+	it("applies the configured presence on clientReady", async () => {
+		const payload = { status: "dnd" as const, activities: [{ name: "lofi", type: 2 }] };
+		const h = await boot({}, { presence: payload });
+		// boot() already fired client.ready() → presence applied once.
+		assert.equal(h.client.presenceCalls.length, 1);
+		assert.deepEqual(h.client.presenceCalls[0], payload);
+	});
+
+	it("does NOT call setPresence when no presence is configured", async () => {
+		const h = await boot();
+		assert.equal(h.client.presenceCalls.length, 0);
+	});
+
+	it("applyPresence re-applies a payload on demand", async () => {
+		const h = await boot();
+		h.conn.applyPresence({ status: "idle", activities: [{ name: "again", type: 0 }] });
+		assert.equal(h.client.presenceCalls.length, 1);
+		assert.deepEqual(h.client.presenceCalls[0], { status: "idle", activities: [{ name: "again", type: 0 }] });
+	});
+
+	it("uses an injected setPresenceImpl seam when provided", async () => {
+		const seen: unknown[] = [];
+		const payload = { status: "online" as const };
+		const h = await boot({}, { presence: payload, setPresenceImpl: (_c, p) => seen.push(p) });
+		void h;
+		assert.deepEqual(seen, [payload]);
+	});
+});
+
+describe("connectDiscord — createThreadFromMessage (Phase 5 autoThread)", () => {
+	it("creates a thread off a message and returns its id", async () => {
+		const h = await boot();
+		const id = await h.conn.createThreadFromMessage("C1", "m42", { name: "My Thread", autoArchiveMinutes: 1440 });
+		assert.equal(id, "nthread-m42");
+		assert.equal(h.client.startThreadCalls.length, 1);
+		assert.deepEqual(h.client.startThreadCalls[0], { messageId: "m42", name: "My Thread", autoArchiveDuration: 1440 });
+	});
+
+	it("reuses an existing thread on a create-race", async () => {
+		const h = await boot({ existingThreadId: "existing-99" });
+		const id = await h.conn.createThreadFromMessage("C1", "m1", { name: "x" });
+		assert.equal(id, "existing-99");
+		// No startThread attempted — the message already had a thread.
+		assert.equal(h.client.startThreadCalls.length, 0);
+	});
+
+	it("returns null when the message can't start a thread", async () => {
+		const h = await boot({ noStartThread: true });
+		const id = await h.conn.createThreadFromMessage("C1", "m1", { name: "x" });
+		assert.equal(id, null);
+	});
+
+	it("skips silently on a Forum channel (no startThread attempt) — Fix 6", async () => {
+		// A Forum channel (type 15) rejects startThread; the guard skips it before
+		// the wasteful failed REST call, returning null so the caller falls back.
+		const h = await boot({ channelType: 15 });
+		const id = await h.conn.createThreadFromMessage("C1", "m1", { name: "x" });
+		assert.equal(id, null);
+		assert.equal(h.client.startThreadCalls.length, 0, "no startThread attempted on a forum channel");
+	});
+
+	it("skips silently on a Voice channel (no startThread attempt) — Fix 6", async () => {
+		const h = await boot({ channelType: 2 });
+		const id = await h.conn.createThreadFromMessage("C1", "m1", { name: "x" });
+		assert.equal(id, null);
+		assert.equal(h.client.startThreadCalls.length, 0, "no startThread attempted on a voice channel");
+	});
+});
+
+describe("connectDiscord — THREAD_UPDATE archive listener (Fix 6)", () => {
+	it("drops the sub-agent thread binding when a thread transitions to archived", async () => {
+		resetDiscordSubagentThreadBindingsForTests();
+		try {
+			rememberDiscordSubagentThreadBinding({
+				childSessionKey: "agent:scout:subagent:a:thread:T-arch",
+				threadId: "T-arch",
+				parentChannelId: "C-1",
+				accountId: "default",
+				agentId: "scout",
+				boundAt: Date.now(),
+			});
+			const h = await boot();
+			// not-archived → archived transition drops the binding.
+			h.client.emit("threadUpdate", { id: "T-arch", archived: false }, { id: "T-arch", archived: true });
+			assert.equal(
+				getDiscordSubagentThreadBinding("agent:scout:subagent:a:thread:T-arch"),
+				undefined,
+				"binding dropped on archive",
+			);
+		} finally {
+			resetDiscordSubagentThreadBindingsForTests();
+		}
+	});
+
+	it("leaves the binding intact for a non-archive thread update (rename/lock)", async () => {
+		resetDiscordSubagentThreadBindingsForTests();
+		try {
+			rememberDiscordSubagentThreadBinding({
+				childSessionKey: "agent:scout:subagent:b:thread:T-keep",
+				threadId: "T-keep",
+				parentChannelId: "C-1",
+				accountId: "default",
+				agentId: "scout",
+				boundAt: Date.now(),
+			});
+			const h = await boot();
+			// archived stays false → no drop.
+			h.client.emit("threadUpdate", { id: "T-keep", archived: false }, { id: "T-keep", archived: false });
+			assert.ok(
+				getDiscordSubagentThreadBinding("agent:scout:subagent:b:thread:T-keep"),
+				"binding intact for a non-archive update",
+			);
+		} finally {
+			resetDiscordSubagentThreadBindingsForTests();
+		}
+	});
+});
+
+describe("connectDiscord — READY watchdog (Phase 5)", () => {
+	it("destroys + reconnects when clientReady never fires within the deadline", async () => {
+		// Boot WITHOUT firing ready, a tiny deadline + a no-op sleep so the
+		// watchdog fires fast and the reconnect runs immediately.
+		const client = makeFakeClient();
+		let connectedCount = 0;
+		const conn = await connectDiscord({
+			botToken: "tok-secret.aaa.bbb",
+			accountId: "default",
+			log: () => {},
+			onConnected: () => {
+				connectedCount += 1;
+			},
+			onMessage: () => {},
+			clientFactory: () => client,
+			buildersFactory: () => fakeBuilders,
+			sleepImpl: async () => {},
+			readyTimeoutMs: 5,
+		});
+		const firstLoginCount = client.loginCalls;
+		// Wait past the watchdog deadline; it should destroy the client + reconnect.
+		await new Promise((r) => setTimeout(r, 40));
+		await tick();
+		assert.ok(client.destroyed >= 1, "watchdog should have destroyed the un-ready client");
+		assert.ok(client.loginCalls > firstLoginCount, "watchdog should have re-logged in");
+		await conn.close();
+	});
+
+	it("a normal clientReady cancels the watchdog (no reconnect)", async () => {
+		const h = await boot({}, { readyTimeoutMs: 5 });
+		const loginsAfterReady = h.client.loginCalls;
+		const destroyedAfterReady = h.client.destroyed;
+		// boot() fired client.ready() → watchdog cancelled. Wait past the deadline.
+		await new Promise((r) => setTimeout(r, 40));
+		assert.equal(h.client.loginCalls, loginsAfterReady, "no reconnect after a clean ready");
+		assert.equal(h.client.destroyed, destroyedAfterReady, "no destroy after a clean ready");
 	});
 });

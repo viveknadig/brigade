@@ -39,28 +39,67 @@ import {
 	type OutboundMedia,
 	type OutboundSendOptions,
 } from "../sdk.js";
+import { readAllowFrom } from "../access-control/store.js";
 import {
 	discordChannelEnabled,
 	discordLiveStreamEnabled,
+	discordReactionNotifications,
 	discordStreamThrottleMs,
 	discordSurfaceReasoning,
 	listDiscordAccountIds,
+	resolveDiscordAutoThread,
 	resolveDiscordBotToken,
+	resolveDiscordPresence,
 	resolveDiscordProxyUrl,
 	DISCORD_CHANNEL_ID,
 	DISCORD_DEFAULT_ACCOUNT_ID,
+	type ResolvedDiscordPresence,
 } from "./account-config.js";
 import { resolveDiscordApprover } from "./approval-authorize.js";
 import { buildDiscordApprovalMessage } from "./approval-native.js";
 import { buildDiscordButtonRows } from "./components.js";
 import { buildDiscordCommandManifest } from "./command-menu.js";
-import { connectDiscord, type ConnectDiscordArgs, type DiscordConnection } from "./connection.js";
+import {
+	connectDiscord,
+	sanitizeThreadName,
+	type ConnectDiscordArgs,
+	type DiscordConnection,
+	type DiscordInboundMessage,
+	type DiscordPresencePayload,
+} from "./connection.js";
+import { resolveDiscordHandle } from "./directory-cache.js";
 import { createDraftStream } from "./draft-stream.js";
-import { discordTextIsEmpty, markdownToDiscord } from "./format.js";
+import { discordTextIsEmpty, markdownToDiscord, rewriteKnownMentions } from "./format.js";
 import { splitDiscordReasoning } from "./reasoning-lane.js";
 
 /** Discord's per-message text limit (chars) for chunked sends. */
 const DISCORD_TEXT_LIMIT = 2_000;
+
+/**
+ * Map a resolved presence config into the discord.js `PresenceData` payload the
+ * connection applies on (re)connect (Phase 5). A `custom` activity (type 4)
+ * carries its text in the `state` field (Discord renders custom status from the
+ * state); every other type uses `name`. A `streaming` activity (type 1) adds the
+ * `url`. Returns `null` when no presence is configured.
+ */
+export function mapDiscordPresencePayload(presence: ResolvedDiscordPresence | null): DiscordPresencePayload | null {
+	if (!presence) return null;
+	const payload: DiscordPresencePayload = { status: presence.status };
+	if (presence.activityTypeCode !== undefined) {
+		const isCustom = presence.activityTypeCode === 4;
+		const text = presence.activityText ?? "";
+		const activity: { name: string; type: number; url?: string; state?: string } = {
+			// A custom activity needs a non-empty `name` per Discord; the visible text
+			// rides in `state`. Other types put the text in `name`.
+			name: isCustom ? "Custom Status" : text,
+			type: presence.activityTypeCode,
+		};
+		if (isCustom && text) activity.state = text;
+		if (presence.activityTypeCode === 1 && presence.activityUrl) activity.url = presence.activityUrl;
+		payload.activities = [activity];
+	}
+	return payload;
+}
 
 /** Adapter construction options — all optional for back-compat. */
 export interface CreateDiscordAdapterOptions {
@@ -76,6 +115,18 @@ export interface CreateDiscordAdapterOptions {
 export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): ChannelAdapter {
 	const accountId = opts.accountId?.trim() || DISCORD_DEFAULT_ACCOUNT_ID;
 	const connectImpl = opts.connectImpl ?? connectDiscord;
+	// Resolver bound to THIS adapter's account, handed to `rewriteKnownMentions`
+	// so a plain `@handle` the agent typed becomes a `<@id>` ping when (and only
+	// when) the inbound directory cache has seen that handle for this account.
+	const resolveMention = (handle: string): string | undefined => resolveDiscordHandle(accountId, handle);
+	// Render an outbound chunk: rewrite known `@handle` mentions to `<@id>` FIRST
+	// (so the converter sees a real mention token), then markdown→Discord, with the
+	// raw chunk as the empty-render fallback (a syntax-only chunk must still send).
+	const renderOutbound = (chunk: string): string => {
+		const withMentions = rewriteKnownMentions(chunk, resolveMention);
+		const rendered = markdownToDiscord(withMentions);
+		return discordTextIsEmpty(rendered) ? withMentions : rendered;
+	};
 	let connection: DiscordConnection | null = null;
 	// The ChannelStartContext doesn't carry the config, but the manager ALWAYS
 	// calls `isConfigured(cfg, env)` immediately before `start(ctx)` — so we
@@ -90,6 +141,59 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 	//     only recovery is `brigade channels add --channel discord` with a new token.
 	let connected = false;
 	let tokenInvalid = false;
+
+	/**
+	 * Cheap SYNCHRONOUS gate: should this inbound trigger autoThread creation? True
+	 * only when the feature is on, the message isn't already in a thread, and it's
+	 * a guild text message carrying text + the ids needed to anchor a thread. Keeps
+	 * the non-autoThread inbound path fully synchronous.
+	 */
+	const shouldAutoThread = (msg: DiscordInboundMessage): boolean => {
+		if (msg.threadId) return false; // already in a thread
+		const cfg = lastConfig;
+		if (!cfg || !connection) return false;
+		if (!resolveDiscordAutoThread(cfg).enabled) return false;
+		// Guild text message only (a DM has no guildId; a reaction/callback carries no text).
+		return Boolean(
+			(msg.guildId ?? "").trim() &&
+				(msg.conversationId ?? "").trim() &&
+				(msg.messageId ?? "").trim() &&
+				(msg.text ?? "").trim(),
+		);
+	};
+
+	/**
+	 * Phase 5 autoThread: create a thread off an inbound guild text message and
+	 * return the new thread id (caller guards with {@link shouldAutoThread}).
+	 * Returns the message's existing `threadId` (undefined) on any failure so the
+	 * reply stays un-threaded.
+	 *
+	 * Thread naming: `"first-message"` uses the inbound's first line; `"generated"`
+	 * would use an LLM-titled name, but Brigade has no simple-completion helper —
+	 * so `"generated"` FALLS BACK to the first-message name here (no completion
+	 * runtime is built).
+	 */
+	const maybeAutoThread = async (msg: DiscordInboundMessage): Promise<string | undefined> => {
+		const existing = msg.threadId;
+		const cfg = lastConfig;
+		if (!cfg || !connection) return existing;
+		const auto = resolveDiscordAutoThread(cfg);
+		const channelId = (msg.conversationId ?? "").trim();
+		const messageId = (msg.messageId ?? "").trim();
+		const text = (msg.text ?? "").trim();
+		// Name source: first-message (or generated → fallback to first-message until
+		// a completion runtime exists).
+		const name = sanitizeThreadName(text, messageId);
+		try {
+			const created = await connection.createThreadFromMessage(channelId, messageId, {
+				name,
+				autoArchiveMinutes: auto.autoArchiveMinutes,
+			});
+			return created ?? existing;
+		} catch {
+			return existing;
+		}
+	};
 
 	const adapter: DiscordAdapter = {
 		id: DISCORD_CHANNEL_ID,
@@ -126,9 +230,12 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 			// The native slash-command manifest, derived from Brigade's central
 			// channel commands; registered right after the connection is live (below).
 			const commandManifest = buildDiscordCommandManifest(buildBundledCommands(adapter));
+			// Resolve the optional bot presence to apply on (re)connect (Phase 5).
+			const presencePayload = mapDiscordPresencePayload(resolveDiscordPresence(cfg, accountId));
 			const conn = await connectImpl({
 				botToken,
 				...(proxyUrl ? { proxyUrl } : {}),
+				...(presencePayload ? { presence: presencePayload } : {}),
 				accountId,
 				log: ctx.log,
 				onConnected: () => {
@@ -144,39 +251,59 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 					ctx.onLoggedOut?.();
 				},
 				onMessage: (msg) => {
-					void ctx.onInbound({
-						channel: DISCORD_CHANNEL_ID,
-						accountId,
-						conversationId: msg.conversationId,
-						messageId: msg.messageId,
-						messageTimestampMs: msg.messageTimestampMs,
-						from: msg.from,
-						fromName: msg.fromName,
-						text: msg.text,
-						chatType: msg.chatType,
-						isGroup: msg.chatType === "group",
-						threadId: msg.threadId,
-						// Discord routes on guildId + member role ids (NOT teamId — that
-						// is Slack's workspace tier; setting it would risk colliding with
-						// a Slack team binding).
-						guildId: msg.guildId,
-						memberRoleIds: msg.memberRoleIds,
-						mentions: msg.mentions,
-						replyTo: msg.replyTo,
-						// Edit provenance rides through so the central pipeline / agent see
-						// "this was an edit".
-						...(msg.edited ? { edited: true } : {}),
-						// Deferred media thunk rides through untouched — the pipeline
-						// resolves it only after the access gate admits the sender.
-						resolveMedia: msg.resolveMedia,
-						raw: msg.raw,
-					});
+					// Build the inbound with a resolved thread id. The dispatch is
+					// SYNCHRONOUS when no thread needs creating (the common path, unchanged
+					// behavior); only autoThread creation defers to a microtask.
+					const dispatch = (threadId: string | undefined): void => {
+						void ctx.onInbound({
+							channel: DISCORD_CHANNEL_ID,
+							accountId,
+							conversationId: msg.conversationId,
+							messageId: msg.messageId,
+							messageTimestampMs: msg.messageTimestampMs,
+							from: msg.from,
+							fromName: msg.fromName,
+							text: msg.text,
+							chatType: msg.chatType,
+							isGroup: msg.chatType === "group",
+							threadId,
+							// Discord routes on guildId + member role ids (NOT teamId — that
+							// is Slack's workspace tier; setting it would risk colliding with
+							// a Slack team binding).
+							guildId: msg.guildId,
+							memberRoleIds: msg.memberRoleIds,
+							mentions: msg.mentions,
+							replyTo: msg.replyTo,
+							// Edit provenance rides through so the central pipeline / agent see
+							// "this was an edit".
+							...(msg.edited ? { edited: true } : {}),
+							// Deferred media thunk rides through untouched — the pipeline
+							// resolves it only after the access gate admits the sender.
+							resolveMedia: msg.resolveMedia,
+							raw: msg.raw,
+						});
+					};
+					// Phase 5 autoThread: when enabled (and this is a fresh guild text
+					// message), spawn a thread off the message and route the reply into it.
+					// `shouldAutoThread` is a cheap synchronous gate so the non-autoThread
+					// path stays fully synchronous.
+					if (shouldAutoThread(msg)) {
+						void maybeAutoThread(msg).then(dispatch).catch(() => dispatch(msg.threadId));
+					} else {
+						dispatch(msg.threadId);
+					}
 				},
 				// Inbound reaction → synthesise a short note and route it through the
 				// SAME inbound pipeline as a normal message so the access gate + routing
 				// apply uniformly. The note carries the added emoji(s) + the target id.
+				//
+				// GATED by `channels.discord.reactionNotifications` (default "own") so a
+				// stranger's reaction in an admitted channel no longer spams the agent:
+				//   off → drop all; own → only reactions on the bot's own messages;
+				//   all → route every reaction; allowlist → only allow-listed reactors.
 				onReaction: (msg) => {
 					if (!msg.reaction) return;
+					if (!shouldNotifyReaction(msg, lastConfig, connection?.selfId() ?? undefined, accountId)) return;
 					const note = buildReactionNote(msg.reaction.emojis, msg.reaction.targetMessageId, msg.fromName);
 					void ctx.onInbound({
 						channel: DISCORD_CHANNEL_ID,
@@ -278,13 +405,14 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 			// convert each chunk to Discord markup and send. A chunk whose rendered
 			// markup is empty (syntax-only) is re-sent as the raw chunk.
 			const chunks = chunkText(text, { limit: DISCORD_TEXT_LIMIT });
+			// A silent send rides through on every chunk (SuppressNotifications).
+			const silentOpt = opts?.silent ? { silent: true } : {};
 			let first = true;
 			for (const chunk of chunks) {
 				const replyOpt = first && replyToMessageId ? { replyToMessageId } : {};
-				const rendered = markdownToDiscord(chunk);
-				const body = discordTextIsEmpty(rendered) ? chunk : rendered;
+				const body = renderOutbound(chunk);
 				if (body.trim().length === 0) continue;
-				await connection.sendText(conversationId, body, { ...sendExtras, ...replyOpt });
+				await connection.sendText(conversationId, body, { ...sendExtras, ...silentOpt, ...replyOpt });
 				first = false;
 			}
 		},
@@ -324,11 +452,10 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 				...(threadId !== undefined ? { threadId } : {}),
 				throttleMs: discordStreamThrottleMs(cfg),
 				maxChars: DISCORD_TEXT_LIMIT,
-				// Render each draft chunk to Discord markup; fall back to the plain chunk
-				// when it renders empty (syntax-only).
+				// Render each draft chunk to Discord markup (incl. known-mention rewrite);
+				// fall back to the plain chunk when it renders empty (syntax-only).
 				renderText: (chunk) => {
-					const rendered = markdownToDiscord(chunk);
-					return { text: discordTextIsEmpty(rendered) ? chunk : rendered };
+					return { text: renderOutbound(chunk) };
 				},
 			});
 			return {
@@ -470,13 +597,18 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 			try {
 				switch (a.kind) {
 					case "edit": {
-						const rendered = markdownToDiscord(a.text);
-						const body = discordTextIsEmpty(rendered) ? a.text : rendered;
+						const body = renderOutbound(a.text);
 						await connection.editMessageText(p.conversationId, a.messageId, body);
 						return { ok: true, messageId: a.messageId };
 					}
 					case "delete":
 						await connection.deleteMessage(p.conversationId, a.messageId);
+						return { ok: true, messageId: a.messageId };
+					case "pin":
+						await connection.pinMessage(p.conversationId, a.messageId);
+						return { ok: true, messageId: a.messageId };
+					case "unpin":
+						await connection.unpinMessage(p.conversationId, a.messageId);
 						return { ok: true, messageId: a.messageId };
 					case "react":
 						// An EMPTY emoji means "clear" (parity with WhatsApp/Telegram/Slack):
@@ -504,8 +636,7 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 						if (!rows) {
 							return { ok: false, error: "no usable buttons (each needs a label + a data token ≤ 100 chars)" };
 						}
-						const rendered = markdownToDiscord(a.text);
-						const body = discordTextIsEmpty(rendered) ? a.text : rendered;
+						const body = renderOutbound(a.text);
 						const sent = await connection.sendInteractive(p.conversationId, body, rows, {
 							...(a.threadId !== undefined ? { threadId: a.threadId } : {}),
 						});
@@ -533,6 +664,54 @@ export function createDiscordAdapter(opts: CreateDiscordAdapterOptions = {}): Ch
 	};
 
 	return adapter;
+}
+
+/**
+ * Decide whether an inbound reaction-add should wake the agent, per the
+ * `channels.discord.reactionNotifications` mode (default `"own"`):
+ *   - `"off"`       → never;
+ *   - `"own"`       → only when the reacted message was authored by the bot
+ *                     (`reaction.targetAuthorId === selfId`);
+ *   - `"all"`       → always (legacy behavior);
+ *   - `"allowlist"` → only when the reactor (`msg.from`) is on the channel
+ *                     allow-list — the central store list ∪ config `allowFrom`.
+ * A null config defensively falls back to `"own"`. Reaction-REMOVE is unaffected
+ * (handled in the connection's dedupe-release path).
+ */
+export function shouldNotifyReaction(
+	msg: DiscordInboundMessage,
+	cfg: BrigadeConfig | null,
+	selfId: string | undefined,
+	accountId?: string,
+): boolean {
+	const mode = cfg ? discordReactionNotifications(cfg) : "own";
+	switch (mode) {
+		case "off":
+			return false;
+		case "all":
+			return true;
+		case "allowlist": {
+			const reactor = msg.from?.trim();
+			if (!reactor) return false;
+			const acct = accountId?.trim() || undefined;
+			const storeAllow = readAllowFrom(DISCORD_CHANNEL_ID, acct);
+			const configAllow = readDiscordAllowFrom(cfg);
+			const allow = new Set([...storeAllow, ...configAllow].map((id) => id.trim()).filter(Boolean));
+			return allow.has(reactor);
+		}
+		case "own":
+		default: {
+			const targetAuthor = msg.reaction?.targetAuthorId?.trim();
+			return Boolean(selfId && targetAuthor && targetAuthor === selfId.trim());
+		}
+	}
+}
+
+/** Read `channels.discord.allowFrom` (config-declared allow-list ids) defensively. */
+function readDiscordAllowFrom(cfg: BrigadeConfig | null): string[] {
+	const slot = (cfg as { channels?: Record<string, { allowFrom?: unknown }> } | null)?.channels?.[DISCORD_CHANNEL_ID];
+	const list = slot?.allowFrom;
+	return Array.isArray(list) ? list.map((x) => String(x)) : [];
 }
 
 /**

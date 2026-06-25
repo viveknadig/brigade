@@ -35,6 +35,9 @@
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { onAgentEvent } from "./agent-events.js";
+// Dependency-light store (no discord.js / REST import) — safe to load statically
+// so the reply-delivery resolver can read a thread binding synchronously.
+import { getDiscordSubagentThreadBinding } from "./channels/discord/subagent-thread-binding-store.js";
 import { requestHeartbeatNow } from "./heartbeat-wake.js";
 import {
 	deliverSubagentCompletionAnnounce,
@@ -234,6 +237,78 @@ function formatLegacyAnnounceHeadline(params: {
 const formatAnnounceText = formatLegacyAnnounceHeadline;
 
 /**
+ * Phase 6 — map a lifecycle ended-outcome to the Discord farewell's outcome
+ * discriminator (`ok | error | timeout | abort`).
+ */
+function farewellOutcomeFor(
+	outcome: SubagentLifecycleEndedOutcome,
+): "ok" | "error" | "timeout" | "abort" {
+	if (outcome === SUBAGENT_ENDED_OUTCOME_TIMEOUT) return "timeout";
+	if (outcome === SUBAGENT_ENDED_OUTCOME_ABORT) return "abort";
+	if (outcome === SUBAGENT_ENDED_OUTCOME_ERROR) return "error";
+	return "ok";
+}
+
+/**
+ * Phase 6 — best-effort Discord sub-agent thread farewell. Lazy-imports the
+ * Discord materializer so a non-Discord build / TUI path never loads it; the
+ * helper itself no-ops when no thread binding is registered for `childSessionKey`.
+ */
+async function deliverDiscordSubagentThreadFarewell(
+	childSessionKey: string,
+	outcome: SubagentLifecycleEndedOutcome,
+): Promise<void> {
+	try {
+		// Cheap synchronous presence check via the dependency-light STORE — only
+		// pull in the heavy materializer (Discord REST + connection deps) when a
+		// farewell is actually owed. This keeps the common no-thread completion
+		// path off the discord.js import graph entirely.
+		const { hasDiscordSubagentThreadBinding } = await import(
+			"./channels/discord/subagent-thread-binding-store.js"
+		);
+		if (!hasDiscordSubagentThreadBinding(childSessionKey)) return;
+		const { sendDiscordSubagentThreadFarewell } = await import(
+			"./channels/discord/subagent-thread-binding.js"
+		);
+		await sendDiscordSubagentThreadFarewell({
+			childSessionKey,
+			outcome: farewellOutcomeFor(outcome),
+		});
+	} catch (err) {
+		log.warn("discord subagent thread farewell failed", {
+			childSessionKey,
+			error: (err as Error)?.message,
+		});
+	}
+}
+
+/**
+ * Fix A2 — resolve the Discord-thread delivery context for a thread-bound child,
+ * or undefined when the child has no thread binding. When present, the completion
+ * announce carries it so the heartbeat hook's `deliverReplyToChannel` delivers the
+ * child's FINAL reply INTO the bound thread (not just the parent inbox + farewell).
+ *
+ * Synchronous + dependency-light: it reads only the binding STORE (no Discord
+ * REST / discord.js import), so the common no-thread path stays off that graph.
+ */
+function resolveDiscordThreadDeliveryContext(
+	childSessionKey: string,
+): { channel: string; to: string; accountId?: string; threadId: string } | undefined {
+	try {
+		const binding = getDiscordSubagentThreadBinding(childSessionKey);
+		if (!binding) return undefined;
+		return {
+			channel: "discord",
+			to: `channel:${binding.threadId}`,
+			...(binding.accountId ? { accountId: binding.accountId } : {}),
+			threadId: binding.threadId,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Install the bridge. Returns a disposer that unsubscribes from the
  * agent-events bus. Idempotent — re-installing replaces the previous
  * listener.
@@ -273,6 +348,11 @@ export function installSubagentCompletionBridge(): () => void {
 		const parentSessionKey =
 			entry.requesterSessionKey?.trim() || entry.controllerSessionKey?.trim();
 
+		// Fix A2 — resolve the thread delivery context NOW, before the farewell
+		// path (which forgets the binding) runs, so a thread-bound child's reply
+		// can be delivered into its thread. Undefined for a non-thread child.
+		const threadDeliveryContext = resolveDiscordThreadDeliveryContext(entry.childSessionKey);
+
 		const deliveryTask = async () => {
 			try {
 				await markSubagentRunCompleted({
@@ -288,6 +368,13 @@ export function installSubagentCompletionBridge(): () => void {
 					error: (err as Error)?.message,
 				});
 			}
+
+			// Phase 6 — Discord sub-agent thread farewell. When the child ran in
+			// a bound Discord thread, post a brief "done" into that thread and
+			// drop the binding (the thread is left for the central idle-reaper).
+			// Best-effort + lazy-imported so a non-Discord build never pays for
+			// it; the helper no-ops when no binding exists for the child key.
+			void deliverDiscordSubagentThreadFarewell(entry.childSessionKey, lifecycleOutcome);
 
 			// Wave O0.7 - announce-delivery into the parent's session inbox so
 			// the parent's next turn sees "child X finished, here is the
@@ -318,6 +405,9 @@ export function installSubagentCompletionBridge(): () => void {
 					...(error ? { error } : {}),
 					...(fallbackReply ? { replyText: fallbackReply } : {}),
 					...(durationMs !== undefined ? { durationMs } : {}),
+					// Fix A2 — deliver the announce (carrying the child's final reply)
+					// INTO the bound Discord thread when present.
+					...(threadDeliveryContext ? { deliveryContext: threadDeliveryContext } : {}),
 				});
 				if (!enqueued) {
 					// Fall back to the short-form text if the rich announce

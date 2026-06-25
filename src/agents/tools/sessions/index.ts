@@ -30,6 +30,7 @@ import type { TSchema } from "typebox";
 
 import type { AnyBrigadeTool } from "../types.js";
 import type { SessionContext } from "../../session-context.js";
+import type { ChannelApprovalRoute } from "../../channels/approval-router.js";
 import { createSessionsHistoryTool } from "./history.js";
 import { createSessionsListTool } from "./list.js";
 import { createSessionsSendTool } from "./send.js";
@@ -61,6 +62,13 @@ export {
 export interface CreateSessionsToolsBundleParams {
 	/** Per-turn context produced by Step 11's `buildSessionContext`. */
 	sessionContext?: SessionContext;
+	/**
+	 * Originating channel route for this turn (Phase 6). When the inbound came
+	 * from a channel adapter, this carries the channel name + conversation id +
+	 * thread id so `sessions_spawn` can materialize a Discord thread for a
+	 * `thread: true` sub-agent. Undefined on TUI / cron / RPC turns.
+	 */
+	channelContext?: ChannelApprovalRoute;
 	/** Caller's resolved spawn depth (from session store). Defaults to 0. */
 	callerDepth?: number;
 	/** Optional cap overrides; defaults to 3 / 5 from Step 20. */
@@ -107,11 +115,20 @@ export function createSessionsToolsBundle(
 	params: CreateSessionsToolsBundleParams = {},
 ): SessionsToolsBundle {
 	const ctx = params.sessionContext;
+	// Phase 6 — when the turn originated from a channel adapter, the
+	// `channelContext` carries the originating channel name + conversation +
+	// thread. Threading it here lets `sessions_spawn` materialize a Discord
+	// thread for a `thread: true` sub-agent. Absent (TUI / cron / RPC) → the
+	// spawn engine sees no channel origin and the thread-binding path is skipped.
+	const route = params.channelContext;
 	const sharedOpts = {
 		agentSessionKey: ctx?.key,
-		agentChannel: undefined,
-		agentAccountId: ctx?.requesterAccountId,
-		agentTo: ctx?.requesterSenderId,
+		agentChannel: route?.channelId,
+		// Prefer the channel route's conversation id (the real Discord channel
+		// id) over the sender id for spawn delivery targeting.
+		agentAccountId: route?.accountId ?? ctx?.requesterAccountId,
+		agentTo: route?.conversationId ?? ctx?.requesterSenderId,
+		agentThreadId: route?.threadId,
 		sandboxed: params.sandboxed,
 	};
 	// Shared access-guard context — threaded into every tool so each
@@ -133,6 +150,9 @@ export function createSessionsToolsBundle(
 		agentChannel: sharedOpts.agentChannel,
 		agentAccountId: sharedOpts.agentAccountId,
 		agentTo: sharedOpts.agentTo,
+		...(sharedOpts.agentThreadId !== undefined
+			? { agentThreadId: sharedOpts.agentThreadId }
+			: {}),
 		requesterAgentIdOverride: ctx?.agentId,
 		workspaceDir: params.workspaceDir,
 		callerDepth: params.callerDepth,

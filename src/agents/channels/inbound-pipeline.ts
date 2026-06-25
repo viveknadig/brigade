@@ -44,7 +44,7 @@ import {
 } from "./access-control/index.js";
 import { isAbortTrigger } from "./abort-triggers.js";
 import { buildAgentSwitchCommands } from "./agent-switch-command.js";
-import { decodeGeneralCallbackData, isGeneralCallbackData } from "./general-callback.js";
+import { buildGeneralCallbackTurnText, decodeGeneralCallbackData, isGeneralCallbackData } from "./general-callback.js";
 import {
 	type ChannelApprovalRoute,
 	tryConsumeChannelApprovalCallback,
@@ -780,8 +780,10 @@ export async function runChannelInboundPipeline(
 				const token = decodeGeneralCallbackData(msg.callbackQuery.data);
 				if (token) {
 					// Synthetic inbound text the agent sees for the tap. Kept short +
-					// explicit so the agent can branch on the token it set.
-					msg.text = `[button] ${token}`;
+					// explicit so the agent can branch on the token it set. A select
+					// menu also carries `values` → they're appended as `Selected: …`
+					// so the agent sees the choice; a plain button stays byte-identical.
+					msg.text = buildGeneralCallbackTurnText(token, msg.callbackQuery.values);
 					// Clear the callbackQuery so the downstream path treats this as a
 					// normal text turn (and doesn't re-enter this block).
 					msg.callbackQuery = undefined;

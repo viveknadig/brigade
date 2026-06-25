@@ -205,8 +205,14 @@ export interface InboundMessage {
 	 * The inbound pipeline routes a present `callbackQuery` to the central
 	 * approval-callback path BEFORE the text-reply path. `undefined` for every
 	 * ordinary message — channels without inline buttons never set it.
+	 *
+	 * `values` carries the chosen value(s) when the press came from a SELECT menu
+	 * rather than a plain button (Discord string/user/role/channel/mentionable
+	 * selects). For a general (agent-attached) select, the central general-callback
+	 * path surfaces these in the synthesized turn text so the agent sees the
+	 * selection. A plain button carries no `values`.
 	 */
-	callbackQuery?: { data: string; callbackId: string };
+	callbackQuery?: { data: string; callbackId: string; values?: string[] };
 	/**
 	 * Set when this inbound is an EDIT of a previously-sent message (Telegram
 	 * `edited_message`, Discord message update, …) rather than a fresh message.

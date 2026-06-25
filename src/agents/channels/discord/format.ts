@@ -222,6 +222,64 @@ export function markdownToDiscord(markdown: string): string {
 }
 
 /**
+ * Code-span matcher: a fenced ```…``` block OR an inline `…` span. Used by
+ * {@link rewriteKnownMentions} to SKIP rewriting handles that live inside code
+ * (where an `@alex` is verbatim text, not a mention the author wants pinged).
+ */
+const CODE_SEGMENT_PATTERN = /```[\s\S]*?```|`[^`\n]*`/g;
+
+/**
+ * A plain `@handle` candidate OUTSIDE a code span. Group 1 is the preceding
+ * boundary char (start-of-string or a separator) so we never match an `@` glued
+ * to a word (an email's `@`, or a `<@id>` token's `@`); group 2 is the handle
+ * body (Discord usernames: letters/digits/underscore/dot/hyphen, 2–32 chars,
+ * with an optional legacy `#1234` discriminator).
+ */
+const MENTION_CANDIDATE_PATTERN = /(^|[\s([{"'.,;:!?])@([a-z0-9_.-]{2,32}(?:#[0-9]{4})?)/gi;
+
+/** Discord resolves these itself — never rewrite them to a user token. */
+const RESERVED_MENTIONS = new Set(["everyone", "here"]);
+
+/**
+ * Rewrite a plain `@handle` to its `<@id>` mention token — but ONLY when
+ * `resolve(handle)` returns a known user id. An unknown handle stays literal
+ * (we never invent a ping). Skips:
+ *   - code spans / fenced blocks (an `@alex` there is verbatim, not a mention);
+ *   - `@everyone` / `@here` (Discord-reserved, and `<@…>`-safe-mentions never
+ *     parse "everyone" anyway);
+ *   - a handle already sitting inside a `<@…>` token (the boundary group means
+ *     the `@` after `<` is never a candidate start).
+ *
+ * Called by the adapter BEFORE `markdownToDiscord` so a freshly-minted `<@id>`
+ * passes through the converter as a verbatim mention token. Pure over its
+ * `resolve` argument — the resolver carries the account-scoped directory cache.
+ */
+export function rewriteKnownMentions(text: string, resolve: (handle: string) => string | undefined): string {
+	if (!text || !text.includes("@")) return text;
+	const rewriteOutsideCode = (segment: string): string =>
+		segment.replace(MENTION_CANDIDATE_PATTERN, (match, boundary: string, handle: string) => {
+			const lookup = handle.toLowerCase();
+			if (RESERVED_MENTIONS.has(lookup.replace(/#[0-9]{4}$/, ""))) return match;
+			const id = resolve(handle);
+			if (!id || !/^\d+$/.test(id)) return match;
+			return `${boundary}<@${id}>`;
+		});
+	// Walk the string, leaving every code segment untouched and rewriting the
+	// gaps between them.
+	let out = "";
+	let offset = 0;
+	CODE_SEGMENT_PATTERN.lastIndex = 0;
+	for (const m of text.matchAll(CODE_SEGMENT_PATTERN)) {
+		const idx = m.index ?? 0;
+		out += rewriteOutsideCode(text.slice(offset, idx));
+		out += m[0];
+		offset = idx + m[0].length;
+	}
+	out += rewriteOutsideCode(text.slice(offset));
+	return out;
+}
+
+/**
  * True when the rendered Discord text carries no visible content — only
  * whitespace and/or markdown markers. Discord rejects an empty message body, so
  * the send path falls back / skips when this returns true. Mirrors

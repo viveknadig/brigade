@@ -10,7 +10,7 @@ import { addAllowFrom } from "../access-control/index.js";
 import { listChannelApprovalDispatchers, resetChannelApprovalRouterForTests } from "../approval-router.js";
 import { resetLastChannelRegistryForTests } from "../last-channel.js";
 import { listDiscordAccountIds, resolveDiscordAccount, discordChannelEnabled } from "./account-config.js";
-import { createDiscordPlugin } from "./plugin.js";
+import { collectConfiguredDiscordChannelIds, createDiscordPlugin } from "./plugin.js";
 
 /** Build a fake adapter that records sends + exposes its start ctx. */
 function makeFakeAdapter(accountId: string): {
@@ -227,5 +227,59 @@ describe("createDiscordPlugin — multi-account lifecycle", () => {
 				"reply must land on the main account with accountId stamped",
 			);
 		});
+	});
+});
+
+describe("createDiscordPlugin — Phase 5 diagnostics wiring", () => {
+	const cfg = (discord: Record<string, unknown>): BrigadeConfig =>
+		({ channels: { discord } }) as unknown as BrigadeConfig;
+
+	it("collectConfiguredDiscordChannelIds gathers per-guild channel ids", () => {
+		const ids = collectConfiguredDiscordChannelIds(
+			cfg({ enabled: true, guilds: { g1: { channels: { "100": {}, "200": {} } }, g2: { channels: { "300": {} } } } }),
+		);
+		assert.deepEqual(ids.sort(), ["100", "200", "300"]);
+	});
+
+	it("registers a security adapter that warns on name-based allow entries", () => {
+		const plugin = createDiscordPlugin({
+			defaultAgentId: "ceo",
+			loadConfig: () => cfg({ enabled: true, allowFrom: ["alex"] }),
+			runTurn: async () => ({ status: "ok" }) as never,
+		});
+		assert.ok(plugin.security?.collectAuditFindings, "a security adapter must be registered");
+		const findings = plugin.security!.collectAuditFindings!({
+			account: undefined as never,
+			accountId: "default",
+			cfg: cfg({ enabled: true, allowFrom: ["alex"] }),
+			sourceConfig: cfg({ enabled: true, allowFrom: ["alex"] }),
+			orderedAccountIds: ["default"],
+		}) as Array<{ severity: string }>;
+		assert.equal(findings.length, 1);
+		assert.equal(findings[0]?.severity, "warn");
+	});
+
+	it("status.collectStatusIssues derives intent + permission issues from snapshots", () => {
+		const plugin = createDiscordPlugin({
+			defaultAgentId: "ceo",
+			loadConfig: () => cfg({ enabled: true }),
+			runTurn: async () => ({ status: "ok" }) as never,
+		});
+		assert.ok(plugin.status?.collectStatusIssues, "a status adapter must be registered");
+		const issues = plugin.status!.collectStatusIssues!([
+			{
+				accountId: "default",
+				probe: {
+					ok: true,
+					elapsedMs: 1,
+					privilegedIntents: { messageContent: "disabled", guildMembers: "enabled", presence: "enabled" },
+					permissionAudit: { unresolvedChannels: 0, channels: [{ channelId: "200", ok: false, missingRequired: ["SendMessages"] }] },
+				},
+			},
+		] as never);
+		// One intent warn + one permission error.
+		assert.equal(issues.length, 2);
+		assert.ok(issues.some((i) => i.severity === "warn"));
+		assert.ok(issues.some((i) => i.severity === "error"));
 	});
 });

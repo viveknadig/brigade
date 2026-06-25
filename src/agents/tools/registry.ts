@@ -41,6 +41,8 @@ import { makeManageChannelAccessTool } from "./manage-channel-access-tool.js";
 import { makeConnectChannelTool } from "./connect-channel-tool.js";
 import { makeMessageActionTool } from "./message-action-tool.js";
 import { makeComposioTool } from "./composio-tool.js";
+import { makeDiscordActionTool } from "./discord-action-tool.js";
+import { discordChannelEnabled } from "../channels/discord/account-config.js";
 import { makeManageProviderTool } from "./manage-provider-tool.js";
 import { makeOAuthAuthorizeTool } from "./oauth-authorize-tool.js";
 import { makeManageSkillTool } from "./manage-skill-tool.js";
@@ -357,6 +359,21 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// loadConfig failures are non-fatal: skip the gate and keep the
 		// legacy tool list rather than crashing tool assembly.
 	}
+	// `discord_action` additive-gate (Phase 4): the owner-only Discord guild
+	// action surface (channels / roles / members / emojis / events / moderation
+	// / rich content) is assembled ONLY when the Discord channel is configured
+	// (`channels.discord.enabled`). A non-Discord install never sees it, so the
+	// exact-count tool surface stays bit-for-bit unchanged. The tool is
+	// SELF-CONTAINED over Discord REST v10 (resolves the bot token like probe.ts;
+	// no live adapter needed). `ownerOnly: true` → the session-wiring owner
+	// wrapper refuses non-owner senders + unattended cron before execute runs.
+	try {
+		if (discordChannelEnabled(_loadConfigForOrgGate() as never)) {
+			tools.push(makeDiscordActionTool());
+		}
+	} catch {
+		// loadConfig failures are non-fatal: skip the Discord gate too.
+	}
 	// Primitive #6 — register `spawn_agent` (sync, single child) AND
 	// `spawn_agents` (sync, parallel fan-out) only when the caller supplied a
 	// parent context AND the child wouldn't be a leaf. `filterToolsForSubagentDepth`
@@ -521,6 +538,9 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 	if (opts.sessionContext) {
 		const sessionsTools = createSessionsBrigadeTools({
 			sessionContext: opts.sessionContext,
+			...(opts.channelContext !== undefined
+				? { channelContext: opts.channelContext }
+				: {}),
 			callerDepth: opts.subagentContext?.callerDepth ?? 0,
 			maxSpawnDepth: opts.subagentMaxDepth,
 			workspaceDir: opts.workspaceDir,
