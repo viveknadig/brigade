@@ -54,8 +54,14 @@ export type { DiscordSubagentThreadBinding } from "./subagent-thread-binding-sto
 
 const log = createSubsystemLogger("agents/channels/discord/subagent-thread-binding");
 
-/** discord.js `ChannelType.PublicThread` (12) — the standalone-thread type. */
-const DISCORD_CHANNEL_TYPE_PUBLIC_THREAD = 12;
+/**
+ * discord.js `ChannelType.PublicThread` (11) — the type a STANDALONE thread is
+ * created with via `POST /channels/{id}/threads`. (Type 12 is PRIVATE_THREAD.)
+ * A standalone create on a normal text channel must NOT carry a forum-only
+ * `message` starter field — that 400s. We create the empty thread, then post the
+ * intro as a separate message INTO it.
+ */
+const DISCORD_CHANNEL_TYPE_PUBLIC_THREAD = 11;
 
 /** Auto-archive a sub-agent thread after 24h of inactivity (Discord-allowed value). */
 const DISCORD_SUBAGENT_THREAD_AUTO_ARCHIVE_MINUTES = 1_440;
@@ -172,15 +178,17 @@ export async function materializeDiscordSubagentThread(
 
 	let threadId = "";
 	try {
-		// A standalone (non-message) thread with a starter `content` posts the
-		// intro AS the thread's first message — one REST call, no webhook.
+		// Create a STANDALONE public thread off the text channel. We deliberately
+		// DON'T pass a starter `content` — that maps to the forum/media-only
+		// `message` field, which Discord 400s on a normal text channel (the bug
+		// the verification caught). The intro is posted as a SEPARATE message into
+		// the thread below.
 		const created = (await threadCreate(
 			{
 				channelId: parentChannelId,
 				name: threadName,
 				type: DISCORD_CHANNEL_TYPE_PUBLIC_THREAD,
 				autoArchiveMinutes: DISCORD_SUBAGENT_THREAD_AUTO_ARCHIVE_MINUTES,
-				content: intro,
 			},
 			restOpts,
 		)) as { id?: string } | null;
@@ -195,6 +203,18 @@ export async function materializeDiscordSubagentThread(
 	if (!threadId) {
 		log.warn("subagent thread materialize: threadCreate returned no id", { parentChannelId });
 		return null;
+	}
+
+	// Post the intro as a separate message INTO the newly-created thread (the
+	// thread id IS a channel id). Best-effort — a failed intro must not undo a
+	// successfully-created thread, so the spawn still binds + runs threaded.
+	try {
+		await sendMessage({ to: threadId, content: intro }, restOpts);
+	} catch (err) {
+		log.warn("subagent thread materialize: intro send failed (thread still created)", {
+			threadId,
+			error: err instanceof Error ? err.message : String(err),
+		});
 	}
 
 	// Re-root the child session into the thread so its `:thread:<id>` session IS

@@ -114,6 +114,146 @@ describe("discord_action — dispatch to the right helper", () => {
 	});
 });
 
+/* ─────────────── typed interactive components (Fix A1) ─────────────── */
+
+/** Fetch stub that captures the parsed JSON body of each call. */
+function recordFetchWithBody(): {
+	fetch: typeof fetch;
+	calls: Array<{ url: string; method: string; body: Record<string, unknown> | undefined }>;
+} {
+	const calls: Array<{ url: string; method: string; body: Record<string, unknown> | undefined }> = [];
+	const fetchImpl = (async (url: string, init?: RequestInit) => {
+		calls.push({
+			url,
+			method: init?.method ?? "GET",
+			body: init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined,
+		});
+		return { ok: true, status: 200, json: async () => ({ id: "m1" }) } as Response;
+	}) as unknown as typeof fetch;
+	return { fetch: fetchImpl, calls };
+}
+
+async function runWithBody(
+	args: Record<string, unknown>,
+): Promise<{ details: { ok: boolean; message: string }; calls: ReturnType<typeof recordFetchWithBody>["calls"] }> {
+	const rec = recordFetchWithBody();
+	const tool = makeDiscordActionTool({ resolveToken: () => "TESTTOKEN", fetchImpl: rec.fetch });
+	const res = (await tool.execute("c", args as never)) as { details: { ok: boolean; message: string } };
+	return { details: res.details, calls: rec.calls };
+}
+
+describe("discord_action — typed interactive components (Fix A1)", () => {
+	it("send with a `select` spec posts a string-select action row with a general-prefixed custom_id", async () => {
+		const { details, calls } = await runWithBody({
+			action: "send",
+			to: "555",
+			content: "pick one",
+			select: { kind: "string", customId: "pick", options: [{ label: "A", value: "a" }] },
+		});
+		assert.equal(details.ok, true, details.message);
+		const body = calls[calls.length - 1]!.body!;
+		const rows = body.components as Array<Record<string, unknown>>;
+		assert.equal(rows.length, 1, "one component row");
+		assert.equal(rows[0]!.type, 1, "action row");
+		const select = (rows[0]!.components as Array<Record<string, unknown>>)[0]!;
+		assert.equal(select.type, 3, "string select");
+		// The custom_id is general-prefixed so the press-router decodes it.
+		assert.match(String(select.custom_id), /^g:/, "general-prefixed custom_id");
+	});
+
+	it("an emitted select's custom_id is one the press-router decodes", async () => {
+		const { calls } = await runWithBody({
+			action: "send",
+			to: "555",
+			select: { kind: "string", customId: "color", options: [{ label: "Red", value: "r" }] },
+		});
+		const body = calls[calls.length - 1]!.body!;
+		const select = ((body.components as Array<Record<string, unknown>>)[0]!.components as Array<Record<string, unknown>>)[0]!;
+		const customId = String(select.custom_id);
+		// The connection's select branch surfaces values via the general callback codec.
+		const { isGeneralCallbackData, decodeGeneralCallbackData } = await import("../channels/general-callback.js");
+		assert.ok(isGeneralCallbackData(customId), "router recognizes it as a general callback");
+		assert.equal(decodeGeneralCallbackData(customId), "color");
+	});
+
+	it("send with a `modal` spec registers an entry + emits a modal:<id> trigger button", async () => {
+		const { __resetDiscordModalRegistryForTest, getDiscordModal } = await import("../channels/discord/modal-registry.js");
+		const { decodeDiscordModalCustomId } = await import("../channels/discord/modals.js");
+		__resetDiscordModalRegistryForTest();
+		try {
+			const { details, calls } = await runWithBody({
+				action: "send",
+				to: "555",
+				content: "fill this in",
+				modal: { buttonLabel: "Open form", title: "Form", fields: [{ id: "name", label: "Name" }] },
+			});
+			assert.equal(details.ok, true, details.message);
+			const body = calls[calls.length - 1]!.body!;
+			const button = ((body.components as Array<Record<string, unknown>>)[0]!.components as Array<Record<string, unknown>>)[0]!;
+			assert.equal(button.type, 2, "button");
+			const customId = String(button.custom_id);
+			assert.match(customId, /^modal:/, "modal trigger marker");
+			const modalId = decodeDiscordModalCustomId(customId);
+			assert.ok(getDiscordModal(modalId), "modal entry registered for the marker");
+		} finally {
+			__resetDiscordModalRegistryForTest();
+		}
+	});
+
+	it("send with `blocks` sets the IsComponentsV2 flag + a container, and drops plain content", async () => {
+		const { details, calls } = await runWithBody({
+			action: "send",
+			to: "555",
+			blocks: { blocks: [{ type: "text", text: "V2 hello" }] },
+		});
+		assert.equal(details.ok, true, details.message);
+		const body = calls[calls.length - 1]!.body!;
+		assert.equal(body.flags, 1 << 15, "IsComponentsV2 flag set");
+		assert.equal(body.content, undefined, "no plain content on a V2 message");
+		const container = (body.components as Array<Record<string, unknown>>)[0]!;
+		assert.equal(container.type, 17, "container");
+		const text = (container.components as Array<Record<string, unknown>>)[0]!;
+		assert.equal(text.type, 10, "text moved into a TextDisplay block");
+		assert.equal(text.content, "V2 hello");
+	});
+
+	it("rejects combining blocks (V2) with content/embeds/select in one send", async () => {
+		const { details, calls } = await runWithBody({
+			action: "send",
+			to: "555",
+			content: "classic",
+			blocks: { blocks: [{ type: "text", text: "v2" }] },
+		});
+		assert.equal(details.ok, false);
+		assert.match(details.message, /cannot be combined/i);
+		assert.equal(calls.length, 0, "no REST call when the combo is rejected");
+	});
+
+	it("fails cleanly on an unusable select spec (string select with no option)", async () => {
+		const { details, calls } = await runWithBody({
+			action: "send",
+			to: "555",
+			content: "x",
+			select: { kind: "string", customId: "p", options: [] },
+		});
+		assert.equal(details.ok, false);
+		assert.match(details.message, /option/i);
+		assert.equal(calls.length, 0, "no REST call on a bad spec");
+	});
+
+	it("still supports the raw components passthrough for power users", async () => {
+		const { details, calls } = await runWithBody({
+			action: "send",
+			to: "555",
+			components: [{ type: 1, components: [{ type: 2, style: 2, label: "Raw", custom_id: "raw1" }] }],
+		});
+		assert.equal(details.ok, true, details.message);
+		const body = calls[calls.length - 1]!.body!;
+		const rows = body.components as Array<Record<string, unknown>>;
+		assert.equal((rows[0]!.components as Array<Record<string, unknown>>)[0]!.custom_id, "raw1");
+	});
+});
+
 describe("discord_action — required-param refusals", () => {
 	it("send without `to` fails cleanly", async () => {
 		const { details, calls } = await run({ action: "send", content: "hi" });

@@ -35,6 +35,9 @@
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { onAgentEvent } from "./agent-events.js";
+// Dependency-light store (no discord.js / REST import) — safe to load statically
+// so the reply-delivery resolver can read a thread binding synchronously.
+import { getDiscordSubagentThreadBinding } from "./channels/discord/subagent-thread-binding-store.js";
 import { requestHeartbeatNow } from "./heartbeat-wake.js";
 import {
 	deliverSubagentCompletionAnnounce,
@@ -280,6 +283,32 @@ async function deliverDiscordSubagentThreadFarewell(
 }
 
 /**
+ * Fix A2 — resolve the Discord-thread delivery context for a thread-bound child,
+ * or undefined when the child has no thread binding. When present, the completion
+ * announce carries it so the heartbeat hook's `deliverReplyToChannel` delivers the
+ * child's FINAL reply INTO the bound thread (not just the parent inbox + farewell).
+ *
+ * Synchronous + dependency-light: it reads only the binding STORE (no Discord
+ * REST / discord.js import), so the common no-thread path stays off that graph.
+ */
+function resolveDiscordThreadDeliveryContext(
+	childSessionKey: string,
+): { channel: string; to: string; accountId?: string; threadId: string } | undefined {
+	try {
+		const binding = getDiscordSubagentThreadBinding(childSessionKey);
+		if (!binding) return undefined;
+		return {
+			channel: "discord",
+			to: `channel:${binding.threadId}`,
+			...(binding.accountId ? { accountId: binding.accountId } : {}),
+			threadId: binding.threadId,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Install the bridge. Returns a disposer that unsubscribes from the
  * agent-events bus. Idempotent — re-installing replaces the previous
  * listener.
@@ -318,6 +347,11 @@ export function installSubagentCompletionBridge(): () => void {
 
 		const parentSessionKey =
 			entry.requesterSessionKey?.trim() || entry.controllerSessionKey?.trim();
+
+		// Fix A2 — resolve the thread delivery context NOW, before the farewell
+		// path (which forgets the binding) runs, so a thread-bound child's reply
+		// can be delivered into its thread. Undefined for a non-thread child.
+		const threadDeliveryContext = resolveDiscordThreadDeliveryContext(entry.childSessionKey);
 
 		const deliveryTask = async () => {
 			try {
@@ -371,6 +405,9 @@ export function installSubagentCompletionBridge(): () => void {
 					...(error ? { error } : {}),
 					...(fallbackReply ? { replyText: fallbackReply } : {}),
 					...(durationMs !== undefined ? { durationMs } : {}),
+					// Fix A2 — deliver the announce (carrying the child's final reply)
+					// INTO the bound Discord thread when present.
+					...(threadDeliveryContext ? { deliveryContext: threadDeliveryContext } : {}),
 				});
 				if (!enqueued) {
 					// Fall back to the short-form text if the rich announce

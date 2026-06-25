@@ -72,7 +72,7 @@ describe("discord subagent thread-binding (Phase 6 materializer)", () => {
 		assert.match(buildSubagentThreadFarewell({ agentId: "scout", outcome: "abort" }), /stopped/i);
 	});
 
-	it("creates a thread, posts the intro as starter, and re-roots the child session", async () => {
+	it("creates a STANDALONE thread (no forum-only message field) then posts the intro into it, and re-roots the child session", async () => {
 		const { fetchImpl, calls } = makeFetchStub({ threadId: "T-42" });
 		const result = await materializeDiscordSubagentThread({
 			parentChannelId: "C-100",
@@ -90,13 +90,22 @@ describe("discord subagent thread-binding (Phase 6 materializer)", () => {
 		// The child session key is re-rooted into the thread.
 		assert.equal(result!.childSessionKey, "agent:scout:subagent:abc:thread:t-42");
 
-		// Exactly one REST call: POST /channels/C-100/threads with starter content.
+		// The thread is created STANDALONE: POST /channels/C-100/threads with a
+		// public-thread type and NO forum-only `message` starter field (that 400s
+		// on a normal text channel — the bug this fixes).
 		const threadCalls = calls.filter((c) => /\/channels\/C-100\/threads$/.test(c.url));
 		assert.equal(threadCalls.length, 1, "one thread-create call");
 		assert.equal(threadCalls[0]!.method, "POST");
-		const body = threadCalls[0]!.body as { name?: string; message?: { content?: string } };
+		const body = threadCalls[0]!.body as { name?: string; type?: number; message?: unknown };
 		assert.ok(body.name && body.name.length <= 100, "thread name set + within 100 chars");
-		assert.match(body.message?.content ?? "", /summarize the repo/, "intro is the starter message");
+		assert.equal(body.type, 11, "standalone PUBLIC_THREAD type");
+		assert.equal(body.message, undefined, "no forum-only message starter field on a text channel");
+
+		// The intro is posted as a SEPARATE message INTO the new thread channel.
+		const introCalls = calls.filter((c) => /\/channels\/T-42\/messages$/.test(c.url));
+		assert.equal(introCalls.length, 1, "one intro send into the thread");
+		assert.equal(introCalls[0]!.method, "POST");
+		assert.match((introCalls[0]!.body as { content?: string }).content ?? "", /summarize the repo/, "intro delivered into the thread");
 
 		// The binding is stored as session metadata keyed by the child key.
 		const binding = getDiscordSubagentThreadBinding(result!.childSessionKey);
@@ -104,6 +113,32 @@ describe("discord subagent thread-binding (Phase 6 materializer)", () => {
 		assert.equal(binding!.threadId, "T-42");
 		assert.equal(binding!.parentChannelId, "C-100");
 		assert.equal(binding!.agentId, "scout");
+	});
+
+	it("still binds + re-roots the child even when the intro send fails (thread already created)", async () => {
+		const calls: RecordedCall[] = [];
+		const fetchImpl = (async (url: unknown, init: unknown) => {
+			const u = String(url);
+			const i = (init ?? {}) as { method?: string; body?: string };
+			calls.push({ url: u, method: i.method ?? "GET", body: i.body ? JSON.parse(i.body) : undefined });
+			if (/\/threads$/.test(u)) {
+				return { ok: true, status: 200, json: async () => ({ id: "T-9" }) } as unknown as Response;
+			}
+			// The intro message send fails — must NOT undo the created thread.
+			return { ok: false, status: 403, json: async () => ({ code: 50013, message: "Missing Permissions" }) } as unknown as Response;
+		}) as unknown as typeof fetch;
+
+		const result = await materializeDiscordSubagentThread({
+			parentChannelId: "C-1",
+			baseChildSessionKey: "agent:scout:subagent:io",
+			agentId: "scout",
+			task: "x",
+			cfg: CFG,
+			fetchImpl,
+		});
+		assert.ok(result, "thread still materialized despite intro failure");
+		assert.equal(result!.threadId, "T-9");
+		assert.ok(getDiscordSubagentThreadBinding(result!.childSessionKey), "binding stored");
 	});
 
 	it("returns null (no binding) when no bot token is resolvable", async () => {

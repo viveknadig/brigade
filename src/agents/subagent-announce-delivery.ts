@@ -31,6 +31,7 @@
  */
 
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
+import type { DeliveryContext } from "../utils/delivery-context.js";
 import { enqueueSystemEvent } from "./session-inbox.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
 import {
@@ -147,6 +148,15 @@ export interface DeliverSubagentCompletionParams {
 	 * the queue insertion order.
 	 */
 	completionSeq?: number;
+	/**
+	 * Fix A2 — a delivery context the dispatcher uses to send the child's reply
+	 * to a CHANNEL (not just the parent's TUI inbox). For a Discord thread-bound
+	 * sub-agent this points at the bound thread (`channel:discord`, `to:
+	 * channel:<threadId>`, `threadId`), so the heartbeat hook's
+	 * `deliverReplyToChannel` (keyed off `resolveSystemEventDeliveryContext`)
+	 * delivers the announce — carrying the child's final reply — INTO the thread.
+	 */
+	deliveryContext?: DeliveryContext;
 }
 
 /**
@@ -174,6 +184,7 @@ export function deliverSubagentCompletionAnnounce(
 			sessionKey: parent,
 			contextKey: `subagent:ended:${params.runId}`,
 			trusted: true,
+			...(params.deliveryContext ? { deliveryContext: params.deliveryContext } : {}),
 		});
 	} catch (err) {
 		log.warn("deliverSubagentCompletionAnnounce threw", {

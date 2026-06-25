@@ -241,6 +241,9 @@ export async function resolveSendChannelId(to: string, opts: DiscordRestOptions)
 
 /* ───────────────────────── messaging / content ───────────────────────── */
 
+/** SUPPRESS_NOTIFICATIONS message flag (1 << 12) — silences the @-ping. */
+const DISCORD_SUPPRESS_NOTIFICATIONS_FLAG = 1 << 12;
+
 export async function sendMessage(
 	params: {
 		to: string;
@@ -249,6 +252,12 @@ export async function sendMessage(
 		components?: unknown[];
 		replyTo?: string;
 		silent?: boolean;
+		/**
+		 * Extra message flags to OR in (e.g. the Components-V2 flag 1<<15). The
+		 * silent flag is added on top of these. A V2 message must NOT carry plain
+		 * `content` — the caller moves text into TextDisplay blocks.
+		 */
+		flags?: number;
 	},
 	opts: DiscordRestOptions,
 ): Promise<unknown> {
@@ -262,7 +271,9 @@ export async function sendMessage(
 		body.components = params.components;
 	}
 	if (params.replyTo) body.message_reference = { message_id: params.replyTo };
-	if (params.silent) body.flags = 1 << 12; // SUPPRESS_NOTIFICATIONS
+	let flags = typeof params.flags === "number" && Number.isFinite(params.flags) ? params.flags : 0;
+	if (params.silent) flags |= DISCORD_SUPPRESS_NOTIFICATIONS_FLAG;
+	if (flags) body.flags = flags;
 	if (body.content === undefined && !body.embeds && !body.components) {
 		throw new Error("send requires content, embeds, or components");
 	}

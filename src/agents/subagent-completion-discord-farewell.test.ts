@@ -14,7 +14,11 @@ import {
 	resetAgentEventsForTests,
 	wireAgentEventsBridge,
 } from "./agent-events.js";
-import { resetSessionInboxForTest } from "./session-inbox.js";
+import {
+	peekSystemEventEntries,
+	resetSessionInboxForTest,
+	resolveSystemEventDeliveryContext,
+} from "./session-inbox.js";
 import { registerSubagentRun, resetSubagentRegistryForTests } from "./subagent-registry.js";
 import { resetSubagentCompletionBridgeForTests } from "./subagent-completion-bridge.js";
 import type { BrigadeConfig } from "../config/io.js";
@@ -100,6 +104,81 @@ test("completion bridge sends a Discord farewell + drops the binding on child en
 		resetSubagentCompletionBridgeForTests();
 		resetSubagentRegistryForTests();
 		resetAgentEventsForTests();
+	}
+});
+
+test("completion bridge delivers the child's reply INTO the bound thread (announce carries the thread deliveryContext)", async () => {
+	resetAgentEventsForTests();
+	resetSessionInboxForTest();
+	resetSubagentRegistryForTests();
+	resetSubagentCompletionBridgeForTests();
+	resetDiscordSubagentThreadBindingsForTests();
+
+	const savedToken = process.env.DISCORD_BOT_TOKEN;
+	process.env.DISCORD_BOT_TOKEN = "tok-test";
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = (async () =>
+		({ ok: true, status: 200, json: async () => ({ id: "msg-1" }) }) as unknown as Response) as unknown as typeof fetch;
+
+	const disposeBridge = wireAgentEventsBridge();
+	try {
+		// A Discord-origin spawn: the parent session is a CHANNEL session (not the
+		// operator main), so the announce routes through the inbox + channel.
+		const parentSessionKey = "agent:scout:discord:peer:C-1";
+		const childSessionKey = "agent:scout:subagent:rd1:thread:t-77";
+		const runId = "run-rd-1";
+
+		rememberDiscordSubagentThreadBinding({
+			childSessionKey,
+			threadId: "T-77",
+			parentChannelId: "C-1",
+			accountId: "default",
+			agentId: "scout",
+			boundAt: Date.now(),
+		});
+
+		registerSubagentRun({
+			runId,
+			childSessionKey,
+			controllerSessionKey: parentSessionKey,
+			requesterSessionKey: parentSessionKey,
+			requesterDisplayKey: parentSessionKey,
+			task: "thread task",
+			cleanup: "keep",
+			createdAt: Date.now() - 50,
+		});
+
+		emitAgentEvent({
+			runId,
+			stream: "lifecycle",
+			sessionKey: childSessionKey,
+			data: { phase: "end", ok: true, reply: "the child's final answer" },
+		});
+
+		await new Promise((r) => setTimeout(r, 60));
+
+		// The announce landed in the PARENT inbox carrying the child's reply AND a
+		// deliveryContext pointing at the BOUND THREAD — so the heartbeat hook's
+		// deliverReplyToChannel will send the reply into the thread, not just the
+		// parent's TUI inbox.
+		const entries = peekSystemEventEntries(parentSessionKey);
+		assert.equal(entries.length, 1, "one completion announce enqueued");
+		assert.match(entries[0]!.text, /the child's final answer/, "announce carries the child's reply");
+		const ctx = resolveSystemEventDeliveryContext(entries);
+		assert.ok(ctx, "announce carries a delivery context");
+		assert.equal(ctx!.channel, "discord", "delivery targets the discord channel");
+		assert.equal(ctx!.to, "channel:T-77", "delivery targets the bound thread channel");
+		assert.equal(String(ctx!.threadId), "T-77", "delivery context carries the thread id");
+	} finally {
+		disposeBridge();
+		globalThis.fetch = originalFetch;
+		if (savedToken === undefined) delete process.env.DISCORD_BOT_TOKEN;
+		else process.env.DISCORD_BOT_TOKEN = savedToken;
+		resetDiscordSubagentThreadBindingsForTests();
+		resetSubagentCompletionBridgeForTests();
+		resetSubagentRegistryForTests();
+		resetAgentEventsForTests();
+		resetSessionInboxForTest();
 	}
 });
 

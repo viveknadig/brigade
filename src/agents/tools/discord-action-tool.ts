@@ -78,6 +78,14 @@ import {
 	unban,
 	untimeout,
 } from "../channels/discord/rest-actions.js";
+import {
+	serializeDiscordModalTrigger,
+	serializeDiscordSelectRow,
+	serializeDiscordV2Message,
+	type DiscordBlocksInput,
+	type DiscordModalInput,
+	type DiscordSelectInput,
+} from "../channels/discord/rest-components.js";
 import { jsonResult } from "./common.js";
 import type { AgentToolResult, BrigadeTool } from "./types.js";
 
@@ -102,6 +110,152 @@ const EmbedSpecSchema = Type.Object(
 				{ maxItems: 25 },
 			),
 		),
+	},
+	{ additionalProperties: false },
+);
+
+/* ── typed interactive-component specs (Fix A1) ── */
+
+/** A structured string-select option. */
+const SelectOptionSchema = Type.Object(
+	{
+		label: Type.String({ maxLength: 100 }),
+		value: Type.String({ maxLength: 100 }),
+		description: Type.Optional(Type.String({ maxLength: 100 })),
+	},
+	{ additionalProperties: false },
+);
+
+/**
+ * A structured select-menu spec. The tool serializes it into a Discord
+ * action-row whose `custom_id` carries the general-callback marker, so a press
+ * routes through the existing select branch and surfaces the chosen values.
+ */
+const SelectSpecSchema = Type.Object(
+	{
+		kind: Type.Union(
+			[Type.Literal("string"), Type.Literal("user"), Type.Literal("role"), Type.Literal("channel"), Type.Literal("mentionable")],
+			{ description: "Select kind. `string` needs `options`; the entity kinds (user/role/channel/mentionable) don't." },
+		),
+		customId: Type.String({ description: "App-defined token a press routes back to the agent (general-prefixed automatically).", maxLength: 80 }),
+		placeholder: Type.Optional(Type.String({ maxLength: 150 })),
+		minValues: Type.Optional(Type.Number({ description: "Min selections (default 1)." })),
+		maxValues: Type.Optional(Type.Number({ description: "Max selections (default 1)." })),
+		options: Type.Optional(Type.Array(SelectOptionSchema, { maxItems: 25, description: "string-select options (required for kind:string, ≤25)." })),
+	},
+	{ additionalProperties: false },
+);
+
+/** A single modal text-input field. */
+const ModalFieldSchema = Type.Object(
+	{
+		id: Type.String({ description: "Field id — echoed back keying the submitted value.", maxLength: 100 }),
+		label: Type.String({ maxLength: 45 }),
+		style: Type.Optional(Type.Union([Type.Literal("short"), Type.Literal("paragraph")])),
+		required: Type.Optional(Type.Boolean()),
+		placeholder: Type.Optional(Type.String({ maxLength: 100 })),
+	},
+	{ additionalProperties: false },
+);
+
+/**
+ * A structured modal spec. The tool registers the form in the TTL modal registry
+ * and emits a trigger button whose `custom_id` is the `modal:<id>` marker the
+ * press-router opens via `showModal`; submitting the form routes back as a turn.
+ */
+const ModalSpecSchema = Type.Object(
+	{
+		buttonLabel: Type.String({ description: "Label of the button that opens the form.", maxLength: 80 }),
+		title: Type.Optional(Type.String({ description: "Modal heading.", maxLength: 45 })),
+		fields: Type.Array(ModalFieldSchema, { minItems: 1, maxItems: 5, description: "1..5 text-input fields." }),
+		buttonStyle: Type.Optional(Type.Number({ description: "Trigger button style (1=primary, 2=secondary, 3=success, 4=danger)." })),
+	},
+	{ additionalProperties: false },
+);
+
+/** A Components-V2 layout block (discriminated by `type`). */
+const BlockSpecSchema = Type.Union(
+	[
+		Type.Object({ type: Type.Literal("text"), text: Type.String({ maxLength: 4000 }) }, { additionalProperties: false }),
+		Type.Object(
+			{
+				type: Type.Literal("section"),
+				texts: Type.Array(Type.String({ maxLength: 4000 }), { minItems: 1, maxItems: 3 }),
+				accessory: Type.Optional(
+					Type.Union([
+						Type.Object({ kind: Type.Literal("thumbnail"), url: Type.String({ maxLength: 2048 }) }, { additionalProperties: false }),
+						Type.Object(
+							{
+								kind: Type.Literal("button"),
+								button: Type.Object(
+									{
+										label: Type.String({ maxLength: 80 }),
+										url: Type.Optional(Type.String({ maxLength: 2048 })),
+										customId: Type.Optional(Type.String({ maxLength: 100 })),
+										style: Type.Optional(Type.Number()),
+									},
+									{ additionalProperties: false },
+								),
+							},
+							{ additionalProperties: false },
+						),
+					]),
+				),
+			},
+			{ additionalProperties: false },
+		),
+		Type.Object(
+			{
+				type: Type.Literal("separator"),
+				divider: Type.Optional(Type.Boolean()),
+				spacing: Type.Optional(Type.Union([Type.Literal("small"), Type.Literal("large")])),
+			},
+			{ additionalProperties: false },
+		),
+		Type.Object(
+			{
+				type: Type.Literal("actions"),
+				buttons: Type.Array(
+					Type.Object(
+						{
+							label: Type.String({ maxLength: 80 }),
+							url: Type.Optional(Type.String({ maxLength: 2048 })),
+							customId: Type.Optional(Type.String({ maxLength: 100 })),
+							style: Type.Optional(Type.Number()),
+						},
+						{ additionalProperties: false },
+					),
+					{ maxItems: 5 },
+				),
+			},
+			{ additionalProperties: false },
+		),
+		Type.Object(
+			{
+				type: Type.Literal("media-gallery"),
+				items: Type.Array(
+					Type.Object(
+						{ url: Type.String({ maxLength: 2048 }), description: Type.Optional(Type.String({ maxLength: 1024 })), spoiler: Type.Optional(Type.Boolean()) },
+						{ additionalProperties: false },
+					),
+					{ maxItems: 10 },
+				),
+			},
+			{ additionalProperties: false },
+		),
+		Type.Object(
+			{ type: Type.Literal("file"), url: Type.String({ description: "An attachment:// ref.", maxLength: 2048 }), spoiler: Type.Optional(Type.Boolean()) },
+			{ additionalProperties: false },
+		),
+	],
+	{ description: "A Components-V2 layout block." },
+);
+
+/** A structured Components-V2 message spec (container of blocks). */
+const BlocksSpecSchema = Type.Object(
+	{
+		blocks: Type.Array(BlockSpecSchema, { minItems: 1, maxItems: 40, description: "Ordered V2 layout blocks." }),
+		accentColor: Type.Optional(Type.Number({ description: "Container accent color (decimal int)." })),
 	},
 	{ additionalProperties: false },
 );
@@ -170,7 +324,10 @@ const DiscordActionParams = Type.Object({
 	content: Type.Optional(Type.String({ description: "Message text for send/poll/sticker.", maxLength: 4000 })),
 	embed: Type.Optional(EmbedSpecSchema),
 	embeds: Type.Optional(Type.Array(EmbedSpecSchema, { maxItems: 10, description: "Rich embeds for send." })),
-	components: Type.Optional(Type.Array(Type.Unknown(), { description: "Pre-built Discord component rows (from the Phase-3 builders)." })),
+	components: Type.Optional(Type.Array(Type.Unknown(), { description: "send (power-user): raw Discord component-row JSON, passed through verbatim. Prefer the typed `select` / `modal` / `blocks` params." })),
+	select: Type.Optional(SelectSpecSchema),
+	modal: Type.Optional(ModalSpecSchema),
+	blocks: Type.Optional(BlocksSpecSchema),
 	replyTo: Type.Optional(Type.String({ description: "send: message id to reply to.", maxLength: 64 })),
 	silent: Type.Optional(Type.Boolean({ description: "send: suppress the @-notification ping." })),
 
@@ -259,6 +416,9 @@ interface DiscordActionResult {
 
 const MAX_DATA_CHARS = 12_000;
 
+/** Discord allows at most 5 component (action) rows on a classic message. */
+const DISCORD_MAX_COMPONENT_ROWS = 5;
+
 /** Compact a payload so a large list result can't flood the model's context. Pure. */
 export function capDiscordData(value: unknown, maxChars = MAX_DATA_CHARS): unknown {
 	let s: string;
@@ -340,7 +500,7 @@ export function makeDiscordActionTool(
 		ownerOnly: true,
 		description: [
 			"Manage a Discord server over the Discord REST API: post/edit content and run guild administration the everyday chat reply can't.",
-			"Messaging: action:send (to a channel id or user:<id> DM — content + optional embeds/components), send-embed (a rich embed), poll, sticker, read-messages, list-reactions, remove-reaction, thread-create, list-threads, search-messages.",
+			"Messaging: action:send (to a channel id or user:<id> DM — content + optional embeds; interactive `select` / `modal` / `blocks` (Components-V2) specs that the user can press/submit — a press routes back to you as a turn), send-embed (a rich embed), poll, sticker, read-messages, list-reactions, remove-reaction, thread-create, list-threads, search-messages.",
 			"Guild-admin: channel-create/edit/delete/move, category-create/edit/delete, role-list/add/remove/info, member-info, emoji-list/upload, event-list/create (scheduled events).",
 			"Moderation: ban, unban, kick, timeout, untimeout — Discord enforces the bot's own permissions (a missing-permission error is decoded into a clear hint).",
 			"Owner-only. Most actions need ids (guildId / channelId / userId / messageId); the tool reports clearly when one is missing.",
@@ -407,12 +567,52 @@ export function makeDiscordActionTool(
 					case "send": {
 						const to = need(args.to, "to");
 						if (!to) return missing("to");
+
+						// Typed interactive components (Fix A1). Each structured spec is
+						// serialized into raw Discord component-row JSON carrying the SAME
+						// custom_id codecs the press-routing expects; a `blocks` (V2) spec
+						// also sets the IsComponentsV2 message flag (text must live in
+						// TextDisplay blocks, not plain content). The raw `components`
+						// passthrough still works for power users.
+						const componentRows: unknown[] = Array.isArray(args.components) ? [...args.components] : [];
+						let v2Flags = 0;
+						let isV2 = false;
+						if (args.modal) {
+							const built = serializeDiscordModalTrigger({
+								...(args.modal as DiscordModalInput),
+								...(accountId ? { accountId } : {}),
+							});
+							if (!built.ok) return fail(built.error);
+							componentRows.push(built.row);
+						}
+						if (args.select) {
+							const built = serializeDiscordSelectRow(args.select as DiscordSelectInput);
+							if (!built.ok) return fail(built.error);
+							componentRows.push(built.row);
+						}
+						if (args.blocks) {
+							const built = serializeDiscordV2Message(args.blocks as DiscordBlocksInput);
+							if (!built.ok) return fail(built.error);
+							// A V2 message is its OWN components array + flag — it cannot mix
+							// with classic content/embeds/action-rows.
+							if (args.content || (Array.isArray(args.embeds) && args.embeds.length > 0) || componentRows.length > 0) {
+								return fail("blocks (Components-V2) cannot be combined with content, embeds, or select/modal in one send — send them separately.");
+							}
+							componentRows.push(...built.components);
+							v2Flags = built.flags;
+							isV2 = true;
+						}
+						if (componentRows.length > DISCORD_MAX_COMPONENT_ROWS && !isV2) {
+							return fail(`send accepts at most ${DISCORD_MAX_COMPONENT_ROWS} component rows.`);
+						}
+
 						const data = await sendMessage(
 							{
 								to,
-								...(args.content ? { content: args.content } : {}),
-								...(args.embeds ? { embeds: args.embeds as DiscordEmbedSpec[] } : {}),
-								...(args.components ? { components: args.components } : {}),
+								...(args.content && !isV2 ? { content: args.content } : {}),
+								...(args.embeds && !isV2 ? { embeds: args.embeds as DiscordEmbedSpec[] } : {}),
+								...(componentRows.length > 0 ? { components: componentRows } : {}),
+								...(v2Flags ? { flags: v2Flags } : {}),
 								...(args.replyTo ? { replyTo: args.replyTo } : {}),
 								...(args.silent ? { silent: true } : {}),
 							},
