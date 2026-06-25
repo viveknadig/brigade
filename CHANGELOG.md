@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.10.0](https://github.com/spinabot/brigade/compare/brigade-v1.9.0...brigade-v1.10.0) (2026-06-25)
+
+
+### Features
+
+* **expose+tools:** expose/tunnel command + document/media tool dependencies ([156aa49](https://github.com/spinabot/brigade/commit/156aa49fedcfad157c23131051e9c825f6a9efda))
+* **media:** analyze_media sees embedded Office-doc images BY DEFAULT (no bash) ([9d2deef](https://github.com/spinabot/brigade/commit/9d2deefa59f721fccf2671d211bf5819c45e85fd))
+* **tools:** document authoring — make_document + edit_document (docx/xlsx/pptx/pdf) ([a004e4e](https://github.com/spinabot/brigade/commit/a004e4eb5848825102619ee300ed1b2f9712e291))
+* **tools:** document authoring beats Hermes — cross-run replace, mail-merge, unicode PDF, formulas, charts ([1660b71](https://github.com/spinabot/brigade/commit/1660b71723b13fd519e8025f757cd3cb86c84a07))
+* **tools:** media tool best-in-class — audio fix, image downscale, multi-source, more formats ([c41566c](https://github.com/spinabot/brigade/commit/c41566c6e9c058c14bf66bf4d88cf472ff38673c))
+
+
+### Bug Fixes
+
+* **cost:** stop logging a garbage negative cost for unpriced models ([ff4fad1](https://github.com/spinabot/brigade/commit/ff4fad15d092c448e1529b524a0fcda37dd0d317))
+* **media:** send-a-doc → Brigade understands it, end-to-end across all channels ([8dc5afd](https://github.com/spinabot/brigade/commit/8dc5afdf06daffdac78f42978943591c001edc99))
+
 ## [1.9.0](https://github.com/spinabot/brigade/compare/brigade-v1.8.0...brigade-v1.9.0) (2026-06-25)
 
 
