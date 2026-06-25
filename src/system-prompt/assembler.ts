@@ -5,6 +5,7 @@ import { sanitizeForPromptLiteral } from "./sanitize.js";
 import { formatRuntimeLine, type RuntimeParams } from "./runtime-params.js";
 import {
   DELEGATION_CASCADE_GUIDANCE,
+  DOCUMENT_GUIDANCE,
   MEDIA_GUIDANCE,
   MEMORY_GUIDANCE,
   ORG_AWARENESS_GUIDANCE,
@@ -810,6 +811,19 @@ export function assembleSystemPrompt(args: AssembleArgs): AssembledPrompt {
   // tool is in its surface only if it was wired.
   if (args.toolDescriptions.some((t) => t.name === "analyze_media")) {
     lines.push(MEDIA_GUIDANCE);
+    lines.push("");
+  }
+
+  // 7d''. ## Creating & editing documents (conditional on the `make_document`
+  // tool). Keyed on the tool NAME (like MEDIA_GUIDANCE) so it only renders when
+  // the authoring tools are actually in the surface. Teaches the model the two
+  // correct WRITE surfaces (make_document / edit_document), that they pair with
+  // analyze_media (read) + send_media (deliver), and that hand-rolling an Office
+  // file in bash silently fails (no python/pandoc/libreoffice here). NOT gated
+  // on minimal mode — a cron / sub-agent turn asked to produce a report needs it
+  // exactly as much, and the tool is in its surface only if it was wired.
+  if (args.toolDescriptions.some((t) => t.name === "make_document")) {
+    lines.push(DOCUMENT_GUIDANCE);
     lines.push("");
   }
 

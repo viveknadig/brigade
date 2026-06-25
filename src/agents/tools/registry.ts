@@ -37,6 +37,8 @@ import { makeManageAgentTool } from "./manage-agent-tool.js";
 import { makeFindTool } from "./find-tool.js";
 import { makeGenerateImageTool } from "./generate-image-tool.js";
 import { makeAnalyzeMediaTool } from "./analyze-media-tool.js";
+import { makeMakeDocumentTool } from "./make-document-tool.js";
+import { makeEditDocumentTool } from "./edit-document-tool.js";
 import { makeManageAccessTool } from "./manage-access-tool.js";
 import { makeManageChannelAccessTool } from "./manage-channel-access-tool.js";
 import { makeConnectChannelTool } from "./connect-channel-tool.js";
@@ -282,6 +284,29 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 			...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
 			...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
 			...(opts.modelContext !== undefined ? { modelContext: opts.modelContext } : {}),
+		}),
+		// make_document — CREATE a Word/Excel/PowerPoint/PDF file from structured
+		// content (the WRITE sibling of analyze_media's read side). Pure-JS libs
+		// (docx / exceljs / pptxgenjs / @cantoo/pdf-lib), no code sandbox needed.
+		// NOT owner-only: writing a file into the workspace is safe, and the
+		// output-path guard (workspace/cwd/cache/temp + the secret/system denylist,
+		// reused from analyze_media) is the real boundary. Produces a path the
+		// agent then hands off via send_media.
+		makeMakeDocumentTool({
+			...(opts.workspaceDir !== undefined ? { workspaceDir: opts.workspaceDir } : {}),
+			...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+			...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+		}),
+		// edit_document — EDIT an existing Word/Excel/PowerPoint/PDF in place
+		// (docx append/replace_text, xlsx set_cells/append_rows, pptx replace_text,
+		// pdf fill_form/merge/split/stamp/watermark/add_pages/remove_pages),
+		// preserving the parts it doesn't touch (OOXML unzip→edit-XML→rezip for
+		// high-fidelity docx/pptx; exceljs / pdf-lib load→mutate→save). Same path
+		// guard on BOTH the input source AND the output. NOT owner-only.
+		makeEditDocumentTool({
+			...(opts.workspaceDir !== undefined ? { workspaceDir: opts.workspaceDir } : {}),
+			...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+			...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
 		}),
 		// manage_provider — owner-only credential + per-agent model surface.
 		// Exists so a pasted API key lands in the canonical 0600 credential

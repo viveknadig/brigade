@@ -254,6 +254,32 @@ Call \`analyze_media({ source: "<path>", question: "<the user's request>" })\` B
 
 Images attached to the message are already visible to you inline when your model supports vision — describe or use them directly, no tool call needed. Only reach for \`analyze_media\` on an image if you genuinely cannot see it (e.g. the note says it was attached but no image is present in the message, which means the current model is text-only).`;
 
+/* ───────────────── Document authoring guidance (conditional on make_document tool) ───────────────── */
+
+/**
+ * Injected when the `make_document` tool is wired this turn (gated on the tool
+ * NAME, like MEDIA_GUIDANCE — not a capability flag — so it only renders when
+ * the model actually has the authoring tools to call).
+ *
+ * Closes the WRITE gap: Brigade has no python / pandoc / libreoffice and no code
+ * sandbox, so a model that tries to "write a Word doc" in bash silently fails.
+ * This block tells it the two correct surfaces (`make_document` to create,
+ * `edit_document` to change), that they pair with `analyze_media` (read) and
+ * `send_media` (deliver), and that it must NEVER claim a file was produced
+ * without actually calling the tool.
+ */
+export const DOCUMENT_GUIDANCE = `## Creating & editing documents
+
+You can produce real Office / PDF files natively — no shell, no Python, no LibreOffice (none of those exist here; trying to build a .docx/.xlsx/.pptx in \`bash\` will silently fail). Two tools own this:
+
+- \`make_document({ format, content, outputPath? })\` — CREATE a Word (docx), Excel (xlsx), PowerPoint (pptx), or PDF from scratch. \`content\` is structured per format: docx → \`{title?, sections:[{heading?, level?, paragraphs?, bullets?, table?, image?}]}\`; xlsx → \`{sheets:[{name?, header?, rows}]}\`; pptx → \`{slides:[{title?, bullets?, image?, notes?}]}\`; pdf → \`{title?, pages:[{heading?, paragraphs?, image?}]}\`. Images embed from a local \`path\` or \`url\`. The file is written into the workspace by default; the tool returns its \`path\`.
+
+- \`edit_document({ source, action, ... })\` — change an EXISTING file, preserving everything you don't touch. docx: \`append\` ({paragraphs, heading?}) / \`replace_text\` ({find, replace}). xlsx: \`set_cells\` ({sheet?, cells:[{ref|row,col, value}]}) / \`append_rows\` ({sheet?, rows}). pptx: \`replace_text\` ({find, replace}). pdf: \`fill_form\` ({fields}) / \`merge\` ({pdfs}) / \`split\` ({pages}) / \`stamp\` or \`watermark\` ({text}) / \`add_pages\` ({pdfs}) / \`remove_pages\` ({pages}). Writes over the source unless you pass \`outputPath\`.
+
+This is the WRITE half of document handling and pairs with \`analyze_media\` (the READ half): to turn a PDF into a Word memo, \`analyze_media\` the PDF to understand it, then \`make_document\` the memo. After producing a file, hand it to the user with \`send_media({path})\` on a channel, or just report the workspace path on the TUI.
+
+Never claim you created or edited a document without actually calling one of these tools — there is no other way a file appears on disk. Don't reach for \`write\`/\`edit\` to hand-author binary Office formats (they are zipped XML; a raw write corrupts them); use these tools.`;
+
 /* ───────────────── Sub-agent guidance (conditional on spawn_agent tool) ───────────────── */
 
 /**
