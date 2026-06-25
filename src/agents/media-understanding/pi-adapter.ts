@@ -1,5 +1,5 @@
 /**
- * Pi-SDK media-understanding adapter — the GENERAL image (and audio) path.
+ * Pi-SDK media-understanding adapter — the GENERAL image path.
  *
  * The bespoke google/anthropic REST adapters only cover two providers, so an
  * operator whose only key is OpenAI / Groq / Mistral / OpenRouter / xAI /
@@ -9,13 +9,17 @@
  * provider, ships the media as an `ImageContent` block + the prompt, and
  * returns the assistant's TEXT — exactly the same shape the REST adapters
  * return. Pi's content model is text + image, so this covers IMAGE for every
- * provider that declares image input; AUDIO rides the same path for the
- * providers whose models accept audio (Pi carries audio inside the image-style
- * inline block on capable providers; we pass the declared MIME through).
+ * provider that declares image input.
+ *
+ * AUDIO is NOT served here. Pi's `Model.input` is `("text"|"image")[]` — there
+ * is no audio modality anywhere in the SDK content model — so a voice note
+ * routed through this path would be packed into an IMAGE block and rejected by
+ * the provider (HTTP 400). Audio understanding is Gemini-only (its real inline-
+ * audio capability); the audio chain in `index.ts` excludes `pi` accordingly.
  *
  * VIDEO (Gemini Files API) and native PDF (Anthropic `document` block) are NOT
- * served here — Pi has no video or document content block — so those stay on
- * the bespoke adapters.
+ * served here either — Pi has no video or document content block — so those
+ * stay on the bespoke adapters.
  *
  * The actual model call is injected as `cfg.piComplete` (defaulting to the
  * `completeSimple` wrapper below) so the whole subsystem stays testable with
@@ -35,7 +39,6 @@ import {
 /** Per-kind default instruction when the caller supplies no prompt. */
 const DEFAULT_PROMPTS: Partial<Record<MediaUnderstandingKind, string>> = {
 	image: "Describe this image in detail.",
-	audio: "Transcribe this audio, then briefly summarize what is said.",
 };
 
 /** True when a resolved model declares image input. */
@@ -50,6 +53,11 @@ export function modelAcceptsImage(model: MediaUnderstandingModel | undefined): b
  *     the first provider whose `cfg.resolveModel` yields an image-capable model.
  * Returns `undefined` when the Pi path is unwired (no `resolveModel`) or no
  * keyed provider has an image-capable model.
+ *
+ * The Pi path is image-only (Pi carries no audio block), so a resolved model
+ * MUST declare image input regardless of `kind` — there is no audio escape
+ * hatch. Audio never reaches here (the audio chain in `index.ts` excludes
+ * `pi`); the image gate below is the defensive backstop.
  */
 export function resolvePiModel(
 	kind: MediaUnderstandingKind,
@@ -64,12 +72,9 @@ export function resolvePiModel(
 		} catch {
 			return undefined;
 		}
-		// Image understanding requires image input. Audio is best-effort: a model
-		// that accepts image is the common multimodal case, but we don't hard-gate
-		// audio on the image flag (a future audio-only model would still be valid),
-		// so for audio we accept any resolved model.
+		// The Pi path can only carry an IMAGE block, so require image input for
+		// every kind — a non-image model (or an audio request) cannot be served.
 		if (!model) return undefined;
-		if (kind === "audio") return model;
 		return modelAcceptsImage(model) ? model : undefined;
 	};
 

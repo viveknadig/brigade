@@ -62,6 +62,9 @@ function toolWithBytes(
 		...(modelContext ? { modelContext } : {}),
 		acquireLocal: async () => ({ bytes, ...(mime ? { mime } : {}), truncated: false }),
 		acquireUrl: async () => ({ bytes, ...(mime ? { mime } : {}), truncated: false }),
+		// Disable the disk result cache by default so identical stub inputs across
+		// tests stay isolated; the cache has its own dedicated tests below.
+		resultCache: false,
 		...(extra ?? {}),
 	});
 }
@@ -799,39 +802,457 @@ describe("analyze_media — video with anthropic override", () => {
 	});
 });
 
-/* ─────────── image byte-cap re-check on a late-detected image (#4b) ─────────── */
+/* ─────────── oversize image is DOWNSCALED, not truncated (#2) ─────────── */
 
-describe("analyze_media — image cap re-applied for an extension-less image URL", () => {
-	it("re-trims to the image cap when the kind is only known via MIME", async () => {
-		// An extension-less URL that returns image/png with bytes > the image cap.
-		// Up-front `looksImage` is false (no extension), so it is fetched under the
-		// larger doc cap; after MIME detection the image cap must be re-applied.
+describe("analyze_media — oversize image is downscaled (not truncated)", () => {
+	// A fake downscaler that proves the tool calls it with the right budget and
+	// returns its bytes verbatim — the real jimp path is exercised separately in
+	// image-downscale.test.ts (with a real codec).
+	function fakeDownscale(stamp: Buffer): MakeAnalyzeMediaToolOptions["downscaleImage"] {
+		return async (_bytes, opts) => ({
+			bytes: stamp,
+			mimeType: "image/jpeg",
+			width: 1024,
+			height: 768,
+			resized: true,
+			rotated: false,
+			// echo the budget so the test can assert it (not part of the type — cast)
+			...({ _budget: opts.maxBytes } as object),
+		});
+	}
+
+	it("downscales an oversize image to a VALID image under the budget (no truncation)", async () => {
+		// Bytes larger than the image budget. The OLD behaviour truncated to the
+		// cap (corrupt); the NEW behaviour downscales to a valid image.
 		const big = Buffer.alloc(DEFAULT_IMAGE_MAX_BYTES + 10_000, 7);
+		const downscaled = Buffer.from("VALID-SMALL-JPEG-BYTES");
 		const tool = makeAnalyzeMediaTool({
 			modelContext: { modelId: "claude-opus-4-8" }, // vision-capable → image block
-			acquireUrl: async () => ({ bytes: big, mime: "image/png", truncated: false }),
+			acquireLocal: async () => ({ bytes: big, mime: "image/png", truncated: false }),
+			downscaleImage: fakeDownscale(downscaled),
 		});
-		const r = (await tool.execute("c1", { source: "https://x.com/download" })) as Result;
+		const r = (await tool.execute("c1", { source: "/ws/huge.png" })) as Result;
 		const imgs = imageBlocks(r);
 		assert.equal(imgs.length, 1);
-		// The returned image was re-trimmed to the image cap (base64 of the cap).
-		const expectedBytes = big.subarray(0, DEFAULT_IMAGE_MAX_BYTES);
-		assert.equal(imgs[0]?.data, expectedBytes.toString("base64"));
-		assert.equal(r.details.truncated, true);
-		assert.equal(r.details.bytes, DEFAULT_IMAGE_MAX_BYTES);
+		// The block carries the DOWNSCALED bytes, not a truncated prefix of `big`.
+		assert.equal(imgs[0]?.data, downscaled.toString("base64"));
+		assert.equal(imgs[0]?.mimeType, "image/jpeg", "re-encoded as JPEG");
+		assert.equal(r.details.bytes, downscaled.length);
+		// A successful downscale yields a valid image → NOT marked truncated.
+		assert.notEqual(r.details.truncated, true);
+		assert.match(textOf(r), /downscaled/i);
 	});
 
-	it("does NOT re-trim when maxBytes was raised explicitly", async () => {
-		const big = Buffer.alloc(DEFAULT_IMAGE_MAX_BYTES + 5_000, 3);
+	it("does NOT downscale a small image (returns it untouched)", async () => {
+		const small = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+		let called = false;
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { modelId: "claude-opus-4-8" },
+			acquireLocal: async () => ({ bytes: small, mime: "image/png", truncated: false }),
+			downscaleImage: async (b) => {
+				called = true;
+				return { bytes: b, mimeType: "image/png", width: 1, height: 1, resized: false, rotated: false };
+			},
+		});
+		const r = (await tool.execute("c1", { source: "/ws/tiny.png" })) as Result;
+		assert.equal(called, false, "downscaler not invoked for a small image");
+		assert.equal(imageBlocks(r)[0]?.data, small.toString("base64"));
+	});
+
+	it("an extension-less image URL (kind via MIME) is also downscaled to the budget", async () => {
+		// Up-front `looksImage` is false (no extension), so it is read at the
+		// ceiling; after MIME detection it must be downscaled to the image budget.
+		const big = Buffer.alloc(DEFAULT_IMAGE_MAX_BYTES + 50_000, 9);
+		const downscaled = Buffer.from("SMALL");
+		let sawBudget = -1;
 		const tool = makeAnalyzeMediaTool({
 			modelContext: { modelId: "claude-opus-4-8" },
 			acquireUrl: async () => ({ bytes: big, mime: "image/png", truncated: false }),
+			downscaleImage: async (_b, opts) => {
+				sawBudget = opts.maxBytes;
+				return { bytes: downscaled, mimeType: "image/jpeg", width: 800, height: 600, resized: true, rotated: false };
+			},
 		});
-		const r = (await tool.execute("c1", {
-			source: "https://x.com/download",
-			maxBytes: DEFAULT_IMAGE_MAX_BYTES + 5_000,
+		const r = (await tool.execute("c1", { source: "https://x.com/download" })) as Result;
+		assert.equal(imageBlocks(r)[0]?.data, downscaled.toString("base64"));
+		assert.equal(sawBudget, DEFAULT_IMAGE_MAX_BYTES, "downscaled to the image budget");
+	});
+
+	it("keeps original bytes when downscaling fails (undecodable) + warns truncated", async () => {
+		const big = Buffer.alloc(DEFAULT_IMAGE_MAX_BYTES + 1000, 1);
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { modelId: "claude-opus-4-8" },
+			acquireLocal: async () => ({ bytes: big, mime: "image/png", truncated: true }),
+			downscaleImage: async () => {
+				throw new Error("undecodable image");
+			},
+		});
+		const r = (await tool.execute("c1", { source: "/ws/broken.png" })) as Result;
+		// Falls back to the original bytes; still flagged as a possibly-corrupt block.
+		assert.equal(imageBlocks(r).length, 1);
+		assert.equal(r.details.truncated, true);
+		assert.match(textOf(r), /could not be re-encoded|may be corrupt/i);
+	});
+});
+
+/* ─────────────────────────── text / structured-text kind (#3) ─────────────────────────── */
+
+describe("analyze_media — plain / structured text", () => {
+	it("detects text by extension (csv/json/md/log/yaml/source)", () => {
+		assert.equal(detectKind({ source: "/a/data.csv" }), "text");
+		assert.equal(detectKind({ source: "/a/config.json" }), "text");
+		assert.equal(detectKind({ source: "/a/notes.md" }), "text");
+		assert.equal(detectKind({ source: "/a/server.log" }), "text");
+		assert.equal(detectKind({ source: "/a/conf.yaml" }), "text");
+		assert.equal(detectKind({ source: "/a/script.py" }), "text");
+		assert.equal(detectKind({ source: "/a/app.ts" }), "text");
+	});
+
+	it("detects text by MIME (text/* + application/json/xml)", () => {
+		assert.equal(detectKind({ source: "https://x.com/d", mime: "text/plain" }), "text");
+		assert.equal(detectKind({ source: "https://x.com/d", mime: "application/json" }), "text");
+		assert.equal(detectKind({ source: "https://x.com/d", mime: "application/xml" }), "text");
+		assert.equal(detectKind({ source: "https://x.com/d", mime: "application/vnd.api+json" }), "text");
+		// html still wins over the generic text branch
+		assert.equal(detectKind({ source: "https://x.com/d", mime: "text/html" }), "html");
+	});
+
+	it("reads a CSV as text wrapped in the untrusted envelope", async () => {
+		const csv = Buffer.from("name,age\nAlice,30\nBob,25\n");
+		const tool = toolWithBytes(csv);
+		const r = (await tool.execute("c1", { source: "/ws/data.csv", question: "who is oldest?" })) as Result;
+		assert.equal(r.details.ok, true);
+		assert.equal(r.details.kind, "text");
+		assert.equal(r.details.returned, "text");
+		const t = textOf(r);
+		assert.match(t, /Alice,30/);
+		assert.match(t, /who is oldest\?/);
+		assert.match(t, /EXTERNAL_UNTRUSTED_CONTENT/);
+	});
+
+	it("reads a JSON file and a Markdown file", async () => {
+		const json = toolWithBytes(Buffer.from('{"key":"value","n":42}'));
+		const rj = (await json.execute("c1", { source: "/ws/x.json" })) as Result;
+		assert.equal(rj.details.kind, "text");
+		assert.match(textOf(rj), /"key":"value"/);
+
+		const md = toolWithBytes(Buffer.from("# Heading\n\nSome **markdown** body."));
+		const rm = (await md.execute("c1", { source: "/ws/x.md" })) as Result;
+		assert.equal(rm.details.kind, "text");
+		assert.match(textOf(rm), /# Heading/);
+	});
+
+	it("strips a UTF-8 BOM", async () => {
+		const withBom = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from("hello after bom")]);
+		const tool = toolWithBytes(withBom);
+		const r = (await tool.execute("c1", { source: "/ws/x.txt" })) as Result;
+		assert.match(textOf(r), /hello after bom/);
+		assert.ok(!textOf(r).includes("﻿"), "BOM stripped");
+	});
+
+	it("falls back to text for an unknown extension whose bytes are UTF-8", async () => {
+		const tool = toolWithBytes(Buffer.from("key = value\n[section]\nx = 1\n"));
+		const r = (await tool.execute("c1", { source: "/ws/config.weirdext" })) as Result;
+		assert.equal(r.details.ok, true);
+		assert.equal(r.details.kind, "text");
+		assert.match(textOf(r), /\[section\]/);
+	});
+
+	it("still rejects true binary as unsupported (NUL bytes)", async () => {
+		const binary = Buffer.from([0x00, 0x01, 0x02, 0xff, 0x00, 0xfe, 0x00]);
+		const tool = toolWithBytes(binary, "application/octet-stream");
+		const r = (await tool.execute("c1", { source: "/ws/blob.weirdbin" })) as Result;
+		assert.equal(r.details.ok, false);
+		assert.match(textOf(r), /Unsupported or undetectable/i);
+	});
+});
+
+/* ─────────────────────────── multi-source batch (#4) ─────────────────────────── */
+
+describe("analyze_media — multi-source sources[]", () => {
+	const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+	function batchTool(extra?: Partial<MakeAnalyzeMediaToolOptions>) {
+		const bytesFor = (s: string): { bytes: Buffer; mime?: string; truncated: boolean } => {
+			if (/\.png$/.test(s)) return { bytes: png, mime: "image/png", truncated: false };
+			if (/\.csv$/.test(s)) return { bytes: Buffer.from("a,b\n1,2\n"), truncated: false };
+			if (/\.md$/.test(s)) return { bytes: Buffer.from("# Doc\nbody long enough to keep around"), truncated: false };
+			return { bytes: Buffer.from("plain text body"), truncated: false };
+		};
+		return makeAnalyzeMediaTool({
+			modelContext: { modelId: "claude-opus-4-8" },
+			acquireLocal: async (s) => bytesFor(s),
+			resultCache: false,
+			...(extra ?? {}),
+		});
+	}
+
+	it("multiple images → multiple image blocks with per-image labels", async () => {
+		const r = (await batchTool().execute("c1", {
+			sources: ["/ws/a.png", "/ws/b.png"],
+			question: "compare these",
 		})) as Result;
-		const imgs = imageBlocks(r);
-		assert.equal(imgs[0]?.data, big.toString("base64"), "full bytes kept when maxBytes raised");
+		assert.equal(imageBlocks(r).length, 2, "two image blocks in one result");
+		assert.equal(r.details.returned, "image");
+		const t = textOf(r);
+		assert.match(t, /--- Image 1: a\.png ---/);
+		assert.match(t, /--- Image 2: b\.png ---/);
+		assert.match(t, /compare these/);
+	});
+
+	it("multiple documents → labeled concatenated text", async () => {
+		const r = (await batchTool().execute("c1", {
+			sources: ["/ws/x.csv", "/ws/y.md"],
+			question: "summarize both",
+		})) as Result;
+		assert.equal(imageBlocks(r).length, 0);
+		const t = textOf(r);
+		assert.match(t, /--- File 1: x\.csv ---/);
+		assert.match(t, /--- File 2: y\.md ---/);
+		assert.match(t, /a,b/);
+		assert.match(t, /# Doc/);
+	});
+
+	it("`source` (singular) still works exactly as before", async () => {
+		const r = (await batchTool().execute("c1", { source: "/ws/a.png" })) as Result;
+		assert.equal(imageBlocks(r).length, 1);
+		assert.equal(r.details.source, "/ws/a.png", "single-source detail unchanged");
+	});
+
+	it("caps images at 20 with an overflow note", async () => {
+		const many = Array.from({ length: 23 }, (_, i) => `/ws/img${i}.png`);
+		const r = (await batchTool().execute("c1", { sources: many })) as Result;
+		assert.equal(imageBlocks(r).length, 20, "capped to 20 image blocks");
+		assert.match(textOf(r), /beyond the per-call cap/i);
+	});
+
+	it("empty sources[] + no source → input error", async () => {
+		await assert.rejects(() => batchTool().execute("c1", { sources: [] as string[] }), /source required/);
+	});
+
+	it("an unsupported source in a batch is reported inline (labeled) without aborting", async () => {
+		const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+		const tool = makeAnalyzeMediaTool({
+			modelContext: { modelId: "claude-opus-4-8" },
+			acquireLocal: async (s) =>
+				/\.png$/.test(s)
+					? { bytes: png, mime: "image/png", truncated: false }
+					: { bytes: Buffer.from([0x00, 0x01, 0x02, 0xff]), mime: "application/octet-stream", truncated: false },
+			resultCache: false,
+		});
+		// One good image + one unsupported binary blob (treated as a doc in the batch).
+		const r = (await tool.execute("c1", { sources: ["/ws/a.png", "/ws/blob.bin"] })) as Result;
+		// The good image still produced a block; the bad file's message is inline.
+		assert.equal(imageBlocks(r).length, 1, "the valid image still analyzed");
+		assert.match(textOf(r), /--- File 1: blob\.bin ---/);
+		assert.match(textOf(r), /Unsupported or undetectable/i);
+	});
+});
+
+/* ─────────────────────────── audio language hint (#5) ─────────────────────────── */
+
+describe("analyze_media — audio language hint", () => {
+	it("folds the language hint into the provider prompt", async () => {
+		const { run, calls } = stubRunner("Transcripción: hola.", "google", "gemini-2.5-flash");
+		const tool = toolWithBytes(Buffer.from([1, 2, 3]), "audio/ogg", undefined, {
+			mediaUnderstandingConfig: muCfg(["google"]),
+			runMediaUnderstanding: run,
+		});
+		await tool.execute("c1", { source: "/ws/voice.ogg", question: "what was said?", language: "Spanish" });
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0]?.kind, "audio");
+		// The provider prompt carries BOTH the question and the language hint.
+		assert.match(calls[0]?.prompt ?? "", /what was said\?/);
+		assert.match(calls[0]?.prompt ?? "", /Spanish/);
+	});
+
+	it("defaults to transcribe+summarize when no question, still honoring language", async () => {
+		const { run, calls } = stubRunner("ok", "google");
+		const tool = toolWithBytes(Buffer.from([1]), "audio/ogg", undefined, {
+			mediaUnderstandingConfig: muCfg(["google"]),
+			runMediaUnderstanding: run,
+		});
+		await tool.execute("c1", { source: "/ws/voice.ogg", language: "fr" });
+		assert.match(calls[0]?.prompt ?? "", /[Tt]ranscribe/);
+		assert.match(calls[0]?.prompt ?? "", /fr/);
+	});
+});
+
+/* ─────────────────────────── extra document formats (#6) ─────────────────────────── */
+
+describe("analyze_media — extra document formats", () => {
+	function buildOdt(text: string): Buffer {
+		const content = `<?xml version="1.0"?><office:document-content xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:text><text:p>${text}</text:p></office:text></office:body></office:document-content>`;
+		return Buffer.from(zipSync({ mimetype: strToU8("application/vnd.oasis.opendocument.text"), "content.xml": strToU8(content) }));
+	}
+	function buildEpub(): Buffer {
+		const opf = `<?xml version="1.0"?><package><manifest><item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/></spine></package>`;
+		const ch1 = `<html><body><h1>Chapter One</h1><p>Opening paragraph long enough for the readability extractor to keep.</p></body></html>`;
+		return Buffer.from(zipSync({ mimetype: strToU8("application/epub+zip"), "content.opf": strToU8(opf), "ch1.xhtml": strToU8(ch1) }));
+	}
+
+	it("odt → extracted text", async () => {
+		const tool = toolWithBytes(buildOdt("OpenDocument body text here."));
+		const r = (await tool.execute("c1", { source: "/ws/d.odt" })) as Result;
+		assert.equal(r.details.ok, true);
+		assert.equal(r.details.kind, "odt");
+		assert.match(textOf(r), /OpenDocument body text here\./);
+	});
+
+	it("epub → readable text in spine order", async () => {
+		const tool = toolWithBytes(buildEpub());
+		const r = (await tool.execute("c1", { source: "/ws/book.epub" })) as Result;
+		assert.equal(r.details.ok, true);
+		assert.equal(r.details.kind, "epub");
+		assert.match(textOf(r), /Chapter One/);
+		assert.match(textOf(r), /Opening paragraph/);
+	});
+
+	it("rtf → plain text (control words stripped)", async () => {
+		const rtf = Buffer.from(String.raw`{\rtf1\ansi\deff0 {\fonttbl{\f0 Times;}}\f0\fs24 Hello \b world\b0 .\par Second line.\par}`);
+		const tool = toolWithBytes(rtf);
+		const r = (await tool.execute("c1", { source: "/ws/doc.rtf" })) as Result;
+		assert.equal(r.details.ok, true);
+		assert.equal(r.details.kind, "rtf");
+		const t = textOf(r);
+		assert.match(t, /Hello world/);
+		assert.match(t, /Second line/);
+		assert.ok(!/fonttbl/.test(t), "control tables stripped");
+	});
+
+	it("ipynb → cell source with code fences (outputs skipped)", async () => {
+		const nb = {
+			cells: [
+				{ cell_type: "markdown", source: ["# My Notebook\n", "Intro."] },
+				{ cell_type: "code", source: "print('hi')\nx = 2", outputs: [{ text: "SHOULD-NOT-APPEAR" }] },
+			],
+			nbformat: 4,
+		};
+		const tool = toolWithBytes(Buffer.from(JSON.stringify(nb)));
+		const r = (await tool.execute("c1", { source: "/ws/nb.ipynb" })) as Result;
+		assert.equal(r.details.ok, true);
+		assert.equal(r.details.kind, "ipynb");
+		const t = textOf(r);
+		assert.match(t, /My Notebook/);
+		assert.match(t, /print\('hi'\)/);
+		assert.match(t, /Cell 1 \(markdown\)/);
+		assert.ok(!/SHOULD-NOT-APPEAR/.test(t), "cell outputs are not included");
+	});
+
+	it("corrupt odt → clean error", async () => {
+		const tool = toolWithBytes(Buffer.from("not a zip"));
+		const r = (await tool.execute("c1", { source: "/ws/d.odt" })) as Result;
+		assert.equal(r.details.ok, false);
+		assert.equal(r.details.returned, "none");
+	});
+
+	it("detects the new formats by extension", () => {
+		assert.equal(detectKind({ source: "/a/x.odt" }), "odt");
+		assert.equal(detectKind({ source: "/a/x.ods" }), "ods");
+		assert.equal(detectKind({ source: "/a/x.odp" }), "odp");
+		assert.equal(detectKind({ source: "/a/x.epub" }), "epub");
+		assert.equal(detectKind({ source: "/a/x.rtf" }), "rtf");
+		assert.equal(detectKind({ source: "/a/x.ipynb" }), "ipynb");
+	});
+});
+
+/* ─────────────────────────── maxTokens plumbing (#8) ─────────────────────────── */
+
+describe("analyze_media — maxTokens", () => {
+	it("threads maxTokens to the provider understanding request (pdf)", async () => {
+		const { run, calls } = stubRunner("summary", "anthropic", "claude-sonnet-4-5");
+		const tool = toolWithBytes(Buffer.from("PDFISH"), "application/pdf", undefined, {
+			mediaUnderstandingConfig: muCfg(["anthropic"]),
+			runMediaUnderstanding: run,
+		});
+		await tool.execute("c1", { source: "/ws/x.pdf", question: "summarize", maxTokens: 1234, mode: "provider" });
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0]?.maxTokens, 1234, "maxTokens reached the request");
+	});
+
+	it("threads maxTokens for video", async () => {
+		const { run, calls } = stubRunner("clip", "google");
+		const tool = toolWithBytes(Buffer.from([0]), "video/mp4", undefined, {
+			mediaUnderstandingConfig: muCfg(["google"]),
+			runMediaUnderstanding: run,
+		});
+		await tool.execute("c1", { source: "/ws/clip.mp4", maxTokens: 555 });
+		assert.equal(calls[0]?.maxTokens, 555);
+	});
+});
+
+/* ─────────────────────────── result cache (#8) ─────────────────────────── */
+
+describe("analyze_media — result cache", () => {
+	it("returns the cached result on a hit WITHOUT calling the provider", async () => {
+		const store = new Map<string, { text: string; provider: string; model: string }>();
+		let providerCalls = 0;
+		const run = async (): Promise<RunMediaUnderstandingResult> => {
+			providerCalls += 1;
+			return { text: "fresh provider answer", provider: "google", model: "gemini-2.5-flash" };
+		};
+		const tool = makeAnalyzeMediaTool({
+			mediaUnderstandingConfig: muCfg(["google"]),
+			runMediaUnderstanding: run,
+			acquireLocal: async () => ({ bytes: Buffer.from([5, 6, 7]), mime: "video/mp4", truncated: false }),
+			resultCache: true,
+			readCache: async (key) => store.get(key),
+			writeCache: async (key, value) => {
+				store.set(key, value);
+			},
+		});
+		const r1 = (await tool.execute("c1", { source: "/ws/clip.mp4", question: "what?" })) as Result;
+		assert.equal(providerCalls, 1, "first call hits the provider");
+		assert.match(textOf(r1), /fresh provider answer/);
+		assert.equal(store.size, 1, "result written to cache");
+
+		const r2 = (await tool.execute("c2", { source: "/ws/clip.mp4", question: "what?" })) as Result;
+		assert.equal(providerCalls, 1, "second identical call served from cache (provider NOT called)");
+		assert.match(textOf(r2), /fresh provider answer/);
+		assert.match(textOf(r2), /cached result/);
+	});
+
+	it("a different question is a cache MISS (re-calls the provider)", async () => {
+		const store = new Map<string, { text: string; provider: string; model: string }>();
+		let providerCalls = 0;
+		const run = async (req: RunMediaUnderstandingRequest): Promise<RunMediaUnderstandingResult> => {
+			providerCalls += 1;
+			return { text: `answer for ${req.prompt}`, provider: "google", model: "m" };
+		};
+		const tool = makeAnalyzeMediaTool({
+			mediaUnderstandingConfig: muCfg(["google"]),
+			runMediaUnderstanding: run,
+			acquireLocal: async () => ({ bytes: Buffer.from([9]), mime: "video/mp4", truncated: false }),
+			resultCache: true,
+			readCache: async (key) => store.get(key),
+			writeCache: async (key, value) => {
+				store.set(key, value);
+			},
+		});
+		await tool.execute("c1", { source: "/ws/clip.mp4", question: "q1" });
+		await tool.execute("c2", { source: "/ws/clip.mp4", question: "q2" });
+		assert.equal(providerCalls, 2, "different question → provider called again");
+		assert.equal(store.size, 2, "two distinct cache entries");
+	});
+
+	it("does NOT read/write the cache when resultCache is false", async () => {
+		let reads = 0;
+		let writes = 0;
+		const { run } = stubRunner("x", "google");
+		const tool = makeAnalyzeMediaTool({
+			mediaUnderstandingConfig: muCfg(["google"]),
+			runMediaUnderstanding: run,
+			acquireLocal: async () => ({ bytes: Buffer.from([1]), mime: "video/mp4", truncated: false }),
+			resultCache: false,
+			readCache: async () => {
+				reads += 1;
+				return undefined;
+			},
+			writeCache: async () => {
+				writes += 1;
+			},
+		});
+		await tool.execute("c1", { source: "/ws/clip.mp4" });
+		assert.equal(reads, 0, "no cache read when disabled");
+		assert.equal(writes, 0, "no cache write when disabled");
 	});
 });

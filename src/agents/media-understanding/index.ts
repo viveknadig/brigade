@@ -15,7 +15,13 @@
  *     a one-shot `completeSimple` against ANY keyed provider with an
  *     image-capable model (OpenAI / Groq / Mistral / OpenRouter / xAI / Ollama
  *     / …), so image understanding is no longer limited to google + anthropic.
- *   • audio → Gemini, then the Pi path.
+ *   • audio → Gemini ONLY. Pi's content model is text + image (`Model.input` is
+ *     `("text"|"image")[]`) — NO provider Pi can drive accepts an audio block,
+ *     so the Pi path is deliberately NOT in the audio chain: routing a voice
+ *     note through it would stuff audio bytes into an IMAGE block and the
+ *     provider would reject it (HTTP 400). Audio understanding is Gemini's real
+ *     capability (inline audio); with no Google key the caller gets a clean
+ *     "needs a Google/Gemini key" message instead of a 400.
  * A `cfg.preferredProvider[kind]` override wins when that provider has a key.
  * When NO provider with a key can handle the kind, a clear
  * `MediaUnderstandingUnavailableError` is thrown.
@@ -55,18 +61,22 @@ export { resolvePiModel, runPi, modelAcceptsImage, defaultPiComplete } from "./p
  * has a resolved key wins. Order encodes "best tool for the job":
  *   • video — only Gemini can.
  *   • pdf   — Anthropic first (native ingestion + OCR for scanned), Gemini next.
- *   • image — Anthropic first, Gemini next (both capable; arbitrary tie-break).
- *   • audio — only Gemini here.
+ *   • image — Anthropic first, Gemini next (both capable; arbitrary tie-break),
+ *     then the Pi catch-all.
+ *   • audio — only Gemini. The Pi path is NOT here: Pi carries text + image
+ *     only, so no Pi-drivable provider can ingest audio (it would 400).
  */
 const PREFERENCE: Record<MediaUnderstandingKind, MediaUnderstandingProviderId[]> = {
 	video: ["google"],
 	pdf: ["anthropic", "google"],
-	// `pi` is listed LAST for image/audio: the bespoke google/anthropic REST
-	// adapters stay the default when keyed (they're proven + cheap), and the Pi
-	// path is the catch-all that makes every OTHER provider work. `pi` is keyed
-	// (hasKey) only when `resolvePiModel` can resolve a capable model.
+	// `pi` is listed LAST for image: the bespoke google/anthropic REST adapters
+	// stay the default when keyed (they're proven + cheap), and the Pi path is
+	// the catch-all that makes every OTHER provider work. `pi` is keyed (hasKey)
+	// only when `resolvePiModel` can resolve a capable model.
 	image: ["anthropic", "google", "pi"],
-	audio: ["google", "pi"],
+	// Audio is Gemini-only: Pi's content model (text + image) has no audio block,
+	// so the Pi path is intentionally excluded — see the file header.
+	audio: ["google"],
 };
 
 /**
@@ -106,8 +116,8 @@ function unavailableMessage(kind: MediaUnderstandingKind): string {
 			);
 		case "audio":
 			return (
-				"Audio understanding needs a Google/Gemini key, or any provider key whose model accepts audio. " +
-				"Add one with `brigade onboard` (or set GEMINI_API_KEY)."
+				"Audio understanding needs a Google/Gemini API key (the only provider here that ingests audio). " +
+				"Add one with `brigade onboard` (or set GEMINI_API_KEY) and try again."
 			);
 		case "image":
 		default:
@@ -275,6 +285,7 @@ function runOneProvider(
 			apiKey,
 			...(req.prompt !== undefined ? { prompt: req.prompt } : {}),
 			...(model !== undefined ? { model } : {}),
+			...(req.maxTokens !== undefined ? { maxTokens: req.maxTokens } : {}),
 			...(cfg.geminiBaseUrl !== undefined ? { baseUrl: cfg.geminiBaseUrl } : {}),
 			...(req.fetchImpl !== undefined ? { fetchFn: req.fetchImpl } : {}),
 			...(req.signal !== undefined ? { signal: req.signal } : {}),
@@ -288,6 +299,7 @@ function runOneProvider(
 		apiKey,
 		...(req.prompt !== undefined ? { prompt: req.prompt } : {}),
 		...(model !== undefined ? { model } : {}),
+		...(req.maxTokens !== undefined ? { maxTokens: req.maxTokens } : {}),
 		...(cfg.anthropicBaseUrl !== undefined ? { baseUrl: cfg.anthropicBaseUrl } : {}),
 		...(req.fetchImpl !== undefined ? { fetchFn: req.fetchImpl } : {}),
 		...(req.signal !== undefined ? { signal: req.signal } : {}),

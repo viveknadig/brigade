@@ -122,6 +122,38 @@ describe("anthropic-adapter — image", () => {
 	});
 });
 
+describe("anthropic-adapter — maxTokens", () => {
+	it("defaults max_tokens to 4096 when unset", async () => {
+		const { fetchFn, calls } = captureFetch({ content: [{ type: "text", text: "x" }] });
+		await runAnthropic({ kind: "image", bytes: Buffer.from([1]), mimeType: "image/png", apiKey: "sk-ant-api-k", fetchFn });
+		assert.equal((calls[0]!.body as { max_tokens: number }).max_tokens, 4096);
+	});
+
+	it("uses a caller maxTokens (clamped to a sane window)", async () => {
+		const { fetchFn, calls } = captureFetch({ content: [{ type: "text", text: "x" }] });
+		await runAnthropic({
+			kind: "pdf",
+			bytes: Buffer.from([1]),
+			mimeType: "application/pdf",
+			apiKey: "sk-ant-api-k",
+			maxTokens: 1500,
+			fetchFn,
+		});
+		assert.equal((calls[0]!.body as { max_tokens: number }).max_tokens, 1500);
+		// An absurd value is clamped down to the ceiling (not passed verbatim).
+		const cap = captureFetch({ content: [{ type: "text", text: "x" }] });
+		await runAnthropic({
+			kind: "pdf",
+			bytes: Buffer.from([1]),
+			mimeType: "application/pdf",
+			apiKey: "sk-ant-api-k",
+			maxTokens: 9_999_999,
+			fetchFn: cap.fetchFn,
+		});
+		assert.ok((cap.calls[0]!.body as { max_tokens: number }).max_tokens <= 32_000, "clamped to ceiling");
+	});
+});
+
 describe("anthropic-adapter — errors", () => {
 	it("throws a provider error on non-2xx (with status + message)", async () => {
 		const { fetchFn } = captureFetch({ error: { message: "overloaded" } }, 529);

@@ -61,11 +61,27 @@ export interface GeminiAdapterParams {
 	apiKey: string;
 	prompt?: string;
 	model?: string;
+	/** Max output tokens (clamped); omitted → the model's own default. */
+	maxTokens?: number;
 	baseUrl?: string;
 	fetchFn?: typeof fetch;
 	signal?: AbortSignal;
 	/** Test seam: replaces the real inter-poll delay so tests don't actually sleep. */
 	sleepFn?: (ms: number) => Promise<void>;
+}
+
+/** Hard ceiling on `maxTokens`. */
+const MAX_OUTPUT_TOKENS_CEILING = 32_000;
+
+/**
+ * Build the optional `generationConfig` for a Gemini request. When no
+ * `maxTokens` is given we omit it entirely (let the model use its default);
+ * otherwise clamp it to a sane window.
+ */
+function generationConfig(maxTokens?: number): { maxOutputTokens: number } | undefined {
+	if (typeof maxTokens !== "number" || !Number.isFinite(maxTokens)) return undefined;
+	const v = Math.max(256, Math.min(MAX_OUTPUT_TOKENS_CEILING, Math.floor(maxTokens)));
+	return { maxOutputTokens: v };
 }
 
 /**
@@ -127,6 +143,7 @@ async function generateInline(params: GeminiAdapterParams): Promise<RunMediaUnde
 	const model = resolveModel(params.kind, params.model);
 	const prompt = resolvePrompt(params.kind, params.prompt);
 	const url = `${baseUrl}/models/${model}:generateContent?key=${encodeURIComponent(params.apiKey)}`;
+	const genCfg = generationConfig(params.maxTokens);
 	const body = {
 		contents: [
 			{
@@ -142,6 +159,7 @@ async function generateInline(params: GeminiAdapterParams): Promise<RunMediaUnde
 				],
 			},
 		],
+		...(genCfg ? { generationConfig: genCfg } : {}),
 	};
 	let res: Response;
 	try {
@@ -360,6 +378,7 @@ async function generateFromFile(
 	const model = resolveModel(params.kind, params.model);
 	const prompt = resolvePrompt(params.kind, params.prompt);
 	const url = `${baseUrl}/models/${model}:generateContent?key=${encodeURIComponent(params.apiKey)}`;
+	const genCfg = generationConfig(params.maxTokens);
 	const body = {
 		contents: [
 			{
@@ -370,6 +389,7 @@ async function generateFromFile(
 				],
 			},
 		],
+		...(genCfg ? { generationConfig: genCfg } : {}),
 	};
 	let res: Response;
 	try {

@@ -98,6 +98,12 @@ export interface RunMediaUnderstandingRequest {
 	provider?: MediaUnderstandingProviderId;
 	/** Override the provider model id (else the per-kind default for the provider). */
 	model?: string;
+	/**
+	 * Max output tokens for the provider answer (Anthropic `max_tokens` / Gemini
+	 * `maxOutputTokens`). Omitted → the adapter's bounded default. Clamped by the
+	 * adapter to a sane ceiling.
+	 */
+	maxTokens?: number;
 	/** Resolved credential config — how the subsystem gets provider API keys. */
 	cfg: MediaUnderstandingConfig;
 	/** Test seam: replaces the global fetch for ALL provider HTTP. */

@@ -104,6 +104,26 @@ describe("gemini-adapter — inline (image / pdf)", () => {
 		assert.match(captured, /models\/gemini-2\.5-pro:generateContent/);
 	});
 
+	it("omits generationConfig when no maxTokens, and sets maxOutputTokens when given", async () => {
+		// No maxTokens → no generationConfig in the body.
+		let body1: { generationConfig?: { maxOutputTokens?: number } } = {};
+		const f1 = (async (_i: string | URL | Request, init?: RequestInit) => {
+			body1 = JSON.parse((init?.body as string) ?? "{}");
+			return jsonResponse({ candidates: [{ content: { parts: [{ text: "x" }] } }] });
+		}) as typeof fetch;
+		await runGemini({ kind: "image", bytes: Buffer.from([1]), mimeType: "image/png", apiKey: "k", fetchFn: f1 });
+		assert.equal(body1.generationConfig, undefined, "no generationConfig without maxTokens");
+
+		// With maxTokens → maxOutputTokens present and clamped.
+		let body2: { generationConfig?: { maxOutputTokens?: number } } = {};
+		const f2 = (async (_i: string | URL | Request, init?: RequestInit) => {
+			body2 = JSON.parse((init?.body as string) ?? "{}");
+			return jsonResponse({ candidates: [{ content: { parts: [{ text: "x" }] } }] });
+		}) as typeof fetch;
+		await runGemini({ kind: "image", bytes: Buffer.from([1]), mimeType: "image/png", apiKey: "k", maxTokens: 2000, fetchFn: f2 });
+		assert.equal(body2.generationConfig?.maxOutputTokens, 2000);
+	});
+
 	it("throws a provider error on a non-2xx response (with the API message)", async () => {
 		const fetchFn = (async () =>
 			jsonResponse({ error: { message: "bad key" } }, 401)) as typeof fetch;

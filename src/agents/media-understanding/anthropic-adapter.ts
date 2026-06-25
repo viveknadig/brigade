@@ -33,8 +33,16 @@ const ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20";
 /** Default model — a current Claude model that reads images + documents. */
 export const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-5";
 
-/** Max tokens for the description response. Bounded — this is a summary, not a doc. */
-const MAX_TOKENS = 4096;
+/** Default max tokens for the description response. Bounded — this is a summary, not a doc. */
+const DEFAULT_MAX_TOKENS = 4096;
+/** Hard ceiling on `maxTokens` so a caller can't request an unbounded answer. */
+const MAX_TOKENS_CEILING = 32_000;
+
+/** Clamp a caller `maxTokens` to a sane window; default when unset/invalid. */
+function resolveMaxTokens(maxTokens?: number): number {
+	if (typeof maxTokens !== "number" || !Number.isFinite(maxTokens)) return DEFAULT_MAX_TOKENS;
+	return Math.max(256, Math.min(MAX_TOKENS_CEILING, Math.floor(maxTokens)));
+}
 
 const GENERATE_TIMEOUT_MS = 180_000;
 
@@ -50,6 +58,8 @@ export interface AnthropicAdapterParams {
 	apiKey: string;
 	prompt?: string;
 	model?: string;
+	/** Max output tokens (clamped); default {@link DEFAULT_MAX_TOKENS}. */
+	maxTokens?: number;
 	baseUrl?: string;
 	fetchFn?: typeof fetch;
 	signal?: AbortSignal;
@@ -149,7 +159,7 @@ export async function runAnthropic(
 	const url = `${baseUrl}/messages`;
 	const body = {
 		model,
-		max_tokens: MAX_TOKENS,
+		max_tokens: resolveMaxTokens(params.maxTokens),
 		messages: [
 			{
 				role: "user",

@@ -1,6 +1,7 @@
 /**
- * Tests for the Pi-SDK media-understanding adapter (the general image/audio
- * path that makes EVERY configured provider work, not just google/anthropic).
+ * Tests for the Pi-SDK media-understanding adapter (the general image path that
+ * makes EVERY configured provider work, not just google/anthropic). Image-only:
+ * Pi carries no audio block, so audio is Gemini's job (see index.ts).
  *
  * The actual model call (`completeSimple`) is injected as `cfg.piComplete`, so
  * no real model traffic happens. Model resolution is injected via
@@ -94,11 +95,14 @@ describe("pi-adapter — resolvePiModel", () => {
 		assert.equal(resolvePiModel("image", cfg), undefined);
 	});
 
-	it("audio does not hard-require image input on the model", () => {
+	it("requires image input for EVERY kind (Pi has no audio block)", () => {
 		const { cfg } = piCfg({ models: { openai: textModel("openai") }, keyed: ["openai"] });
-		// image → rejected (needs image input); audio → accepted (best-effort).
+		// A text-only model is rejected regardless of kind — the Pi path can only
+		// carry an image block, so audio cannot smuggle a non-image model through
+		// (which would 400 at the provider). Audio normally never reaches here
+		// anyway (its provider chain excludes `pi`); this is the defensive gate.
 		assert.equal(resolvePiModel("image", cfg), undefined);
-		assert.equal(resolvePiModel("audio", cfg)?.provider, "openai");
+		assert.equal(resolvePiModel("audio", cfg), undefined);
 	});
 });
 

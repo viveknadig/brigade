@@ -250,7 +250,12 @@ function makeResolveModel(
 			} catch {
 				found = undefined;
 			}
-			if (found && (kind === "audio" || modelHasImageInput(found))) {
+			// The Pi path can only carry an image block, so a configured model is
+			// eligible only when it declares image input — for EVERY kind. (Audio
+			// never resolves here: its provider chain excludes `pi`; this is the
+			// defensive backstop so a stray audio request can't pick a non-image
+			// model and 400 at the provider.)
+			if (found && modelHasImageInput(found)) {
 				return found as MediaUnderstandingModel;
 			}
 		}

@@ -53,10 +53,11 @@
  *     so they are passed through with their declared mime — most providers
  *     reject HEIC, so the tool warns. Capped by `maxBytes`.
  *   • audio (mp3/wav/m4a/ogg/oga/flac/aac/opus): routed to the media-
- *     understanding subsystem (Gemini inline today; the Pi path when a provider
- *     whose model accepts audio is keyed) and the TEXT transcription / summary
- *     is returned, so voice notes work. Needs a capable key; with none the tool
- *     returns a clear "configure a key" message.
+ *     understanding subsystem (Gemini inline — audio is GEMINI-ONLY because Pi's
+ *     content model is text + image, so no Pi-drivable provider can ingest an
+ *     audio block) and the TEXT transcription / summary is returned, so voice
+ *     notes work. Needs a Google/Gemini key; with none the tool returns a clear
+ *     "configure a Gemini key" message (NOT a provider 400).
  *   • pdf: when an understanding provider key is configured, the PDF is sent
  *     NATIVELY (Anthropic `document` block — OCRs scanned pages + reads layout;
  *     or Gemini inline) and the provider's TEXT answer is returned, so scanned
@@ -94,6 +95,17 @@ import { guardedFetch, SsrfBlockedError } from "../../infra/net/fetch-guard.js";
 import { validateOutboundMediaPath } from "../../security/media-path-guard.js";
 import { wrapWebContent } from "../../security/external-content.js";
 import {
+	downscaleImageToBudget,
+	isDownscalableImageMime,
+	type DownscaleResult,
+} from "./image-downscale.js";
+import {
+	mediaCacheKey,
+	readMediaCache,
+	writeMediaCache,
+	type MediaCacheValue,
+} from "./media-cache.js";
+import {
 	resolveCacheDir,
 	resolveOsCacheDir,
 	resolveStateDir,
@@ -129,10 +141,30 @@ const DEFAULT_IMAGE_MAX_BYTES = 8 * 1024 * 1024; // 8 MiB
 const DEFAULT_MAX_CHARS = 60_000;
 /** Per-request HTTP timeout for URL sources. */
 const FETCH_TIMEOUT_MS = 45_000;
+/** Max images accepted in one batch (`sources[]`). Matches the field cap. */
+const MAX_BATCH_IMAGES = 20;
+/** Max non-image (document/text) sources accepted in one batch. */
+const MAX_BATCH_DOCS = 10;
 
 /* ─────────────────────────── kind detection ─────────────────────────── */
 
-export type MediaKind = "image" | "pdf" | "docx" | "pptx" | "xlsx" | "html" | "video" | "audio";
+export type MediaKind =
+	| "image"
+	| "pdf"
+	| "docx"
+	| "pptx"
+	| "xlsx"
+	| "html"
+	| "video"
+	| "audio"
+	| "text"
+	// extra document formats (broader than either rival tool)
+	| "odt" // OpenDocument text
+	| "ods" // OpenDocument spreadsheet
+	| "odp" // OpenDocument presentation
+	| "epub" // EPUB e-book (zip of XHTML)
+	| "rtf" // Rich Text Format
+	| "ipynb"; // Jupyter notebook (JSON)
 
 /** Extension → kind. Lowercase, no leading dot. */
 const EXT_KIND: Record<string, MediaKind> = {
@@ -150,6 +182,13 @@ const EXT_KIND: Record<string, MediaKind> = {
 	docx: "docx",
 	pptx: "pptx",
 	xlsx: "xlsx",
+	// OpenDocument + e-book + rich-text + notebook (broader than either rival)
+	odt: "odt",
+	ods: "ods",
+	odp: "odp",
+	epub: "epub",
+	rtf: "rtf",
+	ipynb: "ipynb",
 	// markup
 	html: "html",
 	htm: "html",
@@ -173,6 +212,80 @@ const EXT_KIND: Record<string, MediaKind> = {
 	flac: "audio",
 	aac: "audio",
 	opus: "audio",
+	// plain / structured text + common source-code files. Read as UTF-8, wrapped
+	// in the untrusted-content envelope, returned as text. (Both rival tools
+	// accept these; Brigade used to reject them outright.)
+	txt: "text",
+	text: "text",
+	log: "text",
+	csv: "text",
+	tsv: "text",
+	json: "text",
+	jsonl: "text",
+	ndjson: "text",
+	json5: "text",
+	xml: "text",
+	yaml: "text",
+	yml: "text",
+	toml: "text",
+	ini: "text",
+	cfg: "text",
+	conf: "text",
+	env: "text",
+	properties: "text",
+	md: "text",
+	markdown: "text",
+	mdx: "text",
+	rst: "text",
+	tex: "text",
+	srt: "text",
+	vtt: "text",
+	// source code
+	js: "text",
+	mjs: "text",
+	cjs: "text",
+	jsx: "text",
+	ts: "text",
+	tsx: "text",
+	mts: "text",
+	cts: "text",
+	py: "text",
+	rb: "text",
+	go: "text",
+	rs: "text",
+	java: "text",
+	kt: "text",
+	kts: "text",
+	c: "text",
+	h: "text",
+	cc: "text",
+	cpp: "text",
+	cxx: "text",
+	hpp: "text",
+	cs: "text",
+	php: "text",
+	swift: "text",
+	scala: "text",
+	sh: "text",
+	bash: "text",
+	zsh: "text",
+	fish: "text",
+	ps1: "text",
+	bat: "text",
+	sql: "text",
+	r: "text",
+	lua: "text",
+	pl: "text",
+	dart: "text",
+	ex: "text",
+	exs: "text",
+	clj: "text",
+	hs: "text",
+	css: "text",
+	scss: "text",
+	sass: "text",
+	less: "text",
+	svg: "text",
 };
 
 /** MIME prefix/exact → kind, consulted when the extension is ambiguous (URLs). */
@@ -184,6 +297,24 @@ function kindFromMime(mime: string | undefined): MediaKind | undefined {
 	if (m.startsWith("audio/")) return "audio";
 	if (m === "application/pdf") return "pdf";
 	if (m === "text/html" || m === "application/xhtml+xml") return "html";
+	// Structured-text content types — JSON / XML / YAML / CSV / source. Checked
+	// AFTER html so an HTML page still routes to the readability extractor.
+	if (
+		m.startsWith("text/") ||
+		m === "application/json" ||
+		m === "application/ld+json" ||
+		m === "application/xml" ||
+		m === "application/x-ndjson" ||
+		m === "application/x-yaml" ||
+		m === "application/yaml" ||
+		m === "application/toml" ||
+		m === "application/x-sh" ||
+		m === "image/svg+xml" ||
+		/\+json$/.test(m) ||
+		/\+xml$/.test(m)
+	) {
+		return "text";
+	}
 	if (
 		m === "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 	)
@@ -194,6 +325,12 @@ function kindFromMime(mime: string | undefined): MediaKind | undefined {
 		return "pptx";
 	if (m === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 		return "xlsx";
+	if (m === "application/vnd.oasis.opendocument.text") return "odt";
+	if (m === "application/vnd.oasis.opendocument.spreadsheet") return "ods";
+	if (m === "application/vnd.oasis.opendocument.presentation") return "odp";
+	if (m === "application/epub+zip") return "epub";
+	if (m === "application/rtf" || m === "text/rtf") return "rtf";
+	if (m === "application/x-ipynb+json") return "ipynb";
 	return undefined;
 }
 
@@ -291,7 +428,14 @@ export function detectKind(args: {
 			k === "xlsx" ||
 			k === "html" ||
 			k === "video" ||
-			k === "audio"
+			k === "audio" ||
+			k === "text" ||
+			k === "odt" ||
+			k === "ods" ||
+			k === "odp" ||
+			k === "epub" ||
+			k === "rtf" ||
+			k === "ipynb"
 		) {
 			return k;
 		}
@@ -304,10 +448,18 @@ export function detectKind(args: {
 /* ─────────────────────────── params ─────────────────────────── */
 
 const AnalyzeMediaParams = Type.Object({
-	source: Type.String({
-		description:
-			"Local file PATH or http(s) URL to analyze. Images, PDF, DOCX, PPTX, XLSX, HTML, audio (voice notes), and video are auto-detected by extension/MIME.",
-	}),
+	source: Type.Optional(
+		Type.String({
+			description:
+				"Local file PATH or http(s) URL to analyze. Images, PDF, DOCX, PPTX, XLSX, HTML, plain/structured text, audio (voice notes), and video are auto-detected by extension/MIME. For a single file. Use `sources` to analyze several at once.",
+		}),
+	),
+	sources: Type.Optional(
+		Type.Array(Type.String(), {
+			description:
+				"Several local PATHs / http(s) URLs to analyze together in ONE call (e.g. compare photos, or read many files). Images are shown as multiple image blocks; documents/text are concatenated under per-file labels. Caps: 20 images / 10 documents per call. When set, takes precedence over `source`.",
+		}),
+	),
 	question: Type.Optional(
 		Type.String({
 			description:
@@ -323,6 +475,12 @@ const AnalyzeMediaParams = Type.Object({
 		Type.String({
 			description:
 				'Page (PDF) or slide (PPTX) range to limit extraction, e.g. "1-5", "3", or "2-". 1-indexed. Ignored for other kinds.',
+		}),
+	),
+	language: Type.Optional(
+		Type.String({
+			description:
+				'Optional spoken-language hint for AUDIO transcription (e.g. "es", "Spanish", "en-US"). Improves accuracy for non-English voice notes; ignored for non-audio kinds.',
 		}),
 	),
 	provider: Type.Optional(
@@ -349,6 +507,13 @@ const AnalyzeMediaParams = Type.Object({
 			minimum: 1024,
 		}),
 	),
+	maxTokens: Type.Optional(
+		Type.Integer({
+			description:
+				"Optional cap on the provider answer length (output tokens) for the understanding call (image-via-provider / PDF / audio / video). Default ~4096; clamped to a sane window. Ignored for the local text-extraction path.",
+			minimum: 64,
+		}),
+	),
 	kind: Type.Optional(
 		Type.Union(
 			[
@@ -360,10 +525,11 @@ const AnalyzeMediaParams = Type.Object({
 				Type.Literal("html"),
 				Type.Literal("video"),
 				Type.Literal("audio"),
+				Type.Literal("text"),
 			],
 			{
 				description:
-					"Optional override of the auto-detected kind (use when the extension/MIME is wrong or missing). Use \"audio\" for a voice note whose extension is ambiguous (e.g. .ogg/.webm).",
+					"Optional override of the auto-detected kind (use when the extension/MIME is wrong or missing). Use \"audio\" for a voice note whose extension is ambiguous (e.g. .ogg/.webm); \"text\" to force plain/structured-text reading.",
 			},
 		),
 	),
@@ -849,6 +1015,173 @@ async function extractHtml(bytes: Buffer, baseUrl: string): Promise<string> {
 	return text;
 }
 
+/* ── extra document formats (ODF / EPUB / RTF / IPYNB) — broader than rivals ── */
+
+/**
+ * Pull text from OpenDocument XML (`content.xml`). ODF uses `<text:p>` /
+ * `<text:h>` paragraphs, `<text:span>` runs, and `<text:line-break/>` /
+ * `<text:tab/>`; spreadsheets use `<table:table-cell>` / `<table:table-row>`.
+ * Strategy mirrors `ooxmlRunsToText`: insert newlines at block boundaries, then
+ * strip remaining tags and decode entities.
+ */
+function odfXmlToText(xml: string): string {
+	const withBreaks = xml
+		.replace(/<text:line-break\s*\/?>/g, "\n")
+		.replace(/<text:tab\s*\/?>/g, "\t")
+		.replace(/<\/text:p>/g, "\n")
+		.replace(/<\/text:h>/g, "\n")
+		.replace(/<\/table:table-row>/g, "\n")
+		.replace(/<\/table:table-cell>/g, "\t");
+	// Drop every remaining tag, then decode the 5 predefined XML entities.
+	const stripped = withBreaks.replace(/<[^>]+>/g, "");
+	return decodeXmlEntities(stripped)
+		.replace(/[ \t]+\n/g, "\n")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
+}
+
+/** OpenDocument (odt/ods/odp) → text from `content.xml`. */
+async function extractOpenDocument(bytes: Buffer, kind: "odt" | "ods" | "odp"): Promise<string> {
+	const entries = await unzipEntries(bytes);
+	const content = await entryText(entries, "content.xml");
+	if (!content)
+		throw new BrigadeToolInputError(
+			`not a valid .${kind} (missing content.xml — corrupt or not an OpenDocument file)`,
+		);
+	const text = odfXmlToText(content);
+	if (!text) throw new BrigadeToolInputError(`no extractable text in the .${kind}`);
+	return text;
+}
+
+/**
+ * EPUB → concatenated readable text. An EPUB is a zip of XHTML "chapters"; we
+ * read them in spine order (from the OPF manifest) when resolvable, else fall
+ * back to every `.x?html` entry sorted by name. Each chapter's markup is run
+ * through the basic HTML extractor so only the readable text survives.
+ */
+async function extractEpub(bytes: Buffer): Promise<string> {
+	const entries = await unzipEntries(bytes);
+	const names = Object.keys(entries);
+	// Resolve spine order via the OPF (content.opf) when present.
+	const opfName = names.find((n) => /\.opf$/i.test(n));
+	let ordered: string[] = [];
+	if (opfName) {
+		const opf = (await entryText(entries, opfName)) ?? "";
+		const opfDir = opfName.includes("/") ? opfName.slice(0, opfName.lastIndexOf("/") + 1) : "";
+		// manifest: id → href
+		const idToHref = new Map<string, string>();
+		const itemRe = /<item\b[^>]*\bid="([^"]+)"[^>]*\bhref="([^"]+)"[^>]*\/?>/g;
+		let im: RegExpExecArray | null;
+		while ((im = itemRe.exec(opf)) !== null) {
+			idToHref.set(im[1] as string, im[2] as string);
+		}
+		// also handle href-before-id ordering
+		const itemRe2 = /<item\b[^>]*\bhref="([^"]+)"[^>]*\bid="([^"]+)"[^>]*\/?>/g;
+		while ((im = itemRe2.exec(opf)) !== null) {
+			if (!idToHref.has(im[2] as string)) idToHref.set(im[2] as string, im[1] as string);
+		}
+		const spineRe = /<itemref\b[^>]*\bidref="([^"]+)"/g;
+		let sm: RegExpExecArray | null;
+		while ((sm = spineRe.exec(opf)) !== null) {
+			const href = idToHref.get(sm[1] as string);
+			if (href) {
+				const full = decodeURIComponent(opfDir + href).replace(/^\.\//, "");
+				if (entries[full]) ordered.push(full);
+			}
+		}
+	}
+	if (ordered.length === 0) {
+		ordered = names.filter((n) => /\.x?html?$/i.test(n)).sort();
+	}
+	const parts: string[] = [];
+	for (const name of ordered) {
+		const html = (await entryText(entries, name)) ?? "";
+		if (!html.trim()) continue;
+		const extracted = extractBasicHtmlContent(html);
+		const { text } = composeFetchBody(extracted, { extractMode: "markdown", maxChars: DEFAULT_MAX_CHARS });
+		if (text.trim()) parts.push(text.trim());
+		if (parts.join("\n\n").length > DEFAULT_MAX_CHARS) break; // bound the work
+	}
+	const joined = parts.join("\n\n").trim();
+	if (!joined) throw new BrigadeToolInputError("no extractable text in the .epub");
+	return joined;
+}
+
+/**
+ * RTF → plain text. A small control-word stripper: drops `{\\*\\...}` groups
+ * (fonts/colour tables/pictures), decodes `\\'hh` hex + `\\uN` unicode escapes,
+ * maps `\\par`/`\\line`/`\\tab` to whitespace, and removes the remaining
+ * `\\control` words and group braces. Best-effort — fidelity is text, not layout.
+ */
+function extractRtf(bytes: Buffer): string {
+	let rtf = bytes.toString("latin1");
+	if (!/^\s*{\\rtf/i.test(rtf)) {
+		throw new BrigadeToolInputError("not a valid .rtf (missing the {\\rtf header)");
+	}
+	// Remove destination groups that carry no body text (font/colour/info/pict…).
+	rtf = rtf.replace(
+		/\{\\\*?\\(?:fonttbl|colortbl|stylesheet|info|pict|object|themedata|colorschememapping|latentstyles|datastore|generator)[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/gi,
+		" ",
+	);
+	// Line / paragraph / tab control words → whitespace.
+	rtf = rtf.replace(/\\par[d]?\b/g, "\n").replace(/\\line\b/g, "\n").replace(/\\tab\b/g, "\t");
+	// Hex escapes \'hh → the byte (latin1).
+	rtf = rtf.replace(/\\'([0-9a-fA-F]{2})/g, (_m, h: string) => {
+		const code = parseInt(h, 16);
+		return Number.isFinite(code) ? String.fromCharCode(code) : "";
+	});
+	// Unicode escapes \uNNNN (followed by a fallback char we drop).
+	rtf = rtf.replace(/\\u(-?\d+)\??/g, (_m, n: string) => {
+		let code = parseInt(n, 10);
+		if (code < 0) code += 65536; // RTF emits negative for >32767
+		return Number.isFinite(code) ? String.fromCodePoint(code) : "";
+	});
+	// Escaped literals.
+	rtf = rtf.replace(/\\([{}\\])/g, "$1");
+	// Remaining control words / symbols.
+	rtf = rtf.replace(/\\[a-zA-Z]+-?\d* ?/g, "").replace(/\\[^a-zA-Z]/g, "");
+	// Group braces.
+	rtf = rtf.replace(/[{}]/g, "");
+	return rtf.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/**
+ * Jupyter notebook (.ipynb) → text. Walks `cells[]`, joining each cell's
+ * `source` (string or string[]) under a per-cell label, prefixing code cells so
+ * the model knows code from prose. Cell OUTPUTS are skipped (often huge / binary
+ * image data) — only the authored source is returned.
+ */
+function extractIpynb(bytes: Buffer): string {
+	let nb: { cells?: Array<{ cell_type?: string; source?: unknown }> };
+	try {
+		nb = JSON.parse(bytes.toString("utf8"));
+	} catch {
+		throw new BrigadeToolInputError("not a valid .ipynb (could not parse the notebook JSON)");
+	}
+	const cells = Array.isArray(nb.cells) ? nb.cells : [];
+	if (cells.length === 0) throw new BrigadeToolInputError("the notebook has no cells");
+	const parts: string[] = [];
+	let n = 0;
+	for (const cell of cells) {
+		n += 1;
+		const type = typeof cell.cell_type === "string" ? cell.cell_type : "code";
+		const src = Array.isArray(cell.source)
+			? cell.source.join("")
+			: typeof cell.source === "string"
+				? cell.source
+				: "";
+		if (!src.trim()) continue;
+		if (type === "markdown" || type === "raw") {
+			parts.push(`--- Cell ${n} (${type}) ---\n${src.trim()}`);
+		} else {
+			parts.push(`--- Cell ${n} (code) ---\n\`\`\`\n${src.trim()}\n\`\`\``);
+		}
+	}
+	const joined = parts.join("\n\n").trim();
+	if (!joined) throw new BrigadeToolInputError("no source text found in the notebook cells");
+	return joined;
+}
+
 /* ─────────────────────────── tool factory ─────────────────────────── */
 
 export interface MakeAnalyzeMediaToolOptions {
@@ -872,6 +1205,24 @@ export interface MakeAnalyzeMediaToolOptions {
 	mediaUnderstandingConfig?: MediaUnderstandingConfig;
 	/** Test seam: replace the media-understanding entry point (mocks provider HTTP). */
 	runMediaUnderstanding?: (req: RunMediaUnderstandingRequest) => Promise<RunMediaUnderstandingResult>;
+	/**
+	 * Test seam: replace the oversize-image downscaler (defaults to the real
+	 * jimp-backed `downscaleImageToBudget`). Lets tests assert the resize/branch
+	 * without bundling a real codec.
+	 */
+	downscaleImage?: typeof downscaleImageToBudget;
+	/**
+	 * Cache provider (Gemini/Anthropic) understanding RESULTS keyed by
+	 * `sha256(bytes)+question+provider+model+maxTokens` so re-analyzing the same
+	 * media doesn't pay for the call twice. Default ON (disk-backed LRU under
+	 * `resolveCacheDir()`). Set `false` to disable. Tests pass injected
+	 * `readCache`/`writeCache` to avoid disk I/O.
+	 */
+	resultCache?: boolean;
+	/** Test seam: replace the cache READ (defaults to the disk cache). */
+	readCache?: typeof readMediaCache;
+	/** Test seam: replace the cache WRITE (defaults to the disk cache). */
+	writeCache?: typeof writeMediaCache;
 }
 
 export function makeAnalyzeMediaTool(
@@ -880,6 +1231,12 @@ export function makeAnalyzeMediaTool(
 	const acquireUrl = opts.acquireUrl ?? acquireUrlBytes;
 	const acquireLocal = opts.acquireLocal ?? acquireLocalBytes;
 	const runUnderstanding = opts.runMediaUnderstanding ?? defaultRunMediaUnderstanding;
+	const downscaleImage = opts.downscaleImage ?? downscaleImageToBudget;
+	// Result cache: ON by default. A test-injected read/write seam overrides the
+	// disk implementation; `resultCache:false` disables it entirely.
+	const cacheEnabled = opts.resultCache !== false;
+	const readCache = opts.readCache ?? readMediaCache;
+	const writeCache = opts.writeCache ?? writeMediaCache;
 	const agentId = opts.agentId ?? DEFAULT_AGENT_ID;
 	// Lazily resolve the media-understanding config (key resolution + per-kind
 	// defaults) from Brigade's credential store the first time it is needed, so
@@ -900,9 +1257,9 @@ export function makeAnalyzeMediaTool(
 		// they run for EVERY sender regardless of owner status.
 		ownerOnly: false,
 		description: [
-			"Understand a local file or URL: images, PDF, DOCX, PPTX, XLSX, HTML, audio (voice notes), and video (auto-detected by extension/MIME).",
-			"Pass `source` (a local path or http(s) URL) and a `question` describing what to analyze.",
-			"Images are shown to a vision model (or, on a text-only model, understood via any configured provider with an image-capable model); PDF is read natively when a provider key is configured (scanned PDFs work) else extracted to text; DOCX/PPTX/XLSX/HTML are extracted to text/markdown; AUDIO is transcribed/summarized; VIDEO is understood via a Google/Gemini key.",
+			"Understand a local file or URL: images, PDF, DOCX, PPTX, XLSX, ODT/ODS/ODP, EPUB, RTF, Jupyter (.ipynb), HTML, plain/structured text (txt/csv/json/xml/yaml/md/log/source code), audio (voice notes), and video (auto-detected by extension/MIME).",
+			"Pass `source` (a single local path or http(s) URL) — or `sources` (an array) to analyze several at once — and a `question` describing what to analyze.",
+			"Images are shown to a vision model (or, on a text-only model, understood via any configured provider with an image-capable model) and oversize images are DOWNSCALED to fit (never truncated); PDF is read natively when a provider key is configured (scanned PDFs work) else extracted to text; office/e-book/notebook/text files are extracted to text; AUDIO is transcribed/summarized via a Google/Gemini key (with an optional `language` hint); VIDEO is understood via a Google/Gemini key.",
 			"Use `pages` to limit a PDF/PPTX range (e.g. \"1-5\"). Use this instead of bash/curl — it applies the SSRF guard for URLs and the path guard for local files.",
 		].join(" "),
 		parameters: AnalyzeMediaParams,
@@ -911,8 +1268,34 @@ export function makeAnalyzeMediaTool(
 			args: Static<typeof AnalyzeMediaParams>,
 			signal,
 		): Promise<AgentToolResult<AnalyzeMediaDetails>> => {
-			const source = (args.source ?? "").trim();
-			if (!source) throw new BrigadeToolInputError("source required");
+			// Resolve the source LIST. `sources[]` (new, batch) wins; else the single
+			// `source` (back-compat) becomes a one-element list. De-dupe blanks.
+			const list = (
+				Array.isArray(args.sources) && args.sources.length > 0
+					? args.sources
+					: args.source
+						? [args.source]
+						: []
+			)
+				.map((s) => (s ?? "").trim())
+				.filter((s) => s.length > 0);
+			if (list.length === 0) throw new BrigadeToolInputError("source required");
+			// Single source → the exact existing behaviour (one result, image block
+			// or text). Multiple → the batch merge.
+			if (list.length === 1) return analyzeOne(list[0] as string, args, signal);
+			return analyzeBatch(list, args, signal);
+		},
+	};
+
+	/* ── single-source pipeline (the original per-source path) ── */
+
+	/** Analyze ONE source end-to-end → a complete tool result (image or text). */
+	async function analyzeOne(
+		source: string,
+		args: Static<typeof AnalyzeMediaParams>,
+		signal: AbortSignal | undefined,
+	): Promise<AgentToolResult<AnalyzeMediaDetails>> {
+		{
 			const question = (args.question ?? args.prompt ?? "").trim();
 			const isUrl = /^https?:\/\//i.test(source);
 			const sourceType: "url" | "path" = isUrl ? "url" : "path";
@@ -923,20 +1306,28 @@ export function makeAnalyzeMediaTool(
 			const looksImage =
 				(args.kind ? args.kind === "image" : false) ||
 				EXT_KIND[extensionOf(source)] === "image";
+			// The byte BUDGET an image must fit into (downscaled if larger).
+			const imageBudget = clampBytes(args.maxBytes, true);
 			const maxBytes = clampBytes(args.maxBytes, looksImage);
+			// For an image we want the WHOLE file (up to the absolute ceiling) so it
+			// can be DOWNSCALED to a valid image — truncating it mid-stream corrupts
+			// the only copy. So read images at the ceiling and let the image handler
+			// resize to `imageBudget`. Non-image sources keep the existing cap
+			// (a byte prefix is fine for text/doc bytes).
+			const readCap = looksImage ? MAX_BYTES_CEILING : maxBytes;
 
 			// Acquire bytes (with the right guard for the source type).
 			let acquired: AcquiredBytes;
 			try {
 				acquired = isUrl
 					? await acquireUrl(source, {
-							maxBytes,
+							maxBytes: readCap,
 							...(signal ? { signal } : {}),
 						})
 					: await acquireLocal(source, {
 							...(opts.workspaceDir ? { workspaceDir: opts.workspaceDir } : {}),
 							...(opts.cwd ? { cwd: opts.cwd } : {}),
-							maxBytes,
+							maxBytes: readCap,
 						});
 			} catch (err) {
 				if (err instanceof SsrfBlockedError) {
@@ -952,35 +1343,29 @@ export function makeAnalyzeMediaTool(
 				...(acquired.mime ? { mime: acquired.mime } : {}),
 			});
 			if (!kind) {
+				// Last-resort: an unknown extension/MIME whose bytes decode as UTF-8
+				// text is handled as the `text` kind (structured text / source code /
+				// logs), so a `.toml`/unknown-but-textual file is read rather than
+				// rejected. Binary that is not a known kind stays unsupported.
+				if (looksLikeUtf8Text(acquired.bytes)) {
+					return handleTextPlain({
+						source,
+						sourceType,
+						bytes: acquired.bytes,
+						truncated: acquired.truncated,
+						...(acquired.mime ? { mime: acquired.mime } : {}),
+						question,
+					});
+				}
 				return failure({
 					source,
 					sourceType,
 					...(acquired.mime ? { mimeType: acquired.mime } : {}),
 					bytes: acquired.bytes.length,
 					message:
-						"Unsupported or undetectable media type. Supported: image (png/jpg/jpeg/webp/gif/bmp/heic), pdf, docx, pptx, xlsx, html, audio, video. " +
+						"Unsupported or undetectable media type. Supported: image (png/jpg/jpeg/webp/gif/bmp/heic), pdf, docx, pptx, xlsx, html, text (txt/csv/json/xml/md/yaml/log/source), audio, video. " +
 						"Pass an explicit `kind` if the extension/MIME is missing.",
 				});
-			}
-
-			// Minor (4b): an extension-less URL only revealed itself as an image
-			// via its `image/*` content-type — AFTER it was fetched under the
-			// larger DOC byte cap (because `looksImage` was false up-front). Image
-			// blocks are the most token-expensive to ship, so re-apply the tighter
-			// image cap now that the kind is known, unless the caller raised
-			// `maxBytes` explicitly. Re-trims in place (no re-fetch). Other kinds
-			// keep the doc cap they were fetched under.
-			if (
-				kind === "image" &&
-				!looksImage &&
-				args.maxBytes === undefined &&
-				acquired.bytes.length > DEFAULT_IMAGE_MAX_BYTES
-			) {
-				acquired = {
-					bytes: acquired.bytes.subarray(0, DEFAULT_IMAGE_MAX_BYTES),
-					...(acquired.mime ? { mime: acquired.mime } : {}),
-					truncated: true,
-				};
 			}
 
 			// Dispatch per kind.
@@ -993,9 +1378,11 @@ export function makeAnalyzeMediaTool(
 						truncated: acquired.truncated,
 						mime: acquired.mime,
 						question,
+						imageBudget,
 						modelContext: opts.modelContext,
 						...(args.provider ? { provider: args.provider } : {}),
 						...(args.model ? { model: args.model } : {}),
+						...(args.maxTokens !== undefined ? { maxTokens: args.maxTokens } : {}),
 						...(signal ? { signal } : {}),
 					});
 				case "video":
@@ -1007,6 +1394,7 @@ export function makeAnalyzeMediaTool(
 						question,
 						...(args.provider ? { provider: args.provider } : {}),
 						...(args.model ? { model: args.model } : {}),
+						...(args.maxTokens !== undefined ? { maxTokens: args.maxTokens } : {}),
 						...(signal ? { signal } : {}),
 					});
 				case "audio":
@@ -1016,8 +1404,10 @@ export function makeAnalyzeMediaTool(
 						bytes: acquired.bytes,
 						mime: acquired.mime,
 						question,
+						...(args.language ? { language: args.language } : {}),
 						...(args.provider ? { provider: args.provider } : {}),
 						...(args.model ? { model: args.model } : {}),
+						...(args.maxTokens !== undefined ? { maxTokens: args.maxTokens } : {}),
 						...(signal ? { signal } : {}),
 					});
 				case "pdf":
@@ -1032,12 +1422,28 @@ export function makeAnalyzeMediaTool(
 						mode: args.mode ?? "auto",
 						...(args.provider ? { provider: args.provider } : {}),
 						...(args.model ? { model: args.model } : {}),
+						...(args.maxTokens !== undefined ? { maxTokens: args.maxTokens } : {}),
 						...(signal ? { signal } : {}),
+					});
+				case "text":
+					return handleTextPlain({
+						source,
+						sourceType,
+						bytes: acquired.bytes,
+						truncated: acquired.truncated,
+						...(acquired.mime ? { mime: acquired.mime } : {}),
+						question,
 					});
 				case "docx":
 				case "pptx":
 				case "xlsx":
 				case "html":
+				case "odt":
+				case "ods":
+				case "odp":
+				case "epub":
+				case "rtf":
+				case "ipynb":
 					return handleTextExtract({
 						kind,
 						source,
@@ -1049,8 +1455,103 @@ export function makeAnalyzeMediaTool(
 						pages: args.pages,
 					});
 			}
-		},
-	};
+		}
+	}
+
+	/* ── batch (multi-source) pipeline ── */
+
+	/**
+	 * Analyze MULTIPLE sources in one call. Images are pushed as N image blocks
+	 * into a single tool result (Pi tool-result content is an array of blocks);
+	 * non-image sources are reduced to their TEXT and concatenated under per-file
+	 * labels. Caps: {@link MAX_BATCH_IMAGES} images / {@link MAX_BATCH_DOCS}
+	 * non-image sources. The image byte budget is applied PER image (so N images
+	 * each get the per-image budget; downscaling keeps each one valid + bounded).
+	 * A per-source failure is reported inline (labeled) and never aborts the batch.
+	 */
+	async function analyzeBatch(
+		sources: string[],
+		args: Static<typeof AnalyzeMediaParams>,
+		signal: AbortSignal | undefined,
+	): Promise<AgentToolResult<AnalyzeMediaDetails>> {
+		const question = (args.question ?? args.prompt ?? "").trim();
+		// Partition by the cheap up-front signal (explicit kind / extension / —).
+		// MIME-only images in a batch are treated as docs/text here (we don't pre-
+		// fetch to classify); that's an acceptable edge for the batch path.
+		const imageSources: string[] = [];
+		const otherSources: string[] = [];
+		for (const s of sources) {
+			const k = args.kind ?? EXT_KIND[extensionOf(s)];
+			if (k === "image") imageSources.push(s);
+			else otherSources.push(s);
+		}
+		const cappedImages = imageSources.slice(0, MAX_BATCH_IMAGES);
+		const cappedOthers = otherSources.slice(0, MAX_BATCH_DOCS);
+		const overflow: string[] = [];
+		if (imageSources.length > MAX_BATCH_IMAGES)
+			overflow.push(`${imageSources.length - MAX_BATCH_IMAGES} image(s)`);
+		if (otherSources.length > MAX_BATCH_DOCS)
+			overflow.push(`${otherSources.length - MAX_BATCH_DOCS} document(s)`);
+
+		const content: AgentToolResult<AnalyzeMediaDetails>["content"] = [];
+		const labelParts: string[] = [];
+		let anyOk = false;
+		let imageCount = 0;
+		let textCount = 0;
+
+		const lead = question
+			? `Analyze the ${sources.length} attached sources and answer this:\n${question}`
+			: `Analyze the ${sources.length} attached sources and describe / summarize what they contain.`;
+		content.push({ type: "text", text: lead });
+
+		// Images first → each becomes its own labeled text + image block.
+		for (let i = 0; i < cappedImages.length; i++) {
+			const src = cappedImages[i] as string;
+			const label = `--- Image ${i + 1}: ${basenameOf(src)} ---`;
+			const one = await analyzeOne(src, args, signal);
+			const img = one.content.find((b) => b.type === "image") as
+				| { type: "image"; data: string; mimeType: string }
+				| undefined;
+			if (img) {
+				content.push({ type: "text", text: label });
+				content.push(img);
+				imageCount += 1;
+				anyOk = anyOk || one.details.ok;
+			} else {
+				// Text-only model / no key / failure → carry the explanatory text.
+				content.push({ type: "text", text: `${label}\n${firstText(one)}` });
+			}
+		}
+
+		// Non-image sources → concatenated labeled text extractions.
+		for (let i = 0; i < cappedOthers.length; i++) {
+			const src = cappedOthers[i] as string;
+			const label = `--- File ${i + 1}: ${basenameOf(src)} ---`;
+			const one = await analyzeOne(src, args, signal);
+			content.push({ type: "text", text: `${label}\n${firstText(one)}` });
+			textCount += 1;
+			anyOk = anyOk || one.details.ok;
+		}
+
+		if (overflow.length > 0) {
+			content.push({
+				type: "text",
+				text: `(Note: ${overflow.join(" and ")} beyond the per-call cap of ${MAX_BATCH_IMAGES} images / ${MAX_BATCH_DOCS} documents were skipped. Split into multiple calls.)`,
+			});
+		}
+		void labelParts;
+		return {
+			content,
+			details: {
+				ok: anyOk,
+				source: sources.join(", "),
+				sourceType: sources.every((s) => /^https?:\/\//i.test(s)) ? "url" : "path",
+				returned: imageCount > 0 ? "image" : textCount > 0 ? "text" : "none",
+				bytes: 0,
+				message: `Batch of ${sources.length} sources: ${imageCount} image block(s), ${textCount} text extraction(s).`,
+			},
+		};
+	}
 
 	/* ── media-understanding helpers (shared by image/video/pdf provider paths) ── */
 
@@ -1067,6 +1568,8 @@ export function makeAnalyzeMediaTool(
 		bytes: Buffer;
 		mimeType: string;
 		question: string;
+		/** Max output tokens for the provider answer (clamped by the adapter). */
+		maxTokens?: number;
 		provider?: "google" | "anthropic";
 		model?: string;
 		signal?: AbortSignal;
@@ -1084,23 +1587,21 @@ export function makeAnalyzeMediaTool(
 		| { ok: false; unavailable: false; result: AgentToolResult<AnalyzeMediaDetails> }
 	> {
 		const cfg = getMuConfig();
-		try {
-			const res = await runUnderstanding({
-				kind: p.kind,
-				bytes: p.bytes,
-				mimeType: p.mimeType,
-				cfg,
-				...(p.question ? { prompt: p.question } : {}),
-				...(p.provider ? { provider: p.provider } : {}),
-				...(p.model ? { model: p.model } : {}),
-				...(p.signal ? { signal: p.signal } : {}),
-			});
+		// Shape a successful provider TEXT into the tool result. Shared by the
+		// cache-HIT and fresh-call paths so they return identically.
+		const buildOk = (
+			text: string,
+			resolvedProvider: string,
+			resolvedModel: string,
+			fromCache: boolean,
+		): { ok: true; result: AgentToolResult<AnalyzeMediaDetails> } => {
 			const promptText = buildPromptText(p.question, p.kind);
 			// The provider's answer is derived from operator-pointed media but can
 			// still echo injected instructions (a hostile document/video caption),
 			// so wrap it in the untrusted-content envelope like extracted text.
-			const wrapped = wrapWebContent(res.text, "web_fetch", { includeWarning: true });
-			const lead = p.note ? `${promptText}\n\n(${p.note})` : promptText;
+			const wrapped = wrapWebContent(text, "web_fetch", { includeWarning: true });
+			const notes = [p.note, fromCache ? "cached result" : undefined].filter(Boolean);
+			const lead = notes.length > 0 ? `${promptText}\n\n(${notes.join("; ")})` : promptText;
 			return {
 				ok: true,
 				result: {
@@ -1113,11 +1614,50 @@ export function makeAnalyzeMediaTool(
 						mimeType: p.mimeType,
 						bytes: p.bytes.length,
 						returned: "text",
-						provider: res.provider,
-						providerModel: res.model,
+						provider: resolvedProvider,
+						providerModel: resolvedModel,
 					},
 				},
 			};
+		};
+
+		// Cache key = content hash + the identity that determines the answer. Use
+		// the REQUEST identity (override provider/model/maxTokens) so a repeat of
+		// the same request hits; the RESOLVED provider/model live in the value.
+		const cacheKey =
+			cacheEnabled
+				? mediaCacheKey({
+						bytes: p.bytes,
+						question: p.question,
+						provider: p.provider ?? "auto",
+						kind: p.kind,
+						...(p.model ? { model: p.model } : {}),
+						...(p.maxTokens !== undefined ? { maxTokens: p.maxTokens } : {}),
+					})
+				: "";
+		if (cacheEnabled) {
+			const hit = await readCache(cacheKey).catch(() => undefined);
+			if (hit) return buildOk(hit.text, hit.provider, hit.model, true);
+		}
+
+		try {
+			const res = await runUnderstanding({
+				kind: p.kind,
+				bytes: p.bytes,
+				mimeType: p.mimeType,
+				cfg,
+				...(p.question ? { prompt: p.question } : {}),
+				...(p.maxTokens !== undefined ? { maxTokens: p.maxTokens } : {}),
+				...(p.provider ? { provider: p.provider } : {}),
+				...(p.model ? { model: p.model } : {}),
+				...(p.signal ? { signal: p.signal } : {}),
+			});
+			// Persist for next time (best-effort; never blocks the result).
+			if (cacheEnabled) {
+				const value: MediaCacheValue = { text: res.text, provider: res.provider, model: res.model };
+				void writeCache(cacheKey, value).catch(() => {});
+			}
+			return buildOk(res.text, res.provider, res.model, false);
 		} catch (err) {
 			if (err instanceof MediaUnderstandingUnavailableError) {
 				return { ok: false, unavailable: true, message: err.message };
@@ -1149,18 +1689,57 @@ export function makeAnalyzeMediaTool(
 		truncated: boolean;
 		mime?: string;
 		question: string;
+		/** Byte budget the image block must fit into (downscaled if larger). */
+		imageBudget: number;
 		modelContext?: AnalyzeMediaModelContext;
 		provider?: "google" | "anthropic";
 		model?: string;
+		maxTokens?: number;
 		signal?: AbortSignal;
 	}): Promise<AgentToolResult<AnalyzeMediaDetails>> {
 		const ext = extensionOf(p.source);
-		const mimeType = (p.mime?.split(";")[0]?.trim() || imageMimeFromExt(ext)).toLowerCase();
+		let mimeType = (p.mime?.split(";")[0]?.trim() || imageMimeFromExt(ext)).toLowerCase();
 		const isHeic = /heic|heif/.test(mimeType) || ext === "heic" || ext === "heif";
 		const sees = modelLikelySeesImages(p.modelContext);
 
 		const promptText = buildPromptText(p.question, "image");
 		const warnings: string[] = [];
+
+		// DOWNSCALE (not truncate) an oversize image. Truncating an image
+		// mid-stream produces a broken payload every vision model rejects; instead
+		// we resize it (fit-inside, down a quality grid) + EXIF auto-rotate, so the
+		// model still sees a VALID image under the budget. HEIC/SVG aren't decodable
+		// without a native dep, so they skip this (pass-through + the HEIC warning).
+		let bytes = p.bytes;
+		let imageTruncated = p.truncated;
+		if (!isHeic && isDownscalableImageMime(mimeType)) {
+			const overBudget = bytes.length > p.imageBudget;
+			// Only pay the decode/encode when the image is actually over budget (or
+			// arrived truncated and must be re-validated). A small image is shipped
+			// untouched (lossless).
+			if (overBudget || imageTruncated) {
+				try {
+					const ds: DownscaleResult = await downscaleImage(bytes, {
+						maxBytes: p.imageBudget,
+						sourceMime: mimeType,
+					});
+					bytes = ds.bytes;
+					mimeType = ds.mimeType;
+					// A successful downscale yields a valid image → clear the truncation
+					// flag (we no longer ship a corrupt prefix).
+					imageTruncated = false;
+					if (ds.resized) {
+						warnings.push(
+							`The image exceeded the byte budget, so it was downscaled to ${ds.width}×${ds.height} (re-encoded as JPEG) to fit — detail may be reduced. Raise \`maxBytes\` for a higher-resolution pass.`,
+						);
+					}
+				} catch {
+					// Could not decode (corrupt / unsupported encoding). Keep the
+					// original bytes; the truncation warning below still applies.
+				}
+			}
+		}
+
 		if (isHeic) {
 			warnings.push(
 				"This is a HEIC/HEIF image. Brigade cannot transcode it without a native dependency, so it is passed through as-is — many models reject HEIC. If the model cannot read it, ask the operator to convert it to JPEG/PNG.",
@@ -1176,9 +1755,10 @@ export function makeAnalyzeMediaTool(
 				kind: "image",
 				source: p.source,
 				sourceType: p.sourceType,
-				bytes: p.bytes,
+				bytes,
 				mimeType,
 				question: p.question,
+				...(p.maxTokens !== undefined ? { maxTokens: p.maxTokens } : {}),
 				...(p.provider ? { provider: p.provider } : {}),
 				...(p.model ? { model: p.model } : {}),
 				...(p.signal ? { signal: p.signal } : {}),
@@ -1214,9 +1794,11 @@ export function makeAnalyzeMediaTool(
 				"Note: Brigade could not confirm this model is vision-capable. If you cannot see the image, switch to a vision-capable model.",
 			);
 		}
-		if (p.truncated) {
+		if (imageTruncated) {
+			// Reached only when the image could NOT be downscaled (undecodable) yet
+			// arrived truncated — the block may be corrupt.
 			warnings.push(
-				"The image was truncated at the byte cap and may be corrupt — raise `maxBytes` if it does not render.",
+				"The image was truncated at the byte cap and could not be re-encoded, so it may be corrupt — raise `maxBytes` if it does not render.",
 			);
 		}
 		const text = warnings.length > 0 ? `${promptText}\n\n${warnings.join("\n\n")}` : promptText;
@@ -1226,7 +1808,7 @@ export function makeAnalyzeMediaTool(
 			// vision model sees it as part of the turn.
 			content: [
 				{ type: "text", text },
-				{ type: "image", data: p.bytes.toString("base64"), mimeType },
+				{ type: "image", data: bytes.toString("base64"), mimeType },
 			],
 			details: {
 				ok: true,
@@ -1234,9 +1816,9 @@ export function makeAnalyzeMediaTool(
 				sourceType: p.sourceType,
 				kind: "image",
 				mimeType,
-				bytes: p.bytes.length,
+				bytes: bytes.length,
 				returned: "image",
-				...(p.truncated ? { truncated: true } : {}),
+				...(imageTruncated ? { truncated: true } : {}),
 				...(warnings.length > 0 ? { warning: warnings.join(" ") } : {}),
 			},
 		};
@@ -1250,6 +1832,7 @@ export function makeAnalyzeMediaTool(
 		question: string;
 		provider?: "google" | "anthropic";
 		model?: string;
+		maxTokens?: number;
 		signal?: AbortSignal;
 	}): Promise<AgentToolResult<AnalyzeMediaDetails>> {
 		// Pi's content channel can't carry video, so we call a video-capable
@@ -1284,6 +1867,7 @@ export function makeAnalyzeMediaTool(
 			bytes: p.bytes,
 			mimeType,
 			question: p.question,
+			...(p.maxTokens !== undefined ? { maxTokens: p.maxTokens } : {}),
 			...(p.provider ? { provider: p.provider } : {}),
 			...(p.model ? { model: p.model } : {}),
 			...(p.signal ? { signal: p.signal } : {}),
@@ -1309,10 +1893,11 @@ export function makeAnalyzeMediaTool(
 
 	/**
 	 * Audio handler (voice notes + clips). Pi's content channel can't carry
-	 * audio, so we route to the media-understanding subsystem (Gemini inline
-	 * today; the Pi path when a provider whose model accepts audio is keyed) and
-	 * return its TEXT transcription / summary. With no capable key, a clear
-	 * "configure a key" message.
+	 * audio (text + image only), so audio understanding is GEMINI-ONLY: we route
+	 * to the media-understanding subsystem (Gemini inline audio) and return its
+	 * TEXT transcription / summary. With no Google/Gemini key, a clear "configure
+	 * a Gemini key" message — never a provider 400 from packing audio into an
+	 * image block.
 	 */
 	async function handleAudio(p: {
 		source: string;
@@ -1320,19 +1905,27 @@ export function makeAnalyzeMediaTool(
 		bytes: Buffer;
 		mime?: string;
 		question: string;
+		/** Spoken-language hint (e.g. "es", "Spanish") folded into the provider prompt. */
+		language?: string;
 		provider?: "google" | "anthropic";
 		model?: string;
+		maxTokens?: number;
 		signal?: AbortSignal;
 	}): Promise<AgentToolResult<AnalyzeMediaDetails>> {
 		const mimeType =
 			p.mime?.split(";")[0]?.trim().toLowerCase() || audioMimeFromExt(extensionOf(p.source));
+		// Fold the language hint (and the question/context) into the provider
+		// prompt — the Gemini generateContent API has no dedicated language field,
+		// so the spoken-language hint rides in the instruction text.
+		const audioPrompt = buildAudioPrompt(p.question, p.language);
 		const viaProvider = await understandViaProvider({
 			kind: "audio",
 			source: p.source,
 			sourceType: p.sourceType,
 			bytes: p.bytes,
 			mimeType,
-			question: p.question,
+			question: audioPrompt,
+			...(p.maxTokens !== undefined ? { maxTokens: p.maxTokens } : {}),
 			...(p.provider ? { provider: p.provider } : {}),
 			...(p.model ? { model: p.model } : {}),
 			...(p.signal ? { signal: p.signal } : {}),
@@ -1375,6 +1968,7 @@ export function makeAnalyzeMediaTool(
 		mode: "auto" | "provider" | "text";
 		provider?: "google" | "anthropic";
 		model?: string;
+		maxTokens?: number;
 		signal?: AbortSignal;
 	}): Promise<AgentToolResult<AnalyzeMediaDetails>> {
 		// Local text extraction is the fallback (and the forced path for mode:"text").
@@ -1406,6 +2000,7 @@ export function makeAnalyzeMediaTool(
 				bytes: p.bytes,
 				mimeType: "application/pdf",
 				question: p.question,
+				...(p.maxTokens !== undefined ? { maxTokens: p.maxTokens } : {}),
 				...(p.provider ? { provider: p.provider } : {}),
 				...(p.model ? { model: p.model } : {}),
 				...(p.signal ? { signal: p.signal } : {}),
@@ -1434,8 +2029,73 @@ export function makeAnalyzeMediaTool(
 		return extractLocally();
 	}
 
+	/**
+	 * Plain / structured-text handler (txt / csv / tsv / json / xml / yaml / log /
+	 * markdown / source code / unknown-but-UTF-8). Decodes the bytes as UTF-8,
+	 * wraps them in the untrusted-content envelope (the file is operator-pointed
+	 * but can still carry injected instructions), and returns them as text capped
+	 * to the char budget. No provider call — this is a pure read, the cheapest
+	 * path. Both rival tools accept these formats; Brigade used to reject them.
+	 */
+	async function handleTextPlain(p: {
+		source: string;
+		sourceType: "url" | "path";
+		bytes: Buffer;
+		truncated: boolean;
+		mime?: string;
+		question: string;
+	}): Promise<AgentToolResult<AnalyzeMediaDetails>> {
+		// Strip a UTF-8 BOM if present, then decode. `Buffer.toString("utf8")`
+		// replaces invalid sequences with U+FFFD rather than throwing, so even
+		// near-text binary degrades gracefully instead of erroring.
+		let raw = p.bytes.toString("utf8");
+		if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+		const rawText = raw.trim();
+		if (!rawText) {
+			return failure({
+				source: p.source,
+				sourceType: p.sourceType,
+				kind: "text",
+				...(p.mime ? { mimeType: p.mime } : {}),
+				bytes: p.bytes.length,
+				message: "The file is empty or contains no readable text.",
+			});
+		}
+		const { text: clamped, truncated: textTruncated } = truncateText(raw, DEFAULT_MAX_CHARS);
+		const wrapped = wrapWebContent(clamped, "web_fetch", { includeWarning: true });
+		const promptText = buildPromptText(p.question, "text");
+		const truncated = p.truncated || textTruncated;
+		const note = truncated
+			? "\n\n(Content was truncated to fit the turn — raise `maxBytes` for more.)"
+			: "";
+		return {
+			content: [{ type: "text", text: `${promptText}${note}\n\n${wrapped}` }],
+			details: {
+				ok: true,
+				source: p.source,
+				sourceType: p.sourceType,
+				kind: "text",
+				...(p.mime ? { mimeType: p.mime } : {}),
+				bytes: p.bytes.length,
+				returned: "text",
+				...(truncated ? { truncated: true } : {}),
+			},
+		};
+	}
+
 	async function handleTextExtract(p: {
-		kind: Exclude<MediaKind, "image" | "video">;
+		kind:
+			| "pdf"
+			| "docx"
+			| "pptx"
+			| "xlsx"
+			| "html"
+			| "odt"
+			| "ods"
+			| "odp"
+			| "epub"
+			| "rtf"
+			| "ipynb";
 		source: string;
 		sourceType: "url" | "path";
 		bytes: Buffer;
@@ -1465,6 +2125,20 @@ export function makeAnalyzeMediaTool(
 					break;
 				case "html":
 					rawText = await extractHtml(p.bytes, p.sourceType === "url" ? p.source : "about:blank");
+					break;
+				case "odt":
+				case "ods":
+				case "odp":
+					rawText = await extractOpenDocument(p.bytes, p.kind);
+					break;
+				case "epub":
+					rawText = await extractEpub(p.bytes);
+					break;
+				case "rtf":
+					rawText = extractRtf(p.bytes);
+					break;
+				case "ipynb":
+					rawText = extractIpynb(p.bytes);
 					break;
 			}
 		} catch (err) {
@@ -1558,13 +2232,82 @@ function buildPromptText(question: string, kind: MediaKind): string {
 				? "the video referenced below"
 				: kind === "audio"
 					? "the audio referenced below"
-					: `the extracted ${kind} content below`;
+					: kind === "text"
+						? "the text content below"
+						: `the extracted ${kind} content below`;
 	if (question) return `Analyze ${what} and answer this:\n${question}`;
 	return `Analyze ${what} and describe / summarize what it contains.`;
 }
 
+/**
+ * Build the provider prompt for an AUDIO call, folding in an optional spoken-
+ * language hint and the caller's question/context. Gemini's generateContent has
+ * no language field, so the hint is expressed in the instruction text. When the
+ * caller gives no question, default to transcribe-then-summarize.
+ */
+export function buildAudioPrompt(question: string, language?: string): string {
+	const lang = (language ?? "").trim();
+	const langClause = lang
+		? ` The spoken language is ${lang} — transcribe in ${lang} and preserve it.`
+		: "";
+	const base = question.trim()
+		? question.trim()
+		: "Transcribe this audio, then briefly summarize what is said.";
+	return `${base}${langClause}`;
+}
+
+/**
+ * Heuristic: do these bytes look like UTF-8 text (so an unknown extension/MIME
+ * can be read as the `text` kind rather than rejected)? Rejects anything with a
+ * NUL byte or a high ratio of C0 control bytes (binary), and validates that a
+ * leading sample decodes as UTF-8 without replacement characters. Conservative
+ * — a false negative just yields the old "unsupported" message.
+ */
+export function looksLikeUtf8Text(bytes: Buffer): boolean {
+	if (bytes.length === 0) return false;
+	const sample = bytes.subarray(0, Math.min(bytes.length, 4096));
+	let control = 0;
+	for (const b of sample) {
+		if (b === 0) return false; // NUL → binary
+		// Allow tab(9), LF(10), CR(13), FF(12); count other C0 controls.
+		if (b < 0x20 && b !== 9 && b !== 10 && b !== 13 && b !== 12) control += 1;
+	}
+	if (control / sample.length > 0.05) return false;
+	// Validate UTF-8: a strict decode shouldn't introduce replacement chars in a
+	// sample that didn't already contain them.
+	const decoded = sample.toString("utf8");
+	const replacements = (decoded.match(/�/g) ?? []).length;
+	if (replacements > 0 && replacements / decoded.length > 0.01) return false;
+	return true;
+}
+
 function failure(d: Omit<AnalyzeMediaDetails, "ok" | "returned"> & { message: string }): AgentToolResult<AnalyzeMediaDetails> {
 	return jsonResult({ ok: false, returned: "none", ...d }) as AgentToolResult<AnalyzeMediaDetails>;
+}
+
+/** Short display name for a source (file basename, or the URL pathname tail). */
+function basenameOf(source: string): string {
+	try {
+		if (/^https?:\/\//i.test(source)) {
+			const u = new URL(source);
+			const last = u.pathname.split("/").filter(Boolean).pop();
+			return last || u.hostname;
+		}
+	} catch {
+		/* fall through to path basename */
+	}
+	const norm = source.replace(/[\\/]+$/, "");
+	const tail = norm.split(/[\\/]/).pop();
+	return tail || source;
+}
+
+/** Concatenate all TEXT blocks of a single-source result (for batch labeling). */
+function firstText(r: AgentToolResult<AnalyzeMediaDetails>): string {
+	return r.content
+		.filter((b): b is { type: "text"; text: string } => b.type === "text")
+		.map((b) => b.text)
+		.join("\n")
+		.trim();
 }
 
 // Image byte cap is applied where the image handler runs; export the constant

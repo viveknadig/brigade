@@ -259,22 +259,47 @@ describe("runMediaUnderstanding — routing", () => {
 		assert.equal(piCalled, false, "Pi path not used when anthropic is keyed");
 	});
 
-	it("routes AUDIO through the Pi path when an audio-capable provider is keyed (no google)", async () => {
+	it("AUDIO does NOT fall back to the Pi path (Pi has no audio block) — stays unavailable", async () => {
+		// Operator has ONLY an OpenAI-style key (no google). Pi carries text+image
+		// only, so there is no provider Pi can drive that ingests audio — routing a
+		// voice note through it would pack audio into an IMAGE block and 400. So
+		// selection must report `undefined` (unavailable), NOT "pi". This is the
+		// audio-via-Pi false-path fix: a clean unavailable instead of a 400.
 		const cfg: MediaUnderstandingConfig = {
 			resolveKey: (p) => (p === "openai" ? "sk-openai" : ""),
 			resolveModel: (provider) =>
 				provider === "openai" ? { provider, id: "gpt-4o-audio", input: ["text", "image"] } : undefined,
 			listKeyedProviders: () => ["openai"],
-			piComplete: async () => "Transcript: hello world.",
+			piComplete: async () => "should never be called for audio",
 		};
-		assert.equal(resolveMediaUnderstandingProvider("audio", cfg), "pi");
+		assert.equal(resolveMediaUnderstandingProvider("audio", cfg), undefined);
+		await assert.rejects(
+			() =>
+				runMediaUnderstanding({
+					kind: "audio",
+					bytes: Buffer.from([1, 2]),
+					mimeType: "audio/ogg",
+					cfg,
+				}),
+			(err: unknown) =>
+				err instanceof MediaUnderstandingUnavailableError && /Gemini API key/i.test(err.message),
+		);
+	});
+
+	it("routes AUDIO to Gemini when a Google key is configured", async () => {
+		const fetchImpl = (async (input: string | URL | Request) => {
+			assert.ok(String(input).includes("generativelanguage.googleapis.com"), "uses Gemini");
+			return jsonResponse({ candidates: [{ content: { parts: [{ text: "Transcript: hello world." }] } }] });
+		}) as typeof fetch;
+		assert.equal(resolveMediaUnderstandingProvider("audio", cfgWithKeys(["google"])), "google");
 		const res = await runMediaUnderstanding({
 			kind: "audio",
 			bytes: Buffer.from([1, 2]),
 			mimeType: "audio/ogg",
-			cfg,
+			cfg: cfgWithKeys(["google"]),
+			fetchImpl,
 		});
-		assert.equal(res.provider, "pi");
+		assert.equal(res.provider, "google");
 		assert.match(res.text, /Transcript: hello world/);
 	});
 
