@@ -55,6 +55,8 @@ export interface ResolveContactNameArgs {
 	timeoutMs?: number;
 	/** TEST SEAM — inject a mock fetch. */
 	fetchImpl?: FetchLike;
+	/** Allow private/LAN/loopback hosts through the SSRF guard (default TRUE for BlueBubbles). */
+	allowPrivateNetwork?: boolean;
 }
 
 /**
@@ -136,7 +138,7 @@ async function fetchDirectory(args: ResolveContactNameArgs, now: number): Promis
 		const res = await blueBubblesFetchWithTimeout(
 			url,
 			{ method: "GET" },
-			{ ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}), ...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}) },
+			{ ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}), ...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}), ...(args.allowPrivateNetwork === false ? { allowPrivateNetwork: false } : {}) },
 		);
 		if (res.ok) {
 			const text = await res.text();

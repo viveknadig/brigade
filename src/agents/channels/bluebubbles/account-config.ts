@@ -94,7 +94,19 @@ interface BlueBubblesAccountEntry {
 	probeTimeoutMs?: number;
 	actions?: Partial<BlueBubblesActionFlags>;
 	catchup?: BlueBubblesCatchupConfig;
+	network?: BlueBubblesNetworkConfig;
+	selfHandle?: string;
 	[key: string]: unknown;
+}
+
+/** Network policy overrides — relax the SSRF guard for a trusted LAN server. */
+export interface BlueBubblesNetworkConfig {
+	/**
+	 * Allow private/LAN/loopback BlueBubbles hosts (default TRUE — a BlueBubbles
+	 * server is almost always on the operator's LAN). Cloud-metadata stays blocked
+	 * regardless. Set false to force the strict public-only SSRF policy.
+	 */
+	allowPrivate?: boolean;
 }
 
 interface BlueBubblesChannelConfigSlot {
@@ -108,6 +120,8 @@ interface BlueBubblesChannelConfigSlot {
 	probeTimeoutMs?: number;
 	actions?: Partial<BlueBubblesActionFlags>;
 	catchup?: BlueBubblesCatchupConfig;
+	network?: BlueBubblesNetworkConfig;
+	selfHandle?: string;
 	accounts?: BlueBubblesAccountEntry[];
 	/** Idle TTL (ms / duration string) after which idle thread sessions are reaped. */
 	threadIdleTtlMs?: number | string;
@@ -134,6 +148,15 @@ export interface ResolvedBlueBubblesAccount {
 	actions: BlueBubblesActionFlags;
 	/** On-(re)connect catch-up backfill config (undefined → defaults; `enabled:false` disables). */
 	catchup?: BlueBubblesCatchupConfig;
+	/** Allow private/LAN/loopback targets through the SSRF guard (default TRUE). */
+	allowPrivateNetwork: boolean;
+	/**
+	 * The bot's OWN iMessage handle (phone/email) — used as `selfId` for group
+	 * mention-gating. Empty when the operator hasn't set it (mention-gating in
+	 * groups then can't fire and the channel falls back to its other group
+	 * addressed-signals). Normalised to digits for a phone, lower-case for email.
+	 */
+	selfHandle: string;
 	verbose: boolean;
 }
 
@@ -322,6 +345,50 @@ export function resolveBlueBubblesActions(cfg: BrigadeConfig, accountId?: string
 }
 
 /**
+ * Normalise a handle for self/mention matching: an email lower-cases; a phone
+ * keeps only its digits (so `+1 (555) 123-4567` and `15551234567` compare equal).
+ * Returns "" for an empty input.
+ */
+export function normalizeBlueBubblesSelfHandle(raw: string | undefined): string {
+	const trimmed = (raw ?? "").trim();
+	if (!trimmed) return "";
+	if (trimmed.includes("@")) return trimmed.toLowerCase();
+	const digits = trimmed.replace(/[^0-9]/g, "");
+	return digits || trimmed.toLowerCase();
+}
+
+/**
+ * Resolve the bot's own handle for an account (per-account `selfHandle` wins over
+ * the top-level slot), normalised. Empty when unset.
+ */
+export function resolveBlueBubblesSelfHandle(
+	cfg: BrigadeConfig,
+	accountId?: string | null,
+	env: NodeJS.ProcessEnv = process.env,
+): string {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = bluebubblesChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	const raw = resolveStringRef(entry?.selfHandle, env) || resolveStringRef(slot?.selfHandle, env);
+	return normalizeBlueBubblesSelfHandle(raw);
+}
+
+/**
+ * Resolve whether the SSRF guard should allow private/LAN/loopback hosts for an
+ * account. Per-account `network.allowPrivate` wins over the top-level slot;
+ * DEFAULTS TO TRUE (a BlueBubbles server is normally on the operator's LAN).
+ * Cloud-metadata stays blocked regardless of this flag.
+ */
+export function resolveBlueBubblesAllowPrivateNetwork(cfg: BrigadeConfig, accountId?: string | null): boolean {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = bluebubblesChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	if (typeof entry?.network?.allowPrivate === "boolean") return entry.network.allowPrivate;
+	if (typeof slot?.network?.allowPrivate === "boolean") return slot.network.allowPrivate;
+	return true;
+}
+
+/**
  * Resolve the on-(re)connect catch-up backfill config for an account
  * (per-account overrides the top-level slot). Returns `undefined` when neither
  * level configured it — the connection then uses catch-up's built-in defaults.
@@ -369,6 +436,8 @@ export function resolveBlueBubblesAccount(
 		mediaMaxBytes: Math.round(mediaMaxMb * 1024 * 1024),
 		probeTimeoutMs: resolveBlueBubblesProbeTimeoutMs(cfg, id),
 		actions: resolveBlueBubblesActions(cfg, id),
+		allowPrivateNetwork: resolveBlueBubblesAllowPrivateNetwork(cfg, id),
+		selfHandle: resolveBlueBubblesSelfHandle(cfg, id, env),
 		...(() => {
 			const catchup = resolveBlueBubblesCatchup(cfg, id);
 			return catchup ? { catchup } : {};

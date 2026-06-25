@@ -72,6 +72,29 @@ describe("sendMessageIMessage", () => {
 		assert.equal(client.lastParams?.to, undefined);
 	});
 
+	it("strips an inline directive tag from the body before the wire call", async () => {
+		const client = new FakeRpcClient();
+		await sendMessageIMessage("+15551234567", "Sure thing [[reply_to_current]] here you go", { client });
+		const sent = String(client.lastParams?.text ?? "");
+		assert.ok(!sent.includes("[["), `directive tag stripped, got: ${JSON.stringify(sent)}`);
+		assert.ok(sent.includes("Sure thing") && sent.includes("here you go"));
+	});
+
+	it("strips a leaked role-scaffolding marker from the body", async () => {
+		const client = new FakeRpcClient();
+		await sendMessageIMessage("+15551234567", "Hello assistant to=final there", { client });
+		const sent = String(client.lastParams?.text ?? "");
+		assert.ok(!/assistant\s+to\s*=\s*final/i.test(sent), `role marker stripped, got: ${JSON.stringify(sent)}`);
+		assert.ok(sent.includes("Hello") && sent.includes("there"));
+	});
+
+	it("strips <think> reasoning residue from the body", async () => {
+		const client = new FakeRpcClient();
+		await sendMessageIMessage("+15551234567", "<think>internal</think>The answer is 42.", { client });
+		const sent = String(client.lastParams?.text ?? "");
+		assert.equal(sent, "The answer is 42.");
+	});
+
 	it("includes a sanitized reply_to", async () => {
 		const client = new FakeRpcClient();
 		await sendMessageIMessage("+15551234567", "re", { client, replyToId: "  msg[1]  " });

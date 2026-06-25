@@ -9,11 +9,15 @@
  * INJECTABLE `fetch` so tests can mock the wire with zero network.
  */
 
+import { guardedFetch } from "../../../infra/net/fetch-guard.js";
+
 /** Default REST timeout (ms). Attachment uploads override to a longer value. */
 export const BLUEBUBBLES_DEFAULT_TIMEOUT_MS = 10_000;
 
 /** The injectable fetch seam — production passes `fetch`; tests pass a mock. */
 export type FetchLike = typeof fetch;
+
+export { SsrfBlockedError } from "../../../infra/net/fetch-guard.js";
 
 /**
  * Build a BlueBubbles REST URL. `path` is the API path AFTER `/api/v1/`
@@ -41,25 +45,59 @@ export function buildBlueBubblesApiUrl(params: {
 }
 
 /**
- * Fetch with an AbortController timeout. `fetchImpl` defaults to the global
- * `fetch`; inject a mock in tests. Never swallows the abort — a timeout rejects
- * with the AbortController's error so callers can classify it.
+ * Fetch a BlueBubbles REST URL through Brigade's SSRF guard with a timeout.
+ *
+ * Every REST call goes through the guard: it re-checks the host on each redirect
+ * hop (so a redirect to `169.254.169.254` / `metadata.*` can't reach cloud
+ * metadata) and strips `Authorization`/`Cookie` on cross-origin redirects.
+ *
+ * A BlueBubbles server is almost always a LAN / private-IP host
+ * (`192.168.x.x`, `10.x.x.x`, `localhost`), so `allowPrivateNetwork` defaults to
+ * TRUE for this channel — but cloud-metadata stays blocked even then, so the
+ * guard still defends against the highest-value SSRF target. The operator can
+ * tighten it via `channels.bluebubbles.network.allowPrivate=false`.
+ *
+ * `fetchImpl` is the test seam (inject a mock); it is threaded into the guard so
+ * the SSRF classification still runs but the actual wire call is the mock.
  */
 export async function blueBubblesFetchWithTimeout(
 	url: string,
 	init: RequestInit,
-	opts: { timeoutMs?: number; fetchImpl?: FetchLike } = {},
+	opts: { timeoutMs?: number; fetchImpl?: FetchLike; allowPrivateNetwork?: boolean } = {},
 ): Promise<Response> {
-	const doFetch = opts.fetchImpl ?? fetch;
 	const timeoutMs = opts.timeoutMs ?? BLUEBUBBLES_DEFAULT_TIMEOUT_MS;
-	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), timeoutMs);
-	if (typeof (timer as { unref?: () => void }).unref === "function") (timer as { unref: () => void }).unref();
-	try {
-		return await doFetch(url, { ...init, signal: controller.signal });
-	} finally {
-		clearTimeout(timer);
+	const headers = headersToRecord(init.headers);
+	const { response } = await guardedFetch(url, {
+		method: init.method ?? "GET",
+		...(Object.keys(headers).length > 0 ? { headers } : {}),
+		...(init.body !== undefined && init.body !== null ? { body: init.body } : {}),
+		timeoutMs,
+		// LAN servers are the norm for BlueBubbles; default-allow private but keep
+		// cloud-metadata blocked. The operator may flip this off per account.
+		allowPrivateNetwork: opts.allowPrivateNetwork !== false,
+		...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+	});
+	return response;
+}
+
+/** Coerce a fetch headers init to a plain record for the guard's option shape. */
+function headersToRecord(h: RequestInit["headers"]): Record<string, string> {
+	const out: Record<string, string> = {};
+	if (!h) return out;
+	if (typeof Headers !== "undefined" && h instanceof Headers) {
+		h.forEach((v, k) => {
+			out[k] = v;
+		});
+	} else if (Array.isArray(h)) {
+		for (const pair of h) {
+			const k = pair[0];
+			const v = pair[1];
+			if (k) out[k] = String(v ?? "");
+		}
+	} else {
+		for (const [k, v] of Object.entries(h as Record<string, string>)) out[k] = String(v ?? "");
 	}
+	return out;
 }
 
 /**

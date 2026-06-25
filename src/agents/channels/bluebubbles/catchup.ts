@@ -46,6 +46,8 @@ export interface RunBlueBubblesCatchupArgs {
 	timeoutMs?: number;
 	/** TEST SEAM — inject a mock fetch. */
 	fetchImpl?: FetchLike;
+	/** Allow private/LAN/loopback hosts through the SSRF guard (default TRUE for BlueBubbles). */
+	allowPrivateNetwork?: boolean;
 	/**
 	 * Re-feed one raw message record through the connection's live webhook path
 	 * (normalize → dedupe → dispatch). The connection wires this to the SAME
@@ -116,7 +118,7 @@ export async function runBlueBubblesCatchup(args: RunBlueBubblesCatchupArgs): Pr
 					with: ["chat", "chat.participants", "attachment", "handle"],
 				}),
 			},
-			{ ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}), ...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}) },
+			{ ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}), ...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}), ...(args.allowPrivateNetwork === false ? { allowPrivateNetwork: false } : {}) },
 		);
 		if (!res.ok) {
 			args.log?.(`catchup: message/query returned HTTP ${res.status}`);

@@ -94,6 +94,69 @@ export function sanitizeReplyToId(raw?: string): string | undefined {
 	return v;
 }
 
+/**
+ * Outbound delivery sanitizer (the twin of the inbound reflection guard).
+ *
+ * The central pipeline already strips `<think>`/`<final>` via
+ * `sanitizeReplyForChannel`, but the channel send path is reachable by OTHER
+ * routes (agent tools, catch-up replays, plugins) and a model can emit Brigade's
+ * own internal scaffolding mid-text. This is the last gate before the wire: it
+ * removes anything that is unambiguously internal so it can never reach a
+ * recipient's iMessage thread. Shared by BOTH channels (iMessage native +
+ * BlueBubbles) — it runs on every outbound text bubble.
+ *
+ * What it strips:
+ *   - inline directive tags (`[[audio_as_voice]]`, `[[reply_to:…]]`,
+ *     `[[reply_to_current]]`) — Brigade consumes these as send-options; they
+ *     must never render as literal text;
+ *   - `<think>`/`<thinking>`/`<thought>` reasoning blocks + `<final>` wrappers
+ *     (residue if an upstream sanitizer was skipped);
+ *   - role/turn scaffolding markers (`assistant to=…`, a trailing
+ *     `user:` / `system:` / `assistant:` line) and internal `#+#+` separators.
+ *
+ * Idempotent + dependency-free. Collapses the blank lines a strip leaves behind.
+ */
+
+/** Inline directive tags Brigade consumes as send-options (never user-visible). */
+const INLINE_DIRECTIVE_TAG_RE =
+	/\s*(?:\[\[\s*audio_as_voice\s*\]\]|\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\])\s*/gi;
+/** Model-internal separator runs (`+#+#+#`). */
+const INTERNAL_SEPARATOR_RE = /(?:[#+]){4,}#?/g;
+/** A leaked `assistant to=<role>` scaffolding marker. */
+const ASSISTANT_ROLE_MARKER_RE = /\bassistant\s+to\s*=\s*\w+/gi;
+/** A trailing role-turn marker on its own line (`assistant:` / `user:` / `system:`). */
+const ROLE_TURN_MARKER_RE = /^[ \t]*(?:user|system|assistant)\s*:\s*$/gim;
+
+/** Iteratively drop fully-closed `<think>`/`<thinking>`/`<thought>` blocks. */
+function stripReasoningBlocks(text: string): string {
+	let out = text;
+	for (let i = 0; i < 32; i++) {
+		const next = out.replace(/<(think|thinking|thought)>(?:(?!<\1>)[\s\S])*?<\/\1>\s*/i, "");
+		if (next === out) break;
+		out = next;
+	}
+	return out;
+}
+
+/**
+ * Strip Brigade-internal scaffolding from outbound text before it hits the wire.
+ * Returns the cleaned text; if stripping leaves nothing, returns the trimmed
+ * original (better to send something than confuse the recipient with silence).
+ */
+export function sanitizeOutboundIMessageText(text: string): string {
+	if (!text) return text;
+	let cleaned = stripReasoningBlocks(text);
+	cleaned = cleaned.replace(/<\/?final>\s*/gi, "");
+	cleaned = cleaned.replace(INLINE_DIRECTIVE_TAG_RE, " ");
+	cleaned = cleaned.replace(INTERNAL_SEPARATOR_RE, "");
+	cleaned = cleaned.replace(ASSISTANT_ROLE_MARKER_RE, "");
+	cleaned = cleaned.replace(ROLE_TURN_MARKER_RE, "");
+	// Collapse runs of spaces a strip can leave mid-line, then blank lines.
+	cleaned = cleaned.replace(/[ \t]{2,}/g, " ").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
+	const trimmed = cleaned.trim();
+	return trimmed.length > 0 ? trimmed : text.trim();
+}
+
 /** Outbound media kind → the placeholder text used when the message has no body. */
 export type IMessageMediaKind = OutboundMediaKind;
 type OutboundMediaKind = "image" | "video" | "audio" | "voice" | "document" | "sticker";

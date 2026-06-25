@@ -67,6 +67,8 @@ export interface DownloadInboundArgs {
 	timeoutMs?: number;
 	/** TEST SEAM — inject a mock fetch. */
 	fetchImpl?: FetchLike;
+	/** Allow private/LAN/loopback hosts through the SSRF guard (default TRUE for BlueBubbles). */
+	allowPrivateNetwork?: boolean;
 }
 
 /**
@@ -92,7 +94,7 @@ export async function downloadBlueBubblesAttachment(
 		const res = await blueBubblesFetchWithTimeout(
 			url,
 			{ method: "GET" },
-			{ timeoutMs: args.timeoutMs ?? 30_000, ...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}) },
+			{ timeoutMs: args.timeoutMs ?? 30_000, ...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}), ...(args.allowPrivateNetwork === false ? { allowPrivateNetwork: false } : {}) },
 		);
 		if (!res.ok) return null;
 		const buf = await res.arrayBuffer();
@@ -136,4 +138,86 @@ export async function downloadInboundAttachments(
 		if (resolved) out.push(resolved);
 	}
 	return out;
+}
+
+/** Pull the raw attachment descriptors out of a `message/{guid}` response record. */
+function extractAttachmentsFromMessage(data: unknown): RawBlueBubblesAttachment[] {
+	const rec = data && typeof data === "object" ? (data as Record<string, unknown>) : null;
+	const raw = rec?.attachments;
+	if (!Array.isArray(raw)) return [];
+	const out: RawBlueBubblesAttachment[] = [];
+	for (const a of raw) {
+		const r = a && typeof a === "object" ? (a as Record<string, unknown>) : null;
+		const guid = typeof r?.guid === "string" ? r.guid.trim() : "";
+		if (!guid) continue;
+		const transferName =
+			(typeof r?.transferName === "string" && r.transferName) ||
+			(typeof r?.transfer_name === "string" && r.transfer_name) ||
+			undefined;
+		const mimeType =
+			(typeof r?.mimeType === "string" && r.mimeType) ||
+			(typeof r?.mime_type === "string" && r.mime_type) ||
+			(typeof r?.uti === "string" && r.uti) ||
+			undefined;
+		const totalBytes =
+			(typeof r?.totalBytes === "number" && r.totalBytes) ||
+			(typeof r?.total_bytes === "number" && r.total_bytes) ||
+			undefined;
+		out.push({
+			guid,
+			...(transferName ? { transferName } : {}),
+			...(mimeType ? { mimeType } : {}),
+			...(totalBytes !== undefined ? { totalBytes } : {}),
+		});
+	}
+	return out;
+}
+
+/** Args for the late-index attachment re-fetch. */
+export interface FetchMessageAttachmentsArgs {
+	serverUrl: string;
+	password: string;
+	timeoutMs?: number;
+	fetchImpl?: FetchLike;
+	allowPrivateNetwork?: boolean;
+}
+
+/**
+ * Re-fetch a message's attachment descriptors by GUID
+ * (`GET /api/v1/message/{guid}?with=attachment`).
+ *
+ * BlueBubbles can fire the `new-message` webhook BEFORE attachment indexing
+ * finishes, so the webhook's `attachments` arrives empty for a message that
+ * actually has media. A short delay + this single re-fetch recovers the media
+ * that would otherwise be silently lost. Returns [] on any failure (never throws).
+ */
+export async function fetchBlueBubblesMessageAttachments(
+	messageGuid: string,
+	args: FetchMessageAttachmentsArgs,
+): Promise<RawBlueBubblesAttachment[]> {
+	const guid = (messageGuid ?? "").trim();
+	if (!guid) return [];
+	const url = buildBlueBubblesApiUrl({
+		serverUrl: args.serverUrl,
+		path: `message/${encodeURIComponent(guid)}`,
+		password: args.password,
+		query: { with: "attachment" },
+	});
+	try {
+		const res = await blueBubblesFetchWithTimeout(
+			url,
+			{ method: "GET" },
+			{
+				timeoutMs: args.timeoutMs ?? 10_000,
+				...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}),
+				...(args.allowPrivateNetwork === false ? { allowPrivateNetwork: false } : {}),
+			},
+		);
+		if (!res.ok) return [];
+		const text = await res.text();
+		const body = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+		return extractAttachmentsFromMessage(body.data);
+	} catch {
+		return [];
+	}
 }

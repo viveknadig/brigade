@@ -129,6 +129,91 @@ describe("BlueBubbles adapter", () => {
 		assert.equal(received.messageId, "M-9");
 	});
 
+	it("surfaces an inbound tapback as a reaction dispatch (not a silent drop)", async () => {
+		const fake = makeFake();
+		const box: { received: InboundMessage | null } = { received: null };
+		const adapter = createBlueBubblesAdapter({
+			probeImpl: probeOk(true),
+			connectImpl: (args) => {
+				fake.args.value = args;
+				return fake.conn;
+			},
+		});
+		adapter.isConfigured(baseCfg());
+		await adapter.start(startCtx((m) => (box.received = m)));
+		// The connection decoded a tapback and called onTapback with it.
+		fake.args.value!.onTapback!({
+			emoji: "❤️",
+			action: "added",
+			chatGuid: "iMessage;-;+1",
+			conversationId: "chat_guid:iMessage;-;+1",
+			from: "+1",
+			isGroup: false,
+			targetGuid: "ORIG-1",
+		});
+		const received = box.received;
+		assert.ok(received, "a tapback produced an inbound dispatch");
+		assert.equal(received.channel, "bluebubbles");
+		assert.deepEqual(received.reaction, { emojis: ["❤️"], targetMessageId: "ORIG-1" });
+		assert.match(received.text, /ORIG-1/);
+	});
+
+	it("drops a tapback REMOVAL (only additions wake the agent)", async () => {
+		const fake = makeFake();
+		const box: { received: InboundMessage | null } = { received: null };
+		const adapter = createBlueBubblesAdapter({
+			probeImpl: probeOk(true),
+			connectImpl: (args) => {
+				fake.args.value = args;
+				return fake.conn;
+			},
+		});
+		adapter.isConfigured(baseCfg());
+		await adapter.start(startCtx((m) => (box.received = m)));
+		fake.args.value!.onTapback!({
+			emoji: "❤️",
+			action: "removed",
+			chatGuid: "iMessage;-;+1",
+			conversationId: "chat_guid:iMessage;-;+1",
+			from: "+1",
+			isGroup: false,
+			targetGuid: "ORIG-1",
+		});
+		assert.equal(box.received, null, "a removal is not dispatched");
+	});
+
+	it("exposes the configured selfHandle as selfId() + surfaces mentions[] (Fix 7)", async () => {
+		const fake = makeFake();
+		const box: { received: InboundMessage | null } = { received: null };
+		const adapter = createBlueBubblesAdapter({
+			probeImpl: probeOk(true),
+			connectImpl: (args) => {
+				fake.args.value = args;
+				return fake.conn;
+			},
+		});
+		// selfHandle is normalised to digits for a phone.
+		adapter.isConfigured({
+			channels: { bluebubbles: { enabled: true, serverUrl: "http://10.0.0.1:1234", password: ENV_PW, selfHandle: "+1 (555) 123-4567" } },
+		} as unknown as BrigadeConfig);
+		await adapter.start(startCtx((m) => (box.received = m)));
+		assert.equal(adapter.selfId?.(), "15551234567");
+		// A group inbound carrying mentions surfaces them on the dispatched message.
+		fake.args.value!.onMessage({
+			conversationId: "chat_guid:iMessage;+;chatABC",
+			chatGuid: "iMessage;+;chatABC",
+			messageGuid: "M-1",
+			from: "+1999",
+			text: "hey 15551234567",
+			isGroup: true,
+			mentions: ["15551234567"],
+			attachments: [],
+			raw: {},
+		});
+		assert.ok(box.received);
+		assert.deepEqual(box.received.mentions, ["15551234567"]);
+	});
+
 	it("advertises rich capabilities only when Private API is enabled", async () => {
 		const fake = makeFake();
 		const adapter = createBlueBubblesAdapter({ probeImpl: probeOk(true), connectImpl: () => fake.conn });

@@ -114,6 +114,35 @@ describe("classifyHostnameSync — allows", () => {
 	});
 });
 
+describe("classifyHostnameSync — allowPrivateNetwork opt-in", () => {
+	const allow = { allowPrivateNetwork: true } as const;
+
+	it("allows RFC1918 / loopback / link-local / localhost when opted in", () => {
+		assert.equal(classifyHostnameSync("192.168.1.5", allow), null);
+		assert.equal(classifyHostnameSync("10.0.0.1", allow), null);
+		assert.equal(classifyHostnameSync("172.16.0.1", allow), null);
+		assert.equal(classifyHostnameSync("127.0.0.1", allow), null);
+		assert.equal(classifyHostnameSync("169.254.5.5", allow), null);
+		assert.equal(classifyHostnameSync("localhost", allow), null);
+		assert.equal(classifyHostnameSync("server.local", allow), null);
+		assert.equal(classifyHostnameSync("::1", allow), null);
+		assert.equal(classifyHostnameSync("fd12::1", allow), null);
+	});
+
+	it("STILL blocks cloud-metadata even with private access on", () => {
+		assert.ok(classifyHostnameSync("169.254.169.254", allow), "AWS/GCP metadata IP stays blocked");
+		assert.ok(classifyHostnameSync("metadata.google.internal", allow));
+		assert.ok(classifyHostnameSync("metadata.aws.amazon.com", allow));
+		assert.ok(classifyHostnameSync("fd00:ec2::254", allow), "AWS IPv6 metadata stays blocked");
+	});
+
+	it("STILL blocks multicast / reserved / legacy literals with private access on", () => {
+		assert.ok(classifyHostnameSync("224.0.0.1", allow));
+		assert.ok(classifyHostnameSync("240.0.0.1", allow));
+		assert.ok(classifyHostnameSync("2130706433", allow), "legacy decimal-int literal stays blocked");
+	});
+});
+
 describe("error classes", () => {
 	it("SsrfBlockedError carries url + reason", () => {
 		const err = new SsrfBlockedError("http://10.0.0.1/", "RFC1918 private");

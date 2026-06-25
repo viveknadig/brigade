@@ -37,15 +37,23 @@ function recordFetch(): { fetch: typeof fetch; calls: Array<{ url: string; metho
 	return { fetch: fetchImpl, calls };
 }
 
+/** Default action flags — everything on, like the config default. */
+const ALL_ACTIONS = { reactions: true, edit: true, unsend: true, effects: true, groupAdmin: true } as const;
+
 /** Run an action with an injected account + Private-API status + recording fetch. */
 async function run(
 	args: Record<string, unknown>,
-	overrides: { privateApi?: boolean | null; rec?: ReturnType<typeof recordFetch> } = {},
+	overrides: {
+		privateApi?: boolean | null;
+		rec?: ReturnType<typeof recordFetch>;
+		actions?: { reactions: boolean; edit: boolean; unsend: boolean; effects: boolean; groupAdmin: boolean };
+	} = {},
 ): Promise<{ details: { action: string; ok: boolean; message: string }; calls: Array<{ url: string; method: string }> }> {
 	const rec = overrides.rec ?? recordFetch();
 	const tool = makeBlueBubblesActionTool({
 		resolveAccount: () => ({ serverUrl: SERVER, password: PASSWORD }),
 		resolvePrivateApi: async () => (overrides.privateApi === undefined ? true : overrides.privateApi),
+		resolveActions: () => overrides.actions ?? { ...ALL_ACTIONS },
 		fetchImpl: rec.fetch,
 		readIcon: async () => new Uint8Array([1, 2, 3]),
 	});
@@ -115,6 +123,70 @@ describe("bluebubbles_action — dispatch to the right endpoint", () => {
 		const { details, calls } = await run({ action: "leave-group", chatGuid: "chat_guid:G" });
 		assert.equal(details.ok, true);
 		assert.match(calls[0]!.url, /\/api\/v1\/chat\/G\/leave\?/);
+	});
+});
+
+describe("bluebubbles_action — send-effect + reply (Fix 5)", () => {
+	it("send-effect POSTs to message/text with the resolved effectId", async () => {
+		const rec = recordFetch();
+		const { details } = await run({ action: "send-effect", chatGuid: "G", text: "surprise!", effect: "confetti" }, { rec });
+		assert.equal(details.ok, true, details.message);
+		assert.equal(rec.calls.length, 1);
+		assert.match(rec.calls[0]!.url, /\/api\/v1\/message\/text\?/);
+	});
+
+	it("send-effect rejects an unknown effect name (no request)", async () => {
+		const rec = recordFetch();
+		const { details } = await run({ action: "send-effect", chatGuid: "G", text: "hi", effect: "nope" }, { rec });
+		assert.equal(details.ok, false);
+		assert.match(details.message, /Unknown effect/);
+		assert.equal(rec.calls.length, 0);
+	});
+
+	it("send-effect is refused when actions.effects = false", async () => {
+		const rec = recordFetch();
+		const { details } = await run(
+			{ action: "send-effect", chatGuid: "G", text: "hi", effect: "confetti" },
+			{ rec, actions: { ...ALL_ACTIONS, effects: false } },
+		);
+		assert.equal(details.ok, false);
+		assert.match(details.message, /effects.*disabled/i);
+		assert.equal(rec.calls.length, 0);
+	});
+
+	it("reply POSTs to message/text (the native inline reply path)", async () => {
+		const rec = recordFetch();
+		const { details } = await run({ action: "reply", chatGuid: "G", text: "got it", replyToId: "ORIG-1", partIndex: 0 }, { rec });
+		assert.equal(details.ok, true, details.message);
+		assert.equal(rec.calls.length, 1);
+		assert.match(rec.calls[0]!.url, /\/api\/v1\/message\/text\?/);
+	});
+
+	it("reply without replyToId → ok:false (no request)", async () => {
+		const rec = recordFetch();
+		const { details } = await run({ action: "reply", chatGuid: "G", text: "got it" }, { rec });
+		assert.equal(details.ok, false);
+		assert.match(details.message, /requires a `replyToId`/);
+		assert.equal(rec.calls.length, 0);
+	});
+});
+
+describe("bluebubbles_action — groupAdmin gating (Fix 6)", () => {
+	it("refuses a group action when actions.groupAdmin = false (no request)", async () => {
+		const rec = recordFetch();
+		const { details } = await run(
+			{ action: "rename-group", chatGuid: "G", displayName: "Team" },
+			{ rec, actions: { ...ALL_ACTIONS, groupAdmin: false } },
+		);
+		assert.equal(details.ok, false);
+		assert.match(details.message, /group administration is disabled/i);
+		assert.equal(rec.calls.length, 0);
+	});
+
+	it("proceeds with a group action when groupAdmin defaults true", async () => {
+		const { details, calls } = await run({ action: "leave-group", chatGuid: "G" });
+		assert.equal(details.ok, true);
+		assert.equal(calls.length, 1);
 	});
 });
 

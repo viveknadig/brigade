@@ -52,6 +52,18 @@ import { probeBlueBubbles } from "./probe.js";
 /** Practical per-message text limit for chunked sends (before bubble-splitting). */
 const BLUEBUBBLES_TEXT_LIMIT = 10_000;
 
+/**
+ * Synthesise the agent-facing note for an inbound tapback. A tapback carries no
+ * text of its own, so the note ("<emoji> tapback on message <id>") is what the
+ * central pipeline routes through dispatchTurn so the agent has context.
+ */
+export function buildBlueBubblesReactionNote(emoji: string, targetMessageId: string): string {
+	const target = targetMessageId.trim();
+	return target
+		? `Reacted ${emoji} to message ${target}.`
+		: `Reacted ${emoji} to a message.`;
+}
+
 /** Build the capability flags for the account's action toggles + Private-API status. */
 function buildCapabilities(actions: BlueBubblesActionFlags, privateApi: boolean | null): ChannelCapabilities {
 	const richAvailable = privateApi === true;
@@ -95,6 +107,7 @@ export function createBlueBubblesAdapter(opts: CreateBlueBubblesAdapterOptions =
 	let lastEnv: NodeJS.ProcessEnv = process.env;
 	let started = false;
 	let privateApi: boolean | null = null;
+	let selfHandle = "";
 	let actions: BlueBubblesActionFlags = {
 		reactions: true,
 		edit: true,
@@ -125,6 +138,7 @@ export function createBlueBubblesAdapter(opts: CreateBlueBubblesAdapterOptions =
 			const cfg = lastConfig ?? (await loadStartConfig());
 			const account = resolveBlueBubblesAccount(cfg, accountId, lastEnv);
 			actions = account.actions;
+			selfHandle = account.selfHandle;
 			// Probe once at start to detect Private-API status (gates rich actions +
 			// honest capabilities). Never throws.
 			try {
@@ -156,8 +170,28 @@ export function createBlueBubblesAdapter(opts: CreateBlueBubblesAdapterOptions =
 							chatType: msg.isGroup ? "group" : "direct",
 							isGroup: msg.isGroup,
 							...(msg.replyToGuid ? { replyTo: { messageId: msg.replyToGuid } } : {}),
+							...(msg.mentions && msg.mentions.length > 0 ? { mentions: msg.mentions } : {}),
 							...(msg.resolveMedia ? { resolveMedia: msg.resolveMedia } : {}),
 							raw: msg.raw,
+						});
+					},
+					// Inbound tapback → synthesise a short note + a `reaction` event and
+					// route it through the SAME inbound pipeline as a normal message so
+					// the access gate + routing apply uniformly. Only "added" tapbacks
+					// wake the agent (a removal is noise); the connection already gates
+					// this on `actions.reactions`.
+					onTapback: (note) => {
+						if (note.action !== "added") return;
+						const targetId = note.targetGuid ?? "";
+						void ctx.onInbound({
+							channel: BLUEBUBBLES_CHANNEL_ID,
+							accountId,
+							conversationId: note.conversationId,
+							from: note.from,
+							text: buildBlueBubblesReactionNote(note.emoji, targetId),
+							chatType: note.isGroup ? "group" : "direct",
+							isGroup: note.isGroup,
+							reaction: { emojis: [note.emoji], targetMessageId: targetId },
 						});
 					},
 				});
@@ -240,8 +274,11 @@ export function createBlueBubblesAdapter(opts: CreateBlueBubblesAdapterOptions =
 			await connection.setTyping(conversationId, state === "composing");
 		},
 
+		// The bot's own iMessage handle (when the operator configured
+		// `channels.bluebubbles.selfHandle`) — lets the central pipeline's group
+		// mention-gating match `msg.mentions` against the bot. Undefined when unset.
 		selfId(): string | undefined {
-			return undefined;
+			return selfHandle || undefined;
 		},
 
 		connectedAt(): number | null {

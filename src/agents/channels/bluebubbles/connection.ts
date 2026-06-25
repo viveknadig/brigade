@@ -31,8 +31,8 @@ import {
 import type { ResolvedBlueBubblesAccount } from "./account-config.js";
 import { BLUEBUBBLES_DEDUPE_MAX_ENTRIES, BLUEBUBBLES_DEDUPE_TTL_MS, resolveBlueBubblesDedupeKey } from "./dedupe.js";
 import { resolveOutboundAttachment } from "../imessage/media.js";
-import { markdownToIMessageText, resolveDeliveredText } from "../imessage/format.js";
-import { downloadInboundAttachments } from "./media.js";
+import { markdownToIMessageText, resolveDeliveredText, sanitizeOutboundIMessageText } from "../imessage/format.js";
+import { downloadInboundAttachments, fetchBlueBubblesMessageAttachments } from "./media.js";
 import { normalizeBlueBubblesWebhook, type NormalizedBlueBubblesMessage } from "./normalize.js";
 import {
 	bubbleSplit,
@@ -48,6 +48,9 @@ import { markBlueBubblesChatRead, sendBlueBubblesTyping } from "./chat.js";
 import { peekBlueBubblesContactName, warmBlueBubblesContactDirectory } from "./contact-names.js";
 import { runBlueBubblesCatchup, type BlueBubblesCatchupConfig, type BlueBubblesCatchupSummary } from "./catchup.js";
 import type { FetchLike } from "./types.js";
+
+/** Delay before the single late-index attachment re-fetch (BB indexes media ~2s after the webhook). */
+const BLUEBUBBLES_ATTACHMENT_REFETCH_DELAY_MS = 2_000;
 
 /** The inbound message handed to the adapter (carries the deferred-media thunk). */
 export interface BlueBubblesInboundMessage extends NormalizedBlueBubblesMessage {
@@ -76,6 +79,8 @@ export interface ConnectBlueBubblesArgs {
 	privateApi?: boolean | null;
 	/** TEST SEAM — inject a mock fetch for every REST call. */
 	fetchImpl?: FetchLike;
+	/** TEST SEAM — override the late-index attachment re-fetch delay (ms). Default 2000. */
+	attachmentRefetchDelayMs?: number;
 }
 
 /** The live connection handle the adapter drives. */
@@ -117,6 +122,7 @@ export function connectBlueBubbles(args: ConnectBlueBubblesArgs): BlueBubblesCon
 		timeoutMs: account.probeTimeoutMs,
 		...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}),
 		privateApiEnabled: privateApi === true,
+		...(account.allowPrivateNetwork === false ? { allowPrivateNetwork: false } : {}),
 	});
 
 	const contactArgs = () => ({
@@ -125,6 +131,7 @@ export function connectBlueBubbles(args: ConnectBlueBubblesArgs): BlueBubblesCon
 		accountId: account.accountId,
 		...(account.probeTimeoutMs !== undefined ? { timeoutMs: account.probeTimeoutMs } : {}),
 		...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}),
+		...(account.allowPrivateNetwork === false ? { allowPrivateNetwork: false } : {}),
 	});
 
 	/**
@@ -146,11 +153,78 @@ export function connectBlueBubbles(args: ConnectBlueBubblesArgs): BlueBubblesCon
 		void warmBlueBubblesContactDirectory(contactArgs()).catch(() => {});
 	};
 
+	const downloadArgs = () => ({
+		serverUrl: account.serverUrl,
+		password: account.password,
+		cacheDir,
+		maxBytes: account.mediaMaxBytes,
+		timeoutMs: account.probeTimeoutMs,
+		...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}),
+		...(account.allowPrivateNetwork === false ? { allowPrivateNetwork: false } : {}),
+	});
+
+	const refetchArgs = () => ({
+		serverUrl: account.serverUrl,
+		password: account.password,
+		...(account.probeTimeoutMs !== undefined ? { timeoutMs: account.probeTimeoutMs } : {}),
+		...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}),
+		...(account.allowPrivateNetwork === false ? { allowPrivateNetwork: false } : {}),
+	});
+
+	/** Wait the late-index delay (skippable in tests). */
+	const refetchDelay = async (): Promise<void> => {
+		const delayMs = args.attachmentRefetchDelayMs ?? BLUEBUBBLES_ATTACHMENT_REFETCH_DELAY_MS;
+		if (delayMs <= 0) return;
+		await new Promise<void>((resolve) => {
+			const t = setTimeout(resolve, delayMs);
+			if (typeof (t as { unref?: () => void }).unref === "function") (t as { unref: () => void }).unref();
+		});
+	};
+
 	const feedWebhookEvent = (eventType: string | undefined, payload: unknown): void => {
 		const allowed = new Set(["new-message", "updated-message", undefined]);
 		if (eventType && !allowed.has(eventType)) return;
-		const result = normalizeBlueBubblesWebhook(payload, eventType);
+		const result = normalizeBlueBubblesWebhook(payload, eventType, account.selfHandle);
 		if (result.kind === "skip") {
+			// An "empty message" with a guid MIGHT be a media message whose
+			// attachments indexed late. Kick a SINGLE bounded background re-fetch; if
+			// media turns up, dispatch a synthetic inbound (deferred-media thunk).
+			// A genuinely empty message finds nothing and is never dispatched (no
+			// agent spam). Dedupe still guards against a follow-up `updated-message`.
+			if (result.mediaCandidate) {
+				const cand = result.mediaCandidate;
+				const key = resolveBlueBubblesDedupeKey(account.accountId, payload, eventType);
+				if (key && !dedupe.claim(key)) {
+					if (account.verbose) args.log("inbound dropped: duplicate");
+					return;
+				}
+				void (async () => {
+					try {
+						await refetchDelay();
+						const refetched = await fetchBlueBubblesMessageAttachments(cand.messageGuid, refetchArgs());
+						if (refetched.length === 0) return;
+						if (account.verbose) args.log(`attachment late-index re-fetch found ${refetched.length} for ${cand.messageGuid}`);
+						const inbound: BlueBubblesInboundMessage = {
+							conversationId: `chat_guid:${cand.chatGuid}`,
+							chatGuid: cand.chatGuid,
+							messageGuid: cand.messageGuid,
+							from: cand.from,
+							...(cand.fromName ? { fromName: cand.fromName } : {}),
+							text: "",
+							isGroup: cand.isGroup,
+							...(cand.timestampMs !== undefined ? { timestampMs: cand.timestampMs } : {}),
+							attachments: refetched,
+							raw: payload,
+							resolveMedia: async () => downloadInboundAttachments(refetched, downloadArgs()),
+						};
+						enrichFromNameSync(inbound);
+						args.onMessage(inbound);
+					} catch (err) {
+						if (account.verbose) args.log(`attachment re-fetch failed: ${err instanceof Error ? err.message : String(err)}`);
+					}
+				})();
+				return;
+			}
 			if (account.verbose) args.log(`inbound dropped: ${result.reason}`);
 			return;
 		}
@@ -178,15 +252,18 @@ export function connectBlueBubbles(args: ConnectBlueBubblesArgs): BlueBubblesCon
 		const message = result.message;
 		const inbound: BlueBubblesInboundMessage = { ...message };
 		if (message.attachments.length > 0) {
-			inbound.resolveMedia = async () =>
-				downloadInboundAttachments(message.attachments, {
-					serverUrl: account.serverUrl,
-					password: account.password,
-					cacheDir,
-					maxBytes: account.mediaMaxBytes,
-					timeoutMs: account.probeTimeoutMs,
-					...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}),
-				});
+			inbound.resolveMedia = async () => downloadInboundAttachments(message.attachments, downloadArgs());
+		} else if (message.messageGuid && eventType === "updated-message") {
+			// An `updated-message` follow-up with text but no attachments may carry
+			// media that indexed late. Defer a SINGLE bounded re-fetch (short delay →
+			// `message/{guid}` → download); resolves [] when there was truly none.
+			inbound.resolveMedia = async () => {
+				await refetchDelay();
+				const refetched = await fetchBlueBubblesMessageAttachments(message.messageGuid, refetchArgs());
+				if (refetched.length === 0) return [];
+				if (account.verbose) args.log(`attachment late-index re-fetch found ${refetched.length} for ${message.messageGuid}`);
+				return downloadInboundAttachments(refetched, downloadArgs());
+			};
 		}
 		// Resolve a human display name for the sender from the warm cache (sync) and
 		// dispatch synchronously — a cold cache warms in the background for next time.
@@ -201,7 +278,9 @@ export function connectBlueBubbles(args: ConnectBlueBubblesArgs): BlueBubblesCon
 	): Promise<{ messageId?: string }> => {
 		const base = restBase();
 		const chatGuid = await resolveChatGuid(base, conversationId);
-		const bubbles = bubbleSplit(markdownToIMessageText(text));
+		// Strip internal directive tags / role scaffolding / reasoning residue
+		// (the outbound twin of the reflection guard) BEFORE bubble-splitting.
+		const bubbles = bubbleSplit(sanitizeOutboundIMessageText(markdownToIMessageText(text)));
 		if (bubbles.length === 0) return {};
 		let lastMessageId: string | undefined;
 		let first = true;
@@ -233,7 +312,7 @@ export function connectBlueBubbles(args: ConnectBlueBubblesArgs): BlueBubblesCon
 		// bubble AFTER the media.
 		const caption = resolveDeliveredText(media.caption ?? "", media.kind);
 		if (caption && caption.trim() && !caption.startsWith("<media:")) {
-			await sendBlueBubblesText(chatGuid, caption, base);
+			await sendBlueBubblesText(chatGuid, sanitizeOutboundIMessageText(caption), base);
 		}
 		return sent.messageId ? { messageId: sent.messageId } : {};
 	};
@@ -272,6 +351,7 @@ export function connectBlueBubbles(args: ConnectBlueBubblesArgs): BlueBubblesCon
 			...(catchupConfig ? { config: catchupConfig } : {}),
 			...(account.probeTimeoutMs !== undefined ? { timeoutMs: account.probeTimeoutMs } : {}),
 			...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}),
+			...(account.allowPrivateNetwork === false ? { allowPrivateNetwork: false } : {}),
 			// Re-feed each fetched record through the SAME normalize+dedupe path a
 			// live webhook uses (as a `new-message` event), so dedupe drops anything
 			// already delivered — no double-delivery.

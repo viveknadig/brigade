@@ -108,6 +108,8 @@ function account(fetchImpl: typeof fetch): ResolvedBlueBubblesAccount {
 		mediaMaxBytes: 100 * 1024 * 1024,
 		probeTimeoutMs: 5000,
 		actions: { reactions: true, edit: true, unsend: true, effects: true, groupAdmin: true },
+		allowPrivateNetwork: true,
+		selfHandle: "",
 		verbose: false,
 	};
 }

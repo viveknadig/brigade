@@ -5,6 +5,7 @@ import {
 	bubbleSplit,
 	editBlueBubblesMessage,
 	reactBlueBubbles,
+	resolveChatGuid,
 	sendBlueBubblesAttachment,
 	sendBlueBubblesText,
 	unsendBlueBubblesMessage,
@@ -139,6 +140,70 @@ describe("sendBlueBubblesAttachment", () => {
 		assert.equal(body.method, "private-api");
 		assert.ok(typeof body.tempGuid === "string");
 		assert.ok(body.attachment, "carries the file part");
+	});
+});
+
+describe("resolveChatGuid", () => {
+	/**
+	 * A fetch that answers `chat/query` with a fixed page of chat records and
+	 * `chat/new` with a fresh guid, recording every URL it saw.
+	 */
+	function chatServerFetch(chats: unknown[], rec: string[], newGuid = "iMessage;-;+1NEW"): typeof fetch {
+		return (async (url: string) => {
+			const u = String(url);
+			rec.push(u);
+			let data: unknown = null;
+			if (/chat\/query/.test(u)) data = rec.filter((r) => /chat\/query/.test(r)).length === 1 ? chats : [];
+			else if (/chat\/new/.test(u)) data = { guid: newGuid };
+			return {
+				ok: true,
+				status: 200,
+				text: async () => JSON.stringify({ status: 200, data }),
+				headers: new Map<string, string>() as unknown as Headers,
+			} as unknown as Response;
+		}) as unknown as typeof fetch;
+	}
+
+	const base = (fetchImpl: typeof fetch) => ({ serverUrl: SERVER, password: PASSWORD, fetchImpl });
+
+	it("passes a chat_guid: target straight through (no query)", async () => {
+		const rec: string[] = [];
+		const guid = await resolveChatGuid(base(chatServerFetch([], rec)), "chat_guid:iMessage;-;+1555");
+		assert.equal(guid, "iMessage;-;+1555");
+		assert.equal(rec.length, 0, "hot path makes no network call");
+	});
+
+	it("resolves a chat_id: target to the matching chat's guid via chat/query", async () => {
+		const rec: string[] = [];
+		const chats = [
+			{ chatId: 7, guid: "iMessage;-;+1777" },
+			{ chatId: 42, guid: "iMessage;-;+1999" },
+		];
+		const guid = await resolveChatGuid(base(chatServerFetch(chats, rec)), "chat_id:42");
+		assert.equal(guid, "iMessage;-;+1999");
+		assert.ok(rec.some((u) => /chat\/query/.test(u)), "queried the server");
+	});
+
+	it("resolves a chat_identifier: target via the GUID's identifier component", async () => {
+		const rec: string[] = [];
+		const chats = [{ guid: "iMessage;+;chat12345", chatId: 3 }];
+		const guid = await resolveChatGuid(base(chatServerFetch(chats, rec)), "chat_identifier:chat12345");
+		assert.equal(guid, "iMessage;+;chat12345");
+	});
+
+	it("creates a fresh DM via chat/new when a handle has no existing chat", async () => {
+		const rec: string[] = [];
+		const guid = await resolveChatGuid(base(chatServerFetch([], rec)), "+15551234567");
+		assert.equal(guid, "iMessage;-;+1NEW");
+		assert.ok(rec.some((u) => /chat\/new/.test(u)), "fell back to chat/new");
+	});
+
+	it("throws when a chat_id: target resolves to nothing on the server", async () => {
+		const rec: string[] = [];
+		await assert.rejects(
+			() => resolveChatGuid(base(chatServerFetch([], rec)), "chat_id:999"),
+			/could not resolve a chat/,
+		);
 	});
 });
 

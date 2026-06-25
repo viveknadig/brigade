@@ -144,3 +144,45 @@ describe("resolveBlueBubblesDedupeKey", () => {
 		assert.equal(key, undefined);
 	});
 });
+
+describe("normalizeBlueBubblesWebhook — group self-mention detection (Fix 7)", () => {
+	const groupMsg = (text: string) => ({
+		data: { guid: "M-1", text, chatGuid: "iMessage;+;chatABC", handle: { address: "+1999" } },
+	});
+
+	it("populates mentions[] when the bot's phone selfHandle appears in group text", () => {
+		const result = normalizeBlueBubblesWebhook(groupMsg("hey 15551234567 can you help"), "new-message", "15551234567");
+		assert.equal(result.kind, "message");
+		if (result.kind !== "message") return;
+		assert.deepEqual(result.message.mentions, ["15551234567"]);
+	});
+
+	it("matches a phone selfHandle across formatting differences", () => {
+		const result = normalizeBlueBubblesWebhook(groupMsg("ping +1 (555) 123-4567 please"), "new-message", "15551234567");
+		assert.equal(result.kind, "message");
+		if (result.kind !== "message") return;
+		assert.deepEqual(result.message.mentions, ["15551234567"]);
+	});
+
+	it("leaves mentions unset when the bot is NOT named in group text", () => {
+		const result = normalizeBlueBubblesWebhook(groupMsg("just chatting among ourselves"), "new-message", "15551234567");
+		assert.equal(result.kind, "message");
+		if (result.kind !== "message") return;
+		assert.equal(result.message.mentions, undefined);
+	});
+
+	it("does NOT populate mentions in a DM (gating is group-only)", () => {
+		const dm = { data: { guid: "M-2", text: "15551234567", chatGuid: "iMessage;-;+1999", handle: { address: "+1999" } } };
+		const result = normalizeBlueBubblesWebhook(dm, "new-message", "15551234567");
+		assert.equal(result.kind, "message");
+		if (result.kind !== "message") return;
+		assert.equal(result.message.mentions, undefined);
+	});
+
+	it("matches an email selfHandle case-insensitively", () => {
+		const result = normalizeBlueBubblesWebhook(groupMsg("cc Bot@Example.com on this"), "new-message", "bot@example.com");
+		assert.equal(result.kind, "message");
+		if (result.kind !== "message") return;
+		assert.deepEqual(result.message.mentions, ["bot@example.com"]);
+	});
+});

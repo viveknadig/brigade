@@ -46,6 +46,26 @@ export interface BlueBubblesRestBase {
 	fetchImpl?: FetchLike;
 	/** When false, Private-API-only params (reply-thread, effect, react, edit…) are skipped/refused. */
 	privateApiEnabled?: boolean;
+	/** Allow private/LAN/loopback hosts through the SSRF guard (default TRUE for BlueBubbles). */
+	allowPrivateNetwork?: boolean;
+}
+
+/**
+ * Shared fetch-option assembly so every helper threads timeout + fetchImpl +
+ * the SSRF private-network knob identically. `allowPrivateNetwork` defaults TRUE
+ * (a BlueBubbles server is normally on the operator's LAN); only forwarded as
+ * `false` when the operator tightened the knob.
+ */
+function fetchOpts(base: BlueBubblesRestBase): {
+	timeoutMs?: number;
+	fetchImpl?: FetchLike;
+	allowPrivateNetwork?: boolean;
+} {
+	return {
+		...(base.timeoutMs !== undefined ? { timeoutMs: base.timeoutMs } : {}),
+		...(base.fetchImpl ? { fetchImpl: base.fetchImpl } : {}),
+		...(base.allowPrivateNetwork === false ? { allowPrivateNetwork: false } : {}),
+	};
 }
 
 /**
@@ -110,7 +130,7 @@ export async function createBlueBubblesChat(
 				tempGuid: `temp-${randomUUID()}`,
 			}),
 		},
-		{ ...(base.timeoutMs !== undefined ? { timeoutMs: base.timeoutMs } : {}), ...(base.fetchImpl ? { fetchImpl: base.fetchImpl } : {}) },
+		fetchOpts(base),
 	);
 	const data = await readBlueBubblesJson(res, "chat/new");
 	const guid = extractChatGuid(data);
@@ -118,30 +138,120 @@ export async function createBlueBubblesChat(
 	return guid;
 }
 
+/** One chat record from a `chat/query` page (shape varies by server version). */
+interface BlueBubblesChatRecord {
+	guid?: string;
+	chatGuid?: string;
+	chatId?: number;
+	id?: number;
+	chat_id?: number;
+	identifier?: string;
+	chatIdentifier?: string;
+	chat_identifier?: string;
+	participants?: unknown[];
+	handles?: unknown[];
+	[key: string]: unknown;
+}
+
+/** Pull a chat GUID off a query record. */
+function recordChatGuid(chat: BlueBubblesChatRecord): string | undefined {
+	const g = chat.guid ?? chat.chatGuid;
+	return typeof g === "string" && g ? g : undefined;
+}
+
+/** Pull the numeric chat id off a query record. */
+function recordChatId(chat: BlueBubblesChatRecord): number | null {
+	for (const c of [chat.chatId, chat.id, chat.chat_id]) {
+		if (typeof c === "number" && Number.isFinite(c)) return c;
+	}
+	return null;
+}
+
+/** The third `;`-delimited component of a chat GUID is the chat identifier. */
+function identifierFromChatGuid(chatGuid: string): string | null {
+	const parts = chatGuid.split(";");
+	if (parts.length < 3) return null;
+	const id = (parts[2] ?? "").trim();
+	return id || null;
+}
+
+/** Page through `chat/query` and return one page of chat records. */
+async function queryBlueBubblesChats(
+	base: BlueBubblesRestBase,
+	params: { offset: number; limit: number },
+): Promise<BlueBubblesChatRecord[]> {
+	const url = buildBlueBubblesApiUrl({ serverUrl: base.serverUrl, path: "chat/query", password: base.password });
+	const res = await blueBubblesFetchWithTimeout(
+		url,
+		{
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ limit: params.limit, offset: params.offset, with: ["participants"] }),
+		},
+		fetchOpts(base),
+	);
+	if (!res.ok) return [];
+	const data = await readBlueBubblesJson<unknown>(res, "chat/query").catch(() => null);
+	return Array.isArray(data) ? (data as BlueBubblesChatRecord[]) : [];
+}
+
 /**
- * Resolve an outbound conversation target to a chatGuid. A `chat_guid:` target
- * passes straight through. A `chat_id` / `chat_identifier` / `handle` target is
- * resolved against the server: an existing 1:1 / group chat is found via
- * `chat/query`, else a fresh handle creates a new chat. Returns the chatGuid.
+ * Resolve an outbound conversation target to a real chatGuid.
  *
- * For simplicity (and to keep the test seam clean) a `chat_id` target is treated
- * as already-resolved when it already looks like a GUID; otherwise the caller
- * should pass a `chat_guid:` or a `handle` target. The common inbound→reply path
- * always carries a `chat_guid:` (the webhook delivers the chatGuid), so this is
- * the hot path.
+ *   - `chat_guid:` — passes straight through (the HOT inbound→reply path; the
+ *     webhook always delivers the chatGuid).
+ *   - `chat_id:` / `chat_identifier:` — looked up against the server via
+ *     `chat/query` (paged), matching the numeric id or the GUID's identifier
+ *     component. Passing these raw produced a silent 400 on a cold send.
+ *   - `handle` — looked up by participant in existing DM chats; if none exists a
+ *     fresh `chat/new` is created.
+ *
+ * Returns the resolved chatGuid. Throws when a `chat_id`/`chat_identifier`
+ * target can't be resolved (the server has no such chat) rather than handing the
+ * server a bad key.
  */
 export async function resolveChatGuid(base: BlueBubblesRestBase, target: string): Promise<string> {
 	const parsed = parseIMessageTarget(target);
-	switch (parsed.kind) {
-		case "chat_guid":
-			return parsed.chatGuid;
-		case "chat_identifier":
-			return parsed.chatIdentifier; // BlueBubbles accepts the identifier as a GUID-ish key
-		case "chat_id":
-			return String(parsed.chatId);
-		case "handle":
-			return createBlueBubblesChat(base, { address: parsed.to });
+	// Hot path — a chat GUID is already a server key.
+	if (parsed.kind === "chat_guid") return parsed.chatGuid;
+
+	const wantChatId = parsed.kind === "chat_id" ? parsed.chatId : null;
+	const wantIdentifier = parsed.kind === "chat_identifier" ? parsed.chatIdentifier : null;
+	const wantHandle = parsed.kind === "handle" ? parsed.to.trim() : "";
+
+	const limit = 500;
+	let participantMatch: string | null = null;
+	for (let offset = 0; offset < 5000; offset += limit) {
+		const chats = await queryBlueBubblesChats(base, { offset, limit });
+		if (chats.length === 0) break;
+		for (const chat of chats) {
+			const guid = recordChatGuid(chat);
+			if (wantChatId != null && recordChatId(chat) === wantChatId && guid) return guid;
+			if (wantIdentifier) {
+				if (guid && guid === wantIdentifier) return guid;
+				if (guid && identifierFromChatGuid(guid) === wantIdentifier) return guid;
+				const id =
+					(typeof chat.identifier === "string" && chat.identifier) ||
+					(typeof chat.chatIdentifier === "string" && chat.chatIdentifier) ||
+					(typeof chat.chat_identifier === "string" && chat.chat_identifier) ||
+					"";
+				if (id && id === wantIdentifier && guid) return guid;
+			}
+			if (wantHandle && !participantMatch && guid && guid.includes(";-;")) {
+				// Only DM chats (`;-;`) match a bare handle — never route a handle to a group.
+				if (identifierFromChatGuid(guid) === wantHandle) participantMatch = guid;
+			}
+		}
 	}
+
+	if (wantHandle) {
+		if (participantMatch) return participantMatch;
+		// No existing chat for this handle — create a fresh DM.
+		return createBlueBubblesChat(base, { address: wantHandle });
+	}
+	throw new Error(
+		`BlueBubbles could not resolve a chat for target "${target}" (no matching chat on the server)`,
+	);
 }
 
 /** Options for a text send. */
@@ -182,7 +292,7 @@ export async function sendBlueBubblesText(
 	const res = await blueBubblesFetchWithTimeout(
 		url,
 		{ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) },
-		{ ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}), ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}) },
+		fetchOpts(opts),
 	);
 	const data = await readBlueBubblesJson(res, "message/text");
 	const guid = extractMessageGuid(data);
@@ -240,7 +350,7 @@ export async function sendBlueBubblesAttachment(
 		url,
 		{ method: "POST", body: form },
 		// Attachments can be large — give a generous default upload timeout.
-		{ timeoutMs: opts.timeoutMs ?? 60_000, ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}) },
+		{ ...fetchOpts(opts), timeoutMs: opts.timeoutMs ?? 60_000 },
 	);
 	const data = await readBlueBubblesJson(res, "message/attachment");
 	const guid = extractMessageGuid(data);
@@ -274,7 +384,7 @@ export async function reactBlueBubbles(
 				partIndex: params.partIndex ?? 0,
 			}),
 		},
-		{ ...(base.timeoutMs !== undefined ? { timeoutMs: base.timeoutMs } : {}), ...(base.fetchImpl ? { fetchImpl: base.fetchImpl } : {}) },
+		fetchOpts(base),
 	);
 	await readBlueBubblesJson(res, "message/react");
 }
@@ -303,7 +413,7 @@ export async function editBlueBubblesMessage(
 				partIndex: params.partIndex ?? 0,
 			}),
 		},
-		{ ...(base.timeoutMs !== undefined ? { timeoutMs: base.timeoutMs } : {}), ...(base.fetchImpl ? { fetchImpl: base.fetchImpl } : {}) },
+		fetchOpts(base),
 	);
 	await readBlueBubblesJson(res, "message/edit");
 }
@@ -328,7 +438,7 @@ export async function unsendBlueBubblesMessage(
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ partIndex: params.partIndex ?? 0 }),
 		},
-		{ ...(base.timeoutMs !== undefined ? { timeoutMs: base.timeoutMs } : {}), ...(base.fetchImpl ? { fetchImpl: base.fetchImpl } : {}) },
+		fetchOpts(base),
 	);
 	await readBlueBubblesJson(res, "message/unsend");
 }

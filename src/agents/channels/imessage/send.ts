@@ -21,6 +21,7 @@ import {
 import {
 	markdownToIMessageText,
 	resolveDeliveredText,
+	sanitizeOutboundIMessageText,
 	sanitizeReplyToId,
 	type IMessageMediaKind,
 } from "./format.js";
@@ -113,6 +114,10 @@ export async function sendMessageIMessage(
 
 	// Plain-text-ify markdown tables when there is text.
 	if (message.trim()) message = markdownToIMessageText(message);
+
+	// Last gate before the wire — strip any internal directive tags / role
+	// scaffolding / reasoning residue (the outbound twin of the reflection guard).
+	if (message.trim()) message = sanitizeOutboundIMessageText(message);
 
 	if (!message.trim() && !filePath) throw new Error("iMessage send requires text or media");
 

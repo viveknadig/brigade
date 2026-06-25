@@ -29,6 +29,8 @@ import { loadConfig } from "../../core/config.js";
 import {
 	BLUEBUBBLES_DEFAULT_ACCOUNT_ID,
 	resolveBlueBubblesAccount,
+	resolveBlueBubblesActions,
+	type BlueBubblesActionFlags,
 } from "../channels/bluebubbles/account-config.js";
 import {
 	addBlueBubblesParticipant,
@@ -37,8 +39,9 @@ import {
 	renameBlueBubblesChat,
 	setBlueBubblesGroupIcon,
 } from "../channels/bluebubbles/chat.js";
+import { resolveEffectId } from "../channels/bluebubbles/effects.js";
 import { probeBlueBubbles } from "../channels/bluebubbles/probe.js";
-import type { BlueBubblesRestBase } from "../channels/bluebubbles/send.js";
+import { sendBlueBubblesText, type BlueBubblesRestBase } from "../channels/bluebubbles/send.js";
 import type { FetchLike } from "../channels/bluebubbles/types.js";
 import { validateOutboundMediaPath } from "../../security/media-path-guard.js";
 import { jsonResult } from "./common.js";
@@ -54,10 +57,12 @@ const BlueBubblesActionParams = Type.Object({
 			Type.Literal("rename-group"),
 			Type.Literal("set-group-icon"),
 			Type.Literal("leave-group"),
+			Type.Literal("send-effect"),
+			Type.Literal("reply"),
 		],
 		{
 			description:
-				"The BlueBubbles group action to run. add-participant / remove-participant (needs address), rename-group (needs displayName), set-group-icon (needs iconPath), leave-group. All require the server's Private API.",
+				"The BlueBubbles action to run. Group admin: add-participant / remove-participant (needs address), rename-group (needs displayName), set-group-icon (needs iconPath), leave-group. Rich send: send-effect (a bubble/screen effect — needs text + effect), reply (a native inline reply — needs text + replyToId). All require the server's Private API.",
 		},
 	),
 	accountId: Type.Optional(
@@ -74,6 +79,22 @@ const BlueBubblesActionParams = Type.Object({
 	iconPath: Type.Optional(
 		Type.String({ description: "set-group-icon: a local image file path to upload as the group photo.", maxLength: 1024 }),
 	),
+	text: Type.Optional(
+		Type.String({ description: "send-effect / reply: the message text to send.", maxLength: 10_000 }),
+	),
+	effect: Type.Optional(
+		Type.String({
+			description:
+				"send-effect: the effect name (slam, loud, gentle, invisible-ink, echo, spotlight, balloons, confetti, love, lasers, fireworks, sparkles).",
+			maxLength: 64,
+		}),
+	),
+	replyToId: Type.Optional(
+		Type.String({ description: "reply: the GUID of the message to reply to (inline thread).", maxLength: 256 }),
+	),
+	partIndex: Type.Optional(
+		Type.Integer({ description: "reply: the part index of the replied-to message (default 0).", minimum: 0 }),
+	),
 });
 
 interface BlueBubblesActionResult {
@@ -89,6 +110,8 @@ export interface MakeBlueBubblesActionToolOptions {
 	resolveAccount?: (accountId: string) => { serverUrl: string; password: string; timeoutMs?: number };
 	/** Inject the Private-API status (tests). When omitted, probed from the server per call. */
 	resolvePrivateApi?: (account: { serverUrl: string; password: string; timeoutMs?: number }) => Promise<boolean | null>;
+	/** Inject the per-account action toggles (tests). Defaults to config-resolve per call. */
+	resolveActions?: (accountId: string) => BlueBubblesActionFlags;
 	/** Inject fetch (tests). Defaults to global fetch in the REST helpers. */
 	fetchImpl?: FetchLike;
 	/** Inject the icon file reader (tests). Defaults to reading from disk after the media-path guard. */
@@ -117,6 +140,10 @@ export function makeBlueBubblesActionTool(
 			return probe.privateApi;
 		});
 
+	const resolveActions =
+		opts.resolveActions ??
+		((accountId: string): BlueBubblesActionFlags => resolveBlueBubblesActions(loadConfig() as never, accountId));
+
 	const readIcon =
 		opts.readIcon ??
 		(async (path: string): Promise<Uint8Array> => {
@@ -132,8 +159,9 @@ export function makeBlueBubblesActionTool(
 		displaySummary: "managing a BlueBubbles group",
 		ownerOnly: true,
 		description: [
-			"Administer a BlueBubbles (iMessage) group chat the everyday chat reply can't:",
-			"add-participant / remove-participant (by phone or email), rename-group, set-group-icon (a local image path), leave-group.",
+			"Administer a BlueBubbles (iMessage) chat the everyday chat reply can't:",
+			"add-participant / remove-participant (by phone or email), rename-group, set-group-icon (a local image path), leave-group;",
+			"plus rich sends — send-effect (a bubble/screen effect with `text` + `effect`) and reply (a native inline reply with `text` + `replyToId`).",
 			"All actions require the BlueBubbles server's Private API; the tool reports clearly when it is off.",
 			"Owner-only. Every action needs a `chatGuid`; membership needs an `address`, rename needs `displayName`, set-group-icon needs `iconPath`.",
 		].join(" "),
@@ -162,7 +190,20 @@ export function makeBlueBubblesActionTool(
 			const chatGuid = (args.chatGuid ?? "").trim().replace(/^chat_guid:/i, "");
 			if (!chatGuid) return fail(`${action} requires a \`chatGuid\`.`);
 
-			// Probe once for the Private-API status — every group action needs it.
+			// Resolve the per-account action toggles + gate the action against them.
+			// Group-admin actions honour `actions.groupAdmin`; send-effect honours
+			// `actions.effects` — mirroring how the live adapter's handleAction gates
+			// reactions/edit/unsend.
+			const actions = resolveActions(accountId);
+			const GROUP_ADMIN_ACTIONS = new Set(["add-participant", "remove-participant", "rename-group", "set-group-icon", "leave-group"]);
+			if (GROUP_ADMIN_ACTIONS.has(action) && !actions.groupAdmin) {
+				return fail(`BlueBubbles group administration is disabled (channels.bluebubbles.actions.groupAdmin = false).`);
+			}
+			if (action === "send-effect" && !actions.effects) {
+				return fail(`BlueBubbles send effects are disabled (channels.bluebubbles.actions.effects = false).`);
+			}
+
+			// Probe once for the Private-API status — every action here needs it.
 			const privateApi = await resolvePrivateApi(account).catch(() => null);
 			if (privateApi === false) {
 				return fail(
@@ -215,6 +256,29 @@ export function makeBlueBubblesActionTool(
 					case "leave-group": {
 						await leaveBlueBubblesChat(base, { chatGuid });
 						return ok("Left the group.");
+					}
+					case "send-effect": {
+						const text = (args.text ?? "").trim();
+						if (!text) return fail("send-effect requires `text`.");
+						const effect = (args.effect ?? "").trim();
+						if (!effect) return fail("send-effect requires an `effect` name.");
+						if (!resolveEffectId(effect)) {
+							return fail(`Unknown effect "${effect}". Try one of: slam, loud, gentle, invisible-ink, echo, spotlight, balloons, confetti, love, lasers, fireworks, sparkles.`);
+						}
+						const sent = await sendBlueBubblesText(chatGuid, text, { ...base, effect });
+						return ok(`Sent with the "${effect}" effect${sent.messageId ? ` (message ${sent.messageId})` : ""}.`);
+					}
+					case "reply": {
+						const text = (args.text ?? "").trim();
+						if (!text) return fail("reply requires `text`.");
+						const replyToId = (args.replyToId ?? "").trim();
+						if (!replyToId) return fail("reply requires a `replyToId` (the message GUID to reply to).");
+						const sent = await sendBlueBubblesText(chatGuid, text, {
+							...base,
+							replyToMessageGuid: replyToId,
+							...(typeof args.partIndex === "number" ? { replyToPartIndex: args.partIndex } : {}),
+						});
+						return ok(`Replied to message ${replyToId}${sent.messageId ? ` (message ${sent.messageId})` : ""}.`);
 					}
 					default:
 						return fail(`Unknown action "${String(action)}".`);

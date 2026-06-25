@@ -39,16 +39,38 @@ export interface NormalizedBlueBubblesMessage {
 	timestampMs?: number;
 	/** A reply-to message GUID, when this message replies to another. */
 	replyToGuid?: string;
+	/**
+	 * Handles mentioned in this message. iMessage has no @-mention metadata, so
+	 * this is populated only when the bot's own `selfHandle` appears in the text —
+	 * which is what lets the central pipeline's group requireMention gate fire.
+	 */
+	mentions?: string[];
 	/** Raw attachment descriptors (downloaded later, post-access-gate). */
 	attachments: RawBlueBubblesAttachment[];
 	/** The raw webhook payload (for the pipeline's `raw` field). */
 	raw: unknown;
 }
 
+/**
+ * A skip that MIGHT actually be a media message whose attachments indexed late
+ * (empty text + empty attachments + a real guid). The connection can use these
+ * fields to re-fetch the message's attachments and, only if media turns up,
+ * dispatch a synthetic inbound — without spamming the agent with truly-empty
+ * messages.
+ */
+export interface EmptyMediaCandidate {
+	messageGuid: string;
+	chatGuid: string;
+	from: string;
+	fromName?: string;
+	isGroup: boolean;
+	timestampMs?: number;
+}
+
 /** The result of normalising a webhook payload: a message, a skip, or a tapback note. */
 export type NormalizeResult =
 	| { kind: "message"; message: NormalizedBlueBubblesMessage }
-	| { kind: "skip"; reason: string }
+	| { kind: "skip"; reason: string; mediaCandidate?: EmptyMediaCandidate }
 	| { kind: "tapback"; tapback: DecodedTapback; chatGuid: string; targetGuid?: string; from: string; isGroup: boolean };
 
 function asRecord(v: unknown): Record<string, unknown> | null {
@@ -162,11 +184,31 @@ function resolveAttachments(message: Record<string, unknown>): RawBlueBubblesAtt
 }
 
 /**
- * Normalise a BlueBubbles webhook payload. `eventType` is the webhook's declared
- * type (`new-message` / `updated-message`). Returns a `message`, a `skip` (with a
- * reason), or a `tapback` (decoded reaction) result.
+ * Detect whether the bot's own `selfHandle` is mentioned in the text. iMessage
+ * has no @-mention metadata, so "mention" = the bot's handle appearing in the
+ * message body. A phone handle matches on its digit-run inside the text's
+ * digits; an email matches case-insensitively. Returns the matched self handle
+ * in an array, or undefined when there's no match (so the field stays unset).
  */
-export function normalizeBlueBubblesWebhook(payload: unknown, eventType?: string): NormalizeResult {
+export function detectBlueBubblesMentions(text: string, selfHandle: string | undefined): string[] | undefined {
+	const handle = (selfHandle ?? "").trim();
+	if (!handle || !text) return undefined;
+	if (handle.includes("@")) {
+		return text.toLowerCase().includes(handle.toLowerCase()) ? [handle] : undefined;
+	}
+	// Phone: compare digit-runs so "+1 (555) 123-4567" in text matches "15551234567".
+	const handleDigits = handle.replace(/[^0-9]/g, "");
+	if (handleDigits.length >= 5 && text.replace(/[^0-9]/g, "").includes(handleDigits)) return [handle];
+	return undefined;
+}
+
+/**
+ * Normalise a BlueBubbles webhook payload. `eventType` is the webhook's declared
+ * type (`new-message` / `updated-message`). `selfHandle` (when set) lets group
+ * mention-gating fire by populating `mentions[]` when the bot is named in text.
+ * Returns a `message`, a `skip` (with a reason), or a `tapback` result.
+ */
+export function normalizeBlueBubblesWebhook(payload: unknown, eventType?: string, selfHandle?: string): NormalizeResult {
 	const message = extractMessageRecord(payload);
 	if (!message) return { kind: "skip", reason: "unparseable payload" };
 
@@ -202,13 +244,31 @@ export function normalizeBlueBubblesWebhook(payload: unknown, eventType?: string
 	const messageGuid = readString(message, "guid", "messageGuid") ?? "";
 	const text = readString(message, "text", "message") ?? "";
 	const attachments = resolveAttachments(message);
+	const timestampMs = resolveTimestampMs(message);
 
-	// Skip a truly empty message (no text, no media) — nothing to act on.
-	if (!text && attachments.length === 0) return { kind: "skip", reason: "empty message" };
+	// Skip a truly empty message (no text, no media) — nothing to act on. BUT when
+	// it carries a real guid it MIGHT be a media message whose attachments indexed
+	// late (BlueBubbles fires the webhook before indexing finishes), so we hand the
+	// connection a `mediaCandidate` it can re-fetch + dispatch only if media exists.
+	if (!text && attachments.length === 0) {
+		const skip: NormalizeResult = { kind: "skip", reason: "empty message" };
+		if (messageGuid) {
+			skip.mediaCandidate = {
+				messageGuid,
+				chatGuid,
+				from,
+				...(fromName ? { fromName } : {}),
+				isGroup,
+				...(timestampMs !== undefined ? { timestampMs } : {}),
+			};
+		}
+		return skip;
+	}
 
 	// A reply target — but NOT a reaction association (that's handled above).
 	const replyToGuid = readString(message, "threadOriginatorGuid", "thread_originator_guid", "replyToGuid");
-	const timestampMs = resolveTimestampMs(message);
+	// Self-mention detection (group gating) — only meaningful in groups.
+	const mentions = isGroup ? detectBlueBubblesMentions(text, selfHandle) : undefined;
 
 	return {
 		kind: "message",
@@ -222,6 +282,7 @@ export function normalizeBlueBubblesWebhook(payload: unknown, eventType?: string
 			isGroup,
 			...(timestampMs !== undefined ? { timestampMs } : {}),
 			...(replyToGuid ? { replyToGuid } : {}),
+			...(mentions ? { mentions } : {}),
 			attachments,
 			raw: payload,
 		},

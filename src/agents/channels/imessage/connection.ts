@@ -120,32 +120,42 @@ export async function connectIMessage(args: ConnectIMessageArgs): Promise<IMessa
 	let attempt = 0;
 
 	const handleNotification = (msg: IMessageRpcNotification): void => {
-		if (msg.method === "error") {
-			args.log("imessage watch error", { params: msg.params });
-			return;
+		// Wrap the whole handler so a synchronous throw (malformed payload, a
+		// decideInbound bug, a downstream onMessage error) can NEVER escape into the
+		// RPC client's notification loop and wedge the watch / crash the gateway.
+		// The transport keeps reading; a single bad notification is logged + dropped.
+		try {
+			if (msg.method === "error") {
+				args.log("imessage watch error", { params: msg.params });
+				return;
+			}
+			if (msg.method !== "message") return;
+			const payload = parseIMessageNotification(msg.params);
+			if (!payload) {
+				args.log("dropping malformed iMessage payload");
+				return;
+			}
+			const decision = decideInbound(state, account.accountId, payload);
+			if (decision.kind === "drop") {
+				if (account.verbose) args.log(`inbound dropped: ${decision.reason}`);
+				return;
+			}
+			const normalized = decision.message;
+			// Deferred media — resolve only after the central access gate admits the
+			// sender (the bridge has already saved the bytes to disk; we just map them).
+			const inbound: IMessageInboundMessage = { ...normalized };
+			if (Array.isArray(payload.attachments) && payload.attachments.length > 0) {
+				inbound.resolveMedia = async () => {
+					const roots = resolveIMessageAttachmentRoots(args.loadConfig(), account.accountId);
+					return resolveInboundAttachments(payload.attachments, roots);
+				};
+			}
+			args.onMessage(inbound);
+		} catch (err) {
+			args.log("imessage notification handler threw (dropped, loop continues)", {
+				error: err instanceof Error ? err.message : String(err),
+			});
 		}
-		if (msg.method !== "message") return;
-		const payload = parseIMessageNotification(msg.params);
-		if (!payload) {
-			args.log("dropping malformed iMessage payload");
-			return;
-		}
-		const decision = decideInbound(state, account.accountId, payload);
-		if (decision.kind === "drop") {
-			if (account.verbose) args.log(`inbound dropped: ${decision.reason}`);
-			return;
-		}
-		const normalized = decision.message;
-		// Deferred media — resolve only after the central access gate admits the
-		// sender (the bridge has already saved the bytes to disk; we just map them).
-		const inbound: IMessageInboundMessage = { ...normalized };
-		if (Array.isArray(payload.attachments) && payload.attachments.length > 0) {
-			inbound.resolveMedia = async () => {
-				const roots = resolveIMessageAttachmentRoots(args.loadConfig(), account.accountId);
-				return resolveInboundAttachments(payload.attachments, roots);
-			};
-		}
-		args.onMessage(inbound);
 	};
 
 	const subscribeOnce = async (): Promise<void> => {

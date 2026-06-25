@@ -35,11 +35,12 @@ import {
 } from "./types.js";
 import type { BlueBubblesRestBase } from "./send.js";
 
-/** Shared fetch-option assembly so every helper threads timeout + fetchImpl identically. */
-function fetchOpts(base: BlueBubblesRestBase): { timeoutMs?: number; fetchImpl?: FetchLike } {
+/** Shared fetch-option assembly so every helper threads timeout + fetchImpl + the SSRF knob identically. */
+function fetchOpts(base: BlueBubblesRestBase): { timeoutMs?: number; fetchImpl?: FetchLike; allowPrivateNetwork?: boolean } {
 	return {
 		...(base.timeoutMs !== undefined ? { timeoutMs: base.timeoutMs } : {}),
 		...(base.fetchImpl ? { fetchImpl: base.fetchImpl } : {}),
+		...(base.allowPrivateNetwork === false ? { allowPrivateNetwork: false } : {}),
 	};
 }
 
@@ -219,7 +220,7 @@ export async function setBlueBubblesGroupIcon(
 		url,
 		{ method: "POST", body: form },
 		// Uploads can be large — give a generous default timeout.
-		{ timeoutMs: base.timeoutMs ?? 60_000, ...(base.fetchImpl ? { fetchImpl: base.fetchImpl } : {}) },
+		{ ...fetchOpts(base), timeoutMs: base.timeoutMs ?? 60_000 },
 	);
 	await readBlueBubblesJson(res, "chat/icon");
 }

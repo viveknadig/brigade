@@ -41,6 +41,8 @@ export interface ProbeBlueBubblesArgs {
 	timeoutMs?: number;
 	/** TEST SEAM — inject a mock fetch. */
 	fetchImpl?: FetchLike;
+	/** Allow private/LAN/loopback hosts through the SSRF guard (default TRUE for BlueBubbles). */
+	allowPrivateNetwork?: boolean;
 }
 
 /** Probe a BlueBubbles server's `server/info`. Never throws. */
@@ -65,7 +67,7 @@ export async function probeBlueBubbles(args: ProbeBlueBubblesArgs): Promise<Blue
 		const res = await blueBubblesFetchWithTimeout(
 			url,
 			{ method: "GET" },
-			{ ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}), ...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}) },
+			{ ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}), ...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}), ...(args.allowPrivateNetwork === false ? { allowPrivateNetwork: false } : {}) },
 		);
 		const elapsedMs = Date.now() - start;
 		if (res.status === 401 || res.status === 403) {
