@@ -5,6 +5,7 @@ import path from "node:path";
 import { describe, it } from "node:test";
 
 import { connectBlueBubbles } from "./connection.js";
+import { clearBlueBubblesContactCache } from "./contact-names.js";
 import type { ResolvedBlueBubblesAccount } from "./account-config.js";
 
 const PASSWORD = ["conn", "bb", "pw"].join("-");
@@ -104,6 +105,40 @@ describe("connection — inbound webhook feed", () => {
 			data: { guid: "MINE", text: "x", isFromMe: true, chatGuid: "iMessage;-;+1" },
 		});
 		assert.equal(got.length, 0);
+	});
+
+	it("enriches the sender's display name from the warmed contact directory", async () => {
+		clearBlueBubblesContactCache();
+		// A fetch that serves the contact directory for the warm + nothing else.
+		const f = (async (url: string) => {
+			const data = typeof url === "string" && url.includes("/contact")
+				? [{ displayName: "Alex Rivera", phoneNumbers: [{ address: "+15551234567" }] }]
+				: [];
+			return {
+				ok: true,
+				status: 200,
+				text: async () => JSON.stringify({ status: 200, data }),
+				headers: new Map() as unknown as Headers,
+			} as unknown as Response;
+		}) as unknown as typeof fetch;
+		const got: Array<{ from: string; fromName?: string }> = [];
+		const conn = connectBlueBubbles({
+			account: account(),
+			log: () => {},
+			fetchImpl: f,
+			onMessage: (m) => got.push({ from: m.from, ...(m.fromName ? { fromName: m.fromName } : {}) }),
+		});
+		const payload = (guid: string) => ({
+			data: { guid, text: "hi", chatGuid: "iMessage;-;+15551234567", handle: { address: "+15551234567" } },
+		});
+		// First message: cache is cold → raw handle, warm kicked off in background.
+		conn.feedWebhookEvent("new-message", payload("C-1"));
+		await new Promise((r) => setTimeout(r, 10)); // let the background warm complete
+		// Second message: cache is warm → resolved display name.
+		conn.feedWebhookEvent("new-message", payload("C-2"));
+		assert.equal(got.length, 2);
+		assert.equal(got[0]!.fromName, undefined);
+		assert.equal(got[1]!.fromName, "Alex Rivera");
 	});
 });
 

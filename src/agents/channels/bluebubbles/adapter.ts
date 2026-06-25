@@ -164,6 +164,19 @@ export function createBlueBubblesAdapter(opts: CreateBlueBubblesAdapterOptions =
 				started = true;
 				ctx.log("BlueBubbles connected");
 				ctx.onConnected?.();
+				// On (re)connect, backfill recently-missed messages so nothing is lost
+				// across a Brigade restart. Each fetched message replays through the
+				// SAME normalize+dedupe path as a live webhook, so a message already
+				// delivered live is dropped at dedupe (no double-delivery). Fire-and-
+				// forget + never throws — a backfill failure never blocks the channel.
+				void connection
+					?.runCatchup()
+					.then((summary) => {
+						if (summary.replayed > 0 || summary.fetched > 0) {
+							ctx.log(`BlueBubbles catch-up: fetched ${summary.fetched}, replayed ${summary.replayed}`);
+						}
+					})
+					.catch((err) => ctx.log(`BlueBubbles catch-up failed: ${err instanceof Error ? err.message : String(err)}`));
 			} catch (err) {
 				started = false;
 				ctx.log(`BlueBubbles failed to start: ${err instanceof Error ? err.message : String(err)}`);
@@ -208,6 +221,23 @@ export function createBlueBubblesAdapter(opts: CreateBlueBubblesAdapterOptions =
 			if (!connection) throw new Error("BlueBubbles channel is not started");
 			const sent = await connection.sendMedia(conversationId, media);
 			return sent.messageId ? { messageId: sent.messageId } : undefined;
+		},
+
+		// Read-receipt hook the pipeline calls after the access gate admits a
+		// sender (so a challenged stranger never sees a read receipt first).
+		// Cosmetic + best-effort: no-ops when the Private API is off, swallows
+		// transport errors (the pipeline already wraps this in a try/catch).
+		async markRead(conversationId: string): Promise<void> {
+			if (!connection) return;
+			await connection.markRead(conversationId);
+		},
+
+		// Typing-indicator hook the pipeline calls around a turn so the user sees
+		// "typing…" while the agent thinks. Cosmetic; no-ops when the Private API
+		// is off. `composing` → start, `paused` → stop.
+		async setComposing(conversationId: string, state: "composing" | "paused"): Promise<void> {
+			if (!connection) return;
+			await connection.setTyping(conversationId, state === "composing");
 		},
 
 		selfId(): string | undefined {

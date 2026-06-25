@@ -43,6 +43,8 @@ import { makeMessageActionTool } from "./message-action-tool.js";
 import { makeComposioTool } from "./composio-tool.js";
 import { makeDiscordActionTool } from "./discord-action-tool.js";
 import { discordChannelEnabled } from "../channels/discord/account-config.js";
+import { makeBlueBubblesActionTool } from "./bluebubbles-action-tool.js";
+import { bluebubblesChannelEnabled } from "../channels/bluebubbles/account-config.js";
 import { makeManageProviderTool } from "./manage-provider-tool.js";
 import { makeOAuthAuthorizeTool } from "./oauth-authorize-tool.js";
 import { makeManageSkillTool } from "./manage-skill-tool.js";
@@ -373,6 +375,21 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		}
 	} catch {
 		// loadConfig failures are non-fatal: skip the Discord gate too.
+	}
+	// `bluebubbles_action` additive-gate: the owner-only BlueBubbles group-admin
+	// surface (add/remove participant, rename, group icon, leave) is assembled
+	// ONLY when the BlueBubbles channel is configured (`channels.bluebubbles.enabled`).
+	// A non-BlueBubbles install never sees it, so the exact-count tool surface
+	// stays bit-for-bit unchanged. The tool is SELF-CONTAINED over BlueBubbles
+	// REST (resolves serverUrl+password like probe.ts; no live adapter needed).
+	// `ownerOnly: true` → the session-wiring owner wrapper refuses non-owner
+	// senders + unattended cron before execute runs.
+	try {
+		if (bluebubblesChannelEnabled(_loadConfigForOrgGate() as never)) {
+			tools.push(makeBlueBubblesActionTool());
+		}
+	} catch {
+		// loadConfig failures are non-fatal: skip the BlueBubbles gate too.
 	}
 	// Primitive #6 — register `spawn_agent` (sync, single child) AND
 	// `spawn_agents` (sync, parallel fan-out) only when the caller supplied a

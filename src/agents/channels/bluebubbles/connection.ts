@@ -44,6 +44,9 @@ import {
 	unsendBlueBubblesMessage,
 	type BlueBubblesRestBase,
 } from "./send.js";
+import { markBlueBubblesChatRead, sendBlueBubblesTyping } from "./chat.js";
+import { peekBlueBubblesContactName, warmBlueBubblesContactDirectory } from "./contact-names.js";
+import { runBlueBubblesCatchup, type BlueBubblesCatchupConfig, type BlueBubblesCatchupSummary } from "./catchup.js";
 import type { FetchLike } from "./types.js";
 
 /** The inbound message handed to the adapter (carries the deferred-media thunk). */
@@ -83,6 +86,12 @@ export interface BlueBubblesConnection {
 	react(params: { conversationId: string; messageId: string; reaction: string }): Promise<void>;
 	edit(params: { messageId: string; text: string }): Promise<void>;
 	unsend(params: { messageId: string }): Promise<void>;
+	/** Signal "typing…" (or stop) in a conversation. Cosmetic; no-ops when the Private API is off. */
+	setTyping(conversationId: string, typing: boolean): Promise<void>;
+	/** Mark a conversation read (read receipt). Cosmetic; no-ops when the Private API is off. */
+	markRead(conversationId: string): Promise<void>;
+	/** Run a bounded backfill of recently-missed messages through the live inbound path. */
+	runCatchup(): Promise<BlueBubblesCatchupSummary>;
 	setPrivateApi(status: boolean | null): void;
 	connectedAt(): number | null;
 	close(): void;
@@ -109,6 +118,33 @@ export function connectBlueBubbles(args: ConnectBlueBubblesArgs): BlueBubblesCon
 		...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}),
 		privateApiEnabled: privateApi === true,
 	});
+
+	const contactArgs = () => ({
+		serverUrl: account.serverUrl,
+		password: account.password,
+		accountId: account.accountId,
+		...(account.probeTimeoutMs !== undefined ? { timeoutMs: account.probeTimeoutMs } : {}),
+		...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}),
+	});
+
+	/**
+	 * Resolve an inbound sender handle → a human display name, SYNCHRONOUSLY, from
+	 * the already-warm per-account contact directory (no network on the hot path,
+	 * so dispatch stays synchronous). On a cache miss, kick a background warm so
+	 * the NEXT message from this sender resolves. Mutates `fromName` in place when
+	 * a cached name is found; the raw handle flows otherwise.
+	 */
+	const enrichFromNameSync = (inbound: BlueBubblesInboundMessage): void => {
+		if (inbound.fromName && inbound.fromName.trim()) return;
+		if (!inbound.from || !inbound.from.trim()) return;
+		const cached = peekBlueBubblesContactName(inbound.from, account.accountId);
+		if (cached) {
+			inbound.fromName = cached;
+			return;
+		}
+		// Cold cache — warm it in the background (best-effort, never throws).
+		void warmBlueBubblesContactDirectory(contactArgs()).catch(() => {});
+	};
 
 	const feedWebhookEvent = (eventType: string | undefined, payload: unknown): void => {
 		const allowed = new Set(["new-message", "updated-message", undefined]);
@@ -152,6 +188,9 @@ export function connectBlueBubbles(args: ConnectBlueBubblesArgs): BlueBubblesCon
 					...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}),
 				});
 		}
+		// Resolve a human display name for the sender from the warm cache (sync) and
+		// dispatch synchronously — a cold cache warms in the background for next time.
+		enrichFromNameSync(inbound);
 		args.onMessage(inbound);
 	};
 
@@ -213,6 +252,34 @@ export function connectBlueBubbles(args: ConnectBlueBubblesArgs): BlueBubblesCon
 		await unsendBlueBubblesMessage(restBase(), { messageGuid: params.messageId });
 	};
 
+	const setTyping = async (conversationId: string, typing: boolean): Promise<void> => {
+		const base = restBase();
+		const chatGuid = await resolveChatGuid(base, conversationId);
+		await sendBlueBubblesTyping(base, { chatGuid, typing });
+	};
+
+	const markRead = async (conversationId: string): Promise<void> => {
+		const base = restBase();
+		const chatGuid = await resolveChatGuid(base, conversationId);
+		await markBlueBubblesChatRead(base, { chatGuid });
+	};
+
+	const runCatchup = async (): Promise<BlueBubblesCatchupSummary> => {
+		const catchupConfig: BlueBubblesCatchupConfig | undefined = account.catchup;
+		return runBlueBubblesCatchup({
+			serverUrl: account.serverUrl,
+			password: account.password,
+			...(catchupConfig ? { config: catchupConfig } : {}),
+			...(account.probeTimeoutMs !== undefined ? { timeoutMs: account.probeTimeoutMs } : {}),
+			...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}),
+			// Re-feed each fetched record through the SAME normalize+dedupe path a
+			// live webhook uses (as a `new-message` event), so dedupe drops anything
+			// already delivered — no double-delivery.
+			feedRecord: (record) => feedWebhookEvent("new-message", { type: "new-message", data: record }),
+			log: (msg) => args.log(msg),
+		});
+	};
+
 	// Ensure the cache dir exists lazily (best-effort; download also mkdir's).
 	try {
 		ensureDir(cacheDir);
@@ -227,6 +294,9 @@ export function connectBlueBubbles(args: ConnectBlueBubblesArgs): BlueBubblesCon
 		react,
 		edit,
 		unsend,
+		setTyping,
+		markRead,
+		runCatchup,
 		setPrivateApi: (status) => {
 			privateApi = status;
 		},

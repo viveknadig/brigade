@@ -21,9 +21,11 @@ function makeFake(): {
 	args: { value: ConnectBlueBubblesArgs | null };
 	sends: Array<{ to: string; text: string }>;
 	actions: string[];
+	catchupRuns: { count: number };
 } {
 	const sends: Array<{ to: string; text: string }> = [];
 	const actions: string[] = [];
+	const catchupRuns = { count: 0 };
 	const conn: BlueBubblesConnection = {
 		feedWebhookEvent() {},
 		async sendText(to, text) {
@@ -42,11 +44,21 @@ function makeFake(): {
 		async unsend() {
 			actions.push("unsend");
 		},
+		async setTyping(_conversationId, typing) {
+			actions.push(`typing:${typing ? "on" : "off"}`);
+		},
+		async markRead() {
+			actions.push("mark-read");
+		},
+		async runCatchup() {
+			catchupRuns.count++;
+			return { querySucceeded: true, fetched: 0, replayed: 0, windowStartMs: 0 };
+		},
 		setPrivateApi() {},
 		connectedAt: () => Date.now(),
 		close() {},
 	};
-	return { conn, args: { value: null }, sends, actions };
+	return { conn, args: { value: null }, sends, actions, catchupRuns };
 }
 
 function startCtx(onInbound: (m: InboundMessage) => void): ChannelStartContext {
@@ -151,5 +163,35 @@ describe("BlueBubbles adapter", () => {
 		});
 		assert.equal(r.ok, false);
 		assert.match(r.error ?? "", /Private API/);
+	});
+
+	it("setComposing maps composing/paused onto the connection's setTyping", async () => {
+		const fake = makeFake();
+		const adapter = createBlueBubblesAdapter({ probeImpl: probeOk(true), connectImpl: () => fake.conn });
+		adapter.isConfigured(baseCfg());
+		await adapter.start(startCtx(() => {}));
+		await adapter.setComposing!("chat_guid:G", "composing");
+		await adapter.setComposing!("chat_guid:G", "paused");
+		assert.ok(fake.actions.includes("typing:on"));
+		assert.ok(fake.actions.includes("typing:off"));
+	});
+
+	it("markRead forwards to the connection's markRead", async () => {
+		const fake = makeFake();
+		const adapter = createBlueBubblesAdapter({ probeImpl: probeOk(true), connectImpl: () => fake.conn });
+		adapter.isConfigured(baseCfg());
+		await adapter.start(startCtx(() => {}));
+		await adapter.markRead!("chat_guid:G", "M-1");
+		assert.ok(fake.actions.includes("mark-read"));
+	});
+
+	it("runs catch-up once on connect", async () => {
+		const fake = makeFake();
+		const adapter = createBlueBubblesAdapter({ probeImpl: probeOk(true), connectImpl: () => fake.conn });
+		adapter.isConfigured(baseCfg());
+		await adapter.start(startCtx(() => {}));
+		// catch-up is fire-and-forget on connect; let the microtask settle.
+		await new Promise((r) => setTimeout(r, 5));
+		assert.equal(fake.catchupRuns.count, 1);
 	});
 });

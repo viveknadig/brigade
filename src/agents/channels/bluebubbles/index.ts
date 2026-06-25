@@ -15,6 +15,7 @@ export {
 	resolveBlueBubblesWebhookPath,
 	resolveBlueBubblesProbeTimeoutMs,
 	resolveBlueBubblesActions,
+	resolveBlueBubblesCatchup,
 	bluebubblesThreadIdleTtlMs,
 	normalizeBlueBubblesServerUrl,
 	BLUEBUBBLES_CHANNEL_ID,
@@ -35,3 +36,22 @@ export {
 } from "./webhook.js";
 export { bluebubblesMessagingAdapter } from "./messaging.js";
 export { bluebubblesModule } from "./module.js";
+export {
+	sendBlueBubblesTyping,
+	markBlueBubblesChatRead,
+	renameBlueBubblesChat,
+	addBlueBubblesParticipant,
+	removeBlueBubblesParticipant,
+	leaveBlueBubblesChat,
+	setBlueBubblesGroupIcon,
+} from "./chat.js";
+export {
+	resolveBlueBubblesContactName,
+	clearBlueBubblesContactCache,
+	type ResolveContactNameArgs,
+} from "./contact-names.js";
+export {
+	runBlueBubblesCatchup,
+	type BlueBubblesCatchupConfig,
+	type BlueBubblesCatchupSummary,
+} from "./catchup.js";

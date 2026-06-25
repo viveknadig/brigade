@@ -41,6 +41,7 @@
 
 import type { BrigadeConfig } from "../../../config/io.js";
 import { readSealedChannelToken } from "../channel-secrets.js";
+import type { BlueBubblesCatchupConfig } from "./catchup.js";
 
 /** Canonical channel id + default account id. */
 const CHANNEL_ID = "bluebubbles";
@@ -92,6 +93,7 @@ interface BlueBubblesAccountEntry {
 	mediaMaxMb?: number;
 	probeTimeoutMs?: number;
 	actions?: Partial<BlueBubblesActionFlags>;
+	catchup?: BlueBubblesCatchupConfig;
 	[key: string]: unknown;
 }
 
@@ -105,6 +107,7 @@ interface BlueBubblesChannelConfigSlot {
 	mediaMaxMb?: number;
 	probeTimeoutMs?: number;
 	actions?: Partial<BlueBubblesActionFlags>;
+	catchup?: BlueBubblesCatchupConfig;
 	accounts?: BlueBubblesAccountEntry[];
 	/** Idle TTL (ms / duration string) after which idle thread sessions are reaped. */
 	threadIdleTtlMs?: number | string;
@@ -129,6 +132,8 @@ export interface ResolvedBlueBubblesAccount {
 	probeTimeoutMs: number;
 	/** Per-rich-action toggles. */
 	actions: BlueBubblesActionFlags;
+	/** On-(re)connect catch-up backfill config (undefined → defaults; `enabled:false` disables). */
+	catchup?: BlueBubblesCatchupConfig;
 	verbose: boolean;
 }
 
@@ -316,6 +321,27 @@ export function resolveBlueBubblesActions(cfg: BrigadeConfig, accountId?: string
 	return coerceActionFlags(entry?.actions, slot?.actions);
 }
 
+/**
+ * Resolve the on-(re)connect catch-up backfill config for an account
+ * (per-account overrides the top-level slot). Returns `undefined` when neither
+ * level configured it — the connection then uses catch-up's built-in defaults.
+ */
+export function resolveBlueBubblesCatchup(
+	cfg: BrigadeConfig,
+	accountId?: string | null,
+): BlueBubblesCatchupConfig | undefined {
+	const id = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+	const slot = bluebubblesChannelConfig(cfg);
+	const entry = findAccountEntry(cfg, id);
+	const raw = entry?.catchup ?? slot?.catchup;
+	if (!raw || typeof raw !== "object") return undefined;
+	const out: BlueBubblesCatchupConfig = {};
+	if (typeof raw.enabled === "boolean") out.enabled = raw.enabled;
+	if (typeof raw.lookbackMs === "number" && raw.lookbackMs > 0) out.lookbackMs = raw.lookbackMs;
+	if (typeof raw.limit === "number" && raw.limit > 0) out.limit = raw.limit;
+	return Object.keys(out).length > 0 ? out : undefined;
+}
+
 /** Resolve a per-account view of the config (defaults filled in). */
 export function resolveBlueBubblesAccount(
 	cfg: BrigadeConfig,
@@ -343,6 +369,10 @@ export function resolveBlueBubblesAccount(
 		mediaMaxBytes: Math.round(mediaMaxMb * 1024 * 1024),
 		probeTimeoutMs: resolveBlueBubblesProbeTimeoutMs(cfg, id),
 		actions: resolveBlueBubblesActions(cfg, id),
+		...(() => {
+			const catchup = resolveBlueBubblesCatchup(cfg, id);
+			return catchup ? { catchup } : {};
+		})(),
 		verbose: slot?.verbose === true,
 	};
 }
