@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.7.0](https://github.com/spinabot/brigade/compare/brigade-v1.6.1...brigade-v1.7.0) (2026-06-25)
+
+
+### Features
+
+* **discord:** parity Phase 1 — inbound correctness ([7043edf](https://github.com/spinabot/brigade/commit/7043edf88b5efd66f87c8dcef286af6fdabda2a6))
+* **discord:** parity Phase 2 — outbound richness ([7553b1d](https://github.com/spinabot/brigade/commit/7553b1db7baf4bd318b6343e417e1075ea49c102))
+* **discord:** parity Phase 3 — interactive components ([aaafdff](https://github.com/spinabot/brigade/commit/aaafdff7d4f8d00095bba2ff4818d77a40f1de5f))
+* **discord:** parity Phase 4 — owner-gated guild-admin action tool ([513be04](https://github.com/spinabot/brigade/commit/513be04116f21b11f17a7b8d50713e68774e9a72))
+* **discord:** parity Phase 5 — presence, autoThread, directory, diagnostics, watchdog ([08ea7c9](https://github.com/spinabot/brigade/commit/08ea7c96c6b9cb50e7ae345c801beaa15e589a84))
+* **discord:** parity Phase 6 — subagent thread-binding ([70b69ac](https://github.com/spinabot/brigade/commit/70b69acecc954fb0af439911b3d881f647e42af9))
+
+
+### Bug Fixes
+
+* **discord:** Phase 7a — make components emittable + subagent reply reaches the thread ([cc106d0](https://github.com/spinabot/brigade/commit/cc106d0cc4c4ba59ce0ba3826d4b97f9ae4453f0))
+* **discord:** Phase 7b — moderation/presence/mass-ping/reply bugs + diagnostics surfacing ([b4e51e6](https://github.com/spinabot/brigade/commit/b4e51e679af6bca5b9304d8f43373b6ac1f6001a))
+
 ## [1.6.1](https://github.com/spinabot/brigade/compare/brigade-v1.6.0...brigade-v1.6.1) (2026-06-24)
 
 
