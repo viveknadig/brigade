@@ -15,7 +15,7 @@ delete process.env.BRIGADE_HOME;
 // (baseline, no-Composio surface) don't flake on machines that have it set.
 delete process.env.COMPOSIO_API_KEY;
 
-const { assembleBrigadeToolset, composeBrigadeBeforeToolCall, resolveSpawnToolTimeoutMs } =
+const { assembleBrigadeToolset, composeBrigadeBeforeToolCall, makeToolPolicyPredicate, resolveSpawnToolTimeoutMs } =
 	await import("./session-wiring.js");
 const { wrapToolExecutionTimeout } = await import("./tools/common.js");
 const approvalsMod = await import("../core/exec-approvals.js");
@@ -88,6 +88,118 @@ describe("assembleBrigadeToolset", () => {
 	it("derives capabilities.memory=true when recall_memory present", () => {
 		const ts = assembleBrigadeToolset({ workspaceDir: workspace, agentId: "main", cwd: workspace });
 		assert.equal(ts.capabilities.memory, true);
+	});
+});
+
+describe("makeToolPolicyPredicate — pure per-group/per-sender tool-name filter", () => {
+	it("allow restricts the set to exactly the allowlisted names", () => {
+		const allows = makeToolPolicyPredicate({ allow: ["read", "web_search"] });
+		assert.equal(allows("read"), true);
+		assert.equal(allows("web_search"), true);
+		// Anything not in the allowlist is dropped.
+		assert.equal(allows("bash"), false);
+		assert.equal(allows("write"), false);
+	});
+
+	it("alsoAllow widens an explicit allowlist (union with allow)", () => {
+		const allows = makeToolPolicyPredicate({ allow: ["read"], alsoAllow: ["web_search"] });
+		assert.equal(allows("read"), true);
+		assert.equal(allows("web_search"), true);
+		assert.equal(allows("bash"), false);
+	});
+
+	it("deny removes a tool (deny wins over an allow that contains it)", () => {
+		const allows = makeToolPolicyPredicate({ deny: ["exec"] });
+		// No allow set → everything else passes.
+		assert.equal(allows("read"), true);
+		assert.equal(allows("bash"), true);
+		// Denied name is removed.
+		assert.equal(allows("exec"), false);
+	});
+
+	it("deny wins even when the name is also in allow ∪ alsoAllow", () => {
+		const allows = makeToolPolicyPredicate({ allow: ["read", "exec"], alsoAllow: ["exec"], deny: ["exec"] });
+		assert.equal(allows("read"), true);
+		assert.equal(allows("exec"), false);
+	});
+
+	it("alsoAllow alone (no allow) does NOT restrict — everything passes", () => {
+		// alsoAllow only widens an explicit allowlist; with no `allow` the
+		// default is "all tools", so alsoAllow is inert.
+		const allows = makeToolPolicyPredicate({ alsoAllow: ["read"] });
+		assert.equal(allows("read"), true);
+		assert.equal(allows("bash"), true);
+		assert.equal(allows("anything"), true);
+	});
+
+	it("empty policy ({}) is a no-op — every name passes", () => {
+		const allows = makeToolPolicyPredicate({});
+		assert.equal(allows("read"), true);
+		assert.equal(allows("bash"), true);
+	});
+});
+
+describe("assembleBrigadeToolset — toolPolicy enforcement at the assembly site", () => {
+	it("allow narrows the assembled toolset to (allow ∪ alsoAllow) only", () => {
+		// `read` is a Pi builtin; `recall_memory` is a Brigade-native tool —
+		// both are in the default surface, so this proves the filter spans
+		// builtins AND custom tools.
+		const ts = assembleBrigadeToolset({
+			workspaceDir: workspace,
+			agentId: "main",
+			cwd: workspace,
+			toolPolicy: { allow: ["read"], alsoAllow: ["recall_memory"] },
+		});
+		assert.deepEqual(ts.builtinToolNames, ["read"]);
+		assert.deepEqual(ts.brigadeToolNames, ["recall_memory"]);
+		assert.deepEqual(ts.enabledToolNames.sort(), ["read", "recall_memory"]);
+		// customTools is narrowed in lockstep with the names.
+		assert.deepEqual(ts.customTools.map((t) => t.name), ["recall_memory"]);
+	});
+
+	it("deny removes the named tool but keeps everything else", () => {
+		const base = assembleBrigadeToolset({ workspaceDir: workspace, agentId: "main", cwd: workspace });
+		const denied = assembleBrigadeToolset({
+			workspaceDir: workspace,
+			agentId: "main",
+			cwd: workspace,
+			toolPolicy: { deny: ["bash"] },
+		});
+		// `bash` (a builtin) is gone…
+		assert.equal(denied.builtinToolNames.includes("bash"), false);
+		// …and the rest of the surface is exactly the unfiltered set minus bash.
+		assert.deepEqual(
+			denied.enabledToolNames.sort(),
+			base.enabledToolNames.filter((n) => n !== "bash").sort(),
+		);
+	});
+
+	it("no toolPolicy → toolset is byte-identical to the unfiltered surface", () => {
+		const withUndefinedPolicy = assembleBrigadeToolset({
+			workspaceDir: workspace,
+			agentId: "main",
+			cwd: workspace,
+			toolPolicy: undefined,
+		});
+		const baseline = assembleBrigadeToolset({ workspaceDir: workspace, agentId: "main", cwd: workspace });
+		assert.deepEqual(withUndefinedPolicy.builtinToolNames, baseline.builtinToolNames);
+		assert.deepEqual(withUndefinedPolicy.brigadeToolNames, baseline.brigadeToolNames);
+		assert.deepEqual(withUndefinedPolicy.enabledToolNames, baseline.enabledToolNames);
+		assert.equal(withUndefinedPolicy.customTools.length, baseline.customTools.length);
+	});
+
+	it("toolPolicy composes with the cron toolsAllow filter (both narrow; deny wins)", () => {
+		// toolsAllow first clamps to {read, recall_memory, bash}; the policy then
+		// denies bash and restricts to read — intersection minus deny = {read}.
+		const ts = assembleBrigadeToolset({
+			workspaceDir: workspace,
+			agentId: "main",
+			cwd: workspace,
+			toolsAllow: ["read", "recall_memory", "bash"],
+			toolPolicy: { allow: ["read", "bash"], deny: ["bash"] },
+		});
+		assert.deepEqual(ts.enabledToolNames, ["read"]);
+		assert.deepEqual(ts.customTools.map((t) => t.name), []);
 	});
 });
 

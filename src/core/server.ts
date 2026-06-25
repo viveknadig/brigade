@@ -117,6 +117,7 @@ import {
 	syncChannelSecurityAdaptersFromPlugins,
 } from "../agents/channels/channel-security-registry.js";
 import { clearChannelMetaRegistry, registerChannelMeta } from "../agents/channels/channel-meta-registry.js";
+import type { GroupToolPolicyConfig } from "../agents/channels/access-control/index.js";
 import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
 import { listOpenRouterModels } from "../integrations/provider-discovery.js";
@@ -2549,6 +2550,18 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		 */
 		channelApprovalRoute?: import("../agents/channels/approval-router.js").ChannelApprovalRoute;
 		/**
+		 * Per-group / per-sender tool policy for THIS turn. Set ONLY by the
+		 * channel inbound pipeline for GROUP messages that resolved a policy
+		 * (`resolveChannelGroupToolsPolicy`), threaded here via the channel
+		 * manager's `runTurn(turn)` bridge. Forwarded into `runResilientTurn`
+		 * → `runSingleTurn` → `assembleBrigadeToolset`, where it narrows the
+		 * per-turn toolset by name (allow ∪ alsoAllow, then deny wins) ON TOP
+		 * of the `ownerOnly` wrapping — it can only REMOVE tools. Always
+		 * undefined for TUI / cron / sub-agent / direct-RPC / DM turns and any
+		 * group without a configured policy, so their toolset is unchanged.
+		 */
+		toolPolicy?: GroupToolPolicyConfig;
+		/**
 		 * OPTIONAL live-streaming delta sink. When a channel turn opts into
 		 * progressive delivery (e.g. Telegram `liveStream: true`), the channel
 		 * manager passes this callback; the gateway forwards the ACCUMULATED
@@ -2677,6 +2690,11 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					...(turn.channelApprovalRoute !== undefined
 						? { channelApprovalRoute: turn.channelApprovalRoute }
 						: {}),
+					// Forward the per-group/per-sender tool policy (set ONLY for
+					// group-message turns that resolved one) so the tool-assembly
+					// site narrows this turn's toolset by name. Undefined elsewhere
+					// → toolset unchanged.
+					...(turn.toolPolicy !== undefined ? { toolPolicy: turn.toolPolicy } : {}),
 					onSessionReady: (session) => {
 						// A fallback candidate builds a fresh session; tear down the
 						// previous candidate's wiring before attaching the new one.

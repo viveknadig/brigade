@@ -39,6 +39,7 @@ import {
 	type InboundPipelineContext,
 	type RunChannelTurnFn,
 } from "./inbound-pipeline.js";
+import type { GroupToolPolicyConfig } from "./access-control/index.js";
 
 const log = createSubsystemLogger("channels/manager");
 
@@ -64,6 +65,14 @@ export interface StartChannelsArgs {
 		signal?: AbortSignal;
 		senderIsOwner?: boolean;
 		channelApprovalRoute?: ChannelApprovalRoute;
+		/**
+		 * Per-group / per-sender tool policy for group-message turns (resolved
+		 * by the inbound pipeline via `resolveChannelGroupToolsPolicy`). Forwarded
+		 * to the gateway turn runner, which narrows the per-turn toolset by name
+		 * (allow ∪ alsoAllow, then deny wins) on top of the `ownerOnly` wrapping.
+		 * Undefined for DMs and groups without a configured policy.
+		 */
+		toolPolicy?: GroupToolPolicyConfig;
 	}) => Promise<ChannelTurnResult>;
 	/** Channel commands (`/name`) handled before the LLM. */
 	commands?: ChannelCommand[];
