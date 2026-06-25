@@ -94,6 +94,18 @@ import {
 	discordThreadIdleTtlMs,
 } from "../agents/channels/discord/account-config.js";
 import { createDiscordPlugin, type DiscordPluginHandle } from "../agents/channels/discord/plugin.js";
+import {
+	listIMessageAccountIds,
+	imessageChannelEnabled,
+	imessageThreadIdleTtlMs,
+} from "../agents/channels/imessage/account-config.js";
+import { createIMessagePlugin, type IMessagePluginHandle } from "../agents/channels/imessage/plugin.js";
+import {
+	listBlueBubblesAccountIds,
+	bluebubblesChannelEnabled,
+	bluebubblesThreadIdleTtlMs,
+} from "../agents/channels/bluebubbles/account-config.js";
+import { createBlueBubblesPlugin, type BlueBubblesPluginHandle } from "../agents/channels/bluebubbles/plugin.js";
 import { createPluginChannelManagerFacade } from "../agents/channels/plugin-channel-manager-facade.js";
 import type { ChannelPlugin } from "../agents/channels/types.plugin.js";
 import {
@@ -105,6 +117,7 @@ import {
 	syncChannelSecurityAdaptersFromPlugins,
 } from "../agents/channels/channel-security-registry.js";
 import { clearChannelMetaRegistry, registerChannelMeta } from "../agents/channels/channel-meta-registry.js";
+import type { GroupToolPolicyConfig } from "../agents/channels/access-control/index.js";
 import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
 import { listOpenRouterModels } from "../integrations/provider-discovery.js";
@@ -2017,7 +2030,13 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					// `loadConfig` is synchronous + cheap; reading fresh keeps the TTL
 					// live across config reloads without threading a mutable holder.
 					const cfg = loadConfig() as never;
-					return telegramThreadIdleTtlMs(cfg) ?? slackThreadIdleTtlMs(cfg) ?? discordThreadIdleTtlMs(cfg);
+					return (
+						telegramThreadIdleTtlMs(cfg) ??
+						slackThreadIdleTtlMs(cfg) ??
+						discordThreadIdleTtlMs(cfg) ??
+						imessageThreadIdleTtlMs(cfg) ??
+						bluebubblesThreadIdleTtlMs(cfg)
+					);
 				} catch {
 					return null;
 				}
@@ -2531,6 +2550,18 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		 */
 		channelApprovalRoute?: import("../agents/channels/approval-router.js").ChannelApprovalRoute;
 		/**
+		 * Per-group / per-sender tool policy for THIS turn. Set ONLY by the
+		 * channel inbound pipeline for GROUP messages that resolved a policy
+		 * (`resolveChannelGroupToolsPolicy`), threaded here via the channel
+		 * manager's `runTurn(turn)` bridge. Forwarded into `runResilientTurn`
+		 * → `runSingleTurn` → `assembleBrigadeToolset`, where it narrows the
+		 * per-turn toolset by name (allow ∪ alsoAllow, then deny wins) ON TOP
+		 * of the `ownerOnly` wrapping — it can only REMOVE tools. Always
+		 * undefined for TUI / cron / sub-agent / direct-RPC / DM turns and any
+		 * group without a configured policy, so their toolset is unchanged.
+		 */
+		toolPolicy?: GroupToolPolicyConfig;
+		/**
 		 * OPTIONAL live-streaming delta sink. When a channel turn opts into
 		 * progressive delivery (e.g. Telegram `liveStream: true`), the channel
 		 * manager passes this callback; the gateway forwards the ACCUMULATED
@@ -2659,6 +2690,11 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					...(turn.channelApprovalRoute !== undefined
 						? { channelApprovalRoute: turn.channelApprovalRoute }
 						: {}),
+					// Forward the per-group/per-sender tool policy (set ONLY for
+					// group-message turns that resolved one) so the tool-assembly
+					// site narrows this turn's toolset by name. Undefined elsewhere
+					// → toolset unchanged.
+					...(turn.toolPolicy !== undefined ? { toolPolicy: turn.toolPolicy } : {}),
 					onSessionReady: (session) => {
 						// A fallback candidate builds a fresh session; tear down the
 						// previous candidate's wiring before attaching the new one.
@@ -5305,14 +5341,36 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		const discordAccounts = discordChannelEnabled(cfg as never)
 			? listDiscordAccountIds(cfg as never)
 			: [];
+		const imessageAccounts = imessageChannelEnabled(cfg as never)
+			? listIMessageAccountIds(cfg as never)
+			: [];
+		const bluebubblesAccounts = bluebubblesChannelEnabled(cfg as never)
+			? listBlueBubblesAccountIds(cfg as never)
+			: [];
 		const wantWhatsAppMulti = whatsappAccounts.length > 1;
 		const wantTelegramMulti = telegramAccounts.length > 1;
 		const wantSlackMulti = slackAccounts.length > 1;
 		const wantDiscordMulti = discordAccounts.length > 1;
-		if (wantWhatsAppMulti || wantTelegramMulti || wantSlackMulti || wantDiscordMulti) {
+		const wantIMessageMulti = imessageAccounts.length > 1;
+		const wantBlueBubblesMulti = bluebubblesAccounts.length > 1;
+		if (
+			wantWhatsAppMulti ||
+			wantTelegramMulti ||
+			wantSlackMulti ||
+			wantDiscordMulti ||
+			wantIMessageMulti ||
+			wantBlueBubblesMulti
+		) {
 			// Fresh list each (re)start so a reload doesn't accumulate stale plugins.
 			bundledChannelPlugins = [];
-			const facadeHandles: Array<WhatsAppPluginHandle | TelegramPluginHandle | SlackPluginHandle | DiscordPluginHandle> = [];
+			const facadeHandles: Array<
+				| WhatsAppPluginHandle
+				| TelegramPluginHandle
+				| SlackPluginHandle
+				| DiscordPluginHandle
+				| IMessagePluginHandle
+				| BlueBubblesPluginHandle
+			> = [];
 			const multiAccountSummary: string[] = [];
 			if (wantWhatsAppMulti) {
 				const whatsappPlugin = createWhatsAppPlugin({
@@ -5361,6 +5419,26 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				bundledChannelPlugins.push(discordPlugin);
 				facadeHandles.push(discordPlugin);
 				multiAccountSummary.push(`discord x${discordAccounts.length}`);
+			}
+			if (wantIMessageMulti) {
+				const imessagePlugin = createIMessagePlugin({
+					defaultAgentId: agentId,
+					loadConfig: () => cfg as never,
+					runTurn: (turn) => runGatewayTurn(turn),
+				});
+				bundledChannelPlugins.push(imessagePlugin);
+				facadeHandles.push(imessagePlugin);
+				multiAccountSummary.push(`imessage x${imessageAccounts.length}`);
+			}
+			if (wantBlueBubblesMulti) {
+				const bluebubblesPlugin = createBlueBubblesPlugin({
+					defaultAgentId: agentId,
+					loadConfig: () => cfg as never,
+					runTurn: (turn) => runGatewayTurn(turn),
+				});
+				bundledChannelPlugins.push(bluebubblesPlugin);
+				facadeHandles.push(bluebubblesPlugin);
+				multiAccountSummary.push(`bluebubbles x${bluebubblesAccounts.length}`);
 			}
 			const pluginById = new Map(bundledChannelPlugins.map((p) => [p.id, p] as const));
 			// Register each constructed plugin's `meta` + its `messaging`/`security`

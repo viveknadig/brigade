@@ -49,6 +49,7 @@ import { readConfigOrInit, type BrigadeConfig } from "../config/io.js";
 import { discoverEligibleSkills } from "./skills/index.js";
 import { BUNDLED_MODULES } from "./extensions/index.js";
 import { getActiveChannelManager } from "./channels/active-manager.js";
+import type { GroupToolPolicyConfig } from "./channels/access-control/index.js";
 import { getOrLoadExtensionRegistry } from "./extensions/registry-cache.js";
 import { assembleSystemPrompt } from "../system-prompt/assembler.js";
 import {
@@ -275,6 +276,18 @@ export interface RunSingleTurnArgs {
   cronMode?: boolean;
   lightContext?: boolean;
   toolsAllow?: string[];
+  /**
+   * Per-group / per-sender tool policy for THIS turn (group messages only).
+   * Resolved by the channel inbound pipeline via
+   * `resolveChannelGroupToolsPolicy(...)` and threaded `runGatewayTurn` →
+   * `runResilientTurn` → `runSingleTurn` → `assembleBrigadeToolset`, where it
+   * applies as a pure NAME filter (allow ∪ alsoAllow, then deny wins) layered
+   * ON TOP of the `ownerOnly` wrapping. It can only REMOVE tools for the turn,
+   * never add or un-gate one. Undefined for TUI / cron / sub-agent / RPC / DM
+   * turns and any group without a configured policy — they keep today's exact
+   * toolset (the filter never runs when this is absent).
+   */
+  toolPolicy?: GroupToolPolicyConfig;
   /**
    * Channel routing for approval prompts. When set, the exec-gate sends the
    * "want to run <command>?" prompt INTO the originating channel
@@ -630,6 +643,11 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // Undefined for non-cron turns, an array for cron-fired turns whose
     // payload sets a tool allowlist.
     ...(args.toolsAllow !== undefined ? { toolsAllow: args.toolsAllow } : {}),
+    // Per-group / per-sender tool policy — set ONLY for group-message turns
+    // that resolved one. Applied as a pure NAME filter on top of ownerOnly
+    // (allow ∪ alsoAllow, then deny wins). Undefined everywhere else, so the
+    // toolset is byte-identical to today when absent.
+    ...(args.toolPolicy !== undefined ? { toolPolicy: args.toolPolicy } : {}),
     // Channel context — set when the inbound came from a channel adapter.
     // The cron tool reads it to auto-fill `delivery.channel/to/threadId` so
     // a `cron add` mid-chat replies back to the same chat by default. The

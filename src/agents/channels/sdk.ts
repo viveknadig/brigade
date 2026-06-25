@@ -238,6 +238,10 @@ export {
 	SLACK_CHANNEL_META,
 	/** Discord's user-facing `ChannelMeta` — import this for your plugin's `meta` field. */
 	DISCORD_CHANNEL_META,
+	/** iMessage's user-facing `ChannelMeta` — import this for your plugin's `meta` field. */
+	IMESSAGE_CHANNEL_META,
+	/** BlueBubbles' user-facing `ChannelMeta` — import this for your plugin's `meta` field. */
+	BLUEBUBBLES_CHANNEL_META,
 	/** Every bundled channel meta in declaration order (the meta registry seeds from this). */
 	BUNDLED_CHANNEL_METAS,
 } from "./bundled-channel-metas.js";

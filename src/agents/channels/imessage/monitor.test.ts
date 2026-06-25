@@ -1,0 +1,242 @@
+import { strict as assert } from "node:assert";
+import { describe, it } from "node:test";
+
+import {
+	createMonitorState,
+	decideInbound,
+	detectIMessageMentions,
+	detectReflectedContent,
+	findCodeRegions,
+	isInsideCode,
+	normalizeIMessageMessage,
+	parseIMessageNotification,
+	stripLengthPrefixedText,
+	SentMessageCache,
+	type IMessagePayload,
+} from "./monitor.js";
+
+describe("parseIMessageNotification", () => {
+	it("returns null for a malformed payload", () => {
+		assert.equal(parseIMessageNotification(null), null);
+		assert.equal(parseIMessageNotification({}), null);
+		assert.equal(parseIMessageNotification({ message: 5 }), null);
+	});
+
+	it("shapes a valid payload + passes text through length-prefix strip", () => {
+		const p = parseIMessageNotification({
+			message: { sender: "+1555", text: "hi", chat_id: 7, is_from_me: false },
+		});
+		assert.ok(p);
+		assert.equal(p?.sender, "+1555");
+		assert.equal(p?.text, "hi");
+		assert.equal(p?.chat_id, 7);
+	});
+});
+
+describe("stripLengthPrefixedText", () => {
+	it("returns plain text unchanged", () => {
+		assert.equal(stripLengthPrefixedText("hello"), "hello");
+	});
+
+	it("unwraps a protobuf field-1 length-prefixed blob", () => {
+		const inner = "hello world";
+		const bytes = Buffer.from(inner, "utf8");
+		const wrapped = Buffer.concat([Buffer.from([0x0a, bytes.length]), bytes]);
+		assert.equal(stripLengthPrefixedText(wrapped.toString("utf8")), inner);
+	});
+
+	it("leaves a non-exact-length blob unchanged", () => {
+		const inner = "hello";
+		const bytes = Buffer.from(inner, "utf8");
+		// Declared length is one short of the actual → not stripped.
+		const wrapped = Buffer.concat([Buffer.from([0x0a, bytes.length - 1]), bytes]);
+		assert.equal(stripLengthPrefixedText(wrapped.toString("utf8")), wrapped.toString("utf8"));
+	});
+});
+
+describe("normalizeIMessageMessage", () => {
+	it("builds a group conversation id from chat_id", () => {
+		const n = normalizeIMessageMessage({ sender: "+1555", text: "hi", chat_id: 7, is_group: true });
+		assert.equal(n.conversationId, "chat:7");
+		assert.equal(n.isGroup, true);
+		assert.equal(n.from, "+1555");
+	});
+
+	it("builds a DM conversation id from the sender", () => {
+		const n = normalizeIMessageMessage({ sender: "+1555", text: "hi" });
+		assert.equal(n.conversationId, "+1555");
+		assert.equal(n.isGroup, false);
+	});
+
+	it("prefers guid as the messageId", () => {
+		const n = normalizeIMessageMessage({ sender: "+1555", text: "hi", guid: "G-1", id: 3 });
+		assert.equal(n.messageId, "G-1");
+	});
+
+	// Fix 2 — group requireMention: populate mentions[] when the bot's handle is named.
+	it("populates mentions[] when a group message names the bot's selfHandle", () => {
+		const n = normalizeIMessageMessage(
+			{ sender: "+1999", text: "hey 15551234567 take a look", chat_id: 7, is_group: true },
+			"15551234567",
+		);
+		assert.deepEqual(n.mentions, ["15551234567"]);
+	});
+
+	it("leaves mentions unset when a group message does NOT name the bot", () => {
+		const n = normalizeIMessageMessage(
+			{ sender: "+1999", text: "just chatting", chat_id: 7, is_group: true },
+			"15551234567",
+		);
+		assert.equal(n.mentions, undefined);
+	});
+
+	it("never sets mentions for a DM even when the handle appears (DM unaffected)", () => {
+		const n = normalizeIMessageMessage({ sender: "+1999", text: "ping 15551234567" }, "15551234567");
+		assert.equal(n.isGroup, false);
+		assert.equal(n.mentions, undefined);
+	});
+
+	it("decideInbound dispatches a group mention with mentions[] populated", () => {
+		const state = createMonitorState();
+		const d = decideInbound(state, "acct", { sender: "+1999", text: "yo 15551234567", chat_id: 9, is_group: true }, "15551234567");
+		assert.equal(d.kind, "dispatch");
+		if (d.kind === "dispatch") assert.deepEqual(d.message.mentions, ["15551234567"]);
+	});
+});
+
+describe("detectReflectedContent", () => {
+	it("flags a leaked thinking tag", () => {
+		assert.equal(detectReflectedContent("<think>secret</think>").isReflection, true);
+	});
+	it("does not flag normal text", () => {
+		assert.equal(detectReflectedContent("hello there").isReflection, false);
+	});
+
+	// Fix 1 — code-fence skip: a marker quoted INSIDE code is legit, not a reflection.
+	it("does NOT flag a <final> tag inside a fenced code block", () => {
+		const msg = "look at this snippet:\n```html\n<final>answer</final>\n```\nthoughts?";
+		assert.equal(detectReflectedContent(msg).isReflection, false);
+	});
+
+	it("does NOT flag a #+#+ separator inside an inline code span", () => {
+		assert.equal(detectReflectedContent("the delimiter `#+#+#` is internal").isReflection, false);
+	});
+
+	it("STILL flags a bare <final> reflection outside any code", () => {
+		const out = detectReflectedContent("here is the <final>leaked answer</final> oops");
+		assert.equal(out.isReflection, true);
+		assert.ok(out.matchedLabels.includes("final-tag"));
+	});
+
+	it("flags when a marker appears both inside AND outside a fence (outside wins)", () => {
+		const msg = "```\n<final>quoted</final>\n```\nand a real <final>leak</final>";
+		assert.equal(detectReflectedContent(msg).isReflection, true);
+	});
+});
+
+describe("findCodeRegions / isInsideCode", () => {
+	it("locates a fenced block and reports a position inside it", () => {
+		const text = "intro\n```\nsecret <final>\n```\ntail";
+		const regions = findCodeRegions(text);
+		assert.ok(regions.length >= 1);
+		const finalIdx = text.indexOf("<final>");
+		assert.equal(isInsideCode(finalIdx, regions), true);
+		// The leading "intro" is outside code.
+		assert.equal(isInsideCode(0, regions), false);
+	});
+
+	it("locates an inline code span", () => {
+		const text = "use `<final>` here";
+		const regions = findCodeRegions(text);
+		const idx = text.indexOf("<final>");
+		assert.equal(isInsideCode(idx, regions), true);
+	});
+});
+
+describe("detectIMessageMentions", () => {
+	it("matches a phone self-handle by digit-run (formatting-insensitive)", () => {
+		assert.deepEqual(detectIMessageMentions("hey +1 (555) 123-4567 can you help", "15551234567"), ["15551234567"]);
+	});
+	it("matches an email self-handle case-insensitively", () => {
+		assert.deepEqual(detectIMessageMentions("ping Bot@Example.com pls", "bot@example.com"), ["bot@example.com"]);
+	});
+	it("returns undefined when the handle is absent", () => {
+		assert.equal(detectIMessageMentions("nobody here", "15551234567"), undefined);
+	});
+	it("returns undefined when no self-handle is configured", () => {
+		assert.equal(detectIMessageMentions("anything", undefined), undefined);
+	});
+});
+
+describe("SentMessageCache", () => {
+	it("matches an inbound echo by text (within TTL)", () => {
+		const cache = new SentMessageCache();
+		cache.remember("acct:imessage:+1555", { text: "hello" });
+		assert.equal(cache.has("acct:imessage:+1555", { text: "hello" }), true);
+		assert.equal(cache.has("acct:imessage:+1555", { text: "different" }), false);
+	});
+
+	it("matches by message id", () => {
+		const cache = new SentMessageCache();
+		cache.remember("scope", { text: "x", messageId: "G-9" });
+		assert.equal(cache.has("scope", { messageId: "G-9" }), true);
+	});
+
+	it("rejects junk ids (ok / unknown / empty)", () => {
+		const cache = new SentMessageCache();
+		cache.remember("scope", { text: "x", messageId: "ok" });
+		assert.equal(cache.has("scope", { messageId: "ok" }), false);
+	});
+});
+
+describe("decideInbound", () => {
+	it("dispatches a normal inbound", () => {
+		const state = createMonitorState();
+		const payload: IMessagePayload = { sender: "+1555", text: "hi", is_from_me: false };
+		const d = decideInbound(state, "acct", payload);
+		assert.equal(d.kind, "dispatch");
+	});
+
+	it("drops a from-me message", () => {
+		const state = createMonitorState();
+		const d = decideInbound(state, "acct", { sender: "+1555", text: "hi", is_from_me: true });
+		assert.equal(d.kind, "drop");
+		if (d.kind === "drop") assert.equal(d.reason, "from me");
+	});
+
+	it("drops an empty body", () => {
+		const state = createMonitorState();
+		const d = decideInbound(state, "acct", { sender: "+1555", text: "   " });
+		assert.equal(d.kind, "drop");
+		if (d.kind === "drop") assert.equal(d.reason, "empty body");
+	});
+
+	it("drops the echo of a just-sent message", () => {
+		const state = createMonitorState();
+		// The connection would remember an outbound under the DM scope.
+		state.sentMessageCache.remember("acct:imessage:+1555", { text: "the answer", messageId: "G-1" });
+		const d = decideInbound(state, "acct", { sender: "+1555", text: "the answer", guid: "G-1" });
+		assert.equal(d.kind, "drop");
+		if (d.kind === "drop") assert.equal(d.reason, "echo");
+	});
+
+	it("drops reflected assistant content", () => {
+		const state = createMonitorState();
+		const d = decideInbound(state, "acct", { sender: "+1555", text: "look <final>answer</final>" });
+		assert.equal(d.kind, "drop");
+		if (d.kind === "drop") assert.equal(d.reason, "reflected assistant content");
+	});
+
+	it("rate-limits a conversation after repeated loop drops", () => {
+		const state = createMonitorState();
+		// Five echo drops feed the loop limiter.
+		for (let i = 0; i < 5; i++) {
+			state.sentMessageCache.remember("acct:imessage:+1555", { text: `m${i}`, messageId: `G${i}` });
+			decideInbound(state, "acct", { sender: "+1555", text: `m${i}`, guid: `G${i}` });
+		}
+		// A fresh real message is now suppressed by the rate limiter.
+		const d = decideInbound(state, "acct", { sender: "+1555", text: "a real new message" });
+		assert.equal(d.kind, "drop");
+		if (d.kind === "drop") assert.equal(d.reason, "loop rate-limited");
+	});
+});

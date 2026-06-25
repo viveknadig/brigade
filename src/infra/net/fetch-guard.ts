@@ -28,6 +28,35 @@ import { buildPinnedDispatcherForHostname, undiciFetch } from "./dns-pinning.js"
 /** Default redirect cap — matches the upstream reference. */
 export const DEFAULT_MAX_REDIRECTS = 3;
 
+/** The injectable fetch primitive — production uses the global `fetch`. */
+export type FetchLike = typeof fetch;
+
+/**
+ * SSRF classification options. `allowPrivateNetwork` is a DANGEROUS opt-in for
+ * channels that legitimately talk to a LAN / private-IP host (e.g. a BlueBubbles
+ * macOS server on `192.168.x.x`). It relaxes the private/loopback/link-local IP
+ * checks — but NEVER the cloud-metadata block: `169.254.169.254`, the
+ * `metadata.*` hostnames, and the IPv6 metadata literal stay forbidden, so a
+ * redirect-to-metadata SSRF is still blocked even with private access on.
+ */
+export interface SsrfClassifyOptions {
+	/** Allow RFC1918 / loopback / link-local / ULA targets (cloud-metadata stays blocked). */
+	allowPrivateNetwork?: boolean;
+}
+
+/**
+ * Cloud-metadata + forbidden-literal hosts that stay blocked EVEN WHEN
+ * `allowPrivateNetwork` is set — these are never a legitimate LAN target and are
+ * the highest-value SSRF destinations.
+ */
+const METADATA_HOSTNAMES = new Set([
+	"metadata.google.internal",
+	"metadata.aws.amazon.com",
+	"metadata.azure.com",
+	"169.254.169.254",
+	"fd00:ec2::254",
+]);
+
 /** Custom error thrown when an SSRF gate rejects a URL or resolved IP. */
 export class SsrfBlockedError extends Error {
 	readonly url: string;
@@ -93,14 +122,25 @@ function isLegacyIpv4Literal(host: string): boolean {
 
 /**
  * Classify an IPv4 address. Returns a reason string when the IP is in a
- * forbidden range, or `null` when it's safe to fetch.
+ * forbidden range, or `null` when it's safe to fetch. When `allowPrivate` is
+ * set, RFC1918 / loopback / link-local / CGNAT ranges are permitted — but the
+ * exact cloud-metadata address `169.254.169.254` and multicast/reserved stay
+ * forbidden.
  */
-function classifyIPv4(ip: string): string | null {
+function classifyIPv4(ip: string, allowPrivate = false): string | null {
 	const parts = ip.split(".").map((p) => Number.parseInt(p, 10));
 	if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
 		return "invalid IPv4";
 	}
-	const [a, b] = parts as [number, number, number, number];
+	const [a, b, c, d] = parts as [number, number, number, number];
+	// Cloud-metadata is ALWAYS blocked (even with private access on).
+	if (a === 169 && b === 254 && c === 169 && d === 254) return "cloud-metadata (169.254.169.254)";
+	// 224.0.0.0/4 — multicast (never a valid unicast target).
+	if (a >= 224 && a <= 239) return "multicast (224.0.0.0/4)";
+	// 240.0.0.0/4 — reserved.
+	if (a >= 240) return "reserved (240.0.0.0/4)";
+	// Below: private/loopback/link-local ranges. Permitted when allowPrivate.
+	if (allowPrivate) return null;
 	// 0.0.0.0/8 — "this network"
 	if (a === 0) return "0.0.0.0/8 unspecified";
 	// 10.0.0.0/8 — RFC1918 private
@@ -117,10 +157,6 @@ function classifyIPv4(ip: string): string | null {
 	if (a === 192 && b === 168) return "RFC1918 private (192.168/16)";
 	// 192.0.0.0/24 — IANA reserved
 	if (a === 192 && b === 0) return "IANA reserved (192.0.0/24)";
-	// 224.0.0.0/4 — multicast
-	if (a >= 224 && a <= 239) return "multicast (224.0.0.0/4)";
-	// 240.0.0.0/4 — reserved
-	if (a >= 240) return "reserved (240.0.0.0/4)";
 	return null;
 }
 
@@ -129,11 +165,22 @@ function classifyIPv4(ip: string): string | null {
  * forbidden range, or `null` when it's safe. Conservative — when in doubt
  * we refuse.
  */
-function classifyIPv6(ip: string): string | null {
+function classifyIPv6(ip: string, allowPrivate = false): string | null {
 	// Strip zone identifier (`fe80::1%eth0`) before classifying — the
 	// address itself is what we judge; zone routes locally only.
 	const noZone = ip.split("%", 1)[0] ?? ip;
 	const lower = noZone.toLowerCase();
+	// AWS IPv6 metadata literal is ALWAYS blocked.
+	if (lower === "fd00:ec2::254") return "cloud-metadata (fd00:ec2::254)";
+	// ::ffff:0:0/96 — IPv4-mapped — re-classify the embedded v4 (respects allowPrivate).
+	const mapped = lower.match(/^::ffff:([0-9.]+)$/);
+	if (mapped) {
+		const inner = classifyIPv4(mapped[1] ?? "", allowPrivate);
+		if (inner) return `IPv4-mapped IPv6 → ${inner}`;
+		return null;
+	}
+	// Below: loopback/ULA/link-local ranges. Permitted when allowPrivate.
+	if (allowPrivate) return null;
 	// ::1 — loopback
 	if (lower === "::1" || lower === "::ffff:127.0.0.1") return "IPv6 loopback";
 	// :: — unspecified
@@ -149,12 +196,6 @@ function classifyIPv6(ip: string): string | null {
 	if (lower.startsWith("fec") || lower.startsWith("fed") || lower.startsWith("fee") || lower.startsWith("fef")) {
 		return "IPv6 site-local (fec0::/10, deprecated)";
 	}
-	// ::ffff:0:0/96 — IPv4-mapped — re-classify the embedded v4
-	const mapped = lower.match(/^::ffff:([0-9.]+)$/);
-	if (mapped) {
-		const inner = classifyIPv4(mapped[1] ?? "");
-		if (inner) return `IPv4-mapped IPv6 → ${inner}`;
-	}
 	return null;
 }
 
@@ -163,23 +204,31 @@ function classifyIPv6(ip: string): string | null {
  * obvious cases (literal `localhost`, IP-in-hostname, forbidden suffix)
  * so we don't even spend a DNS round-trip.
  */
-export function classifyHostnameSync(hostname: string): string | null {
+export function classifyHostnameSync(hostname: string, opts: SsrfClassifyOptions = {}): string | null {
 	const host = hostname.toLowerCase();
 	if (!host) return "empty hostname";
-	if (FORBIDDEN_HOSTNAMES.has(host)) return `forbidden hostname (${host})`;
-	for (const suffix of FORBIDDEN_HOSTNAME_SUFFIXES) {
-		if (host.endsWith(suffix)) return `forbidden hostname suffix (${suffix})`;
+	const allowPrivate = opts.allowPrivateNetwork === true;
+	// Cloud-metadata hostnames are ALWAYS forbidden, even with private access on.
+	if (METADATA_HOSTNAMES.has(host)) return `forbidden hostname (${host})`;
+	// The remaining literal/suffix bans are private-network markers: skip them
+	// when the caller has opted into a trusted LAN host.
+	if (!allowPrivate) {
+		if (FORBIDDEN_HOSTNAMES.has(host)) return `forbidden hostname (${host})`;
+		for (const suffix of FORBIDDEN_HOSTNAME_SUFFIXES) {
+			if (host.endsWith(suffix)) return `forbidden hostname suffix (${suffix})`;
+		}
 	}
 	// Strip brackets from IPv6 literals before classifying.
 	const stripped = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
 	// Refuse non-canonical IPv4 (octal/hex/decimal-int/short forms) outright —
 	// these resolve to the same IP via legacy inet_aton parsers but bypass a
-	// dotted-quad sanity check.
+	// dotted-quad sanity check. (Refused regardless of allowPrivate — a real LAN
+	// target uses a canonical dotted-quad.)
 	if (isLegacyIpv4Literal(stripped)) return "legacy IPv4 literal (non-canonical form)";
-	if (isIPv4(stripped)) return classifyIPv4(stripped);
+	if (isIPv4(stripped)) return classifyIPv4(stripped, allowPrivate);
 	// Drop zone identifier before IPv6 classification.
 	const noZone = stripped.split("%", 1)[0] ?? stripped;
-	if (isIPv6(noZone)) return classifyIPv6(noZone);
+	if (isIPv6(noZone)) return classifyIPv6(noZone, allowPrivate);
 	if (isIP(stripped) === 0 && /^[\d.]+$/.test(stripped)) return "invalid IPv4 literal";
 	return null;
 }
@@ -194,7 +243,7 @@ export function classifyHostnameSync(hostname: string): string | null {
  * URL is safe, returns an `SsrfBlockedError`-shaped reason string when
  * not. Caller throws.
  */
-export async function classifyUrlForSsrf(rawUrl: string): Promise<string | null> {
+export async function classifyUrlForSsrf(rawUrl: string, opts: SsrfClassifyOptions = {}): Promise<string | null> {
 	let parsed: URL;
 	try {
 		parsed = new URL(rawUrl);
@@ -204,7 +253,8 @@ export async function classifyUrlForSsrf(rawUrl: string): Promise<string | null>
 	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
 		return `forbidden protocol (${parsed.protocol})`;
 	}
-	const hostReason = classifyHostnameSync(parsed.hostname);
+	const allowPrivate = opts.allowPrivateNetwork === true;
+	const hostReason = classifyHostnameSync(parsed.hostname, opts);
 	if (hostReason) return hostReason;
 	// If hostname is already an IP, the sync check has already classified
 	// it — skip DNS.
@@ -216,7 +266,7 @@ export async function classifyUrlForSsrf(rawUrl: string): Promise<string | null>
 	try {
 		const addresses = await dnsPromises.lookup(parsed.hostname, { all: true });
 		for (const a of addresses) {
-			const reason = a.family === 6 ? classifyIPv6(a.address) : classifyIPv4(a.address);
+			const reason = a.family === 6 ? classifyIPv6(a.address, allowPrivate) : classifyIPv4(a.address, allowPrivate);
 			if (reason) return `${parsed.hostname} resolves to ${a.address}: ${reason}`;
 		}
 	} catch {
@@ -233,6 +283,14 @@ export interface GuardedFetchOptions {
 	body?: RequestInit["body"];
 	maxRedirects?: number;
 	timeoutMs?: number;
+	/**
+	 * DANGEROUS opt-in: allow private/LAN/loopback targets (cloud-metadata stays
+	 * blocked on every hop). For channels that talk to an operator's own host
+	 * (e.g. a BlueBubbles macOS server on `192.168.x.x`).
+	 */
+	allowPrivateNetwork?: boolean;
+	/** Inject the network primitive (TEST SEAM). Defaults to the global `fetch`. */
+	fetchImpl?: FetchLike;
 	/** Signal from the caller (e.g. agent turn cancel). Combined with the timeout signal. */
 	signal?: AbortSignal;
 	/** When set, retry transient failures (429 / 5xx / network) with exp-backoff. */
@@ -267,6 +325,9 @@ export async function guardedFetch(
 	const timeoutTimer = setTimeout(() => timeoutController.abort(new Error("timeout")), timeoutMs);
 	timeoutTimer.unref?.();
 	const signal = mergeSignals([opts.signal, timeoutController.signal]);
+	const allowPrivate = opts.allowPrivateNetwork === true;
+	const classifyOpts: SsrfClassifyOptions = allowPrivate ? { allowPrivateNetwork: true } : {};
+	const fetchImpl = opts.fetchImpl ?? fetch;
 
 	const visited = new Set<string>();
 	const chain: string[] = [];
@@ -283,7 +344,7 @@ export async function guardedFetch(
 			visited.add(currentUrl);
 			chain.push(currentUrl);
 
-			const ssrfReason = await classifyUrlForSsrf(currentUrl);
+			const ssrfReason = await classifyUrlForSsrf(currentUrl, classifyOpts);
 			if (ssrfReason) throw new SsrfBlockedError(currentUrl, ssrfReason);
 
 			// DNS pinning: pre-resolve + classify every A/AAAA record;
@@ -303,7 +364,7 @@ export async function guardedFetch(
 					const pinned = await buildPinnedDispatcherForHostname({
 						hostname: parsedNow.hostname,
 						classifyAddress: (addr, family) =>
-							family === 6 ? classifyIPv6(addr) : classifyIPv4(addr),
+							family === 6 ? classifyIPv6(addr, allowPrivate) : classifyIPv4(addr, allowPrivate),
 					});
 					if (!pinned) {
 						throw new SsrfBlockedError(currentUrl, "all resolved IPs failed SSRF check");
@@ -332,6 +393,12 @@ export async function guardedFetch(
 					redirect: "manual",
 					signal,
 				};
+				// An injected fetch (test seam, or a channel-supplied transport)
+				// wins — the SSRF classify above already vetted this hop, so we
+				// hand the request straight to it (no real-network pinning).
+				if (opts.fetchImpl) {
+					return fetchImpl(currentUrl, init);
+				}
 				if (pinnedDispatcher) {
 					// Cast through `unknown` then a permissive `RequestInit` —
 					// Node-bundled `undici-types` and the externally-imported
@@ -344,7 +411,7 @@ export async function guardedFetch(
 						dispatcher: pinnedDispatcher,
 					} as unknown as RequestInit);
 				}
-				return fetch(currentUrl, init);
+				return fetchImpl(currentUrl, init);
 			};
 			const response = opts.retry
 				? await fetchWithRetry(doFetch, { ...opts.retry, signal })

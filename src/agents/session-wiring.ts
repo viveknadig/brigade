@@ -20,6 +20,7 @@
  * deliberately "one loop + provider adapters".
  */
 
+import type { GroupToolPolicyConfig } from "./channels/access-control/index.js";
 import type { ChannelApprovalRoute } from "./channels/approval-router.js";
 import type { MemoryCapability } from "./extensions/types.js";
 import { DEFAULT_SUBAGENT_TIMEOUT_SECONDS } from "./subagent-policy.js";
@@ -57,6 +58,36 @@ export interface BrigadeToolset {
 	customTools: AnyBrigadeTool[];
 	/** Capability gates for the system-prompt assembler (## Memory, etc.). */
 	capabilities: { memory: boolean; subAgents: boolean };
+}
+
+/**
+ * Build a pure tool-name predicate from a per-group / per-sender tool policy.
+ *
+ * Semantics (see `channels/access-control/group-tool-policy.ts`):
+ *   - When `allow` is defined, ONLY tools whose name is in `allow ∪ alsoAllow`
+ *     survive; when `allow` is undefined, every tool is allowed by default
+ *     (and `alsoAllow` is inert — it only widens an explicit allowlist).
+ *   - Any name in `deny` is then removed (deny always wins, even over `allow`).
+ *
+ * The returned predicate is the additional name-based narrowing layer applied
+ * to the per-turn toolset for GROUP messages that carry a policy. It can only
+ * REMOVE tools from the surface — it never adds a tool and never un-gates one
+ * (the `ownerOnly` wrapping is applied first and is independent of this).
+ * Names are matched verbatim against the tool's registered `name`.
+ *
+ * Exported for unit tests + reuse by `assembleBrigadeToolset`.
+ */
+export function makeToolPolicyPredicate(policy: GroupToolPolicyConfig): (toolName: string) => boolean {
+	const allowSet =
+		policy.allow !== undefined
+			? new Set<string>([...policy.allow, ...(policy.alsoAllow ?? [])])
+			: undefined;
+	const denySet = policy.deny && policy.deny.length > 0 ? new Set<string>(policy.deny) : undefined;
+	return (toolName: string): boolean => {
+		if (allowSet !== undefined && !allowSet.has(toolName)) return false;
+		if (denySet !== undefined && denySet.has(toolName)) return false;
+		return true;
+	};
 }
 
 /**
@@ -115,6 +146,18 @@ export function assembleBrigadeToolset(opts: {
 	 * undefined means "no filter, full surface".
 	 */
 	toolsAllow?: string[];
+	/**
+	 * Per-group / per-sender tool policy for THIS turn (group messages only).
+	 * Resolved by the channel inbound pipeline via
+	 * `resolveChannelGroupToolsPolicy(...)` and threaded down through the turn.
+	 * Applied as a pure NAME filter AFTER the `ownerOnly` wrapping and AFTER
+	 * the cron `toolsAllow` filter, so it composes with both and can only
+	 * REMOVE tools (allow ∪ alsoAllow, then deny wins — see
+	 * `makeToolPolicyPredicate`). Undefined for TUI / cron / sub-agent / RPC /
+	 * DM turns and any group without a configured policy — those get the exact
+	 * same toolset as before (the filter never runs when this is absent).
+	 */
+	toolPolicy?: GroupToolPolicyConfig;
 	/**
 	 * Active channel context for this turn — set when the inbound came from
 	 * a channel adapter. Threaded into the cron tool so a `cron add` from
@@ -219,12 +262,25 @@ export function assembleBrigadeToolset(opts: {
 	// through. When supplied, only the named tools survive — both for the
 	// custom-tool array AND for the builtinToolNames allowlist below.
 	const allow = opts.toolsAllow;
-	const customTools = allow === undefined
+	const allowedCustomTools = allow === undefined
 		? wrappedCustomTools
 		: wrappedCustomTools.filter((t) => allow.includes(t.name));
-	const builtinNames = allow === undefined
+	const allowedBuiltinNames = allow === undefined
 		? [...BUILTIN_TOOL_NAMES]
 		: BUILTIN_TOOL_NAMES.filter((n) => allow.includes(n));
+	// Per-group / per-sender tool-policy filter. Stacks AFTER the cron
+	// toolsAllow filter and AFTER the ownerOnly wrapping — a pure NAME
+	// narrowing that can only REMOVE tools (allow ∪ alsoAllow, then deny
+	// wins). When no policy is present the predicate is skipped entirely so
+	// the toolset is byte-identical to today for TUI / cron / sub-agent /
+	// RPC / DM turns and any group without a configured policy.
+	const policyAllows = opts.toolPolicy !== undefined ? makeToolPolicyPredicate(opts.toolPolicy) : undefined;
+	const customTools = policyAllows === undefined
+		? allowedCustomTools
+		: allowedCustomTools.filter((t) => policyAllows(t.name));
+	const builtinNames = policyAllows === undefined
+		? allowedBuiltinNames
+		: allowedBuiltinNames.filter((n) => policyAllows(n));
 	const brigadeToolNames = customTools.map((t) => t.name);
 	return {
 		builtinToolNames: builtinNames,
