@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.12.0](https://github.com/spinabot/brigade/compare/brigade-v1.11.2...brigade-v1.12.0) (2026-06-26)
+
+
+### Features
+
+* **tools:** free Edge TTS + Google STT + video → 10 providers ([3a21aa9](https://github.com/spinabot/brigade/commit/3a21aa92a997eb504ffd47cabe81de235b863bd5))
+* **tools:** generate_speech — multi-provider text-to-speech (TTS) ([7bb0da6](https://github.com/spinabot/brigade/commit/7bb0da6949fb16a5920bd2c3e61e2dbb425eb10c))
+* **tools:** generate_speech +MiniMax +xAI — 5 TTS providers ([19ad165](https://github.com/spinabot/brigade/commit/19ad1650cc80f95853efc6850aeb9cc2041da720))
+* **tools:** generate_video + generate_music — the last two Tier-1 modalities ([8c5a45c](https://github.com/spinabot/brigade/commit/8c5a45cb547125542ab2dec71ea1f1c639d1a02b))
+* **tools:** offline command-provider for TTS + STT (local piper / whisper) ([b6dcbe4](https://github.com/spinabot/brigade/commit/b6dcbe4fa2176c8eeffa5a690f4ac8542ca32491))
+* **tools:** transcribe_audio — multi-provider speech-to-text (STT) ([8a890c0](https://github.com/spinabot/brigade/commit/8a890c0077daf6220ad22e312215cf6a3950b3c2))
+
 ## [1.11.2](https://github.com/spinabot/brigade/compare/brigade-v1.11.1...brigade-v1.11.2) (2026-06-25)
 
 
