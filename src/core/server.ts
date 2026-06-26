@@ -321,7 +321,7 @@ export interface ServerHandle {
 /* ────────────────────────── boot ────────────────────────── */
 
 /** Bind addresses that are safe to listen on under the v1 "single-user" model. */
-const LOCALHOST_BINDS = new Set(["127.0.0.1", "::1", "localhost", "0.0.0.0/loopback-only"]);
+const LOCALHOST_BINDS = new Set(["127.0.0.1", "::1", "localhost"]);
 
 function isLocalhostBind(host: string): boolean {
 	return LOCALHOST_BINDS.has(host) || host === "::ffff:127.0.0.1";
