@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.14.0](https://github.com/spinabot/brigade/compare/brigade-v1.13.0...brigade-v1.14.0) (2026-06-26)
+
+
+### Features
+
+* **gateway:** expose the full control plane as typed RPCs ([31176d2](https://github.com/spinabot/brigade/commit/31176d20bccffbc5f77ac7f91b19ea6d32766d17))
+
 ## [1.13.0](https://github.com/spinabot/brigade/compare/brigade-v1.12.0...brigade-v1.13.0) (2026-06-26)
 
 
