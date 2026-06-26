@@ -41,15 +41,17 @@ const REQUEST_TIMEOUT_MS = 120_000;
 /** Hard cap on input length — providers reject very long text; fail clearly. */
 const MAX_INPUT_CHARS = 8_000;
 
-type SpeechProviderId = "openai" | "elevenlabs" | "google";
+type SpeechProviderId = "openai" | "elevenlabs" | "google" | "minimax" | "xai";
 
 /** Preference order when no provider is pinned: first keyed one wins. */
-const PROVIDER_PREFERENCE: SpeechProviderId[] = ["openai", "elevenlabs", "google"];
+const PROVIDER_PREFERENCE: SpeechProviderId[] = ["openai", "elevenlabs", "google", "minimax", "xai"];
 
 const DEFAULTS: Record<SpeechProviderId, { model: string; voice: string }> = {
 	openai: { model: "gpt-4o-mini-tts", voice: "alloy" },
 	elevenlabs: { model: "eleven_multilingual_v2", voice: "21m00Tcm4TlvDq8ikWAM" },
 	google: { model: "gemini-2.5-flash-preview-tts", voice: "Kore" },
+	minimax: { model: "speech-2.8-hd", voice: "English_expressive_narrator" },
+	xai: { model: "", voice: "eve" },
 };
 
 const GenerateSpeechParams = Type.Object({
@@ -61,7 +63,7 @@ const GenerateSpeechParams = Type.Object({
 	text: Type.Optional(Type.String({ description: "The text to speak aloud." })),
 	provider: Type.Optional(
 		Type.Union(
-			[Type.Literal("openai"), Type.Literal("elevenlabs"), Type.Literal("google")],
+			[Type.Literal("openai"), Type.Literal("elevenlabs"), Type.Literal("google"), Type.Literal("minimax"), Type.Literal("xai")],
 			{ description: "Optional TTS provider override. Default: the first one with a configured key." },
 		),
 	),
@@ -182,7 +184,7 @@ export function makeGenerateSpeechTool(
 					{
 						type: "text",
 						text: [
-							`Synthesized speech with ${provider}/${model} (voice: ${voice}).`,
+							`Synthesized speech with ${model ? `${provider}/${model}` : provider} (voice: ${voice}).`,
 							`MEDIA:${outPath}`,
 							"Deliver with send_media({path}) — generation does not auto-send.",
 						].join("\n"),
@@ -212,6 +214,10 @@ async function synthesize(params: {
 			return synthesizeElevenLabs(params);
 		case "google":
 			return synthesizeGoogle(params);
+		case "minimax":
+			return synthesizeMiniMax(params);
+		case "xai":
+			return synthesizeXai(params);
 	}
 }
 
@@ -283,6 +289,56 @@ async function synthesizeGoogle(p: {
 	// Gemini TTS returns raw 16-bit PCM (mimeType like "audio/L16;codec=pcm;rate=24000").
 	const rate = parseInt(/rate=(\d+)/.exec(part?.inlineData?.mimeType ?? "")?.[1] ?? "24000", 10) || 24000;
 	return { bytes: wrapPcmAsWav(pcm, rate), extension: "wav" };
+}
+
+async function synthesizeMiniMax(p: {
+	fetchFn: typeof fetch;
+	apiKey: string;
+	model: string;
+	voice: string;
+	text: string;
+	signal?: AbortSignal;
+}): Promise<{ bytes: Buffer; extension: string }> {
+	const res = await p.fetchFn("https://api.minimax.io/v1/t2a_v2", {
+		method: "POST",
+		headers: { Authorization: `Bearer ${p.apiKey}`, "Content-Type": "application/json" },
+		body: JSON.stringify({
+			model: p.model,
+			text: p.text,
+			voice_setting: { voice_id: p.voice, speed: 1.0, vol: 1.0, pitch: 0 },
+			audio_setting: { format: "mp3", sample_rate: 32000 },
+		}),
+		signal: withTimeout(p.signal, REQUEST_TIMEOUT_MS),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status} ${(await safeText(res)).slice(0, 200)}`);
+	const body = (await res.json()) as {
+		data?: { audio?: string };
+		base_resp?: { status_code?: number; status_msg?: string };
+	};
+	if (body.base_resp && body.base_resp.status_code !== 0) {
+		throw new Error(`MiniMax error ${body.base_resp.status_code}: ${body.base_resp.status_msg ?? ""}`);
+	}
+	const hex = body.data?.audio;
+	if (!hex) throw new Error("MiniMax returned no audio.");
+	// MiniMax returns the audio as a hex-encoded string in data.audio.
+	return { bytes: Buffer.from(hex, "hex"), extension: "mp3" };
+}
+
+async function synthesizeXai(p: {
+	fetchFn: typeof fetch;
+	apiKey: string;
+	voice: string;
+	text: string;
+	signal?: AbortSignal;
+}): Promise<{ bytes: Buffer; extension: string }> {
+	const res = await p.fetchFn("https://api.x.ai/v1/tts", {
+		method: "POST",
+		headers: { Authorization: `Bearer ${p.apiKey}`, "Content-Type": "application/json" },
+		body: JSON.stringify({ text: p.text, voice_id: p.voice, language: "en" }),
+		signal: withTimeout(p.signal, REQUEST_TIMEOUT_MS),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status} ${(await safeText(res)).slice(0, 200)}`);
+	return { bytes: Buffer.from(await res.arrayBuffer()), extension: "mp3" };
 }
 
 /** Wrap raw 16-bit mono little-endian PCM in a minimal WAV (RIFF) container. */

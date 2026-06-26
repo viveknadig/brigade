@@ -120,6 +120,31 @@ test("provider HTTP error → ok:false, message carries the status", async () =>
 	assert.match(res.details.message ?? "", /401/);
 });
 
+test("minimax → hex-encoded audio decoded to an mp3 file", async () => {
+	const hex = Buffer.from([0xff, 0xfb, 0x90]).toString("hex");
+	const fetchFn = (async () =>
+		({
+			ok: true,
+			status: 200,
+			json: async () => ({ data: { audio: hex }, base_resp: { status_code: 0 } }),
+			text: async () => "",
+		}) as unknown as Response) as unknown as typeof fetch;
+	const tool = makeGenerateSpeechTool({ fetchFn, outDirOverride: outDir, resolveKey: (p) => (p === "minimax" ? "k" : "") });
+	const res = await tool.execute("c1", { text: "hi", provider: "minimax" }, undefined as never);
+	assert.equal(res.details.ok, true);
+	assert.equal(res.details.provider, "minimax");
+	assert.ok(res.details.path!.endsWith(".mp3"));
+});
+
+test("xai → raw audio bytes saved as mp3", async () => {
+	const fetchFn = (async () => audioResponse([1, 2, 3])) as unknown as typeof fetch;
+	const tool = makeGenerateSpeechTool({ fetchFn, outDirOverride: outDir, resolveKey: (p) => (p === "xai" ? "k" : "") });
+	const res = await tool.execute("c1", { text: "hi", provider: "xai" }, undefined as never);
+	assert.equal(res.details.ok, true);
+	assert.equal(res.details.provider, "xai");
+	assert.ok(res.details.path!.endsWith(".mp3"));
+});
+
 test("wrapPcmAsWav writes a valid 44-byte RIFF/WAVE header", () => {
 	const wav = wrapPcmAsWav(Buffer.from([1, 2, 3, 4]), 24000);
 	assert.equal(wav.subarray(0, 4).toString("ascii"), "RIFF");
