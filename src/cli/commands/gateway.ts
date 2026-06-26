@@ -114,38 +114,6 @@ export function registerGatewayCommand(program: import("commander").Command): vo
 			const code = await runGatewayStopCommand(opts);
 			process.exit(code);
 		});
-
-	// Optional gateway authentication — multiple tokens supported. Entirely
-	// opt-in: with no tokens the gateway stays unauthenticated (localhost-only).
-	const tokenCmd = gw
-		.command("token")
-		.description("Manage optional gateway access tokens — multiple are supported");
-	tokenCmd
-		.command("list")
-		.description("List configured tokens (masked) and whether auth is enforced")
-		.option("--json", "emit JSON instead of human-readable text", false)
-		.action(async (opts: { json?: boolean }) => {
-			process.exit(await runGatewayTokenListCommand(opts));
-		});
-	tokenCmd
-		.command("new")
-		.description("Generate a new token, store it, and print it once")
-		.option("--json", "emit JSON instead of human-readable text", false)
-		.action(async (opts: { json?: boolean }) => {
-			process.exit(await runGatewayTokenNewCommand(opts));
-		});
-	tokenCmd
-		.command("add <token>")
-		.description("Add an existing token to the accepted list")
-		.action(async (token: string) => {
-			process.exit(await runGatewayTokenAddCommand(token));
-		});
-	tokenCmd
-		.command("revoke <tokenOrIndex>")
-		.description("Remove a token by value, or by its number from `token list`")
-		.action(async (arg: string) => {
-			process.exit(await runGatewayTokenRevokeCommand(arg));
-		});
 }
 
 /* ───────────────────── token management ───────────────────── */

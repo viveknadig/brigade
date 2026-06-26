@@ -316,6 +316,41 @@ export function buildProgram(): Command {
       await exitAfterFlush(await runGatewayStopCommand(opts));
     });
 
+  // Optional gateway authentication — multiple tokens supported. Pure config
+  // edits: these NEVER boot the gateway. With no tokens the gateway stays
+  // unauthenticated + localhost-only.
+  const tokenCmd = gw.command("token").description("Manage optional gateway access tokens (multiple supported)");
+  tokenCmd
+    .command("list")
+    .description("List configured tokens (masked) and whether auth is enforced")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runGatewayTokenListCommand } = await import("../commands/gateway.js");
+      await exitAfterFlush(await runGatewayTokenListCommand(opts));
+    });
+  tokenCmd
+    .command("new")
+    .description("Generate a new token, store it, and print it once")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runGatewayTokenNewCommand } = await import("../commands/gateway.js");
+      await exitAfterFlush(await runGatewayTokenNewCommand(opts));
+    });
+  tokenCmd
+    .command("add <token>")
+    .description("Add an existing token to the accepted list")
+    .action(async (token: string) => {
+      const { runGatewayTokenAddCommand } = await import("../commands/gateway.js");
+      await exitAfterFlush(await runGatewayTokenAddCommand(token));
+    });
+  tokenCmd
+    .command("revoke <tokenOrIndex>")
+    .description("Remove a token by value, or by its number from `token list`")
+    .action(async (arg: string) => {
+      const { runGatewayTokenRevokeCommand } = await import("../commands/gateway.js");
+      await exitAfterFlush(await runGatewayTokenRevokeCommand(arg));
+    });
+
   // OS-service installer: macOS launchd / Linux systemd-user / Windows Task
   // Scheduler. The supervisor IS the restart loop; the gateway survives reboots
   // and crashes via the OS-native mechanism.
