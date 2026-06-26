@@ -32,7 +32,7 @@ describe("validateOutboundMediaPath", () => {
 	});
 
 	it("blocks sensitive basenames", () => {
-		for (const name of [".env", ".env.local", ".env.production", "id_rsa", "brigade.json", "auth.json", "auth-profiles.json", "credentials", ".git-credentials"]) {
+		for (const name of [".env", ".env.local", ".env.production", "id_rsa", "brigade.json", "auth.json", "auth-profiles.json", "credentials", ".git-credentials", "encryption.key", "admin-key.txt"]) {
 			const f = path.join(dir, name);
 			fs.writeFileSync(f, "secret");
 			assert.equal(validateOutboundMediaPath(f).ok, false, `${name} should be blocked`);
@@ -43,6 +43,14 @@ describe("validateOutboundMediaPath", () => {
 		const sshDir = path.join(dir, ".ssh");
 		fs.mkdirSync(sshDir);
 		const f = path.join(sshDir, "mykey"); // innocuous name, still under .ssh
+		fs.writeFileSync(f, "x");
+		assert.equal(validateOutboundMediaPath(f).ok, false);
+	});
+
+	it("blocks files under .convex-data directory", () => {
+		const convexDir = path.join(dir, ".convex-data");
+		fs.mkdirSync(convexDir);
+		const f = path.join(convexDir, "db.sqlite");
 		fs.writeFileSync(f, "x");
 		assert.equal(validateOutboundMediaPath(f).ok, false);
 	});
