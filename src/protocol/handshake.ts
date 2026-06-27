@@ -99,6 +99,16 @@ export interface HelloOk {
 	server: {
 		version: string;
 		connId: string;
+		/**
+		 * Per-process boot id (session generation / "epoch"). Changes whenever
+		 * the gateway process restarts. A client compares the epoch across
+		 * (re)connections: if it changed, the server's per-session seq counters
+		 * reset, so the client must invalidate its seq cursors and re-`resume`
+		 * rather than infer a restart from a backwards seq. This makes cursor
+		 * invalidation explicit + correct, rather than inferred from a
+		 * backwards-jumping seq.
+		 */
+		epoch: string;
 	};
 	features: {
 		methods: readonly string[];

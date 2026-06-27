@@ -38,6 +38,8 @@ import type {
 	CronWakeParams,
 } from "./core/server-methods/cron.js";
 import type { OrgSnapshotResult } from "./protocol/methods.js";
+import type { HelloOk } from "./protocol/handshake.js";
+import type { ShutdownFrame, TickFrame } from "./protocol/messages.js";
 import type { MemoryGraphExport } from "./agents/memory/graph-export.js";
 import type { MemoryQueryResult } from "./agents/memory/query.js";
 
@@ -57,17 +59,44 @@ export interface ResponseFrame {
 	id: string;
 	ok: boolean;
 	payload?: unknown;
-	error?: { code: string; message: string };
+	/**
+	 * Structured error. `code` is one of `ErrorCodes` (see protocol/errors.ts —
+	 * the complete catalogue a client branches on). `retryable` + `retryAfterMs`
+	 * let a client back off correctly (e.g. on `rate-limited`); `details` carries
+	 * optional structured context.
+	 */
+	error?: { code: string; message: string; retryable?: boolean; retryAfterMs?: number; details?: unknown };
 }
 
-/** Server → all clients. Push notification, no id. */
+/**
+ * Server → all clients. Push notification, no id.
+ *
+ * `seq` is a per-session monotonic counter stamped on ORDERED transcript
+ * frames (today: `pi`). A client tracks the last seq it saw for each session;
+ * a jump (next seq ≠ last + 1) means it missed a frame, so it issues a
+ * `resume` to backfill from the transcript. Untagged frames (state / error /
+ * basic log — no session) carry NO seq: they are not part of the ordered
+ * stream and need no gap detection. Optional on the wire so an older or
+ * minimal client that ignores it still works unchanged (unauthenticated +
+ * legacy stay byte-for-byte compatible).
+ */
 export interface EventFrame {
 	type: "event";
 	event: EventName;
 	payload?: unknown;
+	/** Per-session monotonic sequence for ordered streams (`pi`). Absent on
+	 *  untagged frames (state/error/basic log). */
+	seq?: number;
 }
 
-export type Frame = RequestFrame | ResponseFrame | EventFrame;
+/**
+ * Top-level frame union. `tick` (keepalive) and `shutdown` (graceful restart
+ * notice) are defined in `protocol/messages.ts`; the client tolerates them so
+ * a future server can emit them without breaking older clients, and so a
+ * graceful shutdown surfaces as a clean "reconnecting" line instead of a raw
+ * socket drop.
+ */
+export type Frame = RequestFrame | ResponseFrame | EventFrame | TickFrame | ShutdownFrame | HelloOk;
 
 /* ─────────────────────────── request methods (commands) ─────────────────────────── */
 
@@ -138,6 +167,17 @@ export type RequestMethod =
 	| "add-provider"
 	/** Get the current state snapshot on demand. Reply: SessionStateSnapshot. */
 	| "get-state"
+	/**
+	 * Re-materialise a session's transcript after (re)connect or a detected
+	 * seq gap. Reply: ResumeSnapshot (the ordered conversation + the session's
+	 * head seq + the header state). The client renders the messages keyed by
+	 * identity (role + timestamp; tool blocks by toolCall id) and then keeps
+	 * applying live `pi` frames idempotently — so a dropped or reordered frame
+	 * self-heals with nothing missing and nothing misplaced. The transcript is
+	 * the single source of truth: both this snapshot and the live stream
+	 * resolve to it. Cheap + safe to call on every connect.
+	 */
+	| "resume"
 	/** Memory Graph dashboard data — nodes + typed edges + topic clusters + stats.
 	 *  Reply: MemoryGraphExport. */
 	| "memory-graph"
@@ -238,6 +278,165 @@ export type EventName =
 	 */
 	| "approval-request";
 
+/* ─────────────────────── runtime discovery arrays ─────────────────────── */
+
+/**
+ * Runtime list of every core request method, mirroring the `RequestMethod`
+ * union (types are erased at compile time, so a client can't enumerate them
+ * otherwise). The gateway advertises this (plus any plugin-registered methods)
+ * in `HelloOk.features.methods` on connect, so a web/mobile client discovers
+ * what it can call instead of hardcoding strings. `satisfies` makes adding an
+ * invalid method a compile error.
+ */
+export const REQUEST_METHODS = [
+	"prompt",
+	"abort",
+	"steer",
+	"set-model",
+	"switch-model-mid-turn",
+	"set-thinking",
+	"compact",
+	"approval-resolve",
+	"exec-allow-all",
+	"exec-grant-skill",
+	"list-models",
+	"refresh-models",
+	"add-provider",
+	"get-state",
+	"resume",
+	"memory-graph",
+	"memory-query",
+	"shutdown",
+	"subscribe",
+	"unsubscribe",
+	"agents.list",
+	"sessions.list",
+	"cron.status",
+	"cron.list",
+	"cron.add",
+	"cron.update",
+	"cron.remove",
+	"cron.run",
+	"cron.runs",
+	"wake",
+	"org.snapshot",
+] as const satisfies readonly RequestMethod[];
+
+/**
+ * Runtime list of every server-pushed event name, mirroring `EventName`.
+ * Advertised in `HelloOk.features.events` so a client knows what to subscribe
+ * to. `satisfies` keeps it in lock-step with the union.
+ */
+export const EVENT_NAMES = [
+	"pi",
+	"state",
+	"error",
+	"log",
+	"system-event",
+	"approval-request",
+] as const satisfies readonly EventName[];
+
+/* ─────────────────────── pi inner-event contract ─────────────────────── */
+
+/**
+ * The set of `pi.event.type` values the gateway forwards (mirrors Pi's
+ * `AgentSessionEvent` union). A web/mobile renderer switches on `pi.event.type`;
+ * this is the authoritative list so it can be exhaustive.
+ */
+export const PI_EVENT_TYPES = [
+	"agent_start",
+	"turn_start",
+	"turn_end",
+	"message_start",
+	"message_update",
+	"message_end",
+	"tool_execution_start",
+	"tool_execution_update",
+	"tool_execution_end",
+	"agent_end",
+	"queue_update",
+	"compaction_start",
+	"compaction_end",
+	"auto_retry_start",
+	"auto_retry_end",
+	"session_info_changed",
+	"thinking_level_changed",
+] as const;
+
+export type PiEventType = (typeof PI_EVENT_TYPES)[number];
+
+/**
+ * Brigade-native, wire-stable view of a Pi `AgentSessionEvent` — the inner
+ * `payload.event` of a `pi` frame. Provided so a web/mobile client has a typed
+ * contract WITHOUT importing Pi's SDK types (which live in node_modules and
+ * aren't shipped to a browser). It's an open union: known variants carry the
+ * fields a renderer needs; the trailing member keeps it forward-compatible if
+ * Pi adds an event type. Mirror of `@earendil-works/pi-coding-agent`'s
+ * `AgentSessionEvent` — keep in sync when bumping the SDK.
+ *
+ * `message` is a {@link WireMessage}; key assistant blocks by
+ * `role + timestamp` and tool blocks by the tool call id (see
+ * docs/reliable-streaming.md).
+ */
+export type PiEvent =
+	| { type: "agent_start" }
+	| { type: "turn_start" }
+	| { type: "turn_end"; message: WireMessage; toolResults?: WireMessage[] }
+	| { type: "message_start"; message: WireMessage }
+	| { type: "message_update"; message: WireMessage }
+	| { type: "message_end"; message: WireMessage }
+	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args?: unknown }
+	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args?: unknown; partialResult?: unknown }
+	| { type: "tool_execution_end"; toolCallId: string; toolName: string; result?: unknown; isError: boolean }
+	| { type: "agent_end"; messages?: WireMessage[]; willRetry?: boolean }
+	| { type: "queue_update"; steering: readonly string[]; followUp: readonly string[] }
+	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
+	| { type: "compaction_end"; reason?: string; aborted?: boolean; willRetry?: boolean; errorMessage?: string }
+	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage?: string }
+	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	| { type: "session_info_changed"; name?: string }
+	| { type: "thinking_level_changed"; level: string }
+	| { type: string; [field: string]: unknown };
+
+/* ───────────────────────── wire message shapes ───────────────────────── */
+
+/** A text/thinking/tool-call content block on a wire message. */
+export interface WireContentBlock {
+	type: "text" | "thinking" | "toolCall" | "image" | string;
+	/** Present on `text` blocks. */
+	text?: string;
+	/** Present on `thinking` blocks. */
+	thinking?: string;
+	/** Present on `toolCall` blocks — the stable tool call id used to key the
+	 *  tool's render block + correlate its `toolResult`. */
+	id?: string;
+	/** Tool name, on `toolCall` blocks. */
+	name?: string;
+	[field: string]: unknown;
+}
+
+/**
+ * Wire-stable view of a Pi message (the elements of a `ResumeSnapshot.messages`
+ * transcript and the `message` on `pi` events). No top-level `id` — render keys
+ * are `role + timestamp` (assistant/user) and the tool call `id` /
+ * `toolCallId` (tools). Open-ended for forward-compat.
+ */
+export interface WireMessage {
+	role: "user" | "assistant" | "toolResult" | string;
+	/** Creation timestamp (ms) — stable across a message's streaming updates;
+	 *  the identity key a renderer uses for the assistant block. */
+	timestamp?: number;
+	/** `string` for a simple user message, else an array of content blocks. */
+	content?: string | WireContentBlock[];
+	/** On `toolResult` messages — correlates to the assistant's tool call id. */
+	toolCallId?: string;
+	/** On `toolResult` messages. */
+	toolName?: string;
+	/** On `toolResult` messages. */
+	isError?: boolean;
+	[field: string]: unknown;
+}
+
 /* ─────────────────────────── payload types ─────────────────────────── */
 
 /** Params for each request method. `void` = no params required. */
@@ -327,6 +526,18 @@ export interface RequestParams {
 		skipValidation?: boolean;
 	};
 	"get-state": void;
+	resume: {
+		/** Agent whose session is resumed; defaults to the caller's bound agent. */
+		agentId?: string;
+		/** Canonical session key to resume; defaults to that agent's main session. */
+		sessionKey?: string;
+		/**
+		 * When set, the server omits messages the client already has and returns
+		 * only the tail. Today the server always returns the full transcript
+		 * (simple + correct — the client applies it idempotently by identity);
+		 * this is a forward-compat hint for a future tail optimisation. */
+		sinceSeq?: number;
+	};
 	"memory-graph": {
 		/** Agent whose memory graph is exported; defaults to the boot agent. */
 		agentId?: string;
@@ -411,6 +622,7 @@ export interface ResponseFor {
 		warning?: string;
 	};
 	"get-state": SessionStateSnapshot;
+	resume: ResumeSnapshot;
 	"memory-graph": MemoryGraphExport;
 	"memory-query": MemoryQueryResult;
 	shutdown: void;
@@ -571,6 +783,63 @@ export interface SessionStateSnapshot {
 }
 
 /**
+ * Reply to a `resume` request — the heart of reliable streaming.
+ *
+ * The client re-materialises a session from this on (re)connect or a detected
+ * seq gap, then resumes applying live `pi` frames. Because the renderer keys
+ * every block by identity (message role + timestamp; tool blocks by their
+ * toolCall id) and applies terminal snapshots by REPLACE, re-applying a
+ * message the client already has is a harmless no-op — so the snapshot and the
+ * live stream overlap safely with nothing missing, nothing duplicated, and
+ * nothing misplaced. The persisted transcript is the single source of truth.
+ */
+export interface ResumeSnapshot {
+	/** Canonical session key this transcript belongs to. */
+	sessionKey: string;
+	/** Agent id that owns the session. */
+	agentId: string;
+	/**
+	 * The ordered conversation, oldest-first ({@link WireMessage}: user /
+	 * assistant / toolResult). The renderer keys each message by `role +
+	 * timestamp` and each embedded tool call by its `toolCall.id`, the same keys
+	 * the live stream uses — that shared keyspace is what makes snapshot ⊕ live
+	 * idempotent.
+	 */
+	messages: WireMessage[];
+	/**
+	 * The session's current head sequence (the last seq stamped on an ordered
+	 * frame — `pi` / `approval-request` / `system-event` — for this session, or
+	 * 0 if none yet). The client sets its last-seen seq to this; subsequent live
+	 * frames continue from `headSeq + 1`, and any frame with `seq ≤ headSeq` is
+	 * a duplicate it can apply idempotently or skip.
+	 */
+	headSeq: number;
+	/**
+	 * Tool-approval prompts CURRENTLY pending on this session. Recovery for the
+	 * one event that loses an operator ACTION: a client that connected after —
+	 * or missed — the live `approval-request` frame gets the open prompts here
+	 * and can resolve them via `approval-resolve`, instead of the turn hanging
+	 * until it auto-denies. Empty when nothing is pending.
+	 */
+	pendingApprovals: EventPayload["approval-request"][];
+	/**
+	 * Recent `system-event` notices (cron announces, channel-health) for this
+	 * session — a bounded tail so a client that was disconnected when one fired
+	 * can still surface it. Oldest-first. Display-only; safe to dedupe by `at`.
+	 */
+	recentSystemEvents: EventPayload["system-event"][];
+	/**
+	 * The gateway's process boot id (session generation). If it differs from the
+	 * epoch the client saw on its previous `HelloOk`, the gateway restarted and
+	 * its seq counters reset — the client should treat its cursors as invalid.
+	 */
+	epoch: string;
+	/** Header state (provider / model / tokens / running) so the client
+	 *  refreshes its chrome in the same round-trip. */
+	snapshot: SessionStateSnapshot;
+}
+
+/**
  * Wire-safe version of a Pi Model<any>. The full Model has stream functions
  * and other non-serializable fields — clients only need ids + display info
  * to render the picker.
@@ -647,19 +916,31 @@ export const EXIT_USAGE_ERROR = 2;
 export const EXIT_CONFIG_ERROR = 78;
 
 /**
- * Tick interval for the heartbeat. Server pushes a `pi`-wrapped tick event
- * every TICK_INTERVAL_MS so the client can detect a stalled connection.
- * Client closes if no frame received in 2× this interval.
+ * Heartbeat interval. The server's keepalive today is the periodic `state`
+ * broadcast (a real frame that bumps the client's `lastFrameAt`), plus
+ * WS-protocol pings; the dedicated `TickFrame` type exists for forward-compat
+ * but is not emitted yet. The client closes + reconnects if NO frame arrives in
+ * 2× this interval (catches half-open sockets — the common backgrounded-mobile
+ * case), then `resume`s.
  */
 export const TICK_INTERVAL_MS = 30_000;
 
 /* ─────────────────────────── tiny runtime guards ─────────────────────────── */
 
-/** Cheap shape check before routing. Avoids dragging in AJV for v1's small surface. */
+/** Cheap shape check before routing. Avoids dragging in AJV for v1's small surface.
+ *  Accepts `tick`/`shutdown` too so the client never silently drops a keepalive
+ *  or a graceful-shutdown notice (the old guard rejected both). */
 export function isFrame(value: unknown): value is Frame {
 	if (!value || typeof value !== "object") return false;
 	const t = (value as any).type;
-	return t === "req" || t === "res" || t === "event";
+	return (
+		t === "req" ||
+		t === "res" ||
+		t === "event" ||
+		t === "tick" ||
+		t === "shutdown" ||
+		t === "hello-ok"
+	);
 }
 
 /* ─────────────────────── Step 24 protocol barrel re-export ─────────────────────── */

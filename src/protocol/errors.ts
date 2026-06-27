@@ -25,6 +25,20 @@ export const ErrorCodes = {
 	APPROVAL_NOT_FOUND: "APPROVAL_NOT_FOUND",
 	/** Subsystem is loading / draining; caller may retry shortly. */
 	UNAVAILABLE: "UNAVAILABLE",
+	/**
+	 * The remaining codes the gateway actually emits today (previously
+	 * undocumented string literals — catalogued here so a web/mobile client has
+	 * the COMPLETE, stable set to branch on). Values match the on-the-wire
+	 * strings the server already sends.
+	 */
+	/** Per-connection rate limiter tripped; honour `retryAfterMs`. */
+	RATE_LIMITED: "rate-limited",
+	/** Unexpected server-side failure handling the request. */
+	INTERNAL: "internal",
+	/** Caller lacks permission for the target (owner/session gate). */
+	FORBIDDEN: "forbidden",
+	/** Caller's operator scope is insufficient for this method. */
+	SCOPE_INSUFFICIENT: "scope-insufficient",
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];

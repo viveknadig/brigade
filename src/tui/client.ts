@@ -30,8 +30,24 @@ import {
 	type RequestMethod,
 	type RequestParams,
 	type ResponseFor,
+	type ResumeSnapshot,
+	type ShutdownFrame,
 	TICK_INTERVAL_MS,
 } from "../protocol.js";
+import type { HelloOk } from "../protocol/handshake.js";
+import { isSeqGap } from "../protocol/stream-seq.js";
+
+/** Payload of the client-emitted `"resync"` event: a seq gap was detected on a
+ *  session's ordered `pi` stream, so the consumer should `resume()` to backfill. */
+export interface ClientResyncInfo {
+	sessionId: string;
+	lastSeq: number;
+	gotSeq: number;
+}
+
+/** Connection lifecycle state, emitted as the `"connection-state"` event so a
+ *  UI can bind a status indicator directly. */
+export type ClientConnectionState = "connecting" | "connected" | "reconnecting" | "closed";
 import { clientAuthHeaders } from "../core/gateway-auth.js";
 
 export interface ClientOptions {
@@ -98,6 +114,23 @@ export class BrigadeClient extends EventEmitter {
 	private lastFrameAt = 0;
 	private tickWatchTimer: NodeJS.Timeout | undefined;
 
+	/**
+	 * Last `seq` seen per session on the ordered `pi` stream. Used to detect a
+	 * gap: when a frame's seq isn't `last + 1`, a frame was dropped or reordered
+	 * (or the gateway restarted and reset its counters), so we emit `"resync"`
+	 * and the consumer issues a `resume` to backfill from the transcript. Keyed
+	 * by sessionId (= sessionKey), the same key `resume` syncs. Survives
+	 * reconnects so the cursor stays meaningful across a blip.
+	 */
+	private lastSeqBySession = new Map<string, number>();
+
+	/** The most recent HelloOk frame (server connId, build version, epoch,
+	 *  advertised methods/events, policy limits). Undefined until first connect. */
+	private lastHelloOk: HelloOk | undefined;
+
+	/** Connection lifecycle state, mirrored by the "connection-state" event. */
+	private connState: ClientConnectionState = "connecting";
+
 	/** Reconnect state. */
 	private reconnectAttempt = 0;
 	private reconnectTimer: NodeJS.Timeout | undefined;
@@ -134,6 +167,28 @@ export class BrigadeClient extends EventEmitter {
 		}
 		this.ws = undefined;
 		this.connected = false;
+		this.setConnState("closed");
+	}
+
+	/**
+	 * Server handshake info from the last `HelloOk` — connId, build version,
+	 * `epoch` (session generation), the advertised `features.{methods,events}`,
+	 * and `policy` limits. Undefined before the first connect. A web/mobile
+	 * client reads this to discover what it can call/subscribe to + the limits.
+	 */
+	get server(): HelloOk | undefined {
+		return this.lastHelloOk;
+	}
+
+	/** Current connection lifecycle state (also pushed via "connection-state"). */
+	get connectionState(): ClientConnectionState {
+		return this.connState;
+	}
+
+	private setConnState(state: ClientConnectionState): void {
+		if (this.connState === state) return;
+		this.connState = state;
+		super.emit("connection-state", state);
 	}
 
 	/** True if the underlying socket is currently OPEN. */
@@ -185,13 +240,57 @@ export class BrigadeClient extends EventEmitter {
 		});
 	}
 
-	/** Type-aware event subscription. Returns `this` for chaining (matches EventEmitter). */
-	override on<K extends EventName>(event: K, listener: (payload: EventPayload[K]) => void): this {
+	/**
+	 * Type-aware event subscription. Two families:
+	 *   - server-pushed events, typed by `EventName` → `EventPayload[K]`
+	 *   - client lifecycle events BrigadeClient emits itself: `"hello"` (the
+	 *     server's HelloOk handshake landed), `"connection-state"` (connecting /
+	 *     connected / reconnecting / closed), `"reconnected"` (socket re-opened),
+	 *     `"resync"` (a seq gap → call `resume()`), and `"shutdown"` (the gateway
+	 *     sent a graceful-shutdown frame).
+	 * Returns `this` for chaining (matches EventEmitter).
+	 */
+	override on<K extends EventName>(event: K, listener: (payload: EventPayload[K]) => void): this;
+	override on(event: "hello", listener: (hello: HelloOk) => void): this;
+	override on(event: "connection-state", listener: (state: ClientConnectionState) => void): this;
+	override on(event: "reconnected", listener: () => void): this;
+	override on(event: "resync", listener: (info: ClientResyncInfo) => void): this;
+	override on(event: "shutdown", listener: (frame: ShutdownFrame) => void): this;
+	override on(event: string, listener: (...args: any[]) => void): this {
 		return super.on(event, listener as (...args: unknown[]) => void);
 	}
 
-	override off<K extends EventName>(event: K, listener: (payload: EventPayload[K]) => void): this {
+	override off<K extends EventName>(event: K, listener: (payload: EventPayload[K]) => void): this;
+	override off(event: "hello", listener: (hello: HelloOk) => void): this;
+	override off(event: "connection-state", listener: (state: ClientConnectionState) => void): this;
+	override off(event: "reconnected", listener: () => void): this;
+	override off(event: "resync", listener: (info: ClientResyncInfo) => void): this;
+	override off(event: "shutdown", listener: (frame: ShutdownFrame) => void): this;
+	override off(event: string, listener: (...args: any[]) => void): this {
 		return super.off(event, listener as (...args: unknown[]) => void);
+	}
+
+	/**
+	 * Resume a session: fetch its committed transcript + head seq + header
+	 * snapshot, and sync the local seq cursor so live frames continue cleanly
+	 * from `headSeq + 1`. Call this on connect, on reconnect, and on a
+	 * `"resync"` event. The consumer renders the returned `messages` through
+	 * its identity-keyed applier (idempotent), so overlapping with live frames
+	 * is harmless. This is the reliable-streaming recovery primitive — the
+	 * transcript is the source of truth, so a dropped/reordered/missed frame
+	 * always self-heals here.
+	 */
+	async resume(params?: RequestParams["resume"]): Promise<ResumeSnapshot> {
+		// NOTE: we deliberately do NOT write `lastSeqBySession` here. The seq
+		// cursor is owned by `dispatchFrame`, which advances it to each live
+		// frame's seq as it arrives — so after a gap the cursor already reflects
+		// the last frame actually received, and the next contiguous frame won't
+		// re-trigger. Writing `headSeq` here (a snapshot that can LAG the live
+		// frames still streaming during the resume round-trip) would rewind the
+		// cursor below an already-applied frame, making the next live frame look
+		// like a fresh gap → a resync/resume storm on a busy session. resume()
+		// recovers CONTENT (the transcript); the cursor is pure live bookkeeping.
+		return this.request("resume", params);
 	}
 
 	/* ─────────────────────────── socket lifecycle ─────────────────────────── */
@@ -206,6 +305,7 @@ export class BrigadeClient extends EventEmitter {
 				this.connected = true;
 				this.reconnectAttempt = 0;
 				this.lastFrameAt = Date.now();
+				this.setConnState("connected");
 				resolved = true;
 				resolve();
 			});
@@ -243,7 +343,10 @@ export class BrigadeClient extends EventEmitter {
 					this.pending.delete(id);
 				}
 				if (!resolved) reject(new Error("socket closed before open"));
-				if (!this.closed) this.scheduleReconnect();
+				if (!this.closed) {
+					this.setConnState("reconnecting");
+					this.scheduleReconnect();
+				}
 			});
 
 			ws.on("error", (err) => {
@@ -290,8 +393,53 @@ export class BrigadeClient extends EventEmitter {
 			return;
 		}
 		if (frame.type === "event") {
+			// Gap detection on the ordered stream. The server stamps a per-session
+			// monotonic `seq` on every ordered frame — `pi` (top-level),
+			// `approval-request`, and `system-event` — all sharing one counter, so
+			// any frame carrying a `seq` is part of it. If the next seq isn't
+			// `last + 1` we missed a frame (dropped by backpressure, reordered, or
+			// a gateway restart); emit `"resync"` so the consumer `resume`s and
+			// backfills (transcript + pending approvals + recent system-events).
+			// Frames without `seq` (state/error/log + sub-agent pi) are unordered
+			// side-channels and skip the check.
+			if (typeof frame.seq === "number") {
+				const sid = (frame.payload as { sessionId?: string } | undefined)?.sessionId;
+				if (sid) {
+					const last = this.lastSeqBySession.get(sid);
+					this.lastSeqBySession.set(sid, frame.seq);
+					if (isSeqGap(last, frame.seq)) {
+						super.emit("resync", { sessionId: sid, lastSeq: last, gotSeq: frame.seq });
+					}
+				}
+			}
 			// Re-emit with the typed event name so on() handlers fire.
 			super.emit(frame.event, frame.payload);
+			return;
+		}
+		if (frame.type === "hello-ok") {
+			// Server handshake (connId / build version / epoch / advertised
+			// methods+events / policy limits). If the `epoch` changed since the
+			// last HelloOk, the gateway restarted and its per-session seq counters
+			// reset — invalidate our cursors so the fresh low seqs aren't misread
+			// as a backwards gap; the consumer's reconnect → `resume` rebuilds.
+			const prevEpoch = this.lastHelloOk?.server.epoch;
+			this.lastHelloOk = frame;
+			if (prevEpoch !== undefined && prevEpoch !== frame.server.epoch) {
+				this.lastSeqBySession.clear();
+			}
+			super.emit("hello", frame);
+			return;
+		}
+		if (frame.type === "tick") {
+			// Keepalive — `lastFrameAt` already bumped in the message handler;
+			// receiving it is enough to keep the tick watchdog satisfied.
+			return;
+		}
+		if (frame.type === "shutdown") {
+			// Graceful shutdown notice — surface it so the consumer can show a
+			// "gateway restarting" line instead of a bare disconnect. The socket
+			// close that follows still drives the normal reconnect+resume path.
+			super.emit("shutdown", frame);
 			return;
 		}
 		// type === "req" — server doesn't make requests of clients in v1; ignore.

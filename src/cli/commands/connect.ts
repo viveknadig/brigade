@@ -47,8 +47,9 @@ import { summarizeToolResult } from "../../ui/tool-result.js";
 import { BrigadeClient } from "../../tui/client.js";
 import { loadConfig } from "../../core/config.js";
 import { resolveClientToken } from "../../core/gateway-auth.js";
+import { asstKey, clipOneLine, extractUserText, joinToolResultText } from "./connect-transcript.js";
 import { ApprovalPrompt, type ApprovalResolution } from "../../tui/approval-prompt.js";
-import type { AgentSummary, ModelSummary, SessionStateSnapshot, SessionSummary } from "../../protocol.js";
+import type { AgentSummary, EventPayload, ModelSummary, SessionStateSnapshot, SessionSummary } from "../../protocol.js";
 import {
 	computeExplain,
 	filterGraphToSubtree,
@@ -400,17 +401,26 @@ export async function wireConnectUi(
 			...(boundSessionKey !== undefined ? { sessionKey: boundSessionKey } : {}),
 			...extra,
 		});
-	// Streaming-assistant buffers keyed by sub-agent depth (Primitive #6).
-	// Depth 0 = top-level agent's stream; depth ≥ 1 = sub-agent at that nesting
-	// level. Each depth gets its own Markdown block that grows in place as
-	// `message_update` events arrive, so a sub-agent's multi-chunk reply
-	// renders as ONE growing block (not N fresh blocks). Cleared per-depth on
-	// `tool_execution_start` (so the next message_update at that depth
-	// creates a fresh block under the tool), and wholesale on `agent_end` /
-	// abort (turn boundary).
-	const activeAssistants = new Map<number, Markdown>();
+	// Streaming-assistant buffers keyed by MESSAGE IDENTITY, not arrival
+	// position. The key is `${depth}:${timestamp}` — Pi stamps each assistant
+	// message with a stable `timestamp` at creation that is constant across all
+	// its `message_update`s and its `message_end`, and a NEW message (e.g. the
+	// continuation after a tool call) gets a NEW timestamp. So each logical
+	// message owns exactly one growing Markdown block, and a block lands where
+	// its message belongs in the stream — never above a tool it came after, and
+	// a late/duplicate update for an earlier message updates THAT block in place
+	// instead of spawning a misplaced copy. This identity keying is also what
+	// makes `resume` idempotent: re-applying a message the client already has
+	// resolves to the same block. Depth keeps sub-agent (≥1) streams from
+	// colliding with the top-level (0) stream. Cleared wholesale on `agent_end`
+	// / abort (turn boundary). `pendingTools` is already identity-keyed by the
+	// tool call id.
+	const activeAssistants = new Map<string, Markdown>();
 	let activeLoader: CancellableLoader | null = null;
 	const pendingTools = new Map<string, Text>();
+	// `asstKey` (identity key for an assistant block) is imported from
+	// `connect-transcript.js` so the live path + the resume rebuild + the unit
+	// tests all share one definition.
 	// Streaming render coalescer. Every `setText()` on the streaming Markdown
 	// widget invalidates the parser cache, so each paint re-parses the FULL
 	// growing reply (Marked + line-wrap + ANSI styling). At 60Hz that's a
@@ -822,6 +832,226 @@ export async function wireConnectUi(
 		return parts.join("\n\n");
 	};
 
+	/* ───────────────────── reliable-streaming recovery ───────────────────── */
+	// The transcript is the single source of truth. `resume` returns it; we
+	// clear the rendered region and rebuild from it, so a (re)connect or a
+	// detected seq gap heals with nothing missing, duplicated, or misplaced.
+	// Static renderers below share the SAME identity keys as the live path
+	// (`asstKey` for assistant blocks, `pendingTools` for tools), so a live
+	// `message_update` that arrives after the rebuild updates the rebuilt block
+	// in place rather than spawning a copy.
+
+	// `extractUserText`, `joinToolResultText`, `clipOneLine` are imported from
+	// `connect-transcript.js` (pure + unit-tested).
+
+	/** Remove the rendered transcript (everything between the header+divider
+	 *  chrome at indices 0/1 and the editor); the editor + trailing chrome stay.
+	 *  Resets the streaming maps so the rebuild starts clean. */
+	const clearTranscriptRegion = (): void => {
+		const children = tui.children;
+		const editorIdx = children.indexOf(editor);
+		if (editorIdx <= 2) {
+			// Nothing rendered between the chrome and the editor yet.
+		} else {
+			for (const c of children.slice(2, editorIdx)) removeChild(c as AnyChild);
+		}
+		activeAssistants.clear();
+		pendingTools.clear();
+		if (activeLoader) {
+			removeChild(activeLoader);
+			activeLoader = null;
+		}
+		// Drop any showing approval prompt — `resume`'s `pendingApprovals` is the
+		// authoritative pending set and re-renders it (so a resolved-while-away
+		// prompt vanishes, and a still-pending one comes back answerable).
+		if (activePrompt) {
+			try {
+				tui.removeChild(activePrompt);
+			} catch {
+				/* ignore */
+			}
+			activePrompt = null;
+		}
+	};
+
+	/** Render ONE persisted transcript message as final (static) blocks, using
+	 *  the same identity keys the live path uses. */
+	const renderTranscriptMessage = (m: any): void => {
+		if (!m || typeof m !== "object") return;
+		if (m.role === "user") {
+			const text = scrubRenderable(extractUserText(m)).trim();
+			if (text) {
+				insertBeforeEditor(new Markdown(`${brand.user("you")}  ${text}`, 1, 0, markdownTheme));
+			}
+			return;
+		}
+		if (m.role === "assistant") {
+			const text = scrubRenderable(extractAssistantText(m));
+			if (text) {
+				const label = lastSnapshot?.agentName ?? "brigade";
+				const block = new Markdown(`${brand.agent(label)}  ${text}`, 1, 0, markdownTheme);
+				activeAssistants.set(asstKey(0, m), block);
+				insertBeforeEditor(block);
+			}
+			// Tool calls embedded in the assistant message → pending indicators;
+			// the matching toolResult message (below) fills in the ✓/✗ + preview.
+			if (Array.isArray(m.content)) {
+				for (const b of m.content) {
+					if (b?.type === "toolCall" && typeof b.id === "string") {
+						const indicator = new Text(
+							`  ${brand.tool("⚡")} ${brand.tool(typeof b.name === "string" ? b.name : "tool")}`,
+							0,
+							0,
+						);
+						pendingTools.set(b.id, indicator);
+						insertBeforeEditor(indicator);
+					}
+				}
+			}
+			return;
+		}
+		if (m.role === "toolResult" && typeof m.toolCallId === "string") {
+			const mark = m.isError ? brand.error("✗") : brand.tool("✓");
+			const name = typeof m.toolName === "string" ? m.toolName : "tool";
+			// Join → scrub terminal escapes → collapse/clip to one line.
+			const clipped = clipOneLine(scrubRenderable(joinToolResultText(m.content)));
+			const preview = clipped ? ` ${brand.dim(`· ${clipped}`)}` : "";
+			const line = `  ${mark} ${brand.tool(name)}${preview}`;
+			const indicator = pendingTools.get(m.toolCallId);
+			if (indicator) {
+				indicator.setText(line);
+				pendingTools.delete(m.toolCallId);
+			} else {
+				insertBeforeEditor(new Text(line, 0, 0));
+			}
+			return;
+		}
+	};
+
+	/** Render an inline approval card the operator can answer. Shared by the
+	 *  live `approval-request` handler AND `resume` recovery (so a prompt that
+	 *  arrived / was missed during a disconnect comes back answerable instead of
+	 *  hanging the turn to auto-deny). */
+	const renderApprovalPrompt = (req: EventPayload["approval-request"]): void => {
+		// Only one prompt at a time (exec-gate is serial per turn).
+		if (activePrompt) {
+			try {
+				tui.removeChild(activePrompt);
+			} catch {
+				/* ignore */
+			}
+			activePrompt = null;
+		}
+		const prompt = new ApprovalPrompt({
+			tui,
+			request: {
+				id: req.id,
+				command: req.command,
+				toolName: req.toolName,
+				cwd: req.cwd,
+				...(req.subagentLabel !== undefined ? { subagentLabel: req.subagentLabel } : {}),
+				...(req.subagentDepth !== undefined ? { subagentDepth: req.subagentDepth } : {}),
+				...(req.parentRunId !== undefined ? { parentRunId: req.parentRunId } : {}),
+			},
+			onResolve: (resolution: ApprovalResolution) => {
+				if (activePrompt) {
+					try {
+						tui.removeChild(activePrompt);
+					} catch {
+						/* ignore */
+					}
+					activePrompt = null;
+				}
+				tui.setFocus(editor);
+				insertBeforeEditor(new Text(decisionConfirmation(req.command, resolution, req.subagentDepth), 0, 0));
+				tui.requestRender();
+				void client
+					.request("approval-resolve", {
+						id: req.id,
+						decision: resolution.decision,
+						pattern: resolution.pattern,
+					})
+					.catch((err: unknown) => {
+						const msg = err instanceof Error ? err.message : String(err);
+						insertBeforeEditor(
+							new Text(`  ${brand.error("✗")} ${brand.error(`approval send failed: ${msg}`)}`, 0, 0),
+						);
+					});
+			},
+		});
+		activePrompt = prompt;
+		insertBeforeEditor(prompt);
+		tui.setFocus(prompt);
+		tui.requestRender();
+	};
+
+	/** Render one `system-event` notice (cron announce / channel-health) as a
+	 *  visible Brigade-side line. Shared by the live handler + `resume` recovery. */
+	const renderSystemEventLine = (event: EventPayload["system-event"]): void => {
+		const eventText = scrubRenderable(event.text);
+		const isCron = event.source === "cron" || event.jobName !== undefined;
+		if (isCron) {
+			const name = event.jobName ?? "cron";
+			const heading = brand.amber(`🦁 [cron "${name}"]`);
+			let suffix = "";
+			if (event.delivered === true) suffix = ` ${brand.dim("· delivered")}`;
+			else if (event.delivered === false) suffix = ` ${brand.dim("· not delivered (TUI only)")}`;
+			insertBeforeEditor(new Text(`${heading} ${eventText}${suffix}`, 0, 0));
+		} else {
+			insertBeforeEditor(new Text(`${brand.amber("🦁")} ${eventText}`, 0, 0));
+		}
+		tui.requestRender();
+	};
+
+	/** Resume the bound session and rebuild the transcript from the gateway's
+	 *  source of truth. Safe (and idempotent) on first connect (loads history),
+	 *  reconnect (backfills the gap + clears stale spinners), and `"resync"`
+	 *  (fills a mid-stream drop). Best-effort: on failure the current view stays
+	 *  and the next live frame refreshes it. */
+	// Serialize resumes: a reconnect AND a gap-resync can both fire, and live
+	// frames can trigger more while one is in flight. Run at most one at a time
+	// and coalesce concurrent requests into a single follow-up rebuild — no
+	// overlapping clears/rebuilds against the shared render maps.
+	let resumeInFlight = false;
+	let resumePending = false;
+	const doResume = async (): Promise<void> => {
+		if (resumeInFlight) {
+			resumePending = true;
+			return;
+		}
+		resumeInFlight = true;
+		try {
+			let snap: Awaited<ReturnType<typeof client.resume>> | undefined;
+			try {
+				snap = await client.resume(withBinding());
+			} catch {
+				return;
+			}
+			if (!snap) return;
+			clearTranscriptRegion();
+			const messages = Array.isArray(snap.messages) ? snap.messages : [];
+			for (const m of messages) renderTranscriptMessage(m);
+			// Recover the non-transcript events too ("nothing lost"): recent
+			// system-event notices, then any tool-approval prompts STILL pending
+			// on this session — re-rendered answerable, so a prompt that arrived
+			// or was missed during the disconnect doesn't strand the turn.
+			for (const ev of snap.recentSystemEvents ?? []) renderSystemEventLine(ev);
+			for (const appr of snap.pendingApprovals ?? []) renderApprovalPrompt(appr);
+			if (snap.snapshot) {
+				lastSnapshot = snap.snapshot;
+				if (!snap.snapshot.isAgentRunning) isAgentRunning = false;
+			}
+			updateHeader();
+			tui.requestRender();
+		} finally {
+			resumeInFlight = false;
+			if (resumePending) {
+				resumePending = false;
+				void doResume();
+			}
+		}
+	};
+
 	/**
 	 * Format an elapsed-millisecond duration into a compact label for the
 	 * status line — `12s` / `1m 4s` / `2h 3m`. Brigade keeps the loader
@@ -895,7 +1125,12 @@ export async function wireConnectUi(
 		// their own applySubscription() from their handlers below.
 		if (!seededSubscription && (boundAgentId !== undefined || boundSessionKey !== undefined)) {
 			seededSubscription = true;
-			void applySubscription();
+			// Subscribe to the bound lane, THEN resume to load this session's
+			// transcript (history) from the gateway's source of truth. Runs once
+			// per connection (the gate); reconnects drive their own resume below.
+			void applySubscription().finally(() => {
+				void doResume();
+			});
 		}
 		updateHeader();
 	});
@@ -910,74 +1145,13 @@ export async function wireConnectUi(
 	let activePrompt: ApprovalPrompt | null = null;
 	client.on("approval-request", (req) => {
 		// Wave N3 (bug #3) — defence-in-depth: drop approval prompts that
-		// don't belong to the lane this TUI is bound to. Without this, two
-		// operators each running /agent X and /agent Y would both render
-		// every approval card. Server-side subscribe should already filter
-		// this, but a race between /agent rebind + the next gated-tool
-		// frame can still leak a stale one here.
+		// don't belong to the lane this TUI is bound to. Server-side subscribe
+		// should already filter this, but a race between /agent rebind + the
+		// next gated-tool frame can still leak a stale one here.
 		if (isOffLane((req as { agentId?: string }).agentId, (req as { sessionId?: string }).sessionId)) {
 			return;
 		}
-		// If another prompt is somehow already showing (shouldn't happen
-		// because exec-gate is serial per-turn), tear it down first so we
-		// don't stack prompts on the screen.
-		if (activePrompt) {
-			try {
-				tui.removeChild(activePrompt);
-			} catch {
-				/* ignore */
-			}
-			activePrompt = null;
-		}
-		const prompt = new ApprovalPrompt({
-			tui,
-			request: {
-				id: req.id,
-				command: req.command,
-				toolName: req.toolName,
-				cwd: req.cwd,
-				...(req.subagentLabel !== undefined ? { subagentLabel: req.subagentLabel } : {}),
-				...(req.subagentDepth !== undefined ? { subagentDepth: req.subagentDepth } : {}),
-				...(req.parentRunId !== undefined ? { parentRunId: req.parentRunId } : {}),
-			},
-			onResolve: (resolution: ApprovalResolution) => {
-				// Clear the prompt and hand focus back to the editor BEFORE
-				// firing the resolve — so the next agent_start event (which
-				// will follow on allow) doesn't fight the prompt for focus.
-				if (activePrompt) {
-					try {
-						tui.removeChild(activePrompt);
-					} catch {
-						/* ignore */
-					}
-					activePrompt = null;
-				}
-				tui.setFocus(editor);
-				const confirmation = decisionConfirmation(
-					req.command,
-					resolution,
-					req.subagentDepth,
-				);
-				insertBeforeEditor(new Text(confirmation, 0, 0));
-				tui.requestRender();
-				void client
-					.request("approval-resolve", {
-						id: req.id,
-						decision: resolution.decision,
-						pattern: resolution.pattern,
-					})
-					.catch((err: unknown) => {
-						const msg = err instanceof Error ? err.message : String(err);
-						insertBeforeEditor(
-							new Text(`  ${brand.error("✗")} ${brand.error(`approval send failed: ${msg}`)}`, 0, 0),
-						);
-					});
-			},
-		});
-		activePrompt = prompt;
-		insertBeforeEditor(prompt);
-		tui.setFocus(prompt);
-		tui.requestRender();
+		renderApprovalPrompt(req);
 	});
 
 	// Server-side warnings/info (e.g. "primary failed, trying fallback") — the
@@ -1012,27 +1186,7 @@ export async function wireConnectUi(
 		// Wave N3 (bug #3) — defensive lane drop. Cron-fired events stamped
 		// for another agent shouldn't surface on this operator's connect TUI.
 		if (isOffLane(event.agentId, event.sessionId)) return;
-		// Scrub the server-pushed event text before rendering (see
-		// `scrubRenderable`). A cron `system-event` carries the cron run's
-		// MODEL-GENERATED reply verbatim (server enqueueSystemEvent), so this
-		// is an attacker-influenceable path even though it's not direct bash.
-		const eventText = scrubRenderable(event.text);
-		const isCron = event.source === "cron" || event.jobName !== undefined;
-		if (isCron) {
-			const name = event.jobName ?? "cron";
-			const heading = brand.amber(`🦁 [cron "${name}"]`);
-			let suffix = "";
-			if (event.delivered === true) {
-				suffix = ` ${brand.dim("· delivered")}`;
-			} else if (event.delivered === false) {
-				suffix = ` ${brand.dim("· not delivered (TUI only)")}`;
-			}
-			insertBeforeEditor(new Text(`${heading} ${eventText}${suffix}`, 0, 0));
-		} else {
-			const heading = brand.amber("🦁");
-			insertBeforeEditor(new Text(`${heading} ${eventText}`, 0, 0));
-		}
-		tui.requestRender();
+		renderSystemEventLine(event);
 	});
 
 	// Pi events are forwarded as `{ event: <pi event>, subagentDepth? }`.
@@ -1088,12 +1242,15 @@ export async function wireConnectUi(
 				const label = lastSnapshot?.agentName ?? "brigade";
 				const labelPrefix = depth > 0 ? "sub-agent" : label;
 				const renderedText = `${subIndent}${brand.agent(labelPrefix)}  ${text}`;
-				// Per-depth streaming buffers: top-level (depth 0) and each sub-
-				// agent (depth ≥ 1) get their OWN Markdown block that grows in
-				// place. A child's message_update chunks now land in the child's
-				// own buffer (not appended as N fresh blocks, and not overwriting
-				// the parent's buffer).
-				const existing = activeAssistants.get(depth);
+				// Identity-keyed streaming block (see `asstKey`). Each logical
+				// message — top-level or sub-agent — owns ONE growing Markdown
+				// block, resolved by `${depth}:${timestamp}`. A continuation after
+				// a tool call is a new message (new timestamp) → a fresh block
+				// that lands BELOW the tool; a late/duplicate update for an
+				// earlier message resolves to its existing block and updates it in
+				// place, so nothing is ever misplaced or duplicated.
+				const key = asstKey(depth, msg);
+				const existing = activeAssistants.get(key);
 				if (!existing) {
 					// Wave N5 (bug #6) — origin attribution. When this turn is
 					// running on a non-`main` session (e.g. a channel-routed
@@ -1114,7 +1271,7 @@ export async function wireConnectUi(
 						);
 					}
 					const fresh = new Markdown(renderedText, 1, 0, markdownTheme);
-					activeAssistants.set(depth, fresh);
+					activeAssistants.set(key, fresh);
 					insertBeforeEditor(fresh);
 				} else {
 					existing.setText(renderedText);
@@ -1136,19 +1293,16 @@ export async function wireConnectUi(
 					removeChild(activeLoader);
 					activeLoader = null;
 				}
-				// Close the current depth's assistant text block when a tool starts.
-				// Otherwise the assistant block's position is locked at first stream-
-				// chunk, and a long final answer flowing in AFTER the tools end ends
-				// up rendered ABOVE them. Strictly chronological order — clearing
-				// the per-depth pointer lets the next message_update at THIS depth
-				// create a fresh block that lands below the most recent tool.
-				// We clear ONLY this depth's buffer so a sub-agent's tool start
-				// doesn't close the parent's open assistant block (separate streams).
-				activeAssistants.delete(depth);
-				// A tool starting is a turn-boundary for the open assistant
-				// stream — flush any pending debounced paint so the assistant
-				// block above renders its full text BEFORE the tool indicator
-				// lands underneath.
+				// NOTE: we no longer delete any assistant block here. With
+				// identity keying (`asstKey`), the post-tool continuation is a NEW
+				// message with a NEW timestamp, so it naturally opens a fresh block
+				// that lands BELOW this tool — while a late update for the
+				// pre-tool message still resolves to its own (earlier) block and
+				// updates in place. The old `activeAssistants.delete(depth)` hack
+				// (forcing a fresh block by position) is exactly what let a
+				// reordered/duplicate pre-tool update spawn a misplaced copy; it's
+				// gone. We still flush any pending debounced paint so the assistant
+				// text above renders in full BEFORE the tool indicator lands.
 				flushStreamingRender();
 				const indicator = new Text(
 					`${subIndent}  ${brand.tool("⚡")} ${brand.tool(event.toolName)}`,
@@ -1297,66 +1451,34 @@ export async function wireConnectUi(
 	// forever even though the gateway has long since finished — the user sees
 	// a "stuck" indicator that's purely a TUI state-staleness bug, not an
 	// actual hang.
-	client.on("reconnected" as any, () => {
-		insertBeforeEditor(new Text(`  ${brand.dim("↻ reconnected to gateway")}`, 0, 0));
-		// Re-subscription after a dropped/restored gateway. BrigadeClient opens
-		// a BRAND-NEW socket on reconnect, so the gateway assigns a fresh
-		// connection id whose per-connection agent/session subscription Sets are
-		// EMPTY — and the broadcast filter falls through to "deliver everything",
-		// losing server-side lane isolation. It also means the bound agent's
-		// per-binding state snapshot (pushed only in response to a `subscribe`
-		// with the agentId) is never re-sent, so a non-boot binding's header
-		// reverts to the BOOT agent's snapshot. Re-issue the subscription below.
-		//
-		// First clear the last-committed sub mirror: the fresh connection has NO
-		// prior server-side subscription, so leaving these set would make
-		// applySubscription() fire a spurious `unsubscribe` for a sub this
-		// connection never had. Reset → re-subscribe is the correct sequence.
+	client.on("reconnected", () => {
+		// BrigadeClient opened a BRAND-NEW socket on reconnect, so the gateway
+		// assigned a fresh conn id whose per-connection subscription Sets are
+		// EMPTY. Reset the sub mirror (the fresh connection has no prior
+		// server-side subscription, so leaving these set would fire a spurious
+		// `unsubscribe`), re-subscribe to the bound lane, THEN resume — which
+		// rebuilds the transcript from the gateway's source of truth. The rebuild
+		// backfills every `pi` frame missed while disconnected AND clears any
+		// stale tool spinners (each tool re-renders with its actual ✓/✗ outcome),
+		// so there's no separate orphan-reconcile step — the
+		// missing-after-tool / needs-a-refresh class of bug is gone.
 		lastSubscribedAgentId = undefined;
 		lastSubscribedSessionKey = undefined;
-		// Fire-and-forget: ask the gateway for the current snapshot so the
-		// `state` handler above updates `isAgentRunning` + the header. Errors
-		// are swallowed — the next state push (any tool call / turn start)
-		// will refresh anyway. The re-subscribe is appended AFTER this settles
-		// (both success and failure) so ordering is deterministic and the
-		// subscribe-time per-binding snapshot push lands after the get-state
-		// reconcile.
-		client.request("get-state").then(
-			(snap) => {
-				if (!snap) return;
-				lastSnapshot = snap;
-				// Same one-way rule as the `state` handler: the agent-wide flag
-				// may only CLEAR our lane's busy state, never set it.
-				if (!snap.isAgentRunning) isAgentRunning = false;
-				// If the gateway says no turn is in flight, then any tool
-				// indicators we still hold are stale (their `tool_execution_end`
-				// landed while we were disconnected). Mark each one as
-				// completed-with-no-known-outcome so the TUI stops spinning.
-				if (!snap.isAgentRunning && pendingTools.size > 0) {
-					// Reconcile orphaned tool indicators by marking each as
-					// completed-with-unknown-outcome. We don't know which tool's
-					// `tool_execution_end` was missed during the disconnect, so we
-					// can't infer the exit status; the dim ⋯ glyph signals "this
-					// tool finished, but the TUI didn't see how" and stops the spin.
-					for (const [, indicator] of pendingTools) {
-						indicator.setText(`  ${brand.dim("⋯ tool completed during disconnect")}`);
-					}
-					pendingTools.clear();
-				}
-				updateHeader();
-				tui.requestRender();
-			},
-			() => {
-				/* best-effort — silently ignore */
-			},
-		).then(() => {
-			// Re-subscribe the bound agent/session on the fresh connection.
-			// Runs after get-state settles (the rejection handler above swallows
-			// errors, so this chains in both cases) — deterministic ordering.
-			// This also triggers the server's subscribe-time per-binding snapshot
-			// push, restoring the correct header for a non-boot binding.
-			void applySubscription();
-		});
+		void (async () => {
+			await applySubscription();
+			await doResume();
+			// Notice lands AFTER the rebuild — else clearTranscriptRegion wipes it.
+			insertBeforeEditor(new Text(`  ${brand.dim("↻ reconnected to gateway")}`, 0, 0));
+		})();
+	});
+
+	// Mid-stream gap recovery. BrigadeClient emits "resync" when it detects a
+	// seq gap on the ordered `pi` stream — a frame dropped under backpressure or
+	// reordered, or the gateway restarted and reset its counters. Resume to
+	// rebuild from the transcript so the live view self-heals with no missing or
+	// misplaced messages and WITHOUT waiting for a reconnect or a manual refresh.
+	client.on("resync", () => {
+		void doResume();
 	});
 
 	// Switch the live session onto a CONFIGURED provider by reusing the same

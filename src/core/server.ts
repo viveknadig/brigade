@@ -40,18 +40,23 @@ import { WebSocketServer, type ServerOptions as WsServerOptions, type WebSocket 
 import {
 	type AgentSummary,
 	DEFAULT_PORT,
+	EVENT_NAMES,
 	type EventName,
 	type EventPayload,
 	type Frame,
 	isFrame,
 	modelToSummary,
+	REQUEST_METHODS,
 	type RequestFrame,
 	type RequestMethod,
 	type RequestParams,
 	type ResponseFor,
 	type SessionStateSnapshot,
 	TICK_INTERVAL_MS,
+	type WireMessage,
 } from "../protocol.js";
+import { type HelloOk, PROTOCOL_VERSION } from "../protocol/handshake.js";
+import { nextSeq } from "../protocol/stream-seq.js";
 // Per-turn execution path (the single canonical runtime). The gateway no
 // longer holds a long-lived Pi session: every inbound `prompt` builds a
 // fresh session via `runResilientTurn`, resumes the JSONL transcript by
@@ -1817,6 +1822,35 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	const clientAgentSubs = new Map<string, Set<string>>();
 	const clientSessionSubs = new Map<string, Set<string>>();
 
+	/**
+	 * Per-session monotonic sequence for the ordered, recoverable stream.
+	 * `broadcast` stamps the next value onto every ORDERED frame tagged with a
+	 * sessionId (= sessionKey): top-level `pi`, `approval-request`, and
+	 * `system-event` (they SHARE one counter per session, so a client detects a
+	 * gap in any of them and `resume`s). A client tracks the last seq it saw per
+	 * session; a jump means it missed a frame. `resume` returns the current value
+	 * as `headSeq`. One int per session — negligible; never pruned so a session's
+	 * seq stays monotonic across turns. A gateway restart resets these to 0 — the
+	 * client detects that via the `epoch` change on its next `HelloOk` and
+	 * invalidates its cursor.
+	 */
+	const seqCounters = new Map<string, number>();
+
+	/**
+	 * Bounded per-session tail of recent `system-event` notices (cron announces /
+	 * channel-health), so a client that was disconnected when one fired can still
+	 * recover it via `resume`. Oldest-first, capped at RECENT_SYSTEM_EVENTS_MAX.
+	 */
+	const recentSystemEvents = new Map<string, EventPayload["system-event"][]>();
+	const RECENT_SYSTEM_EVENTS_MAX = 30;
+
+	/**
+	 * Process boot id (session generation / "epoch"). Constant for this gateway
+	 * process; a restart yields a new value. Advertised in `HelloOk` so a client
+	 * can tell a restart (→ invalidate seq cursors) from a normal reconnect.
+	 */
+	const gatewayEpoch = crypto.randomUUID();
+
 	const subscribeAgent = (connId: string, agentIdValue: string): void => {
 		let set = clientAgentSubs.get(connId);
 		if (!set) {
@@ -1859,13 +1893,43 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 
 	/** Send one event to all connected clients (or a filtered subset). */
 	const broadcast = <K extends EventName>(event: K, payload: EventPayload[K]): void => {
-		const frame: Frame = { type: "event", event, payload };
-		const json = JSON.stringify(frame);
 		// Untagged payloads broadcast to everyone (state, error, basic log).
 		// Tagged payloads (pi, log with agent/session, approval-request,
 		// system-event with target) consult the subscription filter so the
 		// approval prompt for agent A doesn't pop on operator B's TUI.
 		const { agentId: frameAgentId, sessionId: frameSessionId } = extractFrameTags(payload);
+		// Stamp a per-session monotonic seq on the ordered transcript stream
+		// (`pi`). This is the gap detector: a client that sees seq jump knows it
+		// missed a frame and issues `resume`. Only `pi` frames carry seq — they
+		// are the transcript; state/error/log are unordered side-channels a
+		// client never gap-checks. Same `json` goes to every subscriber, so the
+		// seq is shared across all clients watching this session.
+		//
+		// The ordered, recoverable stream = top-level `pi` + `approval-request` +
+		// `system-event`, sharing one per-session counter so a client detects a
+		// gap in ANY of them and `resume`s. EXCLUDED (no seq):
+		//  - sub-agent `pi` frames (subagentDepth>0): they carry the child's own
+		//    session id (a UUID) and live in a separate child transcript the
+		//    parent's `resume` can't backfill — ephemeral nested decoration.
+		//  - `state` (self-healing cumulative snapshot), `error`, `log` (on disk).
+		const subDepth = event === "pi" ? Number((payload as { subagentDepth?: number }).subagentDepth) || 0 : 0;
+		const isOrderedFrame =
+			(event === "pi" && subDepth === 0) ||
+			event === "approval-request" ||
+			event === "system-event";
+		const seq = isOrderedFrame ? nextSeq(seqCounters, frameSessionId) : undefined;
+		// Retain a bounded per-session tail of system-events for `resume` recovery.
+		if (event === "system-event" && frameSessionId) {
+			const ring = recentSystemEvents.get(frameSessionId) ?? [];
+			ring.push(payload as EventPayload["system-event"]);
+			while (ring.length > RECENT_SYSTEM_EVENTS_MAX) ring.shift();
+			recentSystemEvents.set(frameSessionId, ring);
+		}
+		const frame: Frame =
+			seq !== undefined
+				? { type: "event", event, payload, seq }
+				: { type: "event", event, payload };
+		const json = JSON.stringify(frame);
 		for (const ws of clients) {
 			if (ws.readyState !== ws.OPEN) continue;
 			// Slow-consumer backpressure. A client that keeps answering
@@ -3372,6 +3436,56 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			case "get-state": {
 				return buildSnapshot() as ResponseFor[M];
 			}
+			case "resume": {
+				// Reliable-streaming recovery. Return the session's committed
+				// transcript (the single source of truth — works in BOTH
+				// filesystem + Convex mode via `readSessionTranscriptMessages`)
+				// plus the session's current head seq and the header snapshot.
+				// The client re-materialises from this on (re)connect or a
+				// detected seq gap, then keeps applying live `pi` frames keyed by
+				// identity — so a dropped/reordered frame self-heals. Any
+				// in-flight (not-yet-committed) message is NOT in the transcript
+				// yet; the live `message_update` stream paints it after resume and
+				// the identity-keyed renderer dedupes it on commit. Read-only;
+				// default-pass session guard (the local WS client is the operator).
+				const guardErr = defaultPassSessionGuard(rawParams, "list");
+				if (guardErr) throw guardErr;
+				const p = (params ?? {}) as RequestParams["resume"];
+				const targetAgentId = p.agentId?.trim() || agentId;
+				const targetSessionKey = p.sessionKey?.trim() || defaultSessionKey(targetAgentId);
+				const messages = await readSessionTranscriptMessages({ sessionKey: targetSessionKey });
+				const headSeq = seqCounters.get(targetSessionKey) ?? 0;
+				// Recovery for the two non-transcript event types so a (re)connecting
+				// client loses NOTHING: tool-approval prompts still pending on this
+				// session (else the turn hangs to auto-deny), and the recent
+				// system-event tail. Pending approvals are filtered to this session.
+				const pendingApprovals = approvalBridge
+					.listPending()
+					.filter((a) => a.sessionId === targetSessionKey)
+					.map((a) => ({
+						id: a.id,
+						command: a.command,
+						toolName: a.toolName,
+						timeoutMs: a.timeoutMs,
+						decisions: a.decisions,
+						...(a.cwd !== undefined ? { cwd: a.cwd } : {}),
+						...(a.subagentLabel !== undefined ? { subagentLabel: a.subagentLabel } : {}),
+						...(a.subagentDepth !== undefined ? { subagentDepth: a.subagentDepth } : {}),
+						...(a.parentRunId !== undefined ? { parentRunId: a.parentRunId } : {}),
+						...(a.agentId !== undefined ? { agentId: a.agentId } : {}),
+						...(a.sessionId !== undefined ? { sessionId: a.sessionId } : {}),
+					})) as EventPayload["approval-request"][];
+				return {
+					sessionKey: targetSessionKey,
+					agentId: targetAgentId,
+					messages: messages as WireMessage[],
+					headSeq,
+					pendingApprovals,
+					recentSystemEvents: recentSystemEvents.get(targetSessionKey) ?? [],
+					epoch: gatewayEpoch,
+					snapshot: buildSnapshot(targetAgentId),
+				} as ResponseFor[M];
+			}
 			case "memory-graph": {
 				// Memory Graph dashboard data — nodes + typed edges + topic clusters
 				// + stats, for an agent's workspace. Read; default-pass access guard
@@ -3580,8 +3694,32 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		// today won't need a code change when multi-user lands.
 		const caller: GatewayCaller = { id: "local", scopes: ["operator.admin", "operator.write", "operator.read"] };
 
-		// Send the initial snapshot so the client can render its header
-		// before any user action.
+		// Champion-tier handshake: the FIRST frame is `hello-ok`, handing the
+		// client everything it needs to subscribe without hardcoding — the
+		// protocol version, its connId, the gateway's build version + epoch
+		// (session generation, for restart detection), the full list of callable
+		// methods (core wire methods + registered control-plane RPCs) and
+		// subscribable events, and the policy limits (payload/buffer caps + tick
+		// interval). A client that ignores it still works (the `state` frame
+		// below preserves the legacy boot path).
+		const helloOk: HelloOk = {
+			type: "hello-ok",
+			protocol: PROTOCOL_VERSION,
+			server: { version: getBuildInfo().version, connId, epoch: gatewayEpoch },
+			features: {
+				methods: [...REQUEST_METHODS, ...customMethods.keys()],
+				events: [...EVENT_NAMES],
+			},
+			policy: {
+				maxPayload: MAX_WS_PAYLOAD_BYTES,
+				maxBufferedBytes: MAX_WS_BUFFERED_BYTES,
+				tickIntervalMs: TICK_INTERVAL_MS,
+			},
+			auth: { role: "operator" },
+		};
+		ws.send(JSON.stringify(helloOk satisfies Frame));
+		// Then the initial snapshot so the client can render its header before
+		// any user action (also the back-compat boot frame for older clients).
 		ws.send(JSON.stringify({ type: "event", event: "state", payload: buildSnapshot() } satisfies Frame));
 
 		// Per-connection ring of RPC timestamps powering the sliding-window check.
@@ -3722,16 +3860,30 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 
 	/* ──────────────── tick heartbeat ──────────────── */
 
-	// Push an empty `state` snapshot every TICK_INTERVAL_MS so clients can
-	// detect a dead server (no frames in 2× this interval = close + reconnect).
-	// Sending the snapshot doubles as keep-alive AND consistency check.
-	//
-	// The tick is also the heartbeat-file beat: refreshing the heartbeat from
-	// inside the event-loop tick proves the loop is healthy. A process whose
-	// loop is starved (deadlock, runaway sync compute, exhausted FDs) misses
-	// the refresh and the external supervisor restarts it.
+	// Send a raw (non-`event`) frame to every open client. Used for the cheap
+	// `tick` keepalive + the graceful `shutdown` notice — each a single tiny
+	// frame, so no backpressure gate (the ping reaper handles a truly dead one).
+	const sendRawToAll = (frame: Frame): void => {
+		const json = JSON.stringify(frame);
+		for (const ws of clients) {
+			if (ws.readyState !== ws.OPEN) continue;
+			try {
+				ws.send(json);
+			} catch {
+				/* best-effort */
+			}
+		}
+	};
+
+	// Emit a cheap `tick` frame every TICK_INTERVAL_MS so clients detect a dead
+	// server (no frames in 2× this interval = close + reconnect). Was a full
+	// `state` snapshot to every binding; a tick is far lighter (battery/bandwidth
+	// on mobile) and `state` is still pushed on every real mutation + on connect,
+	// so idle clients stay consistent. The tick also doubles as the heartbeat-file
+	// beat: refreshing it from inside the event-loop tick proves the loop is
+	// healthy — a starved loop misses it and the supervisor restarts the process.
 	const tickTimer = setInterval(() => {
-		broadcastStateAllBindings();
+		sendRawToAll({ type: "tick", ts: Date.now() });
 		void writeHeartbeatFile().catch(() => {
 			/* best-effort */
 		});
@@ -5716,6 +5868,14 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// instead of being silently queued against a tearing-down server.
 			try {
 				markGatewayDraining();
+			} catch {
+				/* best-effort */
+			}
+			// Tell connected clients we're going down gracefully BEFORE the
+			// sockets close, so a web/mobile UI shows "reconnecting…" and
+			// pre-empts the resume instead of treating the drop as an error.
+			try {
+				sendRawToAll({ type: "shutdown", reason: "gateway shutting down" });
 			} catch {
 				/* best-effort */
 			}
