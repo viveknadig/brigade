@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.15.0](https://github.com/spinabot/brigade/compare/brigade-v1.14.0...brigade-v1.15.0) (2026-06-27)
+
+
+### Features
+
+* **gateway:** reliable streaming — seq + resume + HelloOk handshake ([96a8c79](https://github.com/spinabot/brigade/commit/96a8c793fae0241ea22c30b8625abe1fcb5cacbd))
+
 ## [1.14.0](https://github.com/spinabot/brigade/compare/brigade-v1.13.0...brigade-v1.14.0) (2026-06-26)
 
 
