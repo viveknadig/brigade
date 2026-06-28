@@ -53,6 +53,9 @@ skills-lock.json
 # the eval dir would pass the guard yet remain committable.
 *.local.json
 
+# Local planning docs (operator-only, not for the public repo)
+docs/web-client-plan.md
+
 # Misc
 test.txt
 
