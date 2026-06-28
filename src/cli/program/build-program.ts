@@ -197,6 +197,19 @@ export function buildProgram(): Command {
     });
 
   program
+    .command("exec-node")
+    .description("Run a Node script with Brigade's bundled libraries (docx, exceljs, pdf-lib, pptxgenjs, fflate, jimp) requireable — powers the document skills")
+    .allowUnknownOption()
+    .helpOption(false)
+    .action(async () => {
+      const { runExecNodeCommand } = await import("../commands/exec-node.js");
+      const idx = process.argv.indexOf("exec-node");
+      const rest = idx >= 0 ? process.argv.slice(idx + 1) : [];
+      const code = await runExecNodeCommand(rest);
+      process.exit(code);
+    });
+
+  program
     .command("tui", { isDefault: true })
     .description("Launch the Brigade chat TUI (auto-starts the gateway if needed)")
     // Positional agent id — the npm-friendly spelling. `npm run tui <agent>`
