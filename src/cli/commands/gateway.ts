@@ -394,9 +394,32 @@ async function sendShutdownRpc(args: { host?: string; port?: number; timeoutMs: 
 
 export async function runGatewayStopCommand(opts: { timeout?: number; json?: boolean; host?: string; port?: number }): Promise<number> {
 	const timeoutMs = opts.timeout ?? STOP_DEFAULT_TIMEOUT_MS;
-	const pid = await readPid();
+	const resolvedPort = opts.port ?? 7777;
+	let pid = await readPid();
+	// True when `pid` was recovered from the PORT owner rather than our PID
+	// file. A PID-file PID is TRUSTED (we wrote it for our own gateway); a
+	// port-owner PID is NOT — some unrelated app could hold 7777 — so we only
+	// hard-kill it if it proves itself a Brigade gateway via the shutdown
+	// handshake (see the SIGTERM guard below).
+	let pidFromPort = false;
 	if (!pid) {
-		const msg = `no running gateway recorded (checked ${GATEWAY_PID_PATH}) — gateway is probably not running`;
+		// No PID file recorded — but a gateway can still be bound to the port
+		// with its PID + lock files gone: a foreground start that never recorded
+		// them, or an unclean exit that left the process alive holding the
+		// socket. The PID file alone would make us give up while port 7777 stays
+		// stuck. Fall back to the actual port owner so `gateway stop` recovers
+		// the port instead of stranding it. The recovered PID then flows through
+		// the same graceful-shutdown → SIGTERM → cleanup path below.
+		const owner = inspectPortListeners(resolvedPort).find((l) => Number.isInteger(l.pid) && l.pid > 0);
+		if (owner) {
+			pid = owner.pid;
+			pidFromPort = true;
+			const note = `no PID file recorded, but port ${resolvedPort} is held by ${formatPortListener(owner)} — trying a graceful Brigade shutdown`;
+			if (!opts.json) process.stdout.write(`${chalk.yellow(note)}\n`);
+		}
+	}
+	if (!pid) {
+		const msg = `no running gateway recorded (checked ${GATEWAY_PID_PATH}) and nothing is listening on port ${resolvedPort} — gateway is probably not running`;
 		if (opts.json) process.stdout.write(`${JSON.stringify({ ok: true, reason: msg })}\n`);
 		else process.stdout.write(`${chalk.dim(msg)}\n`);
 		return 0;
@@ -445,6 +468,18 @@ export async function runGatewayStopCommand(opts: { timeout?: number; json?: boo
 	// SIGTERM. Forceful on Windows; clean on POSIX. Either way we then poll
 	// for the process to exit and clean up files.
 	if (!gracefulSucceeded) {
+		// Safety gate: if the PID came from the PORT (not our PID file) and the
+		// Brigade `shutdown` handshake did NOT ack, we cannot confirm this is even
+		// a Brigade gateway — it could be an unrelated process that happens to
+		// hold the port. Since SIGTERM is a forceful kill on Windows, refuse to
+		// signal an unidentified process and tell the operator how to kill it by
+		// hand if they're sure. A PID-file PID is trusted and still falls through.
+		if (pidFromPort) {
+			const msg = `port ${resolvedPort} is held by pid ${pid}, but it didn't answer the Brigade shutdown handshake — not force-killing an unidentified process. If you're sure it's a stuck gateway, stop it manually (e.g. \`taskkill /PID ${pid} /F\` on Windows, \`kill ${pid}\` on macOS/Linux).`;
+			if (opts.json) process.stdout.write(`${JSON.stringify({ ok: false, pid, reason: msg })}\n`);
+			else process.stderr.write(`${chalk.yellow(msg)}\n`);
+			return 1;
+		}
 		try {
 			process.kill(pid, "SIGTERM");
 		} catch (err) {
