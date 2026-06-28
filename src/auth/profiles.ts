@@ -366,6 +366,55 @@ export function upsertOAuthProfile(
   return id;
 }
 
+/**
+ * Persist a REFRESHED OAuth credential back into an existing oauth profile,
+ * in place. Pi's AuthStorage auto-refreshes an expired subscription token on
+ * use, and every provider that matters (Anthropic / OpenAI-Codex / Google)
+ * ROTATES the refresh token on each refresh — the response carries a NEW
+ * refresh token and invalidates the old one. If we never write the rotated
+ * token back, the next gateway boot re-reads the stale on-disk refresh token,
+ * the refresh 401s, and the login dies a day or two after onboarding. This is
+ * the write-back path that closes that gap, generically for any provider.
+ *
+ * Non-destructive: preserves the profile's clientSecret (sealed `key`), alias,
+ * refs we don't touch, and existing metadata; only the token fields are
+ * overwritten. Writing a literal token CLEARS any stale `accessRef`/`refreshRef`
+ * so the fresh literal wins on the next read (see `resolveRefValue`). Goes
+ * through the same mode-aware `writeProfiles` choke point, so convex mode seals
+ * the new access/refresh columns. Returns false when no oauth profile exists for
+ * `provider` (nothing to update — e.g. an env-only credential).
+ */
+export function updateOAuthTokens(
+  agentId: string,
+  provider: string,
+  tokens: { access?: string; refresh?: string; expires?: number; metadata?: Record<string, unknown> },
+): boolean {
+  const file = readProfiles(agentId);
+  const matches = Object.entries(file.profiles).filter(
+    ([, p]) => p?.type === "oauth" && p?.provider === provider,
+  );
+  if (matches.length === 0) return false;
+  // Prefer the default-alias profile; otherwise the first oauth profile found.
+  const defaultId = profileId(provider);
+  const [id, prof] = matches.find(([eid]) => eid === defaultId) ?? matches[0]!;
+  const next: AuthProfile = { ...prof };
+  if (tokens.access !== undefined) {
+    next.access = tokens.access;
+    delete next.accessRef;
+  }
+  if (tokens.refresh !== undefined) {
+    next.refresh = tokens.refresh;
+    delete next.refreshRef;
+  }
+  if (tokens.expires !== undefined) next.expires = tokens.expires;
+  if (tokens.metadata !== undefined) {
+    next.metadata = { ...(prof.metadata ?? {}), ...tokens.metadata };
+  }
+  file.profiles[id] = sanitizeProfileShape(next);
+  writeProfiles(agentId, file);
+  return true;
+}
+
 // Ref-mode counterpart: stores a structured BrigadeSecretRef instead of the
 // literal key. The literal `key` field is NOT persisted — sanitizeProfileShape
 // drops it when keyRef is present.

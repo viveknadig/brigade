@@ -16,7 +16,7 @@ import { AuthStorage } from "@earendil-works/pi-coding-agent";
 
 import { DEFAULT_AGENT_ID } from "../config/paths.js";
 import { PROVIDERS } from "../providers/catalog.js";
-import { readProfiles } from "../auth/profiles.js";
+import { readProfiles, updateOAuthTokens } from "../auth/profiles.js";
 
 // Minimal shape we read from auth-profiles.json. Mirrors `AuthProfile` in
 // `src/auth/profiles.ts` but only the fields the credential-map build needs.
@@ -46,31 +46,123 @@ interface ReadProfilesFile {
   profiles?: Record<string, ReadProfile>;
 }
 
+interface LockResult<T> {
+  result: T;
+  next?: string;
+}
+
+/**
+ * An `AuthStorageBackend` that READS Brigade's resolved credential map and
+ * PERSISTS any OAuth refresh Pi performs back into auth-profiles.json.
+ *
+ * Pi's `AuthStorage` auto-refreshes an expired OAuth token on `getApiKey()` and
+ * persists the result through the backend's `withLock` — calling our `fn` with
+ * the current serialized credential map and handing back the refreshed map as
+ * `next`. Every subscription provider that matters (Anthropic / OpenAI-Codex /
+ * Google) ROTATES its refresh token on each refresh, so the refreshed map
+ * carries a NEW refresh token and the old one is now dead. We diff `next`
+ * against `current` and write each changed oauth credential back via
+ * `updateOAuthTokens`. Generic across providers — whatever Pi refreshed lands
+ * on disk, so the rotated token survives a gateway restart.
+ *
+ * Brigade previously used `AuthStorage.inMemory`, which kept refreshes only in
+ * the live process: after a restart it re-read the stale (rotated-out) on-disk
+ * refresh token, every turn 401'd, and the subscription login looked like the
+ * gateway "disconnecting" a day or two after onboarding. This backend closes
+ * that gap.
+ */
+function persistentAuthBackend(agentId: string): {
+  withLock<T>(fn: (current: string | undefined) => LockResult<T>): T;
+  withLockAsync<T>(fn: (current: string | undefined) => Promise<LockResult<T>>): Promise<T>;
+} {
+  const readCurrent = (): string => {
+    try {
+      return JSON.stringify(readBrigadeCredentials(agentId));
+    } catch {
+      return "{}";
+    }
+  };
+  const persist = (next: string | undefined, current: string): void => {
+    if (!next || next === current) return;
+    let nextMap: Record<string, unknown>;
+    try {
+      nextMap = JSON.parse(next) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    let curMap: Record<string, unknown> = {};
+    try {
+      curMap = JSON.parse(current) as Record<string, unknown>;
+    } catch {
+      /* treat as empty — persist everything oauth in `next` */
+    }
+    for (const [provider, raw] of Object.entries(nextMap)) {
+      if (!raw || typeof raw !== "object") continue;
+      const cred = raw as Record<string, unknown>;
+      if (cred.type !== "oauth") continue; // only oauth creds refresh/rotate
+      // Only persist what actually changed — leave untouched providers alone.
+      if (JSON.stringify(curMap[provider]) === JSON.stringify(raw)) continue;
+      const { type: _type, access, refresh, expires, ...rest } = cred;
+      void _type;
+      try {
+        updateOAuthTokens(agentId, provider, {
+          access: typeof access === "string" ? access : undefined,
+          refresh: typeof refresh === "string" ? refresh : undefined,
+          expires: typeof expires === "number" ? expires : undefined,
+          metadata: Object.keys(rest).length > 0 ? (rest as Record<string, unknown>) : undefined,
+        });
+      } catch {
+        /* best-effort — a write-back failure must never break the turn */
+      }
+    }
+  };
+  return {
+    withLock(fn) {
+      const current = readCurrent();
+      const out = fn(current);
+      try {
+        persist(out.next, current);
+      } catch {
+        /* best-effort */
+      }
+      return out.result;
+    },
+    async withLockAsync(fn) {
+      const current = readCurrent();
+      const out = await fn(current);
+      try {
+        persist(out.next, current);
+      } catch {
+        /* best-effort */
+      }
+      return out.result;
+    },
+  };
+}
+
 /**
  * Build a Pi `AuthStorage` populated from Brigade's auth-profiles.json. Returns
  * an empty storage when the file is missing or unparseable so callers can
  * decide whether to surface "no key" themselves (chat re-onboards; gateway
  * throws a clean config error).
+ *
+ * Prefers a PERSISTENT backend (`fromStorage`) so Pi's OAuth refresh is written
+ * back to disk — see `persistentAuthBackend`. Falls back to `inMemory` only on a
+ * Pi build that lacks `fromStorage` (refreshes then live only for the process).
  */
 export function loadBrigadeAuthStorage(agentId: string = DEFAULT_AGENT_ID): unknown {
-  const credentials = readBrigadeCredentials(agentId);
   const Storage = AuthStorage as unknown as {
-    inMemory?: (data?: unknown) => unknown;
     fromStorage?: (storage: unknown) => unknown;
+    inMemory?: (data?: unknown) => unknown;
   };
-  if (typeof Storage.inMemory === "function") {
-    return Storage.inMemory(credentials);
-  }
   if (typeof Storage.fromStorage === "function") {
-    return Storage.fromStorage({
-      withLock<T>(update: (current: string) => { result: T; next?: string }): T {
-        const { result } = update(JSON.stringify(credentials, null, 2));
-        return result;
-      },
-    });
+    return Storage.fromStorage(persistentAuthBackend(agentId));
+  }
+  if (typeof Storage.inMemory === "function") {
+    return Storage.inMemory(readBrigadeCredentials(agentId));
   }
   throw new Error(
-    "Pi AuthStorage exposes neither inMemory nor fromStorage; pin to 0.70.x or update brigade.",
+    "Pi AuthStorage exposes neither fromStorage nor inMemory; pin to 0.70.x or update brigade.",
   );
 }
 
