@@ -27,7 +27,18 @@ export function shouldDeliverFrame(
 	if (!agentId && !sessionId) return true;
 	if (!agentSubs && !sessionSubs) return true;
 	if (agentId && agentSubs?.has(agentId)) return true;
-	if (sessionId && sessionSubs?.has(sessionId)) return true;
+	if (sessionId && sessionSubs) {
+		// Exact match OR a sub-agent DESCENDANT session. A spawned sub-agent runs
+		// under a child key (`<parent>:subagent:<id>`, see routing/session-key.ts),
+		// so its pi frames + approval prompts must still reach the operator
+		// watching the parent turn — otherwise sub-agent activity is invisible and
+		// its `bash` approval prompt never surfaces (the turn then hangs on the
+		// approval timeout). The trailing ":" stops a sibling like `…:main2` from
+		// matching `…:main`.
+		for (const sub of sessionSubs) {
+			if (sessionId === sub || sessionId.startsWith(`${sub}:`)) return true;
+		}
+	}
 	return false;
 }
 

@@ -1843,6 +1843,41 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	 */
 	const recentSystemEvents = new Map<string, EventPayload["system-event"][]>();
 	const RECENT_SYSTEM_EVENTS_MAX = 30;
+	// Cap how many transcript messages `resume` ships. A thread can grow to
+	// thousands of messages; replaying ALL of them on every connect/reconnect/
+	// resync would re-read + re-parse the whole JSONL synchronously and ship a
+	// huge frame (risking the 32 MiB payload cap). Bound it to the recent tail —
+	// the operator lands back in context without the cost scaling with thread
+	// length. (Lazy-loading older history on scroll is a later enhancement.)
+	const RESUME_TRANSCRIPT_MAX = 200;
+	// Cap how many DISTINCT sessions we retain recovery state for. `seqCounters`
+	// and `recentSystemEvents` would otherwise grow unbounded over a multi-day
+	// daemon (every cron run, channel thread, sub-agent child key, and `/new`
+	// mints a fresh key that never gets evicted). LRU-evict the coldest sessions
+	// past this bound — safe because the durable transcript is the source of
+	// truth: an evicted session simply rebuilds from disk on its next `resume`,
+	// and a re-touched seq counter restarting at 0 only triggers a harmless
+	// resync on any client still watching it.
+	const RECOVERY_SESSION_MAX = 512;
+	const evictColdRecoverySessions = (): void => {
+		// JS Maps iterate in insertion order. The recentSystemEvents write below
+		// moves a touched key to the end (delete+set), so its FIRST keys are the
+		// least-recently-used; seqCounters evicts in creation order. Either way the
+		// durable transcript is the source of truth, so eviction is safe — an
+		// evicted session rebuilds from disk on its next `resume`, and a re-touched
+		// seq counter restarting at 0 only makes a still-connected client issue one
+		// harmless self-healing resync.
+		while (recentSystemEvents.size > RECOVERY_SESSION_MAX) {
+			const oldest = recentSystemEvents.keys().next().value as string | undefined;
+			if (oldest === undefined) break;
+			recentSystemEvents.delete(oldest);
+		}
+		while (seqCounters.size > RECOVERY_SESSION_MAX) {
+			const oldest = seqCounters.keys().next().value as string | undefined;
+			if (oldest === undefined) break;
+			seqCounters.delete(oldest);
+		}
+	};
 
 	/**
 	 * Process boot id (session generation / "epoch"). Constant for this gateway
@@ -1919,12 +1954,19 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			event === "system-event";
 		const seq = isOrderedFrame ? nextSeq(seqCounters, frameSessionId) : undefined;
 		// Retain a bounded per-session tail of system-events for `resume` recovery.
+		// delete+set moves this session to the end of the Map (LRU touch) so the
+		// eviction sweep below drops the least-recently-active sessions first.
 		if (event === "system-event" && frameSessionId) {
 			const ring = recentSystemEvents.get(frameSessionId) ?? [];
 			ring.push(payload as EventPayload["system-event"]);
 			while (ring.length > RECENT_SYSTEM_EVENTS_MAX) ring.shift();
+			recentSystemEvents.delete(frameSessionId);
 			recentSystemEvents.set(frameSessionId, ring);
 		}
+		// Bound the recovery maps so a long-lived daemon that touches many
+		// distinct session keys (cron runs, channel threads, sub-agent children,
+		// `/new`) doesn't grow them without limit.
+		if (isOrderedFrame && frameSessionId) evictColdRecoverySessions();
 		const frame: Frame =
 			seq !== undefined
 				? { type: "event", event, payload, seq }
@@ -3453,7 +3495,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				const p = (params ?? {}) as RequestParams["resume"];
 				const targetAgentId = p.agentId?.trim() || agentId;
 				const targetSessionKey = p.sessionKey?.trim() || defaultSessionKey(targetAgentId);
-				const messages = await readSessionTranscriptMessages({ sessionKey: targetSessionKey });
+				const messages = await readSessionTranscriptMessages({
+					sessionKey: targetSessionKey,
+					limit: RESUME_TRANSCRIPT_MAX,
+				});
 				const headSeq = seqCounters.get(targetSessionKey) ?? 0;
 				// Recovery for the two non-transcript event types so a (re)connecting
 				// client loses NOTHING: tool-approval prompts still pending on this
@@ -4021,6 +4066,21 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	let configReadWarningSurfaced = false;
 	const buildSessionsAccessCheck = (): SessionsHandlerAccessCheck => {
 		return ({ action, targetSessionKey }) => {
+			// SAME-AGENT operator pass. The WS requester is the LOCAL OPERATOR
+			// (localhost-bind + admin scope), anchored to the boot agent. The
+			// operator owns EVERY session of their own agent, so any target under
+			// that same agent passes — this guard's job is solely to refuse
+			// CROSS-AGENT reach (gated below by visibility="all" + A2A policy).
+			// Without this, the operator prompting a fresh same-agent thread
+			// (`/new` → `agent:main:t-…`) or switching to any non-boot session of
+			// their own agent was wrongly refused by the `visibility:"self"` rule
+			// in `checkSessionToolAccess`, even though they plainly own it. The
+			// agent's own `sessions_send` tool is unaffected — it calls
+			// `checkSessionToolAccess` directly with the AGENT's session as the
+			// requester, so its self/tree visibility still applies.
+			if ((parseAgentSessionKey(targetSessionKey)?.agentId ?? agentId) === agentId) {
+				return { allowed: true };
+			}
 			// Read the live config snapshot so `system.reload` that
 			// tightens visibility/A2A takes effect on the very next RPC.
 			// Sync `loadConfig()` would be ideal but the project's

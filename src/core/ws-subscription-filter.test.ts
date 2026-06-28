@@ -63,6 +63,33 @@ describe("ws-subscription-filter — shouldDeliverFrame (Wave I)", () => {
 		);
 	});
 
+	it("delivers a sub-agent DESCENDANT session to the client watching the parent", () => {
+		// A spawned sub-agent runs under a child key `<parent>:subagent:<id>`.
+		// The operator watching the parent session must receive its pi frames +
+		// approval prompts — otherwise the sub-agent's `bash` approval never
+		// surfaces and the turn hangs on the timeout.
+		const sessionSubs = new Set(["agent:main:main"]);
+		assert.equal(
+			shouldDeliverFrame(undefined, sessionSubs, { sessionId: "agent:main:main:subagent:abc" }),
+			true,
+			"descendant sub-agent session is in-lane",
+		);
+		assert.equal(
+			shouldDeliverFrame(undefined, sessionSubs, { sessionId: "agent:main:main:subagent:abc:subagent:def" }),
+			true,
+			"nested sub-agent session is in-lane",
+		);
+	});
+
+	it("a sibling session is NOT treated as a descendant (trailing-colon guard)", () => {
+		const sessionSubs = new Set(["agent:main:main"]);
+		assert.equal(
+			shouldDeliverFrame(undefined, sessionSubs, { sessionId: "agent:main:main2" }),
+			false,
+			"`…:main2` must not match `…:main`",
+		);
+	});
+
 	it("two clients on two agents each only get their own frames (Wave I happy path)", () => {
 		// Mirrors the gateway's two-operator topology. The problem Wave H was
 		// supposed to fix was "every TUI sees every agent" — Wave I closes it by
