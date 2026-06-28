@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.17.0](https://github.com/spinabot/brigade/compare/brigade-v1.16.0...brigade-v1.17.0) (2026-06-28)
+
+
+### Features
+
+* **connect:** /new thread, pinned status footer, sub-agent visibility, land-in-thread replay ([18a7f77](https://github.com/spinabot/brigade/commit/18a7f7754aec15920a28665b3f35b07791f07004))
+
+
+### Bug Fixes
+
+* **auth:** persist refreshed/rotated OAuth tokens across restart ([7665a5b](https://github.com/spinabot/brigade/commit/7665a5b882a4318b5a0b634064466ffb2b2fd663))
+* **gateway:** recover a stale port on stop, verify identity before killing ([e225af0](https://github.com/spinabot/brigade/commit/e225af09a2ab5d4fe4f6be06e1ca178a4c952e60))
+* **gateway:** sub-agent frame delivery, same-agent operator access, bounded resume + recovery maps ([6bec717](https://github.com/spinabot/brigade/commit/6bec717aee5ce018f084a4f9c9f0fe4ed37557e1))
+
 ## [1.16.0](https://github.com/spinabot/brigade/compare/brigade-v1.15.0...brigade-v1.16.0) (2026-06-27)
 
 
