@@ -22,6 +22,7 @@ import process from "node:process";
 import { randomBytes } from "node:crypto";
 
 import chalk from "chalk";
+import qrcodeTerminal from "qrcode-terminal";
 
 import { loadConfig } from "../../core/config.js";
 import { mutateConfigAtomic } from "../../config/io.js";
@@ -178,7 +179,7 @@ function printBanner(tunnel: RunningTunnel, provider: string): void {
   console.error("");
 }
 
-export async function runExposeStatusCommand(opts: { json?: boolean; showLink?: boolean }): Promise<number> {
+export async function runExposeStatusCommand(opts: { json?: boolean; showLink?: boolean; showQr?: boolean }): Promise<number> {
   const state = readTunnelState();
   if (!state || !isProcessAlive(state.pid)) {
     if (state) await clearTunnelState().catch(() => {});
@@ -203,6 +204,16 @@ export async function runExposeStatusCommand(opts: { json?: boolean; showLink?: 
   console.log(`  secured    ${state.secured ? chalk.green("yes (key handled automatically)") : chalk.red("NO (open mode)")}`);
   if (state.secured && !opts.showLink) {
     console.log(`  ${chalk.dim("(run with --show-link to reveal the full access link for another device)")}`);
+  }
+  if (opts.showQr) {
+    // Encode the FULL link (key included) so a phone scans once and connects.
+    const link = state.secured ? state.urlWithToken : state.url;
+    console.log("");
+    console.log(`  ${chalk.bold("Scan to connect")} ${chalk.dim("(open the Brigade app and scan this):")}`);
+    qrcodeTerminal.generate(link, { small: true }, (qr: string) => {
+      console.log(qr.replace(/^/gm, "  "));
+    });
+    console.log(`  ${chalk.dim(state.secured ? "Encodes the full link incl. the access key — keep it on-screen only." : "Open mode — no key in the link.")}`);
   }
   console.log(`  pid        ${state.pid}`);
   console.log(`  uptime     ${uptimeS}s`);

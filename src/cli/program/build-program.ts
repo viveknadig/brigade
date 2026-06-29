@@ -530,7 +530,8 @@ export function buildProgram(): Command {
     .description("Show the active tunnel (URL, provider, uptime)")
     .option("--json", "emit JSON instead of human-readable text", false)
     .option("--show-link", "reveal the full access link (includes the private key)", false)
-    .action(async (opts: { json?: boolean; showLink?: boolean }) => {
+    .option("--show-qr", "render the full access link as a scannable QR code (for the app)", false)
+    .action(async (opts: { json?: boolean; showLink?: boolean; showQr?: boolean }) => {
       const { runExposeStatusCommand } = await import("../commands/expose.js");
       await exitAfterFlush(await runExposeStatusCommand(opts));
     });
@@ -556,7 +557,8 @@ export function buildProgram(): Command {
     .description("Show the active tunnel")
     .option("--json", "emit JSON instead of human-readable text", false)
     .option("--show-link", "reveal the full access link (includes the private key)", false)
-    .action(async (opts: { json?: boolean; showLink?: boolean }) => {
+    .option("--show-qr", "render the full access link as a scannable QR code (for the app)", false)
+    .action(async (opts: { json?: boolean; showLink?: boolean; showQr?: boolean }) => {
       const { runExposeStatusCommand } = await import("../commands/expose.js");
       await exitAfterFlush(await runExposeStatusCommand(opts));
     });
