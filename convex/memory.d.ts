@@ -7,7 +7,7 @@ export declare const listFacts: import("convex/server").RegisteredQuery<"public"
     _creationTime: number;
     metadata?: any;
     status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
-    sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
+    sourceType?: "dream" | "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
@@ -30,11 +30,11 @@ export declare const listFacts: import("convex/server").RegisteredQuery<"public"
     createdBySessionKey?: string | undefined;
     createdByAccountId?: string | undefined;
     createdAt: number;
-    memoryId: string;
     content: ArrayBuffer;
+    memoryId: string;
     segment: "project" | "context" | "identity" | "preference" | "correction" | "relationship" | "knowledge";
-    tier: "short" | "long" | "permanent";
     importance: number;
+    tier: "short" | "long" | "permanent";
     decayRate: number;
     accessCount: number;
     lastAccessedAt: number;
@@ -44,7 +44,7 @@ export declare const listFacts: import("convex/server").RegisteredQuery<"public"
 export declare const writeFact: import("convex/server").RegisteredMutation<"public", {
     metadata?: any;
     status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
-    sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
+    sourceType?: "dream" | "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
@@ -66,11 +66,11 @@ export declare const writeFact: import("convex/server").RegisteredMutation<"publ
     createdByConversationId?: string | undefined;
     createdBySessionKey?: string | undefined;
     createdByAccountId?: string | undefined;
-    memoryId: string;
     content: ArrayBuffer;
+    memoryId: string;
     segment: "project" | "context" | "identity" | "preference" | "correction" | "relationship" | "knowledge";
-    tier: "short" | "long" | "permanent";
     importance: number;
+    tier: "short" | "long" | "permanent";
     decayRate: number;
     workspaceId: string;
 }, Promise<{
@@ -78,7 +78,7 @@ export declare const writeFact: import("convex/server").RegisteredMutation<"publ
     _creationTime: number;
     metadata?: any;
     status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
-    sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
+    sourceType?: "dream" | "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
@@ -101,11 +101,11 @@ export declare const writeFact: import("convex/server").RegisteredMutation<"publ
     createdBySessionKey?: string | undefined;
     createdByAccountId?: string | undefined;
     createdAt: number;
-    memoryId: string;
     content: ArrayBuffer;
+    memoryId: string;
     segment: "project" | "context" | "identity" | "preference" | "correction" | "relationship" | "knowledge";
-    tier: "short" | "long" | "permanent";
     importance: number;
+    tier: "short" | "long" | "permanent";
     decayRate: number;
     accessCount: number;
     lastAccessedAt: number;
@@ -123,7 +123,7 @@ export declare const listAllFacts: import("convex/server").RegisteredQuery<"publ
     _creationTime: number;
     metadata?: any;
     status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
-    sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
+    sourceType?: "dream" | "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
@@ -146,11 +146,11 @@ export declare const listAllFacts: import("convex/server").RegisteredQuery<"publ
     createdBySessionKey?: string | undefined;
     createdByAccountId?: string | undefined;
     createdAt: number;
-    memoryId: string;
     content: ArrayBuffer;
+    memoryId: string;
     segment: "project" | "context" | "identity" | "preference" | "correction" | "relationship" | "knowledge";
-    tier: "short" | "long" | "permanent";
     importance: number;
+    tier: "short" | "long" | "permanent";
     decayRate: number;
     accessCount: number;
     lastAccessedAt: number;
@@ -163,7 +163,7 @@ export declare const listAllFacts: import("convex/server").RegisteredQuery<"publ
 export declare const upsertFactRecord: import("convex/server").RegisteredMutation<"public", {
     metadata?: any;
     status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
-    sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
+    sourceType?: "dream" | "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
@@ -186,11 +186,11 @@ export declare const upsertFactRecord: import("convex/server").RegisteredMutatio
     createdBySessionKey?: string | undefined;
     createdByAccountId?: string | undefined;
     createdAt: number;
-    memoryId: string;
     content: ArrayBuffer;
+    memoryId: string;
     segment: "project" | "context" | "identity" | "preference" | "correction" | "relationship" | "knowledge";
-    tier: "short" | "long" | "permanent";
     importance: number;
+    tier: "short" | "long" | "permanent";
     decayRate: number;
     accessCount: number;
     lastAccessedAt: number;
@@ -273,7 +273,7 @@ export declare const searchContent: import("convex/server").RegisteredQuery<"pub
     _creationTime: number;
     metadata?: any;
     status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
-    sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
+    sourceType?: "dream" | "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
@@ -296,11 +296,11 @@ export declare const searchContent: import("convex/server").RegisteredQuery<"pub
     createdBySessionKey?: string | undefined;
     createdByAccountId?: string | undefined;
     createdAt: number;
-    memoryId: string;
     content: ArrayBuffer;
+    memoryId: string;
     segment: "project" | "context" | "identity" | "preference" | "correction" | "relationship" | "knowledge";
-    tier: "short" | "long" | "permanent";
     importance: number;
+    tier: "short" | "long" | "permanent";
     decayRate: number;
     accessCount: number;
     lastAccessedAt: number;
@@ -317,7 +317,7 @@ export declare const findSimilar: import("convex/server").RegisteredQuery<"publi
     _creationTime: number;
     metadata?: any;
     status?: "asserted" | "provisional" | "confirmed" | "disputed" | "retracted" | undefined;
-    sourceType?: "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | "dream" | undefined;
+    sourceType?: "dream" | "user_instruction" | "owner_message" | "channel_message" | "tool_output" | "retrieved_document" | "compaction" | "extraction" | undefined;
     sourceTurn?: string | undefined;
     supersedes?: string[] | undefined;
     links?: {
@@ -340,11 +340,11 @@ export declare const findSimilar: import("convex/server").RegisteredQuery<"publi
     createdBySessionKey?: string | undefined;
     createdByAccountId?: string | undefined;
     createdAt: number;
-    memoryId: string;
     content: ArrayBuffer;
+    memoryId: string;
     segment: "project" | "context" | "identity" | "preference" | "correction" | "relationship" | "knowledge";
-    tier: "short" | "long" | "permanent";
     importance: number;
+    tier: "short" | "long" | "permanent";
     decayRate: number;
     accessCount: number;
     lastAccessedAt: number;

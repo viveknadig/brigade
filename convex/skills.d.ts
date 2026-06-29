@@ -10,10 +10,10 @@ export declare const list: import("convex/server").RegisteredQuery<"public", {
     source: "bundled" | "config" | "managed" | "personal" | "project" | "workspace";
     description: string;
     createdAt: number;
+    body: string;
     ownerId: string;
     updatedAt: number;
     frontmatter: string;
-    body: string;
     eligibility: {
         os: string[];
         requiresBins: string[];
@@ -34,10 +34,10 @@ export declare const get: import("convex/server").RegisteredQuery<"public", {
     source: "bundled" | "config" | "managed" | "personal" | "project" | "workspace";
     description: string;
     createdAt: number;
+    body: string;
     ownerId: string;
     updatedAt: number;
     frontmatter: string;
-    body: string;
     eligibility: {
         os: string[];
         requiresBins: string[];
@@ -52,9 +52,9 @@ export declare const upsert: import("convex/server").RegisteredMutation<"public"
     name: string;
     source: "bundled" | "config" | "managed" | "personal" | "project" | "workspace";
     description: string;
+    body: string;
     ownerId: string;
     frontmatter: string;
-    body: string;
     eligibility: {
         os: string[];
         requiresBins: string[];
