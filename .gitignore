@@ -57,6 +57,10 @@ skills-lock.json
 docs/web-client-plan.md
 docs/aionui-feature-harvest.md
 
+# apps/ (mobile, web, …) — kept OUT of the public repo until the project gains
+# traction (target: 5k GitHub stars). Then un-ignore this + commit apps/.
+apps/
+
 # Misc
 test.txt
 
