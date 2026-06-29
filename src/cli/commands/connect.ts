@@ -1826,7 +1826,13 @@ export async function wireConnectUi(
 					: boundAgentId !== undefined
 						? { agentId: boundAgentId }
 						: {};
-				sessions = await client.request("sessions.list", params);
+				// The sessions.list RPC returns `{ sessions, count }` — extract the
+				// array (a stale type map said it was a bare array, which crashed
+				// `.map`). Defensive: accept either shape.
+				const res: unknown = await client.request("sessions.list", params);
+				sessions = Array.isArray(res)
+					? (res as SessionSummary[])
+					: ((res as { sessions?: SessionSummary[] }).sessions ?? []);
 			} catch (err) {
 				insertBeforeEditor(
 					new Text(
