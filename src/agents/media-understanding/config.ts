@@ -35,6 +35,7 @@ import type {
 const PROVIDER_ENV: Record<string, string[]> = {
 	google: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
 	anthropic: ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"],
+	sarvam: ["SARVAM_API_KEY"],
 };
 
 /**

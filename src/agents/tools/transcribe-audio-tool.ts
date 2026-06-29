@@ -59,7 +59,7 @@ const FETCH_TIMEOUT_MS = 45_000;
 /** Hard cap on audio bytes read for ANY source — providers reject huge uploads. */
 const MAX_AUDIO_BYTES = 48 * 1024 * 1024; // 48 MiB
 
-type TranscribeProviderId = "groq" | "openai" | "deepgram" | "elevenlabs" | "mistral" | "xai" | "google" | "command";
+type TranscribeProviderId = "groq" | "openai" | "deepgram" | "elevenlabs" | "mistral" | "xai" | "google" | "sarvam" | "command";
 
 /** Preference order when no provider is pinned: first keyed one wins. */
 const PROVIDER_PREFERENCE: TranscribeProviderId[] = [
@@ -70,6 +70,7 @@ const PROVIDER_PREFERENCE: TranscribeProviderId[] = [
 	"mistral",
 	"xai",
 	"google",
+	"sarvam",
 	"command",
 ];
 
@@ -82,6 +83,7 @@ const DEFAULT_MODEL: Record<TranscribeProviderId, string> = {
 	mistral: "voxtral-mini-latest",
 	xai: "",
 	google: "gemini-2.5-flash",
+	sarvam: "saaras:v3",
 	command: "",
 };
 
@@ -108,6 +110,7 @@ const TranscribeAudioParams = Type.Object({
 				Type.Literal("mistral"),
 				Type.Literal("xai"),
 				Type.Literal("google"),
+				Type.Literal("sarvam"),
 				Type.Literal("command"),
 			],
 			{
@@ -349,7 +352,39 @@ async function transcribe(params: {
 			return transcribeDeepgram(params);
 		case "google":
 			return transcribeGoogle(params);
+		case "sarvam":
+			return transcribeSarvam(params);
 	}
+}
+
+/**
+ * Sarvam `/speech-to-text` (saaras) — multipart `{ file, model, mode, language_code? }`,
+ * `api-subscription-key` header; response `{transcript}`. REST caps at ~30s of audio.
+ * Language is auto-detected unless pinned (param OR SARVAM_STT_LANGUAGE, e.g. hi-IN).
+ */
+async function transcribeSarvam(p: {
+	fetchFn: typeof fetch;
+	apiKey: string;
+	model: string;
+	audio: TranscribeSource;
+	language?: string;
+	signal?: AbortSignal;
+}): Promise<string> {
+	const fd = new FormData();
+	fd.append("file", new Blob([p.audio.bytes], { type: p.audio.mime }), `audio.${p.audio.extension}`);
+	fd.append("model", p.model);
+	fd.append("mode", "transcribe");
+	const lang = (p.language ?? process.env.SARVAM_STT_LANGUAGE ?? "").trim();
+	if (lang) fd.append("language_code", lang);
+	const res = await p.fetchFn("https://api.sarvam.ai/speech-to-text", {
+		method: "POST",
+		headers: { "api-subscription-key": p.apiKey },
+		body: fd,
+		signal: withTimeout(p.signal, REQUEST_TIMEOUT_MS),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status} ${(await safeText(res)).slice(0, 200)}`);
+	const body = (await res.json()) as { transcript?: string };
+	return body.transcript ?? "";
 }
 
 /**

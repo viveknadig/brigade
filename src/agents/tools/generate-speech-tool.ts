@@ -43,18 +43,19 @@ const REQUEST_TIMEOUT_MS = 120_000;
 /** Hard cap on input length — providers reject very long text; fail clearly. */
 const MAX_INPUT_CHARS = 8_000;
 
-type SpeechProviderId = "openai" | "elevenlabs" | "google" | "minimax" | "xai" | "command" | "edge";
+type SpeechProviderId = "openai" | "elevenlabs" | "google" | "sarvam" | "minimax" | "xai" | "command" | "edge";
 
 /** Preference order when no provider is pinned: first AVAILABLE one wins. Keyed
  *  cloud providers come first; a configured local `command` (offline piper /
  *  kitten-tts) is next; the free `edge` (Microsoft "Read Aloud" WS, no key) is the
  *  always-available last fallback. */
-const PROVIDER_PREFERENCE: SpeechProviderId[] = ["openai", "elevenlabs", "google", "minimax", "xai", "command", "edge"];
+const PROVIDER_PREFERENCE: SpeechProviderId[] = ["openai", "elevenlabs", "google", "sarvam", "minimax", "xai", "command", "edge"];
 
 const DEFAULTS: Record<SpeechProviderId, { model: string; voice: string }> = {
 	openai: { model: "gpt-4o-mini-tts", voice: "alloy" },
 	elevenlabs: { model: "eleven_multilingual_v2", voice: "21m00Tcm4TlvDq8ikWAM" },
 	google: { model: "gemini-2.5-flash-preview-tts", voice: "Kore" },
+	sarvam: { model: "bulbul:v3", voice: "shubh" },
 	minimax: { model: "speech-2.8-hd", voice: "English_expressive_narrator" },
 	xai: { model: "", voice: "eve" },
 	command: { model: "", voice: "" },
@@ -70,8 +71,8 @@ const GenerateSpeechParams = Type.Object({
 	text: Type.Optional(Type.String({ description: "The text to speak aloud." })),
 	provider: Type.Optional(
 		Type.Union(
-			[Type.Literal("openai"), Type.Literal("elevenlabs"), Type.Literal("google"), Type.Literal("minimax"), Type.Literal("xai"), Type.Literal("command"), Type.Literal("edge")],
-			{ description: "Optional TTS provider override. `edge` is FREE (no key). Default: first available (cloud preferred, edge fallback)." },
+			[Type.Literal("openai"), Type.Literal("elevenlabs"), Type.Literal("google"), Type.Literal("sarvam"), Type.Literal("minimax"), Type.Literal("xai"), Type.Literal("command"), Type.Literal("edge")],
+			{ description: "Optional TTS provider override. `sarvam` = Indian-language TTS (bulbul). `edge` is FREE (no key). Default: first available (cloud preferred, edge fallback)." },
 		),
 	),
 	voice: Type.Optional(
@@ -243,6 +244,8 @@ async function synthesize(params: {
 			return synthesizeElevenLabs(params);
 		case "google":
 			return synthesizeGoogle(params);
+		case "sarvam":
+			return synthesizeSarvam(params);
 		case "minimax":
 			return synthesizeMiniMax(params);
 		case "xai":
@@ -318,6 +321,38 @@ async function synthesizeGoogle(p: {
 	// Gemini TTS returns raw 16-bit PCM (mimeType like "audio/L16;codec=pcm;rate=24000").
 	const rate = parseInt(/rate=(\d+)/.exec(part?.inlineData?.mimeType ?? "")?.[1] ?? "24000", 10) || 24000;
 	return { bytes: wrapPcmAsWav(pcm, rate), extension: "wav" };
+}
+
+async function synthesizeSarvam(p: {
+	fetchFn: typeof fetch;
+	apiKey: string;
+	model: string;
+	voice: string;
+	text: string;
+	signal?: AbortSignal;
+}): Promise<{ bytes: Buffer; extension: string }> {
+	// Sarvam (bulbul) — Indian-language TTS. Auth is the `api-subscription-key`
+	// header (NOT Bearer). `target_language_code` is REQUIRED; default to English
+	// (India), overridable via SARVAM_TTS_LANGUAGE (e.g. hi-IN, ta-IN). The chosen
+	// `voice` is Sarvam's `speaker` (must belong to the model — bulbul:v3 default
+	// "shubh"). Response is `{ audios: [<base64 wav>] }`.
+	const language = (process.env.SARVAM_TTS_LANGUAGE ?? "en-IN").trim() || "en-IN";
+	const res = await p.fetchFn("https://api.sarvam.ai/text-to-speech", {
+		method: "POST",
+		headers: { "api-subscription-key": p.apiKey, "Content-Type": "application/json" },
+		body: JSON.stringify({
+			text: p.text,
+			target_language_code: language,
+			model: p.model,
+			speaker: p.voice,
+		}),
+		signal: withTimeout(p.signal, REQUEST_TIMEOUT_MS),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status} ${(await safeText(res)).slice(0, 200)}`);
+	const body = (await res.json()) as { audios?: string[] };
+	const b64 = body.audios?.[0];
+	if (!b64) throw new Error("Sarvam returned no audio.");
+	return { bytes: Buffer.from(b64, "base64"), extension: "wav" };
 }
 
 async function synthesizeMiniMax(p: {
