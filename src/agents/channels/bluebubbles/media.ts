@@ -179,7 +179,11 @@ export async function downloadBlueBubblesAttachment(
 	}
 	const rawName = (att.transferName ?? "").trim() || `${guid}`;
 	const fileName = mapInboundExtension(rawName);
-	const dest = path.join(args.cacheDir, `${guid}-${fileName}`);
+	// `guid` and `fileName` are server-supplied — reduce the composed name to a
+	// safe single leaf (no separators / traversal) so the HTTP bytes can never be
+	// written outside `cacheDir`.
+	const leaf = `${guid}-${fileName}`.replace(/[\\/]+/g, "_").replace(/^\.+/, "_");
+	const dest = path.join(args.cacheDir, path.basename(leaf));
 	try {
 		await mkdir(args.cacheDir, { recursive: true });
 		await writeFile(dest, bytes);

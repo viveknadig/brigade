@@ -41,17 +41,26 @@ interface MwSearchResponse {
 	query?: { search?: MwSearchHit[] };
 }
 
+const MW_TAG_RE = /<[^>]*>/g;
+const MW_ENTITY_RE = /&(?:quot|amp|lt|gt|nbsp);/g;
+const MW_ENTITY_MAP: Record<string, string> = {
+	"&quot;": '"',
+	"&amp;": "&",
+	"&lt;": "<",
+	"&gt;": ">",
+	"&nbsp;": " ",
+};
+
 function stripMwMarkup(html: string): string {
 	// MediaWiki returns snippets with `<span class="searchmatch">…</span>`
-	// wrappers around hit terms. Drop the tags but keep the text. Then
-	// decode the few entities the API uses.
+	// wrappers around hit terms. Strip every `<…>` span first (one pass over
+	// a regex that can't leave a reconstructable tag behind), THEN decode the
+	// entities in a single map-driven pass. Doing the decode last — and as one
+	// pass rather than chained replaces — avoids double-unescaping (`&amp;lt;`
+	// must stay `&lt;`, not become `<`).
 	return html
-		.replace(/<\/?[a-z][^>]*>/gi, "")
-		.replace(/&quot;/g, '"')
-		.replace(/&amp;/g, "&")
-		.replace(/&lt;/g, "<")
-		.replace(/&gt;/g, ">")
-		.replace(/&nbsp;/g, " ")
+		.replace(MW_TAG_RE, "")
+		.replace(MW_ENTITY_RE, (m) => MW_ENTITY_MAP[m] ?? m)
 		.trim();
 }
 

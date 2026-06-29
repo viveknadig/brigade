@@ -81,8 +81,19 @@ export type ChatType = "direct" | "group" | "channel";
 // Pre-compiled regex (same as upstream — agent-id validation + sanitisation)
 const VALID_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 const INVALID_CHARS_RE = /[^a-z0-9_-]+/g;
-const LEADING_DASH_RE = /^-+/;
-const TRAILING_DASH_RE = /-+$/;
+
+/**
+ * Strip leading + trailing "-" runs without a `$`-anchored greedy quantifier
+ * (a `/-+$/` trim is quadratic on dash-heavy input — polynomial ReDoS). A
+ * two-pointer scan is linear and behaviour-identical.
+ */
+function trimDashes(value: string): string {
+	let start = 0;
+	let end = value.length;
+	while (start < end && value.charCodeAt(start) === 45 /* "-" */) start++;
+	while (end > start && value.charCodeAt(end - 1) === 45 /* "-" */) end--;
+	return start === 0 && end === value.length ? value : value.slice(start, end);
+}
 
 function normalizeToken(value: string | undefined | null): string {
 	return normalizeLowercaseStringOrEmpty(value);
@@ -183,13 +194,7 @@ export function normalizeAgentId(value: string | undefined | null): string {
 		return normalized;
 	}
 	// Best-effort fallback: collapse invalid characters to "-"
-	return (
-		normalized
-			.replace(INVALID_CHARS_RE, "-")
-			.replace(LEADING_DASH_RE, "")
-			.replace(TRAILING_DASH_RE, "")
-			.slice(0, 64) || DEFAULT_AGENT_ID
-	);
+	return trimDashes(normalized.replace(INVALID_CHARS_RE, "-")).slice(0, 64) || DEFAULT_AGENT_ID;
 }
 
 export function isValidAgentId(value: string | undefined | null): boolean {

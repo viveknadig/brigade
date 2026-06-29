@@ -136,7 +136,7 @@ describe("web_search — error-time fallback chain", () => {
 		assert.match(out.message ?? "", /dead-4b: network down/);
 		assert.match(out.message ?? "", /all search providers failed/);
 		assert.match(out.message ?? "", /browser tool/);
-		assert.match(out.message ?? "", /bing\.com\/search/);
+		assert.match(out.message ?? "", /https:\/\/www\.bing\.com\/search/);
 	});
 
 	it("an explicit per-call override never falls back to other providers", async () => {

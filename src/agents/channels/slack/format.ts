@@ -263,10 +263,12 @@ export function markdownToSlackMrkdwn(markdown: string): string {
  */
 export function slackMrkdwnIsEmpty(mrkdwn: string): boolean {
 	if (!mrkdwn) return true;
+	// Decode `&amp;` LAST so an already-decoded entity sequence is never
+	// re-expanded into a second decode pass (e.g. `&amp;lt;` → `&lt;`, not `<`).
 	const decoded = mrkdwn
-		.replace(/&amp;/g, "&")
 		.replace(/&lt;/g, "<")
-		.replace(/&gt;/g, ">");
+		.replace(/&gt;/g, ">")
+		.replace(/&amp;/g, "&");
 	const stripped = decoded
 		.replace(/<[@#!][^>]+>/g, "x") // user/channel/special mentions ARE content
 		.replace(/<[^>|]+\|([^>]*)>/g, "$1") // <url|label> → label (content)

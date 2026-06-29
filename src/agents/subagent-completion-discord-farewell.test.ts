@@ -218,7 +218,7 @@ test("completion bridge makes no Discord REST call for an unbound child", async 
 		});
 		await new Promise((r) => setTimeout(r, 50));
 		assert.equal(
-			fetchUrls.some((u) => /discord\.com/.test(u)),
+			fetchUrls.some((u) => /^https:\/\/discord\.com\//.test(u)),
 			false,
 			"no Discord REST traffic for an unbound child",
 		);

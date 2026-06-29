@@ -64,7 +64,7 @@ describe("anthropic-adapter — native / scanned PDF", () => {
 		assert.equal(res.model, "claude-sonnet-4-5"); // default
 		assert.equal(calls.length, 1);
 		const call = calls[0]!;
-		assert.match(call.url, /api\.anthropic\.com\/v1\/messages/);
+		assert.match(call.url, /^https:\/\/api\.anthropic\.com\/v1\/messages(?:[?#]|$)/);
 		assert.equal(call.method, "POST");
 		// auth header: console key → x-api-key, with version header.
 		assert.equal(call.headers["x-api-key"], "sk-ant-api-xyz");

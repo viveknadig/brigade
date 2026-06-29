@@ -19,7 +19,7 @@ import { mkdirSync, existsSync, writeFileSync, readFileSync, unlinkSync } from "
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
-import { extname, join, dirname, resolve } from "node:path";
+import { extname, join, dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -235,12 +235,26 @@ const MIME = {
   ".woff2": "font/woff2",
 };
 
+// Confine a request-derived file path under DASHBOARD_DIR. `req.url` is
+// attacker-controllable (any local process can hit 127.0.0.1:6791), so a
+// decoded `..` segment must never let `join` escape the served root. Resolve
+// to an absolute path and reject anything outside DASHBOARD_DIR.
+const DASHBOARD_ROOT = resolve(DASHBOARD_DIR);
+function confineToDashboard(candidate) {
+  const resolved = resolve(candidate);
+  if (resolved === DASHBOARD_ROOT || resolved.startsWith(DASHBOARD_ROOT + sep)) {
+    return resolved;
+  }
+  return null;
+}
+
 const dashboardServer = createServer(async (req, res) => {
   try {
     let urlPath = decodeURIComponent((req.url ?? "/").split("?")[0]);
     if (urlPath === "/") urlPath = "/index.html";
 
-    let filePath = join(DASHBOARD_DIR, urlPath);
+    let filePath = confineToDashboard(join(DASHBOARD_DIR, urlPath));
+    if (!filePath) { res.writeHead(404); res.end("Not Found"); return; }
 
     // SPA fallback — if the requested path has no extension and doesn't exist,
     // try $path.html, then fall back to index.html.
@@ -248,11 +262,12 @@ const dashboardServer = createServer(async (req, res) => {
     try { st = await stat(filePath); } catch {}
     if (!st || st.isDirectory()) {
       const candidates = [
-        filePath + ".html",
-        join(filePath, "index.html"),
-        join(DASHBOARD_DIR, "index.html"),
+        confineToDashboard(filePath + ".html"),
+        confineToDashboard(join(filePath, "index.html")),
+        join(DASHBOARD_ROOT, "index.html"),
       ];
       for (const c of candidates) {
+        if (!c) continue;
         try {
           const s = await stat(c);
           if (s.isFile()) { filePath = c; st = s; break; }
@@ -294,8 +309,11 @@ const dashboardServer = createServer(async (req, res) => {
     }
     res.end(await readFile(filePath));
   } catch (err) {
+    // Log the detail locally; never echo the raw error (path/stack) to the
+    // HTTP response.
+    console.error(`\x1b[31m▌ dashboard request failed: ${String(err)}\x1b[0m`);
     res.writeHead(500);
-    res.end(String(err));
+    res.end("Internal Server Error");
   }
 });
 

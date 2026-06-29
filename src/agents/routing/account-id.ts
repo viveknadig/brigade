@@ -35,9 +35,22 @@ export const DEFAULT_ACCOUNT_ID = "default";
 
 const VALID_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 const INVALID_CHARS_RE = /[^a-z0-9_-]+/g;
-const LEADING_DASH_RE = /^-+/;
-const TRAILING_DASH_RE = /-+$/;
 const ACCOUNT_ID_CACHE_MAX = 512;
+
+/**
+ * Strip leading/trailing `-` with linear character scans rather than the
+ * anchored `^-+` / `-+$` regexes. The trailing-anchored form is a textbook
+ * polynomial-ReDoS shape (each starting position retries the `-+` run before
+ * failing `$`), so on a long all-dash input it goes quadratic. Plain index
+ * walks are O(n) and produce the identical trimmed string.
+ */
+function trimDashes(value: string): string {
+	let start = 0;
+	let end = value.length;
+	while (start < end && value.charCodeAt(start) === 0x2d /* '-' */) start++;
+	while (end > start && value.charCodeAt(end - 1) === 0x2d /* '-' */) end--;
+	return start === 0 && end === value.length ? value : value.slice(start, end);
+}
 
 const normalizeAccountIdCache = new Map<string, string>();
 const normalizeOptionalAccountIdCache = new Map<string, string | undefined>();
@@ -47,11 +60,7 @@ function canonicalizeAccountId(value: string): string {
 	if (VALID_ID_RE.test(value)) {
 		return normalized;
 	}
-	return normalized
-		.replace(INVALID_CHARS_RE, "-")
-		.replace(LEADING_DASH_RE, "")
-		.replace(TRAILING_DASH_RE, "")
-		.slice(0, 64);
+	return trimDashes(normalized.replace(INVALID_CHARS_RE, "-")).slice(0, 64);
 }
 
 function normalizeCanonicalAccountId(value: string): string | undefined {

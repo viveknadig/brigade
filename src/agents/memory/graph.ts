@@ -149,7 +149,7 @@ function extractSpans(content: string): string[] {
 	let run: string[] = [];
 	const flush = (): void => {
 		if (run.length > 0) {
-			const span = run.join(" ").replace(/[.,;:!?'")\]]+$/, "").replace(/^[("[]+/, "");
+			const span = run.join(" ").replace(/(?<![.,;:!?'")\]])[.,;:!?'")\]]+$/, "").replace(/^[("[]+/, "");
 			if (span.length > 1) spans.push(span);
 			run = [];
 		}
@@ -159,7 +159,7 @@ function extractSpans(content: string): string[] {
 		// "Sarah's" clusters with "Sarah" instead of forming a second entity.
 		const t = raw
 			.replace(/^[("[]+/, "")
-			.replace(/[.,;:!?'")\]]+$/, "")
+			.replace(/(?<![.,;:!?'")\]])[.,;:!?'")\]]+$/, "")
 			.replace(/['’]s$/i, "")
 			.replace(/['’]$/, "");
 		const isCapitalised = /^[A-Z][A-Za-z0-9'-]*$/.test(t);

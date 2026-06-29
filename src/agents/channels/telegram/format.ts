@@ -270,13 +270,16 @@ export function markdownToTelegramHtml(markdown: string): string {
  */
 export function telegramHtmlIsEmpty(html: string): boolean {
 	if (!html) return true;
-	// Drop tags, then decode the handful of entities we emit, then trim.
-	const withoutTags = html.replace(/<[^>]*>/g, "");
+	// Drop tags (allowing quoted attribute values that themselves contain `>`),
+	// then decode the handful of entities we emit, then trim.
+	const withoutTags = html.replace(/<(?:"[^"]*"|'[^']*'|[^'">])*>/g, "");
+	// Decode `&amp;` LAST so an already-decoded entity sequence is never
+	// re-expanded into a second decode pass (e.g. `&amp;lt;` → `&lt;`, not `<`).
 	const decoded = withoutTags
-		.replace(/&amp;/g, "&")
 		.replace(/&lt;/g, "<")
 		.replace(/&gt;/g, ">")
-		.replace(/&quot;/g, '"');
+		.replace(/&quot;/g, '"')
+		.replace(/&amp;/g, "&");
 	return decoded.trim().length === 0;
 }
 

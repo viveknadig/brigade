@@ -109,12 +109,15 @@ function mediaPrefix(kind: "pptx" | "docx" | "xlsx"): string {
  * (targets rarely contain entities, but `&amp;` in a path would otherwise miss).
  */
 function decodeRelTarget(s: string): string {
+	// Decode the named entities first and `&amp;` LAST: decoding `&amp;` first would
+	// turn `&amp;lt;` into `&lt;` and then into `<` (double-unescaping). Doing it last
+	// keeps each entity a single decode step.
 	return s
-		.replace(/&amp;/g, "&")
 		.replace(/&lt;/g, "<")
 		.replace(/&gt;/g, ">")
 		.replace(/&quot;/g, '"')
-		.replace(/&apos;/g, "'");
+		.replace(/&apos;/g, "'")
+		.replace(/&amp;/g, "&");
 }
 
 /**

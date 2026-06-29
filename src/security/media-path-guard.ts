@@ -96,8 +96,14 @@ export function validateOutboundMediaPath(rawPath: string): MediaPathVerdict {
 		}
 	}
 	// Brigade's sealed per-agent auth subtree (…/agents/<id>/agent/…) and any
-	// auth* file under a .brigade dir — denied regardless of basename.
-	if (/[\\/]agents[\\/][^\\/]+[\\/]agent[\\/]/.test(resolved) || /[\\/]\.brigade[\\/].*auth/i.test(resolved)) {
+	// `auth` path component under a .brigade dir — denied regardless of basename.
+	// Walk the already-split segments (linear, no regex backtracking).
+	const sealedPerAgent = segments.some(
+		(seg, i) => seg === "agents" && i + 2 < segments.length && segments[i + 2] === "agent" && Boolean(segments[i + 1]),
+	);
+	const brigadeIdx = segments.indexOf(".brigade");
+	const authUnderBrigade = brigadeIdx >= 0 && segments.slice(brigadeIdx + 1).some((seg) => seg.includes("auth"));
+	if (sealedPerAgent || authUnderBrigade) {
 		return { ok: false, reason: "refusing to attach from the credential store" };
 	}
 	return { ok: true };

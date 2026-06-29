@@ -241,8 +241,17 @@ export async function installSkill(
 					};
 				}
 				const buffer = Buffer.from(await response.arrayBuffer());
-				const basename = path.basename(new URL(url).pathname) || "downloaded";
-				const dest = path.join(targetDir, basename);
+				// Derive the filename from the URL but confine the write under
+				// `targetDir`. `path.basename` strips slashes, yet a pathname
+				// ending in `..` (or an empty basename) could still resolve
+				// outside the target; reject anything that escapes and fall back
+				// to a fixed name so a download can never write up the tree.
+				const rawName = path.basename(new URL(url).pathname);
+				const baseRoot = path.resolve(targetDir);
+				let dest = path.resolve(baseRoot, rawName || "downloaded");
+				if (dest !== baseRoot && !dest.startsWith(baseRoot + path.sep)) {
+					dest = path.join(baseRoot, "downloaded");
+				}
 				fs.writeFileSync(dest, buffer);
 				return { ok: true, kind: spec.kind, downloadedTo: dest };
 			} catch (err) {

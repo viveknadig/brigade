@@ -68,7 +68,7 @@ test("spawn lifecycle: parent next turn sees child completion announce", async (
 	assert.equal(events.length, 1, `expected 1 announce event, got ${events.length}`);
 	const text = events[0]!;
 	assert.match(text, /Sub-agent "e2e" completed/);
-	assert.match(text, new RegExp(`childSessionKey=${childSessionKey.replace(/:/g, "\\:")}`));
+	assert.ok(text.includes(`childSessionKey=${childSessionKey}`), `expected childSessionKey=${childSessionKey} in: ${text}`);
 	assert.match(text, /status=completed/);
 	assert.match(text, /Final answer from child: 42/);
 

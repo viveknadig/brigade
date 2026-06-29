@@ -43,6 +43,27 @@ const MAX_BYTES = 20 * 1024 * 1024;
 /** Public Telegram Bot API base (file downloads hang off `/file/bot<token>/…`). */
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 
+/**
+ * The only host an inbound file download may ever hit. `file_path` ultimately
+ * derives from an untrusted inbound message, so before fetching we REQUIRE the
+ * built URL to resolve to https on the Telegram Bot API host — a spoofed
+ * `file_path` (e.g. `..` traversal, an `http://169.254.169.254/…` style value,
+ * or a scheme-bearing string) can't make Brigade fetch an arbitrary URL (SSRF).
+ * Mirrors the Discord/Slack inbound-media host guards.
+ */
+const TELEGRAM_FILE_HOST = "api.telegram.org";
+
+/** True only when `rawUrl` is https on the Telegram Bot API host. */
+function isAllowedTelegramFileUrl(rawUrl: string): boolean {
+	let parsed: URL;
+	try {
+		parsed = new URL(rawUrl);
+	} catch {
+		return false;
+	}
+	return parsed.protocol === "https:" && parsed.hostname.toLowerCase() === TELEGRAM_FILE_HOST;
+}
+
 /** The grammY surface the downloader needs — kept minimal + injectable for tests. */
 export interface TelegramBotFileApi {
 	/** Resolve a file_id to a downloadable `file_path` (grammY `bot.api.getFile`). */
@@ -160,8 +181,18 @@ export async function downloadTelegramMedia(args: DownloadTelegramMediaArgs): Pr
 			return null;
 		}
 		const url = `${TELEGRAM_API_BASE}/file/bot${token}/${filePath}`;
+		// SSRF guard: `file_path` derives from an untrusted inbound message, so
+		// REFUSE any built URL that isn't https on the Telegram Bot API host before
+		// fetching. Checked BEFORE the fetch.
+		if (!isAllowedTelegramFileUrl(url)) {
+			log?.("telegram media skipped — file URL is not an allowed Telegram host (SSRF guard)", { kind });
+			return null;
+		}
 		const res = await withMediaRetry(async () => {
-			const r = await doFetch(url);
+			// `redirect: "manual"` so a cross-origin 30x can't carry the request off
+			// to a non-Telegram host. A redirect surfaces as a non-ok response and
+			// falls through to the `!res.ok` handler below.
+			const r = await doFetch(url, { redirect: "manual" });
 			// Retry 5xx (transient server/CDN blip); a 4xx falls through to the
 			// !ok handler below (no point retrying a permanent client error).
 			if (!r.ok && r.status >= 500) throw new Error(`telegram media fetch failed (${r.status})`);

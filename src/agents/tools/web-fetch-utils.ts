@@ -135,8 +135,11 @@ export function sanitizeHtml(html: string): string {
 		const selfRe = new RegExp(`<${tag}\\b[^>]*\\/?>`, "gi");
 		out = out.replace(selfRe, "");
 	}
-	// Strip HTML comments — including ones spanning multiple lines.
-	out = out.replace(/<!--[\s\S]*?-->/g, "");
+	// Strip HTML comments — including ones spanning multiple lines. Accept both
+	// the standard `-->` and the spec's legacy `--!>` terminator, and drop an
+	// unterminated trailing `<!--` so a crafted page can't smuggle markup past a
+	// comment that never closes.
+	out = out.replace(/<!--[\s\S]*?(?:--!?>|$)/g, "");
 	// Strip <input type="hidden" …>.
 	out = out.replace(/<input\b[^>]*type=["']hidden["'][^>]*>/gi, "");
 	// Strip elements with hidden / aria-hidden / hidden-class / hidden-style.
@@ -365,7 +368,7 @@ export function htmlToMarkdown(html: string): string {
 		(_m, href: string, body: string) => {
 			const label = stripTags(body).trim();
 			if (!label) return "";
-			if (!href || href.startsWith("#") || href.toLowerCase().startsWith("javascript:")) return label;
+			if (!href || href.startsWith("#") || hasDangerousScheme(href)) return label;
 			return `[${label}](${href})`;
 		},
 	);
@@ -401,9 +404,25 @@ export function htmlToMarkdown(html: string): string {
 	return out.trim();
 }
 
+/**
+ * True when an `href` resolves to a script-bearing scheme. Mirrors how an HTML
+ * parser reads a URL: leading ASCII whitespace and any embedded tab/newline are
+ * ignored before the scheme is matched, so `\tjava\nscript:` is treated as
+ * `javascript:`. Covers the schemes that can execute or smuggle markup.
+ */
+function hasDangerousScheme(href: string): boolean {
+	// Drop the ASCII control + space characters (0x00-0x20) an HTML URL parser
+	// strips/ignores before scheme detection, then match the scheme exactly.
+	const normalized = href.replace(/[\x00-\x20]/g, "").toLowerCase();
+	return /^(?:javascript|data|vbscript):/.test(normalized);
+}
+
 /** Strip ALL remaining HTML tags from a string. */
 function stripTags(input: string): string {
-	return input.replace(/<\/?[a-z][a-z0-9-]*\b[^>]*>/gi, "");
+	// `(?:"[^"]*"|'[^']*'|[^'">])*` lets quoted attribute values carry a literal
+	// `>` without prematurely ending the tag match (which would leave a dangling
+	// fragment behind).
+	return input.replace(/<\/?[a-z][a-z0-9-]*\b(?:"[^"]*"|'[^']*'|[^'">])*>/gi, "");
 }
 
 /** Collapse runs of whitespace; keep paragraph breaks (double newlines). */
@@ -447,8 +466,9 @@ function exceedsEstimatedNestingDepth(html: string, maxDepth: number): boolean {
  * actually appears in scraped pages 99% of the time.
  */
 export function decodeHtmlEntities(input: string): string {
+	// `&amp;` is decoded LAST so an already-decoded entity is never re-expanded
+	// into a second pass (e.g. `&amp;lt;` must yield `&lt;`, not `<`).
 	return input
-		.replace(/&amp;/g, "&")
 		.replace(/&lt;/g, "<")
 		.replace(/&gt;/g, ">")
 		.replace(/&quot;/g, '"')
@@ -456,7 +476,8 @@ export function decodeHtmlEntities(input: string): string {
 		.replace(/&apos;/g, "'")
 		.replace(/&nbsp;/g, " ")
 		.replace(/&#x([0-9a-f]+);/gi, (_m, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
-		.replace(/&#(\d+);/g, (_m, dec: string) => String.fromCodePoint(parseInt(dec, 10)));
+		.replace(/&#(\d+);/g, (_m, dec: string) => String.fromCodePoint(parseInt(dec, 10)))
+		.replace(/&amp;/g, "&");
 }
 
 /* ─────────────────────────── extractors ─────────────────────────── */

@@ -51,8 +51,8 @@ test("generate (google) → Lyria generateContent, base64 audio saved as mp3 + M
 
 	assert.equal(res.details.ok, true);
 	assert.equal(res.details.provider, "google");
-	assert.ok(calledUrl.includes("generativelanguage.googleapis.com"));
-	assert.ok(calledUrl.includes(":generateContent"));
+	assert.equal(new URL(calledUrl).hostname, "generativelanguage.googleapis.com");
+	assert.ok(new URL(calledUrl).pathname.endsWith(":generateContent"));
 	assert.deepEqual((body as { generationConfig?: { responseModalities?: string[] } }).generationConfig?.responseModalities, [
 		"AUDIO",
 		"TEXT",

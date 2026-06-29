@@ -140,8 +140,10 @@ export function looksLikeContactName(to: string): boolean {
 	if (t.length === 0) return false;
 	// `scheme:value` (telegram:123) — explicit id form, not a name.
 	if (/^[a-z][a-z0-9_-]*:/i.test(t)) return false;
-	// `user@domain` JID (14057144199@s.whatsapp.net) — an id, not a name.
-	if (/@[^@\s]+\.[^@\s]+$/.test(t)) return false;
+	// `user@domain` JID (14057144199@s.whatsapp.net) — an id, not a name. The
+	// final label forbids `.`/`@`/space so there's exactly one way to bind the
+	// last dot — linear matching, no polynomial backtracking.
+	if (/@[^@\s]+\.[^@\s.]+$/.test(t)) return false;
 	// Phone-ish (+15551234567 / 15551234567) — an id, not a name.
 	if (/^\+?\d[\d\s().-]{4,}$/.test(t)) return false;
 	// `@handle` OR a plain word/words → treat as a name worth resolving.

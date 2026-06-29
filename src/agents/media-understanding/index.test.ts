@@ -38,6 +38,21 @@ function jsonResponse(body: unknown, status = 200): Response {
 	});
 }
 
+/**
+ * Does this fetch input target exactly `host`? Parses the URL and compares the
+ * `hostname` (an exact match, not a substring) so a probe can't be fooled by a
+ * lookalike like `api.anthropic.com.evil.test`. Used as the test oracle for
+ * "which provider endpoint did the adapter call?".
+ */
+function fetchTargetsHost(input: string | URL | Request, host: string): boolean {
+	const raw = typeof input === "string" || input instanceof URL ? input : (input as Request).url;
+	try {
+		return new URL(raw).hostname === host;
+	} catch {
+		return false;
+	}
+}
+
 describe("resolveMediaUnderstandingProvider — selection", () => {
 	it("video → google when keyed; undefined when not", () => {
 		assert.equal(resolveMediaUnderstandingProvider("video", cfgWithKeys(["google"])), "google");
@@ -115,7 +130,7 @@ describe("runMediaUnderstanding — routing", () => {
 	it("routes pdf to the Anthropic adapter when anthropic is keyed", async () => {
 		let hitAnthropic = false;
 		const fetchImpl = (async (input: string | URL | Request) => {
-			if (String(input).includes("api.anthropic.com")) hitAnthropic = true;
+			if (fetchTargetsHost(input, "api.anthropic.com")) hitAnthropic = true;
 			return jsonResponse({ content: [{ type: "text", text: "pdf summary" }] });
 		}) as typeof fetch;
 
@@ -149,7 +164,7 @@ describe("runMediaUnderstanding — routing", () => {
 		// Force anthropic for an image even though google is also keyed.
 		let hitAnthropic = false;
 		const fetchImpl = (async (input: string | URL | Request) => {
-			if (String(input).includes("api.anthropic.com")) hitAnthropic = true;
+			if (fetchTargetsHost(input, "api.anthropic.com")) hitAnthropic = true;
 			return jsonResponse({ content: [{ type: "text", text: "img" }] });
 		}) as typeof fetch;
 		const res = await runMediaUnderstanding({
@@ -243,7 +258,7 @@ describe("runMediaUnderstanding — routing", () => {
 			},
 		};
 		const fetchImpl = (async (input: string | URL | Request) => {
-			if (String(input).includes("api.anthropic.com")) hitAnthropic = true;
+			if (fetchTargetsHost(input, "api.anthropic.com")) hitAnthropic = true;
 			return jsonResponse({ content: [{ type: "text", text: "anthropic image text" }] });
 		}) as typeof fetch;
 		assert.equal(resolveMediaUnderstandingProvider("image", cfg), "anthropic");
@@ -288,7 +303,7 @@ describe("runMediaUnderstanding — routing", () => {
 
 	it("routes AUDIO to Gemini when a Google key is configured", async () => {
 		const fetchImpl = (async (input: string | URL | Request) => {
-			assert.ok(String(input).includes("generativelanguage.googleapis.com"), "uses Gemini");
+			assert.ok(fetchTargetsHost(input, "generativelanguage.googleapis.com"), "uses Gemini");
 			return jsonResponse({ candidates: [{ content: { parts: [{ text: "Transcript: hello world." }] } }] });
 		}) as typeof fetch;
 		assert.equal(resolveMediaUnderstandingProvider("audio", cfgWithKeys(["google"])), "google");
@@ -341,8 +356,7 @@ describe("runMediaUnderstanding — routing", () => {
 	it("falls over to the NEXT provider when the first keeps failing (image: anthropic → google)", async () => {
 		const hosts: string[] = [];
 		const fetchImpl = (async (input: string | URL | Request) => {
-			const url = String(input);
-			if (url.includes("api.anthropic.com")) {
+			if (fetchTargetsHost(input, "api.anthropic.com")) {
 				hosts.push("anthropic");
 				return jsonResponse({ error: { message: "rate limited" } }, 429);
 			}
@@ -367,7 +381,7 @@ describe("runMediaUnderstanding — routing", () => {
 	it("does NOT fall over across providers for an explicit override (honours the pick)", async () => {
 		let anthropicCalls = 0;
 		const fetchImpl = (async (input: string | URL | Request) => {
-			if (String(input).includes("api.anthropic.com")) {
+			if (fetchTargetsHost(input, "api.anthropic.com")) {
 				anthropicCalls += 1;
 				return jsonResponse({ error: { message: "boom" } }, 500);
 			}

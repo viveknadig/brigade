@@ -270,8 +270,13 @@ function normalizeSubjectKey(raw: string): string {
 	// instead of collapsing to empty, so same-slot supersede works across scripts.
 	return raw
 		.toLowerCase()
+		// Collapse every non-alphanumeric run (underscores included) to a single
+		// "_", so at most ONE underscore can ever sit at each edge afterwards…
 		.replace(/[^\p{L}\p{N}]+/gu, "_")
-		.replace(/^_+|_+$/g, "");
+		// …which is why edge-trimming needs no `+` here: a single-char match is
+		// exact given the collapse above, and avoids the `_+$` quadratic-scan
+		// shape a quantified anchored run would introduce.
+		.replace(/^_|_$/g, "");
 }
 
 /** Jaccard similarity |A∩B| / |A∪B| of two token sets (0 when both empty). */

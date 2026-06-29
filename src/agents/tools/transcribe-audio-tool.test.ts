@@ -28,7 +28,7 @@ test("transcribe (google) → Gemini generateContent joins the transcript parts"
 	const tool = makeTranscribeAudioTool({ fetchFn, readSource, resolveKey: (p) => (p === "google" ? "gk" : "") });
 	const res = await tool.execute("c1", { source: "voice.mp3", provider: "google" }, undefined as never);
 	assert.equal(res.details.ok, true);
-	assert.ok(calledUrl.includes("generativelanguage.googleapis.com"));
+	assert.equal(new URL(calledUrl).hostname, "generativelanguage.googleapis.com");
 	assert.equal(res.details.transcript, "hello world");
 });
 

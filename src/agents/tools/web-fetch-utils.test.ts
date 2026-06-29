@@ -210,7 +210,7 @@ describe("markdownToText", () => {
 		assert.ok(!/[#*]/.test(t));
 		assert.ok(/Title/.test(t));
 		assert.ok(/link/.test(t));
-		assert.ok(!/https:\/\/example\.com/.test(t));
+		assert.ok(!t.includes("https://example.com"));
 		assert.ok(/bold/.test(t));
 		assert.ok(/item one/.test(t));
 	});

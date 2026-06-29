@@ -53,7 +53,19 @@ function unwrapDdgUrl(rawHref: string): string {
 
 /** Strip ALL HTML tags from a fragment + decode entities. */
 function stripHtmlToText(html: string): string {
-	return decodeHtmlEntities(html.replace(/<[^>]+>/g, "")).replace(/\s+/g, " ").trim();
+	// Strip tags repeatedly until the string stabilises. A single
+	// `<[^>]+>` pass is incomplete: overlapping/nested angle brackets
+	// (e.g. `<a<b>`) can leave a residual `<…>` that the one-shot replace
+	// never sees, which — after entity decoding — could smuggle markup
+	// back into the title/snippet text. Looping to a fixed point closes
+	// that gap and is a no-op for well-formed fragments.
+	let prev = html;
+	let stripped = html.replace(/<[^>]*>/g, "");
+	while (stripped !== prev) {
+		prev = stripped;
+		stripped = stripped.replace(/<[^>]*>/g, "");
+	}
+	return decodeHtmlEntities(stripped).replace(/\s+/g, " ").trim();
 }
 
 /** Parse the DDG HTML response into normalized hit objects. */

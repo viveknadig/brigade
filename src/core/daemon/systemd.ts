@@ -26,7 +26,7 @@ export function renderSystemdUnit(ctx: ServiceContext): string {
 		.map(([k, v]) => `Environment=${k}=${v}`)
 		.join("\n");
 	const execArgs = [ctx.nodePath, ctx.brigadeBin, "gateway", "run"]
-		.map((s) => (s.includes(" ") ? `"${s.replace(/"/g, '\\"')}"` : s))
+		.map((s) => (s.includes(" ") ? `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` : s))
 		.join(" ");
 	return [
 		"[Unit]",
