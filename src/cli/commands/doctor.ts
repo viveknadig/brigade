@@ -26,6 +26,7 @@ import {
 	resolveSessionsDir,
 } from "../../config/paths.js";
 import { readProfiles } from "../../auth/profiles.js";
+import { detectUnrefreshableSubscriptions } from "../../auth/auth-health.js";
 import { FileMemoryStore } from "../../agents/memory/storage.js";
 import { FactStore } from "../../agents/memory/records.js";
 import { discoverEligibleSkills } from "../../agents/skills/index.js";
@@ -71,6 +72,7 @@ export async function runDoctorCommand(opts: DoctorCommandOptions = {}): Promise
 	checks.push(await checkBrigadeConfig());
 	checks.push(checkAuthProfiles());
 	checks.push(checkConfiguredProvider(await safeLoadConfig()));
+	checks.push(checkSubscriptionRefresh());
 	checks.push(checkWorkspace());
 	checks.push(await checkMemory());
 	checks.push(checkSkills());
@@ -331,6 +333,33 @@ function checkConfiguredProvider(config: Awaited<ReturnType<typeof loadConfig>> 
 		status: "warn",
 		message: `${provider}/${modelId} but no API key found`,
 		hint: info.envVar ? "set a key in your environment, or run `brigade onboard`" : "run `brigade onboard`",
+	};
+}
+
+/**
+ * Subscription-login refresh health — flags a Claude/ChatGPT/Copilot login
+ * stored in a form that CAN'T auto-refresh (a bare token, or an `sk-ant-oat`
+ * subscription token pasted as a static key, or an OAuth profile with no
+ * refresh token). Those silently 401 a day or two after onboarding. The fix is
+ * `brigade login`. Mode-aware (reads via the same choke point as everything
+ * else), so it never false-warns on a healthy Convex deployment.
+ */
+function checkSubscriptionRefresh(): CheckResult {
+	let list: ReturnType<typeof detectUnrefreshableSubscriptions>;
+	try {
+		list = detectUnrefreshableSubscriptions(DEFAULT_AGENT_ID);
+	} catch (err) {
+		return { name: "subscription refresh", status: "ok", message: `could not check: ${(err as Error).message}` };
+	}
+	if (list.length === 0) {
+		return { name: "subscription refresh", status: "ok", message: "subscription logins are refreshable (or none configured)" };
+	}
+	const names = list.map((c) => c.label).join(", ");
+	return {
+		name: "subscription refresh",
+		status: "warn",
+		message: `${names} can't auto-refresh and will eventually 401`,
+		hint: "run `brigade login` to replace it with a refreshable credential",
 	};
 }
 

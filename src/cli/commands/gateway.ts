@@ -667,6 +667,22 @@ export async function runGatewayCommand(opts: GatewayCommandOptions = {}): Promi
 	// Banner already printed by startServer (verbose path uses consoleStream;
 	// quiet path writes the two plain lines). No additional banner needed here.
 
+	// Proactively warn when a subscription login can't auto-refresh — so the
+	// operator fixes it with `brigade login` up front instead of discovering it
+	// as a silent 401 mid-turn (the credential dies a day or two after onboarding
+	// if it was stored without a refresh token). Best-effort; never blocks boot.
+	try {
+		const { detectUnrefreshableSubscriptions, formatUnrefreshableWarning } = await import(
+			"../../auth/auth-health.js"
+		);
+		const stale = detectUnrefreshableSubscriptions();
+		if (stale.length > 0) {
+			process.stderr.write(`\nbrigade-gateway: ${formatUnrefreshableWarning(stale)}\n\n`);
+		}
+	} catch {
+		/* health check must never block gateway startup */
+	}
+
 	// Wire signal handlers so the listening socket gets released cleanly. The
 	// shared chat command's SIGINT handler is process-wide; we install our own
 	// here because the gateway runs without the TUI and never reaches that path.

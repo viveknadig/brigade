@@ -1181,12 +1181,30 @@ async function ensureCliLogin(
 			// profile (above) keeps the real value (possibly undefined).
 			expires: cred.expires ?? 0,
 		});
+	} else if (provider.subscription) {
+		// The reused CLI login has NO refresh token (Claude Code didn't store one).
+		// Persisting it would create a credential that expires in a day or two and
+		// CAN'T auto-refresh — the silent 401 the operator hit. Since this provider
+		// supports a browser OAuth login (which DOES return a refresh token), steer
+		// there instead of saving a dead-end token. The caller falls through to
+		// `ensureSubscriptionLogin` when we return "other".
+		tui.addChild(new Text("", 0, 0));
+		tui.addChild(
+			new Text(`  ${brand.dim("This machine's login has no refresh token, so it would expire and couldn't refresh.")}`, 0, 0),
+		);
+		tui.addChild(
+			new Text(`  ${brand.dim("Doing a quick browser sign-in instead so the crew stays connected.")}`, 0, 0),
+		);
+		tui.requestRender();
+		await delay(1200);
+		return "other";
 	} else {
+		// No OAuth fallback for this provider — keep the legacy token behaviour.
 		// Durable store keeps the type:"token" shape (upsertTokenProfile). Mirror
 		// it into Pi's in-memory store as type:"oauth" for shape-consistency with
-		// the refresh-capable path — a Claude credential with an access token but
-		// no refresh token. expires:0 makes Pi treat the access token as expired
-		// and refresh on first use when a refresh token later exists.
+		// the refresh-capable path — a credential with an access token but no
+		// refresh token. expires:0 makes Pi treat the access token as expired and
+		// refresh on first use when a refresh token later exists.
 		upsertTokenProfile(DEFAULT_AGENT_ID, { provider: cred.provider, token: cred.token });
 		// Pi's in-memory OAuthCredential requires a `refresh` string; this CLI
 		// credential carries no refresh token, so seed "".

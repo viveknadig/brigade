@@ -184,6 +184,47 @@ export function buildProgram(): Command {
       await exitAfterFlush(code);
     });
 
+  // `brigade auth` — unified login surface (status / login / fix / logout).
+  // `status` is the default subcommand so a bare `brigade auth` reports health.
+  const auth = program
+    .command("auth")
+    .description("Manage provider logins — status, sign in, fix expiring logins, sign out");
+  auth
+    .command("status", { isDefault: true })
+    .description("Show which logins are healthy vs will expire")
+    .action(async () => {
+      const { runAuthCommand } = await import("../commands/auth.js");
+      await exitAfterFlush(await runAuthCommand({ action: "status" }));
+    });
+  auth
+    .command("login [provider]")
+    .description("Sign in / re-auth a provider (browser OAuth for subscriptions, API key for others)")
+    .action(async (provider: string | undefined) => {
+      const { runAuthCommand } = await import("../commands/auth.js");
+      await exitAfterFlush(await runAuthCommand({ action: "login", ...(provider ? { provider } : {}) }));
+    });
+  auth
+    .command("fix")
+    .description("Re-login every provider whose credential can't auto-refresh")
+    .action(async () => {
+      const { runAuthCommand } = await import("../commands/auth.js");
+      await exitAfterFlush(await runAuthCommand({ action: "fix" }));
+    });
+  auth
+    .command("logout <provider>")
+    .description("Remove a provider's stored login")
+    .action(async (provider: string) => {
+      const { runAuthCommand } = await import("../commands/auth.js");
+      await exitAfterFlush(await runAuthCommand({ action: "logout", provider }));
+    });
+  auth
+    .command("use <provider> [model]")
+    .description("Set the default provider (+ model) the crew runs on")
+    .action(async (provider: string, model: string | undefined) => {
+      const { runAuthCommand } = await import("../commands/auth.js");
+      await exitAfterFlush(await runAuthCommand({ action: "use", provider, ...(model ? { model } : {}) }));
+    });
+
   program
     .command("agent")
     .description("Drive a single turn through the agent pipeline")
