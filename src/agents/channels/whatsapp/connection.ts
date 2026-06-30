@@ -682,6 +682,26 @@ async function restoreFsCredsFromBackupIfNeeded(
 	}
 }
 
+// Windows holds mandatory file locks: rename()/copyFile() over a file that an
+// antivirus, the search indexer, or another handle has briefly open fail with
+// EPERM/EBUSY/EACCES. Retry a few times with a short backoff before giving up;
+// on POSIX the op almost always succeeds on the first try (negligible overhead).
+async function withWindowsRetry<T>(op: () => Promise<T>): Promise<T> {
+	const TRANSIENT = new Set(["EPERM", "EBUSY", "EACCES"]);
+	let lastErr: unknown;
+	for (let attempt = 0; attempt < 5; attempt++) {
+		try {
+			return await op();
+		} catch (err) {
+			const code = (err as NodeJS.ErrnoException).code;
+			if (!code || !TRANSIENT.has(code)) throw err;
+			lastErr = err;
+			await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+		}
+	}
+	throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
 /**
  * Build a crash-safe replacement for Baileys' raw saveCreds (filesystem branch
  * only). Baileys' saveCreds writes only creds.json, so fully owning that one
@@ -701,12 +721,14 @@ function makeFsCrashSafeCredsSaver(
 ): () => Promise<void> {
 	const credsPath = joinPath(authDir, FS_CREDS_FILE_NAME);
 	const backupPath = joinPath(authDir, FS_CREDS_BACKUP_FILE_NAME);
-	return async () => {
+	let tmpCounter = 0;
+
+	const doWrite = async (): Promise<void> => {
 		// 1. Back up the live file only when it currently parses — never
 		//    overwrite a good backup with a truncated one.
 		try {
 			if (await fileParsesAsJson(credsPath)) {
-				await copyFile(credsPath, backupPath);
+				await withWindowsRetry(() => copyFile(credsPath, backupPath));
 				try {
 					await chmod(backupPath, 0o600);
 				} catch {
@@ -719,8 +741,10 @@ function makeFsCrashSafeCredsSaver(
 				error: err instanceof Error ? err.message : String(err),
 			});
 		}
-		// 2. Atomic write: temp file + rename.
-		const tmpPath = joinPath(authDir, `.creds.${process.pid}.${Date.now()}.tmp`);
+		// 2. Atomic write: a UNIQUE temp file (pid + time + counter — same-ms
+		//    saves must not collide) then rename, retried because Windows fails
+		//    the rename with EPERM/EBUSY when AV/indexer holds a transient handle.
+		const tmpPath = joinPath(authDir, `.creds.${process.pid}.${Date.now()}.${tmpCounter++}.tmp`);
 		try {
 			await writeFile(tmpPath, JSON.stringify(liveCreds, bufferJsonReplacer));
 			try {
@@ -728,7 +752,7 @@ function makeFsCrashSafeCredsSaver(
 			} catch {
 				// chmod unsupported here — ignore.
 			}
-			await rename(tmpPath, credsPath);
+			await withWindowsRetry(() => rename(tmpPath, credsPath));
 		} catch (err) {
 			// Best-effort temp cleanup so a failed write doesn't litter authDir.
 			try {
@@ -739,6 +763,36 @@ function makeFsCrashSafeCredsSaver(
 			}
 			throw err instanceof Error ? err : new Error(String(err));
 		}
+	};
+
+	// Baileys fires creds.update in rapid BURSTS (especially right after connect /
+	// offline-queue flush). Running those saves CONCURRENTLY makes the backup
+	// copyFile and the temp→creds rename race on the same files — on Windows that
+	// surfaces as EBUSY / EPERM / ENOENT (mandatory locks, rename-over-open-file
+	// fails, same-ms temp names collide). So SERIALIZE the writes and COALESCE a
+	// burst into a single trailing write that captures the latest liveCreds.
+	// `tail` is the in-flight write, so awaiters (incl. close()'s final flush)
+	// block until the newest creds are durably on disk.
+	let running = false;
+	let again = false;
+	let tail: Promise<void> = Promise.resolve();
+	return (): Promise<void> => {
+		if (running) {
+			again = true;
+			return tail;
+		}
+		running = true;
+		tail = (async () => {
+			try {
+				do {
+					again = false;
+					await doWrite();
+				} while (again);
+			} finally {
+				running = false;
+			}
+		})();
+		return tail;
 	};
 }
 
