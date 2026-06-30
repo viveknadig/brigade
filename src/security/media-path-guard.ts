@@ -40,10 +40,14 @@ const SENSITIVE_BASENAMES = new Set([
 	"auth-profiles.json",
 	"models.json",
 	"exec-approvals.json",
+	// Brigade encryption key (stored outside ~/.brigade by design)
+	"encryption.key",
+	// Convex local backend admin key
+	"admin-key.txt",
 ]);
 
 /** Path fragments that mark a credentials directory (platform-normalized separators). */
-const SENSITIVE_DIR_NAMES = [".ssh", ".aws", ".gnupg", ".kube", ".docker", "gcloud"];
+const SENSITIVE_DIR_NAMES = [".ssh", ".aws", ".gnupg", ".kube", ".docker", "gcloud", ".convex-data"];
 
 /** Resolved-prefix roots that are off-limits regardless of filename. */
 function systemRoots(): string[] {

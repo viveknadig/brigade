@@ -14,8 +14,9 @@ For user-facing docs see [README.md](README.md). For the release flow see
 A single-operator, multi-agent AI-crew runtime written in TypeScript. It runs as a
 headless WebSocket **gateway** (the state-holding daemon) with thin clients (a chat
 TUI, `connect`, channel adapters). It is built on the **pi** SDK
-(`@mariozechner/pi-coding-agent` + `@mariozechner/pi-tui`, pinned exact at
-`0.73.1`) and adds product layers on top: memory, skills, sub-agents, tools, an org
+(`@earendil-works/pi-agent-core` + `@earendil-works/pi-ai` +
+`@earendil-works/pi-coding-agent` + `@earendil-works/pi-tui`, pinned exact at
+`0.79.9`) and adds product layers on top: memory, skills, sub-agents, tools, an org
 hierarchy, channels, cron, an extension SDK, and a dual-mode storage layer.
 
 - **Stack:** TypeScript (strict), ESM, Node **≥ 22.12**, **npm** (never pnpm).
@@ -29,7 +30,7 @@ hierarchy, channels, cron, an extension SDK, and a dual-mode storage layer.
 
 - The product is **Brigade**. In code, comments, copy, CLI help, error messages,
   env vars, daemon labels, and docs, refer to the agent SDK **only** as `pi` /
-  `@mariozechner/pi-coding-agent`. Do not name other third-party AI agent projects.
+  `@earendil-works/pi-coding-agent`. Do not name other third-party AI agent projects.
 - **Never** commit secrets, real personal data (names, phone numbers, emails), or
   local absolute paths. Use placeholders (`+1 555 010 0001`, `/path/to/project`).
 - The mascot is 🦁 the Pride. No other animal/symbol.
@@ -70,9 +71,9 @@ files under `src/`.
 ## Repository layout
 
 ```
-F:\Brigade\  (working tree; storage is ~/.brigade)
+brigade/  (working tree; storage is ~/.brigade)
 ├── brigade.mjs                 # bin shim: enforces Node ≥22.12, routes to dist/entry.js
-├── package.json                # npm; pi 0.73.1 pinned exact
+├── package.json                # npm; pi 0.79.9 pinned exact
 ├── tsconfig.json               # typecheck config (includes tests)
 ├── tsconfig.build.json         # build config (emits dist/, excludes tests/templates)
 ├── scripts/                    # run-brigade.mjs, run-tests.mjs, build-done.mjs, convex-*.mjs

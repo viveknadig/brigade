@@ -64,8 +64,8 @@ install; switch to a self-hosted Convex database when you want one. Bring any mo
 Claude, GPT, Gemini, Llama, or a local Ollama. Privileged actions wait for your
 approval, and your keys and data never leave your machine. No telemetry.
 
-It's an ecosystem, not an app: one crew you reach from the terminal, WhatsApp, and Telegram, and
-from your watch, Meta smart glasses, and Meta Quest.
+It's an ecosystem, not an app: one crew you reach from the terminal, WhatsApp, Telegram,
+Slack, Discord, iMessage, and BlueBubbles, and from your watch, Meta smart glasses, and Meta Quest.
 
 ```bash
 npm i -g @spinabot/brigade
@@ -117,7 +117,7 @@ backend — all under one `~/.brigade/` directory you fully own.
 | 👥 **A real crew** | Spawn isolated agents with their own personas, credentials, and memory; wire them into an **org chart** that governs who can talk to whom. |
 | 🔌 **Bring any model** | Anthropic, OpenAI, Gemini, OpenRouter, Groq, Cerebras, xAI, DeepSeek, Mistral, local Ollama, or any OpenAI-compatible endpoint. Switch mid-conversation. |
 | 📅 **Always-on** | Run as a headless WebSocket gateway with a crash supervisor, cron jobs, and OS service install. |
-| 💬 **Channels** | Talk to your crew from WhatsApp and Telegram today; the adapter contract is built for more. |
+| 💬 **Channels** | Talk to your crew from WhatsApp, Telegram, Slack, Discord, iMessage, and BlueBubbles today; the adapter contract is built for more. |
 | 🔗 **1,000+ connectors** | Gmail, Slack, GitHub, Notion, Calendar, Linear… via the built-in Composio tool. |
 | 📄 **Reads & writes documents** | Send a PDF, Office doc, image, audio, or video and your crew *understands* it — then have it **create or edit** Word, Excel, PowerPoint, and PDF files and hand them back. |
 | 🧩 **MCP** | Expose your long-term memory to any MCP client (`brigade mcp`), or connect MCP servers in. |
@@ -262,9 +262,13 @@ or render a 🦁 Pride chart with the `org` tool.
 ### 💬 Channels
 A typed channel-adapter contract with a shared inbound pipeline (access control,
 dedupe, abort triggers, approval routing). **WhatsApp** (Baileys, QR/code pairing,
-multi-account, reconnect backoff) and **Telegram** (Bot API token, inline-button
-approvals, owner bootstrapped on the gateway) ship today; the contract is built for
-more. See [Telegram setup](#telegram-setup-end-to-end) for the full walkthrough.
+multi-account, reconnect backoff), **Telegram** (Bot API token, inline-button
+approvals, owner bootstrapped on the gateway), **Slack** (Socket Mode, bot + app
+tokens, channel/thread chat), **Discord** (bot token, DM/server/thread chat),
+**iMessage** (via the `imsg` CLI, plain-text only), and **BlueBubbles** (macOS
+server, REST-out + webhook-in, reactions/edit/unsend) ship today; the contract is
+built for more. See [Telegram setup](#telegram-setup-end-to-end) for the full
+walkthrough.
 
 ### ⏰ Cron
 Schedule recurring or one-shot work: cron expressions (with IANA timezones and
@@ -572,7 +576,8 @@ target (`--channel`, `--to`).
 
 ### `brigade channels`
 
-Connect external messaging channels — WhatsApp and Telegram ship today.
+Connect external messaging channels — WhatsApp, Telegram, Slack, Discord, iMessage,
+and BlueBubbles ship today.
 
 ```bash
 brigade channels list

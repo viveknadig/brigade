@@ -16,7 +16,7 @@ flow. You almost never run npm commands by hand.
    updates `CHANGELOG.md`, and aggregates everything since the last release.
 
 3. **Merge the Release PR** when you want to ship. release-please then:
-   - creates a git tag (e.g. `v0.2.0`) and a GitHub Release, and
+   - creates a git tag (e.g. `v1.12.0`) and a GitHub Release, and
    - triggers the `publish-npm` job, which runs `npm ci`, `npm run build`,
      `npm test`, and `npm publish --access public` (with `--provenance` added
      automatically when the repo is public — see below).

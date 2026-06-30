@@ -58,7 +58,7 @@ function mapErrorToExitCode(err: unknown): number {
     if (typeof e.exitCode === "number") return e.exitCode;
     if (e.message) {
       // Translate Pi's auth errors (which leak `/login` references and raw
-      // `node_modules/@mariozechner/pi-coding-agent/docs/...` paths) into
+      // `node_modules/@earendil-works/pi-coding-agent/docs/...` paths) into
       // Brigade-native messages. `translateAuthError` returns its own
       // `⚠`-prefixed message that doesn't need the `brigade:` prefix; for
       // anything else, fall through to `friendlyError` (peels JSON wrappers
