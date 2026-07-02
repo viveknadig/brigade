@@ -151,10 +151,64 @@ export function inferOllamaModelCapabilities(modelId: string): InferredCapabilit
 	return { reasoning, contextWindow, maxTokens, input };
 }
 
+/** Subset of Ollama's POST /api/show response we read: the `capabilities`
+ *  array (for vision) and `model_info` (for the real context length). */
+interface OllamaShowResponse {
+	capabilities?: unknown;
+	model_info?: Record<string, unknown>;
+}
+
 /**
- * Write Brigade's Ollama provider entry into Pi's `~/.brigade/models.json`.
- * Pi's `ModelRegistry.refresh()` picks this up and exposes the models as
- * regular Pi models from then on.
+ * Best-effort per-model probe of Ollama's `/api/show`. Returns whether the model
+ * accepts images (`vision` capability) and its real trained context window
+ * (`<arch>.context_length`). Any failure yields nulls so the caller falls back
+ * to the name-heuristic. NOTE: we deliberately do NOT derive `reasoning` from
+ * the `thinking` capability — defaulting local models to thinking-on turns them
+ * into narrators that emit tool intent as prose instead of structured calls, so
+ * reasoning stays name-heuristic (thinking off by default; opt in via /thinking).
+ */
+async function fetchOllamaModelInfo(
+	modelId: string,
+	baseUrl: string = DEFAULT_BASE_URL,
+): Promise<{ vision: boolean | null; contextLength: number | null }> {
+	const url = `${baseUrl.replace(/\/+$/, "").replace(/\/v1$/i, "")}/api/show`;
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+	try {
+		const res = await fetch(url, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ model: modelId }),
+			signal: controller.signal,
+		});
+		if (!res.ok) return { vision: null, contextLength: null };
+		const body = (await res.json()) as OllamaShowResponse;
+		const caps = Array.isArray(body.capabilities)
+			? body.capabilities.map((c) => String(c).toLowerCase())
+			: null;
+		const vision = caps ? caps.includes("vision") : null;
+		let contextLength: number | null = null;
+		if (body.model_info && typeof body.model_info === "object") {
+			for (const [k, v] of Object.entries(body.model_info)) {
+				if (k.endsWith(".context_length") && typeof v === "number" && Number.isFinite(v) && v > 0) {
+					contextLength = Math.floor(v);
+					break;
+				}
+			}
+		}
+		return { vision, contextLength };
+	} catch {
+		return { vision: null, contextLength: null };
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/**
+ * Write Brigade's Ollama provider entry into Pi's `~/.brigade/models.json` as a
+ * NATIVE provider — `api:"ollama"` (dispatched to our /api/chat transport) with
+ * the base URL (no `/v1`). Pi's `ModelRegistry.refresh()` picks this up and
+ * exposes the models as regular Pi models from then on.
  *
  * We MERGE rather than overwrite — the user (or other providers) may have
  * existing entries in the file we shouldn't clobber.
@@ -173,24 +227,34 @@ export async function writeOllamaToModelsJson(
 		// File missing or unparseable — start fresh. Pi treats an absent file as no config.
 	}
 
-	const modelDefs = models.map((m) => {
-		const caps = inferOllamaModelCapabilities(m.id);
-		return {
-			id: m.id,
-			name: m.name + (m.parameterSize ? ` (${m.parameterSize})` : ""),
-			reasoning: caps.reasoning,
-			input: caps.input,
-			contextWindow: caps.contextWindow,
-			maxTokens: caps.maxTokens,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, // local = free
-		};
-	});
+	// Probe /api/show for real vision + context (parallel, best-effort); fall back
+	// to the name-heuristic when unreachable. Reasoning stays name-heuristic.
+	const modelDefs = await Promise.all(
+		models.map(async (m) => {
+			const caps = inferOllamaModelCapabilities(m.id);
+			const info = await fetchOllamaModelInfo(m.id, baseUrl);
+			const vision = info.vision ?? caps.input.includes("image");
+			const input: ("text" | "image")[] = vision ? ["text", "image"] : ["text"];
+			const contextWindow = info.contextLength ?? caps.contextWindow;
+			return {
+				id: m.id,
+				name: m.name + (m.parameterSize ? ` (${m.parameterSize})` : ""),
+				reasoning: caps.reasoning,
+				input,
+				contextWindow,
+				maxTokens: caps.maxTokens,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, // local = free
+			};
+		}),
+	);
 
 	existing.providers!["ollama"] = {
-		baseUrl: `${baseUrl.replace(/\/$/, "")}/v1`,
-		api: "openai-completions",
-		// Ollama ignores the API key but Pi requires apiKey to be set when defining
-		// custom models for non-built-in providers. Use a sentinel value.
+		// Native transport: base URL WITHOUT /v1; Brigade registers api:"ollama"
+		// (→ /api/chat) so tool-calls + thinking come back structured.
+		baseUrl: baseUrl.replace(/\/+$/, "").replace(/\/v1$/i, ""),
+		api: "ollama",
+		// Ollama (local) ignores the API key, but Pi requires apiKey to be set when
+		// defining custom models for a non-built-in provider. Use a sentinel value.
 		apiKey: "ollama-local-no-auth-required",
 		models: modelDefs,
 	};

@@ -96,6 +96,7 @@ import {
 // exact same derivation this build uses.
 import { resolveSessionAccessPolicy } from "./tools/sessions/resolve-access.js";
 import { wrapStreamFnWithPayloadMutations } from "./payload-mutators.js";
+import { ensureOllamaNativeApiRegistered } from "./ollama-native/register.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
 import type { BrigadeBeforeToolCallHook } from "./tool-guard.js";
@@ -385,6 +386,11 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   );
   const authStorage = authBuild.storage;
   const selectedProfileId = authBuild.selectedProfileId;
+  // Register the native Ollama transport (api:"ollama" → /api/chat) before the
+  // registry/session resolve, so any Ollama model dispatches to it via Pi's
+  // api-registry (getApiProvider). Idempotent + process-global; no-op for every
+  // other provider. This is what makes Ollama tool-calling first-class.
+  ensureOllamaNativeApiRegistered();
   const modelRegistry = buildModelRegistry(authStorage, modelsFile);
 
   // ModelRegistry.find returns undefined when the provider+modelId pair isn't
