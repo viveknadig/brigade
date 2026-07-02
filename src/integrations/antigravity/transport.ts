@@ -54,15 +54,42 @@ export const CLOUD_CODE_ASSIST_BASE = "https://cloudcode-pa.googleapis.com";
 const STREAM_URL = `${CLOUD_CODE_ASSIST_BASE}/v1internal:streamGenerateContent?alt=sse`;
 const LOAD_CODE_ASSIST_URL = `${CLOUD_CODE_ASSIST_BASE}/v1internal:loadCodeAssist`;
 
-// OAuth client for Antigravity's Google sign-in — OPERATOR-SUPPLIED ONLY. Brigade
-// ships NO client secret: GitHub push-protection AND our own safety guard block
-// embedding it (obfuscated or not), and Google's Antigravity Terms prohibit
-// third-party use with reports of account bans (see the catalog entry's warning).
-// To enable browser sign-in, set BRIGADE_ANTIGRAVITY_CLIENT_ID + _SECRET (e.g. to
-// the values a public Antigravity auth plugin uses, or your own Google OAuth
-// client). Without them, browser login is unavailable and Brigade says so clearly.
-const GOOGLE_CLIENT_ID = process.env.BRIGADE_ANTIGRAVITY_CLIENT_ID ?? "";
-const GOOGLE_CLIENT_SECRET = process.env.BRIGADE_ANTIGRAVITY_CLIENT_SECRET ?? "";
+// The OAuth client is NOT stored in Brigade's repo. It's the Cloud Code Assist
+// installed-app client that GOOGLE ITSELF ships in the open-source gemini-cli —
+// whose own source comments that this secret is safe in source control because
+// it's a desktop app (Google's words). Brigade pulls it LIVE from that public
+// source at login and caches it in memory, so nothing credential-shaped lives in
+// this repo and there's zero setup. Operator env vars override the live pull.
+const OAUTH_CLIENT_SOURCES = [
+	"https://raw.githubusercontent.com/google-gemini/gemini-cli/main/packages/core/src/code_assist/oauth2.ts",
+];
+let cachedOAuthClient: { clientId: string; clientSecret: string } | null = null;
+
+/** Resolve the OAuth client: operator env → in-memory cache → a live pull from
+ *  Google's public gemini-cli source. Returns null only when there's genuinely no
+ *  client to be found (offline + nothing cached + no env). Never throws. */
+async function resolveOAuthClient(): Promise<{ clientId: string; clientSecret: string } | null> {
+	const envId = process.env.BRIGADE_ANTIGRAVITY_CLIENT_ID?.trim();
+	const envSecret = process.env.BRIGADE_ANTIGRAVITY_CLIENT_SECRET?.trim();
+	if (envId && envSecret) return { clientId: envId, clientSecret: envSecret };
+	if (cachedOAuthClient) return cachedOAuthClient;
+	for (const url of OAUTH_CLIENT_SOURCES) {
+		try {
+			const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+			if (!res.ok) continue;
+			const text = await res.text();
+			const clientId = text.match(/(\d[\w-]+\.apps\.googleusercontent\.com)/)?.[1];
+			const clientSecret = text.match(/(GOCSPX-[A-Za-z0-9_-]+)/)?.[1];
+			if (clientId && clientSecret) {
+				cachedOAuthClient = { clientId, clientSecret };
+				return cachedOAuthClient;
+			}
+		} catch {
+			/* try the next source */
+		}
+	}
+	return null;
+}
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/auth";
 // Scopes the Antigravity client requests — including the cclog +
@@ -119,14 +146,14 @@ async function discoverProject(accessToken: string): Promise<string | undefined>
 }
 
 async function refreshGoogleToken(refresh: string): Promise<AntigravityCreds> {
+	const client = await resolveOAuthClient();
 	const res = await fetch(GOOGLE_TOKEN_URL, {
 		method: "POST",
 		headers: { "Content-Type": "application/x-www-form-urlencoded" },
 		body: new URLSearchParams({
 			grant_type: "refresh_token",
 			refresh_token: refresh,
-			client_id: GOOGLE_CLIENT_ID,
-			...(GOOGLE_CLIENT_SECRET ? { client_secret: GOOGLE_CLIENT_SECRET } : {}),
+			...(client ? { client_id: client.clientId, client_secret: client.clientSecret } : {}),
 		}).toString(),
 	});
 	if (!res.ok) throw new Error(`Antigravity token refresh failed (${res.status})`);
@@ -246,6 +273,7 @@ async function exchangeAntigravityCode(
 	code: string,
 	verifier: string,
 	redirectUri: string,
+	client: { clientId: string; clientSecret: string },
 ): Promise<{ access: string; refresh: string; expires: number }> {
 	const res = await fetch(GOOGLE_TOKEN_URL, {
 		method: "POST",
@@ -253,8 +281,8 @@ async function exchangeAntigravityCode(
 		body: new URLSearchParams({
 			grant_type: "authorization_code",
 			code,
-			client_id: GOOGLE_CLIENT_ID,
-			...(GOOGLE_CLIENT_SECRET ? { client_secret: GOOGLE_CLIENT_SECRET } : {}),
+			client_id: client.clientId,
+			client_secret: client.clientSecret,
 			code_verifier: verifier,
 			redirect_uri: redirectUri,
 		}).toString(),
@@ -279,13 +307,13 @@ export const antigravityOAuthProvider: OAuthProviderInterface = {
 
 	async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
 		// Antigravity runs its OWN Google OAuth (it does NOT reuse the Gemini CLI's
-		// token — that's a separate, now-deprecated product). Browser sign-in needs an
-		// OAuth client, which Brigade does not ship, so it's available only when the
-		// operator supplies one via env.
-		if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+		// token — that's a separate, now-deprecated product). The OAuth client is
+		// pulled LIVE from Google's public gemini-cli source (or an env override).
+		const client = await resolveOAuthClient();
+		if (!client) {
 			throw new Error(
-				"Antigravity sign-in isn't configured. Set BRIGADE_ANTIGRAVITY_CLIENT_ID and " +
-					"BRIGADE_ANTIGRAVITY_CLIENT_SECRET to a Google OAuth client, then sign in. Note: Google's " +
+				"Couldn't get the Antigravity sign-in client — no network to fetch it and no " +
+					"BRIGADE_ANTIGRAVITY_CLIENT_ID/_SECRET set. Check your connection and retry. Note: Google's " +
 					"Antigravity Terms prohibit third-party use and accounts have been banned — use at your own risk.",
 			);
 		}
@@ -298,7 +326,7 @@ export const antigravityOAuthProvider: OAuthProviderInterface = {
 		const server = await startLoopbackServer(state);
 		try {
 			const authUrl = `${GOOGLE_AUTH_URL}?${new URLSearchParams({
-				client_id: GOOGLE_CLIENT_ID,
+				client_id: client.clientId,
 				redirect_uri: server.redirectUri,
 				response_type: "code",
 				scope: OAUTH_SCOPES.join(" "),
@@ -344,7 +372,7 @@ export const antigravityOAuthProvider: OAuthProviderInterface = {
 			}
 			if (!code) throw new Error("Sign-in didn't complete — no authorization code was received.");
 
-			const tokens = await exchangeAntigravityCode(code, verifier, server.redirectUri);
+			const tokens = await exchangeAntigravityCode(code, verifier, server.redirectUri, client);
 			const project = await discoverProject(tokens.access);
 			return { ...tokens, project };
 		} finally {

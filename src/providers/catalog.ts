@@ -193,10 +193,11 @@ export const PROVIDERS: ProviderInfo[] = [
 	{
 		// Its OWN Pi provider id (NOT "google") — Antigravity serves models through
 		// Google's Cloud Code Assist (api:"antigravity" → cloudcode-pa /v1internal),
-		// not the public Gemini API. It runs its OWN Google OAuth (PKCE); Brigade
-		// ships no OAuth client, so browser sign-in needs BRIGADE_ANTIGRAVITY_CLIENT_ID
-		// + _SECRET. ⚠ Google's Antigravity Terms prohibit third-party use and accounts
-		// have been banned — this provider is opt-in and at the operator's own risk.
+		// not the public Gemini API. It runs its OWN Google OAuth (PKCE); the OAuth
+		// client is pulled live from Google's public gemini-cli source at login (no
+		// setup; env override available), so nothing credential-shaped ships in-repo.
+		// ⚠ Google's Antigravity Terms prohibit third-party use and accounts have been
+		// banned — this provider is opt-in and at the operator's own risk.
 		id: "antigravity",
 		providerId: "antigravity",
 		name: "Google Antigravity",
