@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.22.0](https://github.com/spinabot/brigade/compare/brigade-v1.21.0...brigade-v1.22.0) (2026-07-02)
+
+
+### Features
+
+* **antigravity:** pull the OAuth client live from Google's public source ([7dbc3e6](https://github.com/spinabot/brigade/commit/7dbc3e6bcff9e9490c4dce2fa9b1aceedfba5672))
+
 ## [1.21.0](https://github.com/spinabot/brigade/compare/brigade-v1.20.0...brigade-v1.21.0) (2026-07-02)
 
 
