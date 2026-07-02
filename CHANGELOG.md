@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.21.0](https://github.com/spinabot/brigade/compare/brigade-v1.20.0...brigade-v1.21.0) (2026-07-02)
+
+
+### Features
+
+* Antigravity login, live model discovery + reachability precheck ([d0c0f7d](https://github.com/spinabot/brigade/commit/d0c0f7d85c48a2f88221ecceef7704612f982b28))
+* **providers:** NVIDIA NIM with live model discovery ([6771719](https://github.com/spinabot/brigade/commit/67717193c491023d8c33d6917b5cf72f9d9529f1))
+
+
+### Bug Fixes
+
+* **convex:** support Convex Cloud deployments, not just self-hosted ([3e62b27](https://github.com/spinabot/brigade/commit/3e62b27a800ecaf9b7e9e5631e09917b023381ec))
+
 ## [1.20.0](https://github.com/spinabot/brigade/compare/brigade-v1.19.2...brigade-v1.20.0) (2026-07-02)
 
 
