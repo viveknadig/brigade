@@ -849,8 +849,13 @@ export async function wireConnectUi(
 			}
 			if (b.type === "text" && typeof b.text === "string") {
 				const inlineThinking: string[] = [];
+				// Match <think>, <thinking>, and <thought> (with any attributes) —
+				// local models (e.g. Ollama's reasoning models) emit <thinking>…
+				// </thinking> inline as TEXT when models.json marks them
+				// reasoning:false, so a <think>-only regex left the raw tags in the
+				// transcript. Case-insensitive; tolerant of attributes/whitespace.
 				const stripped = b.text.replace(
-					/<think>([\s\S]*?)<\/think>\s*/g,
+					/<\s*(?:think(?:ing)?|thought)\b[^>]*>([\s\S]*?)<\/\s*(?:think(?:ing)?|thought)\s*>\s*/gi,
 					(_m: string, inner: string) => {
 						const t = inner.trim();
 						if (t) inlineThinking.push(t);
@@ -886,15 +891,24 @@ export async function wireConnectUi(
 	// `connect-transcript.js` (pure + unit-tested).
 
 	/** Remove the rendered transcript (everything between the header+divider
-	 *  chrome at indices 0/1 and the editor); the editor + trailing chrome stay.
-	 *  Resets the streaming maps so the rebuild starts clean. */
+	 *  chrome and the editor); the editor + trailing chrome stay. Resets the
+	 *  streaming maps so the rebuild starts clean.
+	 *
+	 *  The header chrome is NOT a fixed 0/1 pair: `renderBrandHeader` prepends
+	 *  padTop + splash block + padBottom (3 children) and only THEN does connect
+	 *  add the status `header` line and the `divider`. Anchor on the divider's
+	 *  live index so the splash + status line + divider always survive a clear
+	 *  (a hardcoded `slice(2, …)` deleted the status line and divider, leaving
+	 *  the splash butting straight into the conversation with no separator). */
 	const clearTranscriptRegion = (): void => {
 		const children = tui.children;
 		const editorIdx = children.indexOf(editor);
-		if (editorIdx <= 2) {
-			// Nothing rendered between the chrome and the editor yet.
-		} else {
-			for (const c of children.slice(2, editorIdx)) removeChild(c as AnyChild);
+		const dividerIdx = children.indexOf(divider);
+		// Start clearing just past the divider (the last chrome element). Fall
+		// back to index 2 only if the divider somehow isn't in the tree.
+		const start = dividerIdx >= 0 ? dividerIdx + 1 : 2;
+		if (editorIdx > start) {
+			for (const c of children.slice(start, editorIdx)) removeChild(c as AnyChild);
 		}
 		activeAssistants.clear();
 		pendingTools.clear();
@@ -2587,12 +2601,39 @@ export async function wireConnectUi(
 
 			const arg = trimmed === "/model" ? "" : trimmed.slice("/model ".length).trim();
 			if (!arg) {
-				const list = models
-					.map((m) => `  ${brand.dim(m.provider)}  ${brand.white(m.id)}`)
-					.join("\n");
+				// `/model` lists EVERY configured provider's models (it's a global
+				// switcher — picking a model on another provider switches provider
+				// too). Group by provider with the CURRENT one first so the operator
+				// sees the provider they're on up top instead of hunting through a
+				// flat list dominated by providers with huge catalogs (OpenRouter's
+				// live catalog is merged in gateway-side and runs to hundreds).
+				const current = lastSnapshot?.provider;
+				const byProvider = new Map<string, ModelSummary[]>();
+				for (const m of models) {
+					const arr = byProvider.get(m.provider) ?? [];
+					arr.push(m);
+					byProvider.set(m.provider, arr);
+				}
+				const PER_PROVIDER_CAP = 20;
+				const order = [...byProvider.keys()].sort((a, b) =>
+					a === current ? -1 : b === current ? 1 : a.localeCompare(b),
+				);
+				const sections = order.map((prov) => {
+					const rows = byProvider.get(prov) ?? [];
+					const head =
+						prov === current
+							? `${brand.amber(prov)} ${brand.dim("(current)")}`
+							: brand.dim(prov);
+					const shown = rows.slice(0, PER_PROVIDER_CAP);
+					const body = shown.map((m) => `    ${brand.white(m.id)}`).join("\n");
+					const more = rows.length - shown.length;
+					const moreLine =
+						more > 0 ? `\n    ${brand.dim(`… +${more} more — type /model <id>`)}` : "";
+					return `  ${head}\n${body}${moreLine}`;
+				});
 				insertBeforeEditor(
 					new Markdown(
-						`${brand.dim("configured models on the gateway:")}\n${list}\n\n${brand.dim("usage: /model <id>")}`,
+						`${brand.dim("configured models on the gateway (current provider first):")}\n\n${sections.join("\n\n")}\n\n${brand.dim("usage: /model <id>")}`,
 						1,
 						0,
 						markdownTheme,
