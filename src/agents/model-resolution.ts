@@ -77,10 +77,16 @@ export async function resolveModelNeverMiss(args: ResolveModelArgs): Promise<unk
 
 	// 2. Local Ollama discovery (writes models.json + refresh, then re-find).
 	if (provider === "ollama") {
-		const found = await rediscoverOllamaModel(modelsFile, modelId).catch(() => false);
-		if (found) {
+		// rediscover returns the CANONICAL catalog id it matched (tag/prefix-tolerant),
+		// or null. Re-find with THAT id — Pi's find is an EXACT id match, so a tag-less
+		// or composed request id ("qwen3" or "ollama/qwen3" when the installed model is
+		// "qwen3:latest") would miss here otherwise, defeating the never-miss guarantee
+		// even though the model is pulled + freshly written to the catalog. Fall back to
+		// the original id in case the catalog already carried the exact requested id.
+		const canonicalId = await rediscoverOllamaModel(modelsFile, modelId).catch(() => null);
+		if (canonicalId) {
 			registry.refresh?.();
-			const reFound = registry.find(provider, modelId);
+			const reFound = registry.find(provider, canonicalId) ?? registry.find(provider, modelId);
 			if (reFound) return reFound;
 		}
 		// Ollama daemon unreachable / model not pulled → no synth (a local model

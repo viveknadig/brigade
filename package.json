@@ -248,7 +248,10 @@
     },
     "exceljs": {
       "uuid": "^11.1.1"
-    }
+    },
+    "@earendil-works/pi-ai": "0.79.9",
+    "@earendil-works/pi-agent-core": "0.79.9",
+    "@earendil-works/pi-tui": "0.79.9"
   },
   "keywords": [
     "ai",

@@ -153,6 +153,7 @@ const TIMEOUT_PATTERNS: RegExp[] = [
   /\bfinish_reason:\s*(?:abort|error|malformed_response|network_error)\b/i,
   /socket hang up/i,
   /network error/i,
+  /connection dropped|ended without a final response/i, // Ollama native stream cut mid-generation
 ];
 
 const FORMAT_PATTERNS: RegExp[] = [
@@ -181,6 +182,7 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
   /prompt\s+is\s+too\s+long/i,
   /context_window_exceeded/i,
   /context_length_exceeded/i,
+  /truncating\s+input.*too\s+long/i, // Ollama native /api/chat overflow phrasing
 ];
 
 const MODEL_NOT_FOUND_PATTERNS: RegExp[] = [

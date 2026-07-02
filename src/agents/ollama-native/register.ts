@@ -18,19 +18,16 @@ export const OLLAMA_NATIVE_API = "ollama";
 
 const REGISTRY_SOURCE_ID = "brigade-ollama-native";
 
-let registered = false;
-
 /**
  * Idempotently register the native Ollama transport for `api: "ollama"`.
- * No-op if some provider already owns that API string (e.g. a re-entrant call)
- * or if it's been registered before in this process. Safe to call at boot and
- * per turn.
+ * Guards on the LIVE registry (getApiProvider) — NOT a sticky flag — so it
+ * self-heals: Pi's `ModelRegistry.refresh()` calls `resetApiProviders()`, which
+ * wipes dynamically-registered API providers; a subsequent call here re-registers.
+ * Fully synchronous, so it's race-free within a process. Safe to call at boot,
+ * per turn, and before any isolated Ollama session.
  */
 export function ensureOllamaNativeApiRegistered(): boolean {
-	if (registered || getApiProvider(OLLAMA_NATIVE_API)) {
-		registered = true;
-		return false;
-	}
+	if (getApiProvider(OLLAMA_NATIVE_API)) return false;
 	const streamFn: StreamFn = createOllamaStreamFn();
 	registerApiProvider(
 		{
@@ -43,6 +40,5 @@ export function ensureOllamaNativeApiRegistered(): boolean {
 		},
 		REGISTRY_SOURCE_ID,
 	);
-	registered = true;
 	return true;
 }

@@ -161,4 +161,50 @@ describe("runWithThinkingFallback", () => {
 		const calls = m.getCalls();
 		assert.equal(calls.promptCalls.length, 1, "should not retry when already off");
 	});
+
+	// THROW path: Brigade's agent loop converts a provider error-stop into a THROWN
+	// error (assertNoProviderErrorStop) inside the body — so for providers like the
+	// native Ollama transport the rejection arrives as an exception, not as session
+	// data. The wrapper must still downgrade + retry (and re-throw unrelated errors).
+	it("DOES downgrade + retry when body THROWS a thinking-not-supported error", async () => {
+		let onDowngradeCalled = false;
+		const m = mockSession({
+			initialThinkingLevel: "high",
+			messagesAfterFirst: [
+				{ role: "assistant", content: [], stopReason: "error", errorMessage: '"qwen3-coder" does not support thinking' },
+			],
+			messagesAfterRetry: [{ role: "assistant", content: [{ type: "text", text: "recovered" }] }],
+		});
+		let firstBody = true;
+		await runWithThinkingFallback(
+			m.session as never,
+			async () => {
+				await m.session.prompt("hey");
+				if (firstBody) {
+					firstBody = false;
+					throw new Error('"qwen3-coder" does not support thinking');
+				}
+			},
+			{ onDowngrade: () => { onDowngradeCalled = true; } },
+		);
+		const calls = m.getCalls();
+		assert.equal(calls.promptCalls.length, 2, "downgrade retry fired despite the throw");
+		assert.deepEqual(calls.setThinkingCalls, ["off"]);
+		assert.equal(onDowngradeCalled, true);
+	});
+
+	it("RE-THROWS when body throws an error unrelated to thinking (preserves retry/fallback flow)", async () => {
+		const m = mockSession({ messagesAfterFirst: [] });
+		await assert.rejects(
+			() =>
+				runWithThinkingFallback(m.session as never, async () => {
+					await m.session.prompt("hey");
+					throw new Error("500 internal server error");
+				}),
+			/500 internal server error/,
+		);
+		const calls = m.getCalls();
+		assert.equal(calls.promptCalls.length, 1, "no downgrade retry for a non-thinking error");
+		assert.equal(calls.setThinkingCalls.length, 0);
+	});
 });

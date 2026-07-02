@@ -49,7 +49,7 @@ function buildRequest(providerId: string, apiKey: string): { url: string; init: 
 		case "ollama":
 			// Ollama runs locally; `/api/tags` is auth-free and lists installed models.
 			return {
-				url: "http://localhost:11434/api/tags",
+				url: "http://127.0.0.1:11434/api/tags",
 				init: { method: "GET" },
 			};
 		case "anthropic": {

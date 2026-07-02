@@ -32,6 +32,7 @@ import { wrapStreamFnWithPayloadMutations } from "../payload-mutators.js";
 import { FactStore, MEMORY_SEGMENTS, type MemoryRecordOrigin, type MemorySegment, type MemorySourceType } from "./records.js";
 import { confineUntrustedSegment } from "./write-gate.js";
 import { balancedObjects } from "./json-scan.js";
+import { ensureOllamaNativeApiRegistered } from "../ollama-native/register.js";
 import {
 	buildCandidateBlock,
 	DEFAULT_CANDIDATE_K,
@@ -587,6 +588,12 @@ export function makeIsolatedLlm(
 	args: MakeExtractionLlmArgs,
 ): (input: string) => Promise<string> {
 	return async (input: string): Promise<string> => {
+		// The isolated extraction sweep can itself run on an Ollama model. Re-assert
+		// the native transport before each run: `ModelRegistry.refresh()` calls
+		// `resetApiProviders()`, which wipes our dynamic `api: "ollama"` registration,
+		// and this isolated session builds its own registry independent of the main
+		// agent loop. Idempotent + synchronous — a no-op when already registered.
+		ensureOllamaNativeApiRegistered();
 		// `inMemory()` skips ALL persistence (both modes) — the isolated sweep
 		// never touches disk. Convex mode additionally needs this so the sweep
 		// writes nothing under ~/.brigade.

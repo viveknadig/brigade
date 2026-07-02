@@ -97,6 +97,7 @@ import {
 import { resolveSessionAccessPolicy } from "./tools/sessions/resolve-access.js";
 import { wrapStreamFnWithPayloadMutations } from "./payload-mutators.js";
 import { ensureOllamaNativeApiRegistered } from "./ollama-native/register.js";
+import { migrateOllamaProviderToNative } from "../integrations/ollama.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
 import type { BrigadeBeforeToolCallHook } from "./tool-guard.js";
@@ -142,12 +143,20 @@ const log = createSubsystemLogger("loop/turn");
 // hung connection wastes a session's worth of tokens of headroom.
 const DEFAULT_LLM_IDLE_TIMEOUT_MS = 90_000;
 
-function resolveIdleTimeoutMs(): number {
+// Local Ollama cold-starts a model (VRAM/RAM load + full-context prompt-eval)
+// BEFORE emitting the first token, which on modest hardware can far exceed the
+// cloud-tuned 90s — the idle window races time-to-first-token. Give local models
+// a much larger default so a slow first token isn't mistaken for a hung stream.
+// The explicit env override still wins for both.
+const DEFAULT_LOCAL_LLM_IDLE_TIMEOUT_MS = 300_000;
+
+function resolveIdleTimeoutMs(provider?: string): number {
   const raw = process.env.BRIGADE_LLM_IDLE_TIMEOUT_SECONDS?.trim();
-  if (!raw) return DEFAULT_LLM_IDLE_TIMEOUT_MS;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n < 0) return DEFAULT_LLM_IDLE_TIMEOUT_MS;
-  return Math.floor(n * 1000);
+  if (raw) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return Math.floor(n * 1000);
+  }
+  return provider === "ollama" ? DEFAULT_LOCAL_LLM_IDLE_TIMEOUT_MS : DEFAULT_LLM_IDLE_TIMEOUT_MS;
 }
 
 /**
@@ -391,6 +400,10 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   // api-registry (getApiProvider). Idempotent + process-global; no-op for every
   // other provider. This is what makes Ollama tool-calling first-class.
   ensureOllamaNativeApiRegistered();
+  // Migrate any pre-existing OpenAI-compat Ollama entry (api:"openai-completions"
+  // + /v1) to the native shape so upgraders don't stay silently on the degraded
+  // /v1 path. Idempotent + best-effort; a no-op read once migrated.
+  await migrateOllamaProviderToNative(modelsFile).catch(() => {});
   const modelRegistry = buildModelRegistry(authStorage, modelsFile);
 
   // ModelRegistry.find returns undefined when the provider+modelId pair isn't
@@ -938,6 +951,11 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     }
   }
 
+  // Re-assert the native Ollama api registration: model resolution above can call
+  // ModelRegistry.refresh() (on a cold-model miss), which resets dynamically-
+  // registered api providers. This (idempotent, self-healing) call re-registers
+  // "ollama" so the session's streamFn dispatches to the native transport.
+  ensureOllamaNativeApiRegistered();
   const { session } = await createAgentSession({
     cwd,
     agentDir,
@@ -1029,13 +1047,30 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   }).agent;
   if (sessionAgent && typeof sessionAgent.streamFn === "function") {
     const baseStreamFn = sessionAgent.streamFn;
-    const idleTimeoutMs = resolveIdleTimeoutMs();
-    sessionAgent.streamFn = wrapStreamFnWithIdleTimeout(
+    const idleTimeoutMs = resolveIdleTimeoutMs(args.provider);
+    const wrappedStreamFn = wrapStreamFnWithIdleTimeout(
       wrapStreamFnWithStopReasonRecovery(
         wrapStreamFnWithToolCallRepair(baseStreamFn),
       ),
       { timeoutMs: idleTimeoutMs },
     );
+    // Re-assert the native Ollama api registration at the LAST possible moment —
+    // immediately before Pi's streamSimple calls getApiProvider(model.api). Pi's
+    // api-provider registry is a process-global that Pi resets from SEVERAL
+    // internal points (AgentSession.reload(), ModelRegistry.refresh(), and
+    // register/unregisterProvider() all call resetApiProviders()). Any of those can
+    // fire AFTER the pre-session re-assert — createAgentSession's own resource
+    // reload, a config hot-reload, a mid-turn model switch, or a same-session retry
+    // (the retry loop re-prompts the SAME session, so a one-time pre-session
+    // registration doesn't survive a wipe). Registering here is the only spot that
+    // runs on EVERY dispatch and EVERY retry, so an "ollama" turn can never hit an
+    // empty registry ("No API provider registered for api: ollama"). Gated to
+    // ollama models so pure-cloud turns don't register an unused provider. Wrap,
+    // never REPLACE — Pi's auth wrapper stays at the bottom of the stack.
+    sessionAgent.streamFn = ((model: { api?: string }, context: unknown, options: unknown) => {
+      if (model?.api === "ollama") ensureOllamaNativeApiRegistered();
+      return (wrappedStreamFn as (m: unknown, c: unknown, o: unknown) => unknown)(model, context, options);
+    }) as typeof baseStreamFn;
     log.debug("stream wrappers installed", {
       idleTimeoutMs,
       provider: args.provider,
@@ -2728,7 +2763,12 @@ function detectMaxTokensStop(session: AgentSession): boolean {
     const m = messages[i];
     if (!m || m.role !== "assistant") continue;
     const reason = (m.stopReason ?? m.stop_reason ?? "").toLowerCase();
-    return reason === "max_tokens";
+    // Pi normalises an output-cap stop to "length" (its canonical StopReason);
+    // "max_tokens" is the raw provider passthrough some minors leave unnormalised.
+    // Checking only "max_tokens" meant this NEVER fired (Pi always emits "length"),
+    // so the continuation loop was dead for every provider — including Ollama's
+    // num_predict cap (done_reason:"length"). Accept both.
+    return reason === "length" || reason === "max_tokens";
   }
   return false;
 }

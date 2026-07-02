@@ -246,7 +246,7 @@ export const PROVIDERS: ProviderInfo[] = [
 		envVar: "", // no env key
 		noAuth: true,
 		local: true,
-		baseUrl: "http://localhost:11434",
+		baseUrl: "http://127.0.0.1:11434",
 	},
 	{
 		id: "custom",

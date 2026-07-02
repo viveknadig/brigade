@@ -78,15 +78,37 @@ export async function runWithThinkingFallback(
 	body: () => Promise<void>,
 	options: ThinkingFallbackOptions = {},
 ): Promise<void> {
-	await body();
+	let thrown: unknown;
+	try {
+		await body();
+	} catch (err) {
+		thrown = err;
+	}
 
-	const errMsg = lastAssistantErrorMessage(session);
-	if (!errMsg || !looksLikeThinkingNotSupported(errMsg)) return;
-	// Already on off — retry would loop.
-	if (session.thinkingLevel === "off") return;
+	// The "thinking not supported" signal reaches us TWO ways:
+	//   (a) as a THROW — Brigade's agent loop converts a provider error-stop into a
+	//       thrown error (assertNoProviderErrorStop) INSIDE `body`, so the rejection
+	//       arrives as an exception, not as inspectable session data; OR
+	//   (b) as DATA — the last assistant message settled with stopReason:"error"
+	//       (for any caller whose body doesn't convert the error-stop to a throw).
+	// We must handle both, or the downgrade never fires for providers (e.g. Ollama)
+	// whose transport surfaces the 400 as an error event.
+	const giveUp = (): void => {
+		// Not a recoverable thinking-reject: preserve the original control flow — a
+		// real error re-throws (so the retry / model-fallback layers own it); a
+		// clean turn just returns.
+		if (thrown !== undefined) throw thrown;
+	};
+	const signalMsg =
+		(thrown instanceof Error ? thrown.message : typeof thrown === "string" ? thrown : undefined) ??
+		lastAssistantErrorMessage(session);
+
+	if (!signalMsg || !looksLikeThinkingNotSupported(signalMsg)) return giveUp();
+	// Already on off — a downgrade retry would loop; surface the original outcome.
+	if (session.thinkingLevel === "off") return giveUp();
 
 	const originalLevel = session.thinkingLevel;
-	options.onDowngrade?.(originalLevel, errMsg);
+	options.onDowngrade?.(originalLevel, signalMsg);
 	session.setThinkingLevel("off");
 
 	// Retry once with thinking off. Re-prompt with the same user
@@ -94,10 +116,10 @@ export async function runWithThinkingFallback(
 	const lastUser = [...session.messages]
 		.reverse()
 		.find((m: { role?: string }) => m.role === "user");
-	if (!lastUser) return;
+	if (!lastUser) return giveUp();
 
 	const content = (lastUser as { content?: unknown }).content;
-	if (!Array.isArray(content)) return;
+	if (!Array.isArray(content)) return giveUp();
 	const text = content
 		.filter(
 			(b) =>
@@ -106,7 +128,7 @@ export async function runWithThinkingFallback(
 		)
 		.map((b) => (b as { text: string }).text)
 		.join("");
-	if (!text) return;
+	if (!text) return giveUp();
 
 	await session.prompt(text);
 }
