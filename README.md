@@ -968,12 +968,8 @@ Questions or ideas? Open a
 A pride of contributors who make Brigade better. Thank you to everyone who has
 joined the crew!
 
-<!-- brigadiers:start -->
-
-[![Bhasvanth-Dev9380](https://avatars.githubusercontent.com/u/157608971?v=4&s=48)](https://github.com/Bhasvanth-Dev9380) [![Ranjithsingh2004](https://avatars.githubusercontent.com/u/122562396?v=4&s=48)](https://github.com/Ranjithsingh2004)
-
-<!-- brigadiers:end -->
-
-<sub>Auto-updated from the [contributor graph](https://github.com/spinabot/brigade/graphs/contributors) on every merge — see [`scripts/update-brigadiers.mjs`](scripts/update-brigadiers.mjs).</sub>
+<a href="https://github.com/spinabot/brigade/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=spinabot/brigade&columns=16" alt="Brigade contributors — the Brigadiers" />
+</a>
 
 Want to join the pride? See [CONTRIBUTING.md](CONTRIBUTING.md).
