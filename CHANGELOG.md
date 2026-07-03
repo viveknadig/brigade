@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.22.1](https://github.com/spinabot/brigade/compare/brigade-v1.22.0...brigade-v1.22.1) (2026-07-03)
+
+
+### Reverts
+
+* remove Antigravity provider (public OAuth client denied /v1internal inference) ([274bb81](https://github.com/spinabot/brigade/commit/274bb81c54fc9a4ccce32c0b6ce43c043045bd1f))
+
 ## [1.22.0](https://github.com/spinabot/brigade/compare/brigade-v1.21.0...brigade-v1.22.0) (2026-07-02)
 
 
