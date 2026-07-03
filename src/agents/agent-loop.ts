@@ -98,7 +98,6 @@ import { resolveSessionAccessPolicy } from "./tools/sessions/resolve-access.js";
 import { wrapStreamFnWithPayloadMutations } from "./payload-mutators.js";
 import { ensureOllamaNativeApiRegistered } from "./ollama-native/register.js";
 import { migrateOllamaProviderToNative } from "../integrations/ollama.js";
-import { ensureAntigravityRegistered } from "../integrations/antigravity/transport.js";
 import { describeModelProbe, probeModelReachable } from "../integrations/provider-discovery.js";
 import { repairSessionFileIfNeeded } from "../sessions/session-file-repair.js";
 import { acquireSessionWriteLock } from "../sessions/session-write-lock.js";
@@ -402,11 +401,6 @@ export async function runSingleTurn(args: RunSingleTurnArgs): Promise<RunSingleT
   // api-registry (getApiProvider). Idempotent + process-global; no-op for every
   // other provider. This is what makes Ollama tool-calling first-class.
   ensureOllamaNativeApiRegistered();
-  // Same idea for Google Antigravity: register its OAuth provider + the native
-  // "antigravity" transport (Cloud Code Assist /v1internal) before resolve, so an
-  // Antigravity model dispatches to it. Idempotent + process-global; no-op for
-  // every other provider.
-  ensureAntigravityRegistered();
   // Migrate any pre-existing OpenAI-compat Ollama entry (api:"openai-completions"
   // + /v1) to the native shape so upgraders don't stay silently on the degraded
   // /v1 path. Idempotent + best-effort; a no-op read once migrated.
@@ -963,7 +957,6 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // registered api providers. This (idempotent, self-healing) call re-registers
   // "ollama" so the session's streamFn dispatches to the native transport.
   ensureOllamaNativeApiRegistered();
-  ensureAntigravityRegistered();
   const { session } = await createAgentSession({
     cwd,
     agentDir,
@@ -1077,7 +1070,6 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // never REPLACE — Pi's auth wrapper stays at the bottom of the stack.
     sessionAgent.streamFn = ((model: { api?: string }, context: unknown, options: unknown) => {
       if (model?.api === "ollama") ensureOllamaNativeApiRegistered();
-      if (model?.api === "antigravity") ensureAntigravityRegistered();
       return (wrappedStreamFn as (m: unknown, c: unknown, o: unknown) => unknown)(model, context, options);
     }) as typeof baseStreamFn;
     log.debug("stream wrappers installed", {

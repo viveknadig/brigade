@@ -23,7 +23,6 @@ import { getEnvApiKey, getModels, type KnownProvider, type Model } from "@earend
 // The package.json "exports" map exposes "./oauth", so this is the supported
 // path (verified against node_modules @ pi-ai 0.79.9).
 import { getOAuthProvider } from "@earendil-works/pi-ai/oauth";
-import { ensureAntigravityRegistered } from "../integrations/antigravity/transport.js";
 import type { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { CancellableLoader, Input, type SelectItem, SelectList, Text, TUI } from "@earendil-works/pi-tui";
 
@@ -35,7 +34,7 @@ import {
 } from "../auth/profiles.js";
 import { DEFAULT_AGENT_ID, resolveAuthProfilesPath, resolveModelsPath } from "../config/paths.js";
 import { BRIGADE_DIR, saveConfig } from "../core/config.js";
-import { readClaudeCliLogin, readCodexCliLogin, readGeminiCliLogin } from "../integrations/cli-login.js";
+import { readClaudeCliLogin, readCodexCliLogin } from "../integrations/cli-login.js";
 import { writeCustomProviderToModelsJson } from "../integrations/custom-provider.js";
 import { discoverOllamaModels, writeOllamaToModelsJson } from "../integrations/ollama.js";
 import {
@@ -122,6 +121,16 @@ async function getProviderModels(modelRegistry: ModelRegistry, providerId: strin
 				.getAll()
 				.filter((m) => m.provider === providerId) as Array<Model<any>>;
 			if (fromRegistry.length > 0) return fromRegistry;
+			// Curated catalog list (subscription/custom provider not in Pi's bundled
+			// catalog and has no live models endpoint). Surfacing it here gives a real
+			// PICKER — same UX as claude-code (whose list is likewise a bundled set) —
+			// instead of dead-ending to a "type the model name" free-text prompt.
+			const curated = findProvider(providerId)?.models;
+			if (curated && curated.length > 0) {
+				return curated.map(
+					(id) => ({ id, provider: providerId, name: id, api: findProvider(providerId)?.api }) as unknown as Model<any>,
+				);
+			}
 		}
 		try {
 			const fromCatalog = getModels(providerId as KnownProvider) as Array<Model<any>>;
@@ -459,12 +468,7 @@ async function pickProvider(tui: TUI): Promise<string> {
 		// A login the matching vendor CLI already minted on this machine?
 		let cliReady = false;
 		if (p.cliLogin) {
-			const cred =
-				p.cliLogin.read === "claude"
-					? readClaudeCliLogin()
-					: p.cliLogin.read === "gemini"
-						? readGeminiCliLogin()
-						: readCodexCliLogin();
+			const cred = p.cliLogin.read === "claude" ? readClaudeCliLogin() : readCodexCliLogin();
 			cliReady = cred !== null;
 		}
 		const hasEnvKey = !!readProviderEnvKey(p);
@@ -963,11 +967,6 @@ export async function ensureSubscriptionLogin(
 	provider: ProviderInfo,
 ): Promise<"ok" | "back"> {
 	const sub = provider.subscription!;
-	// Antigravity's OAuth provider is a Brigade-registered custom provider (not a Pi
-	// built-in), so register it before the lookup or `getOAuthProvider` returns
-	// undefined and the wizard reports "not supported yet". Idempotent + no-op once
-	// registered; gated so other subscription logins don't touch it.
-	if (sub.oauthProviderId === "antigravity") ensureAntigravityRegistered();
 	const oauthProvider = getOAuthProvider(sub.oauthProviderId);
 	if (!oauthProvider) {
 		// Pi build doesn't know this provider — fail cleanly back to the picker
@@ -1193,12 +1192,7 @@ async function ensureCliLogin(
 	authStorage: AuthStorage,
 	provider: ProviderInfo,
 ): Promise<"ok" | "back" | "other"> {
-	const cred =
-		provider.cliLogin!.read === "claude"
-			? readClaudeCliLogin()
-			: provider.cliLogin!.read === "gemini"
-				? readGeminiCliLogin()
-				: readCodexCliLogin();
+	const cred = provider.cliLogin!.read === "claude" ? readClaudeCliLogin() : readCodexCliLogin();
 	if (!cred) return "other"; // no CLI login present on this machine
 
 	// A login is already on this machine — but LEAD with browser sign-in: it works
