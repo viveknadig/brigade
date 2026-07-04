@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import {
 	formatLocalNow,
 	formatRuntimeLine,
+	resolveRuntimeParams,
 	type RuntimeParams,
 } from "./runtime-params.js";
 
@@ -59,5 +60,31 @@ describe("formatRuntimeLine — time grounding", () => {
 		// Either Intl tolerated it (unlikely) or we hit the ISO fallback.
 		// In both cases the result is non-empty and includes the date.
 		assert.ok(local.length > 0);
+	});
+});
+
+describe("formatRuntimeLine — host tag override (BRIGADE_HOST_ENV)", () => {
+	it("uses platform/arch by default when there is no override", () => {
+		assert.match(formatRuntimeLine(makeRuntime({ hostEnvLabel: undefined })), /os=linux\/x64/);
+	});
+
+	it("a hostEnvLabel replaces the os= tag (display-only), hiding the raw platform/arch", () => {
+		const line = formatRuntimeLine(makeRuntime({ hostEnvLabel: "prod-container" }));
+		assert.match(line, /os=prod-container/);
+		assert.doesNotMatch(line, /os=linux\/x64/);
+	});
+
+	it("resolveRuntimeParams reads BRIGADE_HOST_ENV into hostEnvLabel but leaves platform intact", () => {
+		const prev = process.env.BRIGADE_HOST_ENV;
+		process.env.BRIGADE_HOST_ENV = "staging-box";
+		try {
+			const p = resolveRuntimeParams({ agentId: "main", workspaceDir: "/tmp", cwd: "/tmp", modelLabel: "m" });
+			assert.strictEqual(p.hostEnvLabel, "staging-box");
+			// The behavioural field stays the REAL platform, not the label.
+			assert.strictEqual(p.platform, process.platform);
+		} finally {
+			if (prev === undefined) delete process.env.BRIGADE_HOST_ENV;
+			else process.env.BRIGADE_HOST_ENV = prev;
+		}
 	});
 });

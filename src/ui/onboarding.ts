@@ -42,6 +42,7 @@ import {
 	PROVIDERS,
 	readProviderEnvKey,
 	resolveProviderEnvVarSource,
+	routesToCustomProvider,
 	type ProviderInfo,
 } from "../providers/catalog.js";
 import { validateApiKeyOnline } from "../providers/validate-key.js";
@@ -320,7 +321,7 @@ export async function runOnboarding(
 			// prompts for the URL when it's missing. Without this, the generic
 			// custom path falls through to `ensureApiKey`, which never writes
 			// `models.json` — leaving the model unresolvable at gateway startup.
-			if (providerInfo?.custom) {
+			if (routesToCustomProvider(providerInfo)) {
 				const r = await ensureCustomProvider(tui, authStorage, modelRegistry, providerInfo);
 				if (r === "back") {
 					step = "provider";
@@ -1319,8 +1320,17 @@ async function ensureCustomProvider(
 	// key-entry loop, then attach it to a shallow copy so the downstream
 	// write path sees a fully resolved provider without mutating the catalog.
 	if (!provider.baseUrl) {
+		let urlError: string | null = null;
 		while (true) {
 			renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
+			// Render the error at the TOP of the loop (before the prompt), with the
+			// single requestRender() below. Adding it AFTER requestRender lets the
+			// next iteration's clear() wipe it before it ever paints — a silent
+			// re-prompt with no reason shown. Mirrors the key-entry loop's lastError.
+			if (urlError) {
+				tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error(urlError)}`, 0, 0));
+				tui.addChild(new Text("", 0, 0));
+			}
 			tui.addChild(new Text(`  Enter your OpenAI-compatible base URL.`, 0, 0));
 			tui.addChild(new Text(brand.dim("  Example: https://api.example.com/v1"), 0, 0));
 			tui.addChild(new Text(brand.dim("  Enter to continue  ·  Esc to go back"), 0, 0));
@@ -1339,14 +1349,12 @@ async function ensureCustomProvider(
 				return "back";
 			}
 			if (!rawUrl) {
-				// Empty submit — re-render with a hint.
+				urlError = "Enter a base URL, or press Esc to go back.";
 				continue;
 			}
 			// Minimal URL sanity check — must start with http(s)://.
 			if (!/^https?:\/\//i.test(rawUrl)) {
-				renderScreen(tui, `Step 3 of 5 · ${provider.name}`);
-				tui.addChild(new Text(`  ${brand.error("✗")} ${brand.error("URL must start with http:// or https://")}`, 0, 0));
-				tui.addChild(new Text("", 0, 0));
+				urlError = "URL must start with http:// or https://";
 				continue;
 			}
 			provider = { ...provider, baseUrl: rawUrl, api: provider.api ?? "openai-completions" };

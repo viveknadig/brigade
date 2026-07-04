@@ -86,6 +86,10 @@ const SENSITIVE_PATTERNS: RegExp[] = [
 	/\bghp_[A-Za-z0-9]{20,}\b/g,
 	/\bxoxb-[A-Za-z0-9-]{10,}\b/g,
 	/\bxoxp-[A-Za-z0-9-]{10,}\b/g,
+	// Google AI / Gemini keys — legacy AIza… and the newer AQ.… (base64url).
+	// The lookbehind keeps `com.AQ.x`, `/AQ.x`, `token.AQ.x` from matching.
+	/\bAIza[A-Za-z0-9_-]{35}\b/g,
+	/(?<![\w./\\-])AQ\.[A-Za-z0-9_-]{30,}/g,
 ];
 
 /** Best-effort credential redaction for history text. NOT a security boundary. */

@@ -5,8 +5,8 @@
  * `ensureCustomProvider` path (which writes `models.json`) because the gate
  * checked `providerInfo?.custom && providerInfo.baseUrl` — but the generic
  * custom catalog entry has no `baseUrl`. After the fix, the gate is
- * `providerInfo?.custom`, and `ensureCustomProvider` prompts for the URL
- * when it's absent.
+ * `routesToCustomProvider(providerInfo)`, and `ensureCustomProvider` prompts
+ * for the URL when it's absent.
  *
  * These tests verify:
  *   1. The catalog routing condition now matches the generic custom entry.
@@ -21,7 +21,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
-import { findProvider } from "../providers/catalog.js";
+import { findProvider, routesToCustomProvider } from "../providers/catalog.js";
 import { writeCustomProviderToModelsJson } from "../integrations/custom-provider.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
 
@@ -42,18 +42,24 @@ describe("generic custom provider onboarding", () => {
 			);
 		});
 
-		it("the routing condition `providerInfo?.custom` matches the generic entry", () => {
-			// This test exists to prevent regressions: the old condition
-			// (`custom && baseUrl`) excluded this entry. The fix widened it
-			// to `custom` only. If someone adds `&& baseUrl` back, this test
-			// surfaces the regression with a clear explanation.
-			const provider = findProvider("custom");
-			assert.ok(provider);
-			const wouldRoute = !!provider.custom;
+		it("routesToCustomProvider() — the REAL onboarding gate — matches the generic entry", () => {
+			// Guards the ACTUAL predicate the provider gate calls (onboarding.ts:323),
+			// not a re-implemented copy. The old condition (`custom && baseUrl`)
+			// excluded the generic entry (no baseUrl); the fix widened it to `custom`.
+			// If someone reverts `routesToCustomProvider` to require baseUrl, this fails.
+			const generic = findProvider("custom");
+			assert.ok(generic);
+			assert.ok(!generic.baseUrl, "the generic custom entry has no baseUrl");
 			assert.ok(
-				wouldRoute,
-				"the generic custom provider must be routed to ensureCustomProvider",
+				routesToCustomProvider(generic),
+				"the generic custom provider (no baseUrl) must route to ensureCustomProvider",
 			);
+			// A named custom (has baseUrl) still routes here — unchanged behavior.
+			const named = findProvider("nvidia-nim") ?? findProvider("glm");
+			assert.ok(named && routesToCustomProvider(named), "named customs still route to ensureCustomProvider");
+			// A non-custom provider uses the plain key path, NOT ensureCustomProvider.
+			const nonCustom = findProvider("anthropic");
+			assert.ok(nonCustom && !routesToCustomProvider(nonCustom), "non-custom providers must not route here");
 		});
 	});
 

@@ -13,6 +13,11 @@ export interface RuntimeParams {
   hostName: string;
   platform: NodeJS.Platform;
   arch: string;
+  /** Operator override (BRIGADE_HOST_ENV) for the DISPLAYED host tag in the
+   *  runtime line — e.g. "windows" or "prod-container". Display-only: the
+   *  `platform` field above stays the real `process.platform`, so behavioural
+   *  branching (e.g. the Windows shell-hygiene guidance) is unaffected. */
+  hostEnvLabel?: string;
   nodeVersion: string;
   shell: string | undefined;
   modelLabel: string;
@@ -47,6 +52,7 @@ export function resolveRuntimeParams(args: ResolveRuntimeArgs): RuntimeParams {
     hostName: safeHostName(),
     platform: process.platform,
     arch: process.arch,
+    hostEnvLabel: process.env.BRIGADE_HOST_ENV?.trim() || undefined,
     nodeVersion: process.versions.node,
     shell: process.env.SHELL ?? process.env.ComSpec,
     modelLabel: args.modelLabel,
@@ -67,7 +73,7 @@ export function formatRuntimeLine(p: RuntimeParams): string {
   const parts = [
     `agent=${p.agentId}`,
     `host=${p.hostName}`,
-    `os=${p.platform}/${p.arch}`,
+    `os=${p.hostEnvLabel ?? `${p.platform}/${p.arch}`}`,
     `node=${p.nodeVersion}`,
     `shell=${p.shell ?? "?"}`,
     `tz=${p.timezone}`,

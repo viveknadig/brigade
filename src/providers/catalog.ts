@@ -282,6 +282,20 @@ export function findProvider(id: string): ProviderInfo | undefined {
 }
 
 /**
+ * Whether onboarding routes a picked provider through `ensureCustomProvider`
+ * (which writes `models.json` so the model resolves at gateway boot) instead of
+ * the plain API-key path. ANY `custom` catalog entry routes here — including the
+ * generic "Custom (OpenAI-compatible)" entry that has NO pre-set `baseUrl` (its
+ * URL is prompted for). The old gate also required `baseUrl`, which wrongly
+ * excluded the generic entry and left its model unresolvable at boot. Kept here
+ * (not in onboarding.ts) so tests assert the REAL predicate the gate uses
+ * without importing the TUI module — see onboarding-custom-url.test.ts.
+ */
+export function routesToCustomProvider(p: ProviderInfo | undefined): p is ProviderInfo & { custom: true } {
+	return !!p?.custom;
+}
+
+/**
  * Look for the provider's API key across `envVar` and any `envVarFallbacks`,
  * in order. Returns the first non-empty value found, or `undefined` if none
  * are set. Used by the onboard auto-select shortcut and the provider picker's
