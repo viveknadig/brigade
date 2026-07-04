@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.23.0](https://github.com/spinabot/brigade/compare/brigade-v1.22.1...brigade-v1.23.0) (2026-07-04)
+
+
+### Features
+
+* add --replace flag to brigade gateway for in-place restart ([#64](https://github.com/spinabot/brigade/issues/64)) ([81e827f](https://github.com/spinabot/brigade/commit/81e827fd733eb5d0fabcd71c519ad2e3b82fde34))
+
+
+### Bug Fixes
+
+* **gateway:** auto-heal an expired Claude subscription at boot; remove --replace ([0eb9864](https://github.com/spinabot/brigade/commit/0eb9864bbaeccc7ef561871a653c820d2cd3cb2f))
+* redactor leak on history path, wire BRIGADE_HOST_ENV, custom-provider UX ([b3617bf](https://github.com/spinabot/brigade/commit/b3617bf32389397903e2006b9b4c673cf766f64b))
+* route generic custom provider through ensureCustomProvider to write models.json ([#63](https://github.com/spinabot/brigade/issues/63)) ([9eb7ec3](https://github.com/spinabot/brigade/commit/9eb7ec3e2cdf03279dfc9819ea4232f441493edf))
+* **security:** recognise Google AQ. prefix in redactor and secrets audit ([#65](https://github.com/spinabot/brigade/issues/65)) ([a48c114](https://github.com/spinabot/brigade/commit/a48c1144559afa848ded1b53022eeff9f604170f))
+
 ## [1.22.1](https://github.com/spinabot/brigade/compare/brigade-v1.22.0...brigade-v1.22.1) (2026-07-03)
 
 
