@@ -229,9 +229,6 @@
     "yaml": "^2.9.0",
     "zod": "^3.23.8"
   },
-  "optionalDependencies": {
-    "@hyperframes/producer": "^0.7.36"
-  },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/prompts": "^2.4.9",

@@ -300,6 +300,17 @@ merge / split / stamp / watermark PDFs — all with pure-JS libraries, no sandbo
 Drop a document into a channel and Brigade sees it; ask for a report and it hands
 one back with `send_media`.
 
+### 🎬 Motion-graphics video (HyperFrames)
+`render_video` turns an HTML composition into a **deterministic MP4** — animated
+charts and dashboards, data explainers, quote/announcement cards, kinetic
+typography, branded short-form social clips. Your crew writes a self-contained
+GSAP-timeline composition (the `hyperframes` skill teaches the conventions) and
+Brigade renders it frame-by-frame in an **isolated worker** (headless Chrome +
+FFmpeg), then hands back the file with `send_media`. It's the deterministic,
+data-driven counterpart to `generate_video` (generative AI footage). The engine is
+an **optional** dependency — the tool stays dormant until you install it
+(`npm i @hyperframes/producer`), so it adds nothing to a lean setup.
+
 ### 🧩 MCP
 Run `brigade mcp` to expose your long-term memory to any MCP client (Claude Desktop,
 editors, etc.) as add/search/context tools over stdio, owner-bound.
@@ -665,7 +676,7 @@ Every agent gets a curated toolset. Mutating/privileged tools are owner-gated
 - **Scheduling:** `cron` (schedule jobs from inside a turn)
 - **Web:** `web_search`, `fetch_url`, `browser` (when a provider is configured)
 - **Connectors:** `composio` (1,000+ apps), `oauth_authorize`
-- **Generation:** `generate_image`
+- **Generation:** `generate_image`, `generate_video`, `generate_speech`, `generate_music`, `render_video` (HTML→MP4 motion graphics, optional engine)
 - **Documents & media:** `analyze_media` (read/understand PDF · Office · image · audio · video), `make_document` · `edit_document` (create & edit Word/Excel/PowerPoint/PDF)
 - **Channels:** `send_message`, `send_media` (when a channel is linked)
 
