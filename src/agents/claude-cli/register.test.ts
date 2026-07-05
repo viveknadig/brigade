@@ -60,3 +60,20 @@ test("isClaudeCliAvailable: PATH scan is cached + never throws", () => {
 		__resetClaudeCliAvailabilityCache();
 	}
 });
+
+test("synthClaudeCliModel: has a string baseUrl (guards Pi provider-attribution crash)", () => {
+	// Pi's provider-attribution does `model.provider==="openrouter" || model.baseUrl.includes(...)`,
+	// which throws on a missing baseUrl. Every synth model MUST carry a string baseUrl.
+	for (const id of ["claude-sonnet-4-6", "claude-fable-5", "claude-cli/claude-future-9"]) {
+		const m = synthClaudeCliModel(id);
+		assert.equal(typeof m.baseUrl, "string");
+		assert.ok((m.baseUrl as string).length > 0);
+		// And it must NOT look like openrouter (so attribution resolves false, not true).
+		assert.ok(!(m.baseUrl as string).includes("openrouter"));
+	}
+});
+
+test("synthClaudeCliModel: Fable/Sonnet flagged reasoning", () => {
+	assert.equal(synthClaudeCliModel("claude-fable-5").reasoning, true);
+	assert.equal(synthClaudeCliModel("claude-sonnet-5").reasoning, true);
+});

@@ -100,7 +100,14 @@ export interface ClaudeCliModelDef {
 	maxTokens: number;
 }
 
+// Static FALLBACK catalog — used only when live discovery (models-live.ts,
+// which queries the account's real `/v1/models`) is unavailable. Kept roughly
+// current so an offline picker still offers sensible choices, but the live
+// fetch is the source of truth and will surface anything newer (it's what puts
+// Fable 5 / Sonnet 5 in front of the operator the moment their account has it).
 export const CLAUDE_CLI_MODELS: readonly ClaudeCliModelDef[] = [
+	{ id: "claude-sonnet-5", name: "Claude Sonnet 5 (subscription)", cliModel: "claude-sonnet-5", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+	{ id: "claude-fable-5", name: "Claude Fable 5 (subscription)", cliModel: "claude-fable-5", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
 	{ id: "claude-opus-4-8", name: "Claude Opus 4.8 (subscription)", cliModel: "claude-opus-4-8", reasoning: true, contextWindow: 200_000, maxTokens: 32_000 },
 	{ id: "claude-opus-4-7", name: "Claude Opus 4.7 (subscription)", cliModel: "claude-opus-4-7", reasoning: true, contextWindow: 200_000, maxTokens: 32_000 },
 	{ id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6 (subscription)", cliModel: "claude-sonnet-4-6", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },

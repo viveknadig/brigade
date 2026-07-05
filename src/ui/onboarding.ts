@@ -1905,12 +1905,16 @@ async function pickModel(tui: TUI, modelRegistry: ModelRegistry, providerId: str
 }
 
 /** Model picker for the claude-cli backend — its models are synthesized (not in
- *  the registry), so we present the backend's own catalog. */
+ *  the registry). Pulls the account's LIVE model set from `/v1/models` (Fable 5,
+ *  Sonnet 5, …); falls back to the static catalog on any failure. */
 async function pickClaudeCliModel(tui: TUI): Promise<"back" | { modelId: string }> {
-	const items: SelectItem[] = CLAUDE_CLI_MODELS.map((m) => ({
-		value: m.id,
-		label: m.id,
-		description: m.name,
+	const { fetchClaudeCliModelIds } = await import("../agents/claude-cli/models-live.js");
+	const liveIds = await fetchClaudeCliModelIds().catch(() => CLAUDE_CLI_MODELS.map((m) => m.id));
+	const nameById = new Map(CLAUDE_CLI_MODELS.map((m) => [m.id, m.name]));
+	const items: SelectItem[] = liveIds.map((id) => ({
+		value: id,
+		label: id,
+		description: nameById.get(id) ?? `${id} (subscription)`,
 	}));
 	// Default first = the catalog default (Sonnet), then the rest as listed.
 	items.sort((a, b) =>

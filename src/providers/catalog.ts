@@ -110,8 +110,8 @@ export const PROVIDERS: ProviderInfo[] = [
 		// with Claude Pro / Max, or reuse an existing Claude Code login — no key.
 		id: "claude-code",
 		providerId: "anthropic",
-		name: "Claude Code",
-		description: "Use your Claude Pro / Max subscription — no API key",
+		name: "Claude (browser OAuth)",
+		description: "Claude Pro / Max via browser sign-in — heavy turns can draw extra-usage (for none, pick 'Claude via Claude Code CLI')",
 		keyUrl: "https://claude.ai",
 		envVar: "",
 		subscription: { oauthProviderId: "anthropic", label: "Log in with Claude Pro / Max" },

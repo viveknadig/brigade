@@ -126,7 +126,7 @@ import type { GroupToolPolicyConfig } from "../agents/channels/access-control/in
 import { makeOpQueue, withTimeout } from "./extension-lifecycle.js";
 import { resolveModelNeverMiss } from "../agents/model-resolution.js";
 import { isClaudeCliAvailable } from "../agents/claude-cli/availability.js";
-import { listClaudeCliModels } from "../agents/claude-cli/register.js";
+import { listClaudeCliModels, listClaudeCliModelsLive } from "../agents/claude-cli/register.js";
 import {
 	getCachedSubscriptionModels,
 	listOpenRouterModels,
@@ -3470,7 +3470,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				// so merge them explicitly; registry entries win on id collision.
 				if (isClaudeCliAvailable()) {
 					const seenCli = new Set(merged.map((m) => `${m.provider}/${m.id}`));
-					for (const cm of listClaudeCliModels()) {
+					// Live model set from the account's `/v1/models` (Fable 5, Sonnet 5,
+					// …); falls back to the static catalog internally on any failure.
+					const cliModels = await listClaudeCliModelsLive().catch(() => listClaudeCliModels());
+					for (const cm of cliModels) {
 						if (!seenCli.has(`${cm.provider}/${cm.id}`)) merged.push(cm as unknown as Model<any>);
 					}
 				}

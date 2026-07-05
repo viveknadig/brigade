@@ -67,8 +67,13 @@ export function synthClaudeCliModel(modelId: string): SynthClaudeCliModel {
 		id,
 		name: known?.name ?? `${id} (subscription)`,
 		api: CLAUDE_CLI_API,
-		// No baseUrl — the transport is a subprocess, not an HTTP endpoint.
-		reasoning: known?.reasoning ?? /opus|sonnet/i.test(id),
+		// The transport is a subprocess, not an HTTP endpoint — but a `baseUrl`
+		// MUST still be present + a string: Pi's provider-attribution runs on
+		// every model (`model.provider === "openrouter" || model.baseUrl.includes(
+		// …)`) and crashes with "Cannot read properties of undefined (reading
+		// 'includes')" on a missing baseUrl. This placeholder is never dialed.
+		baseUrl: "https://api.anthropic.com",
+		reasoning: known?.reasoning ?? /opus|sonnet|fable/i.test(id),
 		input: ["text"] as ("text" | "image")[],
 		cost: { ...ZERO_COST },
 		contextWindow: known?.contextWindow ?? 200_000,
@@ -82,10 +87,23 @@ export function isClaudeCliProvider(provider: string | undefined): boolean {
 }
 
 /**
- * The catalogued claude-cli models as Pi `Model` objects, for merging into the
- * gateway's `/model` list so the backend is selectable. Callers should gate on
+ * The catalogued claude-cli models as Pi `Model` objects (static fallback), for
+ * merging into the gateway's `/model` list. Callers should gate on
  * `isClaudeCliAvailable()` first — advertise it only when the binary exists.
  */
 export function listClaudeCliModels(): SynthClaudeCliModel[] {
 	return CLAUDE_CLI_MODELS.map((m) => synthClaudeCliModel(m.id));
+}
+
+/**
+ * Like `listClaudeCliModels` but resolves the account's LIVE model set from
+ * Anthropic's `/v1/models` (via the subscription token) so the picker reflects
+ * exactly what the subscription can run — including models newer than the
+ * static catalog (Fable 5, Sonnet 5, …). Falls back to the static list on any
+ * failure. Async; call from the gateway's already-async `list-models`.
+ */
+export async function listClaudeCliModelsLive(): Promise<SynthClaudeCliModel[]> {
+	const { fetchClaudeCliModelIds } = await import("./models-live.js");
+	const ids = await fetchClaudeCliModelIds();
+	return ids.map((id) => synthClaudeCliModel(id));
 }
