@@ -39,6 +39,8 @@ import { makeGenerateImageTool } from "./generate-image-tool.js";
 import { makeGenerateSpeechTool } from "./generate-speech-tool.js";
 import { makeTranscribeAudioTool } from "./transcribe-audio-tool.js";
 import { makeGenerateVideoTool } from "./generate-video-tool.js";
+import { isRenderVideoAvailable } from "./render-video/availability.js";
+import { makeRenderVideoTool } from "./render-video/tool.js";
 import { makeGenerateMusicTool } from "./generate-music-tool.js";
 import { makeAnalyzeMediaTool } from "./analyze-media-tool.js";
 import { makeMakeDocumentTool } from "./make-document-tool.js";
@@ -284,6 +286,14 @@ export function createBrigadeTools(opts: CreateBrigadeToolsOptions): AnyBrigadeT
 		// minimax / runway) with async submit→poll→download. Saves an mp4 the agent
 		// hands off to send_media.
 		makeGenerateVideoTool(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+		// render_video — HTML→MP4 via the HyperFrames engine: DETERMINISTIC,
+		// data-driven video (animated charts/dashboards, explainers, text/quote
+		// cards, motion graphics) — the programmatic complement to the generative
+		// generate_video above. Registered only when the engine is present (Node 22
+		// + the `hyperframes` binary), like the claude-cli backend appears when
+		// `claude` is installed. FFmpeg/Chrome gaps surface as render-time
+		// remediation rather than hiding the tool.
+		...(isRenderVideoAvailable() ? [makeRenderVideoTool()] : []),
 		// generate_music — text-to-music. Billed (owner-gated); multi-provider
 		// (google-lyria / minimax-music / elevenlabs-music). Saves audio for send_media.
 		makeGenerateMusicTool(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),

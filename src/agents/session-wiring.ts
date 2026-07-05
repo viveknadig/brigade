@@ -252,6 +252,26 @@ export function assembleBrigadeToolset(opts: {
 		if (t.name === "generate_image") {
 			return wrapToolExecutionTimeout(ownerWrapped, 200_000);
 		}
+		// generate_video's real worst case STACKS phases that run outside the poll
+		// window: submit (≤120s) + poll (720s ceiling, but a final tick can start
+		// at ~719s and hang a full 120s → ~840s) + download (≤120s), and the
+		// image-to-video path adds a ≤120s image fetch first — so ~1200s, not the
+		// 720s poll ceiling alone. Undersizing silently drops a BILLED cloud render
+		// (the tool is killed while the provider job keeps going). Budget for i2v.
+		if (t.name === "generate_video") {
+			return wrapToolExecutionTimeout(ownerWrapped, 1_220_000);
+		}
+		// generate_music's MiniMax path is TWO sequential REQUEST_TIMEOUT_MS (180s)
+		// calls — submit (returns a URL) then download — so ~360s worst case, well
+		// over a single 200s budget. Give it its own ceiling.
+		if (t.name === "generate_music") {
+			return wrapToolExecutionTimeout(ownerWrapped, 400_000);
+		}
+		// generate_speech is a single ≤120s POST per provider (no multi-chunk / no
+		// retries) — 200s clears it with slack.
+		if (t.name === "generate_speech") {
+			return wrapToolExecutionTimeout(ownerWrapped, 200_000);
+		}
 		// sessions_send WAITS for the peer's run up to its own
 		// `timeoutSeconds` (default 90s) + a 10s final-text flush poll — the
 		// blanket 60s watchdog killed every legitimate wait mid-flight
@@ -267,6 +287,14 @@ export function assembleBrigadeToolset(opts: {
 		// waitSeconds + slack (same pattern as spawn / sessions_send).
 		if (t.name === "oauth_authorize") {
 			return wrapToolExecutionTimeout(ownerWrapped, undefined, resolveOAuthAuthorizeTimeoutMs);
+		}
+		// render_video runs lint (≤60s) THEN render (≤600s overall watchdog) + a 5s
+		// kill-settle each + doctor/fs overhead — sequential, so ~680s worst case,
+		// not the 600s render ceiling alone. The blanket 60s budget would kill every
+		// real render; a 620s budget would kill a near-done render after a slow
+		// lint. Size for lint + render + slack.
+		if (t.name === "render_video") {
+			return wrapToolExecutionTimeout(ownerWrapped, 700_000);
 		}
 		return wrapToolExecutionTimeout(ownerWrapped);
 	});

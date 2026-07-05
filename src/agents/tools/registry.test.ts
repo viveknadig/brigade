@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 
+import { __resetRenderVideoAvailabilityCache } from "./render-video/availability.js";
 import { createBrigadeTools, listBrigadeToolNames } from "./registry.js";
 
 // createBrigadeTools constructs a FileMemoryStore rooted at workspaceDir.
@@ -40,6 +41,12 @@ describe("createBrigadeTools — Primitive #4 (memory) + agents_list + manage_ag
 		const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-registry-noorg-"));
 		const prev = process.env.BRIGADE_STATE_DIR;
 		process.env.BRIGADE_STATE_DIR = stateDir;
+		// render_video is registered only when the HyperFrames engine resolves on
+		// this host — force it OFF so the baseline count/name assertions are
+		// deterministic regardless of whether a dev has `hyperframes` installed.
+		const prevHf = process.env.BRIGADE_HYPERFRAMES_PATH;
+		process.env.BRIGADE_HYPERFRAMES_PATH = path.join(stateDir, "no-such-hyperframes");
+		__resetRenderVideoAvailabilityCache();
 		let tools;
 		try {
 			tools = createBrigadeTools({
@@ -50,6 +57,9 @@ describe("createBrigadeTools — Primitive #4 (memory) + agents_list + manage_ag
 		} finally {
 			if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
 			else process.env.BRIGADE_STATE_DIR = prev;
+			if (prevHf === undefined) delete process.env.BRIGADE_HYPERFRAMES_PATH;
+			else process.env.BRIGADE_HYPERFRAMES_PATH = prevHf;
+			__resetRenderVideoAvailabilityCache();
 			fs.rmSync(stateDir, { recursive: true, force: true });
 		}
 		assert.equal(tools.length, 23);
@@ -79,6 +89,32 @@ describe("createBrigadeTools — Primitive #4 (memory) + agents_list + manage_ag
 			"transcribe_audio",
 			"write_memory",
 		]);
+	});
+
+	it("registers render_video only when the HyperFrames engine resolves", () => {
+		const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-registry-hf-"));
+		const prevState = process.env.BRIGADE_STATE_DIR;
+		const prevHf = process.env.BRIGADE_HYPERFRAMES_PATH;
+		process.env.BRIGADE_STATE_DIR = stateDir;
+		// Point the engine override at a real, resolvable executable (the running
+		// node) so availability's PATH probe succeeds without a real install.
+		process.env.BRIGADE_HYPERFRAMES_PATH = process.execPath;
+		__resetRenderVideoAvailabilityCache();
+		try {
+			const names = createBrigadeTools({
+				workspaceDir: tmpWorkspace,
+				agentId: "main",
+				cwd: tmpWorkspace,
+			}).map((t) => t.name);
+			assert.ok(names.includes("render_video"), "render_video present when engine resolves");
+		} finally {
+			if (prevState === undefined) delete process.env.BRIGADE_STATE_DIR;
+			else process.env.BRIGADE_STATE_DIR = prevState;
+			if (prevHf === undefined) delete process.env.BRIGADE_HYPERFRAMES_PATH;
+			else process.env.BRIGADE_HYPERFRAMES_PATH = prevHf;
+			__resetRenderVideoAvailabilityCache();
+			fs.rmSync(stateDir, { recursive: true, force: true });
+		}
 	});
 
 	it("each tool has the required AgentTool shape", () => {
