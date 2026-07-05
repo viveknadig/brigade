@@ -67,7 +67,7 @@ function makeFakeSpawn(script: FakeSpawnScript) {
 }
 
 const MODEL = { id: "claude-sonnet-4-6", api: "claude-cli", provider: "claude-cli" } as never;
-const CTX = { systemPrompt: "You are Brigade.", messages: [{ role: "user", content: "hey" }] };
+const CTX = { systemPrompt: "You are Brigade.", messages: [{ role: "user", content: "hey" }] } as never;
 
 async function drain(stream: { [Symbol.asyncIterator](): AsyncIterator<unknown>; result(): Promise<unknown> }) {
 	const events: any[] = [];
@@ -178,7 +178,7 @@ test("stream fn: abort signal → aborted error event", async () => {
 	const ac = new AbortController();
 	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES }) });
 	ac.abort();
-	const { events } = await drain(fn(MODEL, { ...CTX }, { signal: ac.signal }) as never);
+	const { events } = await drain(fn(MODEL, CTX, { signal: ac.signal }) as never);
 	// Either an aborted error or a clean end — never a crash. Assert no throw + terminal event present.
 	assert.ok(events.some((e) => e.type === "error" || e.type === "done"));
 });
