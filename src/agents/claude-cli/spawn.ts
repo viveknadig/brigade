@@ -4,11 +4,15 @@
 // Pi-event mapping and the OS-process concerns test independently.
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { buildClaudeCliEnv, resolveClaudeCliCommand } from "./catalog.js";
+import {
+	buildClaudeCliEnv,
+	CLAUDE_CLI_SYSTEM_PROMPT_FILE_FLAG,
+	resolveClaudeCliCommand,
+} from "./catalog.js";
 import { hasBrigadeClaudeLogin, resolveBrigadeClaudeConfigDir } from "./claude-config.js";
 import { parseClaudeCliLine, type ClaudeCliFrame } from "./stream-json.js";
 
@@ -27,6 +31,13 @@ export interface SpawnClaudeCliArgs {
 	args: string[];
 	/** Prompt delivered on stdin (the whole serialized conversation). */
 	stdin: string;
+	/**
+	 * Composed system prompt. Written to a temp file inside the isolated cwd and
+	 * passed via `--append-system-prompt-file` — NEVER on argv, so a large
+	 * Brigade system prompt can't trip the OS command-line length limit
+	 * (`spawn ENAMETOOLONG` on Windows). Omitted/empty ⇒ no system-prompt flag.
+	 */
+	systemPrompt?: string;
 	/** External cancel (turn abort). Aborting SIGKILLs the child. */
 	signal?: AbortSignal;
 	noOutputTimeoutMs?: number;
@@ -69,7 +80,24 @@ export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 	// operator's personal ~/.claude. Absent it, leave CLAUDE_CONFIG_DIR unset so
 	// the binary uses its default (the operator's own login).
 	const configDir = hasBrigadeClaudeLogin() ? resolveBrigadeClaudeConfigDir() : undefined;
-	const child: ChildProcessWithoutNullStreams = doSpawn(command, args.args, {
+
+	// Deliver the (potentially large) system prompt via a FILE, not argv — this
+	// keeps argv tiny and dodges `spawn ENAMETOOLONG`. Written into the throwaway
+	// cwd, so it's removed with it on exit.
+	const finalArgs = [...args.args];
+	const sys = args.systemPrompt?.trim();
+	if (sys && sys.length > 0) {
+		try {
+			const sysFile = path.join(cwd, "system-prompt.txt");
+			writeFileSync(sysFile, sys, "utf8");
+			finalArgs.push(CLAUDE_CLI_SYSTEM_PROMPT_FILE_FLAG, sysFile);
+		} catch {
+			/* couldn't write the file — proceed without the appended prompt rather
+			   than fail the turn (the CLI still has its own default identity). */
+		}
+	}
+
+	const child: ChildProcessWithoutNullStreams = doSpawn(command, finalArgs, {
 		cwd,
 		env: buildClaudeCliEnv(process.env, { configDir }),
 		stdio: ["pipe", "pipe", "pipe"],

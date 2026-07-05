@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import {
 	buildClaudeCliArgs,
+	composeClaudeCliSystemPrompt,
 	buildClaudeCliEnv,
 	CLAUDE_CLI_FORBIDDEN_ENV,
 	resolveCliModelArg,
@@ -27,8 +28,8 @@ test("resolveCliModelArg: catalogued + full ids pass through; families map; junk
 	assert.equal(resolveCliModelArg("gpt-4o"), "claude-sonnet-4-6"); // non-claude → default
 });
 
-test("buildClaudeCliArgs: fresh turn argv shape", () => {
-	const args = buildClaudeCliArgs({ modelId: "claude-cli/claude-sonnet-4-6", systemPrompt: "You are Brigade." });
+test("buildClaudeCliArgs: fresh turn argv shape (system prompt NOT on argv)", () => {
+	const args = buildClaudeCliArgs({ modelId: "claude-cli/claude-sonnet-4-6" });
 	assert.ok(args.includes("-p"));
 	assert.deepEqual(args.slice(1, 5), ["--output-format", "stream-json", "--include-partial-messages", "--verbose"]);
 	assert.ok(args.includes("--permission-mode"));
@@ -36,24 +37,29 @@ test("buildClaudeCliArgs: fresh turn argv shape", () => {
 	// model
 	const mi = args.indexOf("--model");
 	assert.equal(args[mi + 1], "claude-sonnet-4-6");
-	// conversational default → deny mutating tools + append system prompt
+	// conversational default → deny mutating tools
 	assert.ok(args.includes("--disallowedTools"));
-	const si = args.indexOf("--append-system-prompt");
-	assert.ok(si > 0);
-	assert.match(args[si + 1]!, /You are Brigade\./);
-	assert.match(args[si + 1]!, /do not use tools/i); // conversational suffix appended
+	// The system prompt is delivered via a FILE by the spawner, never on argv
+	// (dodges the OS command-line length limit) — so no inline flag here.
+	assert.ok(!args.includes("--append-system-prompt"));
+	assert.ok(!args.includes("--append-system-prompt-file"));
 });
 
-test("buildClaudeCliArgs: no system prompt still appends the conversational nudge", () => {
-	const args = buildClaudeCliArgs({ modelId: "opus" });
-	assert.ok(args.includes("--append-system-prompt"));
+test("composeClaudeCliSystemPrompt: persona + conversational nudge", () => {
+	const sys = composeClaudeCliSystemPrompt({ systemPrompt: "You are Brigade." });
+	assert.match(sys, /You are Brigade\./);
+	assert.match(sys, /do not use tools/i);
 });
 
-test("buildClaudeCliArgs: conversational:false drops tool-deny + suffix", () => {
-	const args = buildClaudeCliArgs({ modelId: "opus", systemPrompt: "x", conversational: false });
+test("composeClaudeCliSystemPrompt: no persona still yields the nudge; conversational:false → empty", () => {
+	assert.match(composeClaudeCliSystemPrompt({}), /do not use tools/i);
+	assert.equal(composeClaudeCliSystemPrompt({ systemPrompt: "x", conversational: false }), "x");
+	assert.equal(composeClaudeCliSystemPrompt({ conversational: false }), "");
+});
+
+test("buildClaudeCliArgs: conversational:false drops the tool-deny flag", () => {
+	const args = buildClaudeCliArgs({ modelId: "opus", conversational: false });
 	assert.ok(!args.includes("--disallowedTools"));
-	const si = args.indexOf("--append-system-prompt");
-	assert.equal(args[si + 1], "x"); // no suffix
 });
 
 test("buildClaudeCliEnv: strips credential/routing/telemetry vars + the host-managed marker", () => {

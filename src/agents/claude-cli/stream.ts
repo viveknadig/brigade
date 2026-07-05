@@ -23,7 +23,12 @@ import {
 } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 
-import { buildClaudeCliArgs, CLAUDE_CLI_API, CLAUDE_CLI_PROVIDER } from "./catalog.js";
+import {
+	buildClaudeCliArgs,
+	composeClaudeCliSystemPrompt,
+	CLAUDE_CLI_API,
+	CLAUDE_CLI_PROVIDER,
+} from "./catalog.js";
 import { spawnClaudeCli, type SpawnClaudeCliArgs } from "./spawn.js";
 import {
 	classifyResultFrame,
@@ -292,11 +297,15 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 			try {
 				const ctx = (context ?? {}) as { systemPrompt?: string; messages?: CtxMessage[] };
 				const prompt = serializeConversationPrompt(ctx.messages ?? []);
-				const args = buildClaudeCliArgs({ modelId: model.id, systemPrompt: ctx.systemPrompt });
+				const args = buildClaudeCliArgs({ modelId: model.id });
+				// System prompt goes via a file (not argv) — see spawn.ts. Composed
+				// here so the conversational nudge is included.
+				const systemPrompt = composeClaudeCliSystemPrompt({ systemPrompt: ctx.systemPrompt });
 
 				handle = spawnClaudeCli({
 					args,
 					stdin: prompt,
+					systemPrompt,
 					signal: options?.signal as AbortSignal | undefined,
 					spawnFn: opts.spawnFn,
 				});

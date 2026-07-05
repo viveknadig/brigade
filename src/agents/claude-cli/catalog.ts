@@ -296,19 +296,38 @@ export interface BuildArgsInput {
 }
 
 /**
- * Assemble the full argv (excluding the leading command) for a fresh turn.
- * Order: base flags → `--model <m>` → tool policy → `--append-system-prompt`.
- * The prompt itself is delivered on STDIN (never argv), so it never appears in
- * a process listing and has no length limit.
+ * Compose the full system-prompt TEXT for a turn (Brigade's assembled persona +
+ * the conversational nudge). Returned as a string so the caller can deliver it
+ * via a FILE (`--append-system-prompt-file`) — Brigade's system prompt is tens
+ * of KB (persona + skills + tools + memory), which blows the OS command-line
+ * length limit if passed as an argv string (Windows `spawn ENAMETOOLONG`).
+ * Returns "" when there's nothing to append.
+ */
+export function composeClaudeCliSystemPrompt(input: {
+	systemPrompt?: string;
+	conversational?: boolean;
+}): string {
+	const conversational = input.conversational !== false;
+	const parts = [input.systemPrompt?.trim(), conversational ? CLAUDE_CLI_SYSTEM_SUFFIX : ""].filter(
+		(p): p is string => !!p && p.length > 0,
+	);
+	return parts.join("\n\n");
+}
+
+/**
+ * Assemble the argv (excluding the leading command) for a fresh turn.
+ * Order: base flags → `--model <m>` → tool policy. The system prompt is NOT put
+ * on argv — it's delivered by the spawner via `--append-system-prompt-file`
+ * (see spawn.ts) to avoid the OS command-line length limit — and the user
+ * prompt is delivered on STDIN. So argv stays tiny + constant.
  */
 export function buildClaudeCliArgs(input: BuildArgsInput): string[] {
 	const args = [...CLAUDE_CLI_BASE_ARGS];
 	args.push("--model", resolveCliModelArg(input.modelId));
 	const conversational = input.conversational !== false;
 	if (conversational) args.push("--disallowedTools", CLAUDE_CLI_DENY_TOOLS);
-	const sysParts = [input.systemPrompt?.trim(), conversational ? CLAUDE_CLI_SYSTEM_SUFFIX : ""].filter(
-		(p): p is string => !!p && p.length > 0,
-	);
-	if (sysParts.length > 0) args.push("--append-system-prompt", sysParts.join("\n\n"));
 	return args;
 }
+
+/** The flag the spawner uses to deliver the composed system prompt from a file. */
+export const CLAUDE_CLI_SYSTEM_PROMPT_FILE_FLAG = "--append-system-prompt-file";
