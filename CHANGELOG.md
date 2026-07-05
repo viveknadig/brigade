@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.24.2](https://github.com/spinabot/brigade/compare/brigade-v1.24.1...brigade-v1.24.2) (2026-07-05)
+
+
+### Bug Fixes
+
+* **claude-cli:** crash on every turn (missing baseUrl), stale model list, misleading label ([00e9414](https://github.com/spinabot/brigade/commit/00e94147f75f13b38b96e4695c820f5c76f3ca6c))
+* **claude-cli:** deliver the system prompt via file, not argv (spawn ENAMETOOLONG) ([ee86fab](https://github.com/spinabot/brigade/commit/ee86fab3fc4865d00033151f70ddb59c93902944))
+
 ## [1.24.1](https://github.com/spinabot/brigade/compare/brigade-v1.24.0...brigade-v1.24.1) (2026-07-05)
 
 
