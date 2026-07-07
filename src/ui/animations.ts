@@ -257,6 +257,35 @@ export async function probeTerminalAnimationSupport(timeoutMs = 500): Promise<vo
 	});
 }
 
+/* ───────────────────── focus reporting (mode 1004) ───────────────────── */
+// While the intro clip plays, the terminal is asked to report window focus
+// (CSI ?1004h → it sends CSI I on focus, CSI O on blur). A minimized or
+// backgrounded window pauses the clip completely — zero writes, zero
+// flicker on restore, zero viewport yanking while the user is elsewhere.
+// Terminals without focus reporting simply never send the events (the clip
+// plays as if always focused), and restoreTerminal() force-disables the
+// mode on every exit path as the safety net.
+
+export const FOCUS_REPORTING_ON = "\x1b[?1004h";
+export const FOCUS_REPORTING_OFF = "\x1b[?1004l";
+const FOCUS_IN = "\x1b[I";
+const FOCUS_OUT = "\x1b[O";
+
+/**
+ * Scan an input chunk for focus events. Returns the focus state after the
+ * chunk (the LAST event wins; `current` when none present) and the chunk
+ * with the focus sequences stripped, so surrounding user input survives.
+ */
+export function scanFocusEvents(data: string, current: boolean): { focused: boolean; stripped: string } {
+	const lastIn = data.lastIndexOf(FOCUS_IN);
+	const lastOut = data.lastIndexOf(FOCUS_OUT);
+	if (lastIn === -1 && lastOut === -1) return { focused: current, stripped: data };
+	return {
+		focused: lastIn > lastOut,
+		stripped: data.replaceAll(FOCUS_IN, "").replaceAll(FOCUS_OUT, ""),
+	};
+}
+
 /**
  * Loader-spinner indicator override for the current terminal.
  *

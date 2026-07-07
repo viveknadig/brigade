@@ -22,6 +22,7 @@ import {
 	loaderIndicator,
 	parseSyncOutputProbeReply,
 	recordSyncOutputProbe,
+	scanFocusEvents,
 	shouldProbeTerminal,
 	terminalAnimationsEnabled,
 } from "./animations.js";
@@ -246,6 +247,30 @@ describe("gate honours the recorded probe result", () => {
 		} finally {
 			recordSyncOutputProbe(undefined);
 		}
+	});
+});
+
+describe("scanFocusEvents — window focus tracking for the intro clip", () => {
+	const IN = "\x1b[I";
+	const OUT = "\x1b[O";
+
+	it("no focus bytes → state unchanged, data untouched", () => {
+		assert.deepEqual(scanFocusEvents("hello", true), { focused: true, stripped: "hello" });
+		assert.deepEqual(scanFocusEvents("hello", false), { focused: false, stripped: "hello" });
+	});
+
+	it("focus-in / focus-out alone flip the state and strip clean", () => {
+		assert.deepEqual(scanFocusEvents(IN, false), { focused: true, stripped: "" });
+		assert.deepEqual(scanFocusEvents(OUT, true), { focused: false, stripped: "" });
+	});
+
+	it("mixed with user input: focus bytes stripped, keystrokes preserved", () => {
+		assert.deepEqual(scanFocusEvents(`ab${OUT}cd`, true), { focused: false, stripped: "abcd" });
+	});
+
+	it("multiple events in one chunk: the LAST one wins", () => {
+		assert.equal(scanFocusEvents(`${OUT}x${IN}`, false).focused, true);
+		assert.equal(scanFocusEvents(`${IN}x${OUT}`, true).focused, false);
 	});
 });
 

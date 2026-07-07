@@ -34,7 +34,7 @@ const { render } = cfontsPkg;
 
 import { type Component, type TUI, Text } from "@earendil-works/pi-tui";
 import chalk from "chalk";
-import { terminalAnimationsEnabled } from "./animations.js";
+import { FOCUS_REPORTING_OFF, FOCUS_REPORTING_ON, scanFocusEvents, terminalAnimationsEnabled } from "./animations.js";
 import { VIDEO_COLS, VIDEO_FPS, VIDEO_FRAME_COUNT, VIDEO_FRAMES, VIDEO_ROWS } from "./brand-frames-cli.js";
 
 // Wordmark palette — unchanged from the prior pure-text version.
@@ -496,6 +496,7 @@ export function composeFrame(frameIdx: number, termCols?: number, termRows?: num
 // over the brand row.
 let liveHeaderTimer: NodeJS.Timeout | undefined;
 let liveHeaderOnResize: (() => void) | undefined;
+let liveHeaderFocusCleanup: (() => void) | undefined;
 // The intro clip plays at most ONCE per process. Surfaces that rebuild the
 // screen per step (onboarding calls renderBrandHeader once per step) get the
 // animated intro on their first screen only; every later render holds the
@@ -538,6 +539,10 @@ export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): C
 	if (liveHeaderOnResize) {
 		process.stdout.removeListener("resize", liveHeaderOnResize);
 		liveHeaderOnResize = undefined;
+	}
+	if (liveHeaderFocusCleanup) {
+		liveHeaderFocusCleanup();
+		liveHeaderFocusCleanup = undefined;
 	}
 
 	// Pi-TUI's TUI exposes the underlying Terminal with live `columns` / `rows`
@@ -638,8 +643,36 @@ export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): C
 	const ABORT_BACKPRESSURE_BYTES = 4 * (process.stdout.writableHighWaterMark || 16 * 1024);
 	let frameIdx = initialFrameIdx;
 	if (animate) {
+		// Focus tracking: pause the clip completely while the terminal window
+		// is unfocused or minimized — zero writes means zero flicker on
+		// restore and no viewport yanking while the user works elsewhere.
+		// The listener strips CSI I / CSI O out of the input stream (mixed
+		// bytes pass through untouched); terminals without focus reporting
+		// never send the events, so the default `focused = true` just plays
+		// the clip. The mode is disabled the moment the clip retires (and by
+		// restoreTerminal() on every exit path as the safety net).
+		let terminalFocused = true;
+		process.stdout.write(FOCUS_REPORTING_ON);
+		const removeFocusListener = tui.addInputListener((data) => {
+			const scan = scanFocusEvents(data, terminalFocused);
+			if (scan.stripped === data) return undefined;
+			terminalFocused = scan.focused;
+			return scan.stripped.length === 0 ? { consume: true } : { data: scan.stripped };
+		});
+		const focusCleanup = (): void => {
+			try {
+				process.stdout.write(FOCUS_REPORTING_OFF);
+			} catch {
+				/* terminal already gone */
+			}
+			removeFocusListener();
+		};
+		liveHeaderFocusCleanup = focusCleanup;
 		const tickMs = Math.max(1, Math.round(1000 / VIDEO_FPS));
 		const timer: NodeJS.Timeout = setInterval(() => {
+			// Window hidden — fully idle. Even completion waits for focus so
+			// the hold-pose write can't land in an invisible window.
+			if (!terminalFocused) return;
 			if (frameIdx >= VIDEO_FRAME_COUNT - 1) {
 				// Clip finished. Make sure the hold pose is actually on screen
 				// (intermediate frames may have been skipped under backpressure;
@@ -648,6 +681,8 @@ export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): C
 				clipPlayedThisProcess = true;
 				clearInterval(timer);
 				if (liveHeaderTimer === timer) liveHeaderTimer = undefined;
+				if (liveHeaderFocusCleanup === focusCleanup) liveHeaderFocusCleanup = undefined;
+				focusCleanup();
 				return;
 			}
 			frameIdx += 1;
