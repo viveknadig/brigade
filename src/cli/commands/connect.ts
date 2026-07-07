@@ -578,9 +578,9 @@ export async function wireConnectUi(
 
 	/**
 	 * Tick the elapsed-time display every second while the agent is busy.
-	 * Cheap (one timer per connect session, not per-turn) and unref'd so it
-	 * doesn't keep the process alive past `process.exit`. Cleared in the
-	 * abort/close path below.
+	 * Cheap (one timer per connect session, not per-turn), repaints only
+	 * while a turn is running, and unref'd — connect exits via process.exit,
+	 * which is what retires it (there is deliberately no clearInterval).
 	 */
 	const elapsedTimer = setInterval(() => {
 		if (isAgentRunning && agentStartedAt != null) {

@@ -25,6 +25,7 @@ import { ProcessTerminal, SelectList, type SelectItem, Text, TUI } from "@earend
 import chalk from "chalk";
 
 import { initAuthProfiles } from "../../auth/profiles.js";
+import { probeTerminalAnimationSupport } from "../../ui/animations.js";
 import { DEFAULT_AGENT_ID } from "../../config/paths.js";
 import { EXIT_CONFIG_ERROR } from "../../protocol.js";
 import { findProvider, PROVIDERS, type ProviderInfo } from "../../providers/catalog.js";
@@ -100,6 +101,9 @@ export async function runLoginCommand(opts: { provider?: string } = {}): Promise
 		markTuiActive();
 		initAuthProfiles(DEFAULT_AGENT_ID);
 		const authStorage = AuthStorage.inMemory();
+		// Terminal capability probe (animated vs static spinners) — one-shot
+		// per process; must run before the TUI owns stdin.
+		await probeTerminalAnimationSupport();
 		const tui = new TUI(new ProcessTerminal());
 		tui.start();
 		const onSigintCli = (): void => {
@@ -157,6 +161,9 @@ export async function runLoginCommand(opts: { provider?: string } = {}): Promise
 	initAuthProfiles(DEFAULT_AGENT_ID);
 	const authStorage = AuthStorage.inMemory();
 
+	// Terminal capability probe (animated vs static spinners) — one-shot per
+	// process; must run before the TUI owns stdin.
+	await probeTerminalAnimationSupport();
 	const tui = new TUI(new ProcessTerminal());
 	tui.start();
 

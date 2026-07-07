@@ -23,6 +23,7 @@ import { ProcessTerminal, SelectList, type SelectItem, Text, TUI } from "@earend
 import chalk from "chalk";
 
 import { detectUnrefreshableSubscriptions } from "../../auth/auth-health.js";
+import { probeTerminalAnimationSupport } from "../../ui/animations.js";
 import { initAuthProfiles, readProfiles, writeProfiles } from "../../auth/profiles.js";
 import { DEFAULT_AGENT_ID } from "../../config/paths.js";
 import { loadConfig } from "../../core/config.js";
@@ -121,6 +122,9 @@ async function runAuthLogin(provider?: string): Promise<number> {
 	markTuiActive();
 	initAuthProfiles(DEFAULT_AGENT_ID);
 	const authStorage = AuthStorage.inMemory();
+	// Terminal capability probe (animated vs static spinners) — one-shot per
+	// process; must run before the TUI owns stdin. See ui/animations.ts.
+	await probeTerminalAnimationSupport();
 	const tui = new TUI(new ProcessTerminal());
 	tui.start();
 	const onSigint = (): void => {
@@ -247,6 +251,9 @@ async function runAuthFix(): Promise<number> {
 	markTuiActive();
 	initAuthProfiles(DEFAULT_AGENT_ID);
 	const authStorage = AuthStorage.inMemory();
+	// Terminal capability probe (animated vs static spinners) — one-shot per
+	// process; must run before the TUI owns stdin. See ui/animations.ts.
+	await probeTerminalAnimationSupport();
 	const tui = new TUI(new ProcessTerminal());
 	tui.start();
 	const onSigint = (): void => {

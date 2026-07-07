@@ -195,6 +195,12 @@ export async function probeTerminalAnimationSupport(timeoutMs = 500): Promise<vo
 		return;
 	}
 	probedSyncOutput = await new Promise<SyncOutputProbeResult>((resolve) => {
+		// Accumulate in latin1: it maps bytes 1:1 to chars, so regex indices
+		// are byte offsets, escape sequences (pure ASCII) match exactly, and
+		// user type-ahead — including multibyte UTF-8 split across chunk
+		// boundaries — round-trips byte-identical when handed back via
+		// Buffer.from(s, "latin1"). Decoding chunks as UTF-8 here would turn
+		// a split multibyte char into U+FFFD and corrupt preserved input.
 		let buf = "";
 		let done = false;
 		const cleanup = (): void => {
@@ -213,21 +219,37 @@ export async function probeTerminalAnimationSupport(timeoutMs = 500): Promise<vo
 			cleanup();
 			resolve(v);
 		};
+		// Hand every byte that is NOT one of our two solicited replies back to
+		// the stream — keystrokes typed during the probe window arrive BEFORE
+		// the terminal's replies on the wire, so type-ahead must be preserved
+		// from anywhere in the buffer, not just after the fence. Stray escape
+		// fragments (a half-arrived reply on the timeout path) are safe to
+		// hand back too: the TUI's input pipeline consumes DA1-shaped replies
+		// and drops non-printable CSI input rather than typing it.
+		const giveBack = (leftover: string): void => {
+			if (leftover.length > 0) stdin.unshift(Buffer.from(leftover, "latin1"));
+		};
 		const onData = (chunk: Buffer | string): void => {
-			buf += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+			buf += typeof chunk === "string" ? chunk : chunk.toString("latin1");
 			// Resolve ONLY on the DA1 fence (CSI ? … c) — waiting for it even
-			// after a DECRPM reply guarantees both responses are consumed, so
-			// no escape bytes leak into the TUI's input stream.
+			// after a DECRPM reply guarantees both solicited responses have
+			// arrived and can be excised.
 			const fence = /\x1b\[\?[\d;]*c/.exec(buf);
 			if (!fence) return;
-			// Anything AFTER the fence is real user input typed during the
-			// probe window — hand it back to the stream instead of eating it.
-			const rest = buf.slice(fence.index + fence[0].length);
-			const decrpm = parseSyncOutputProbeReply(buf.slice(0, fence.index + fence[0].length));
+			const decrpm = parseSyncOutputProbeReply(buf.slice(0, fence.index));
+			const leftover =
+				buf.slice(0, fence.index).replace(/\x1b\[\?2026;\d+\$y/, "") + buf.slice(fence.index + fence[0].length);
 			finish(decrpm === undefined ? "mute" : decrpm ? "yes" : "no");
-			if (rest.length > 0) stdin.unshift(Buffer.from(rest, "utf8"));
+			giveBack(leftover);
 		};
-		const timer = setTimeout(() => finish(undefined), timeoutMs);
+		const timer = setTimeout(() => {
+			// Timeout: the terminal answered neither query (or is still
+			// mid-answer). Preserve everything buffered — any late reply
+			// fragments are filtered harmlessly downstream.
+			const pending = buf;
+			finish(undefined);
+			giveBack(pending);
+		}, timeoutMs);
 		timer.unref?.();
 		stdin.on("data", onData);
 		stdin.resume();

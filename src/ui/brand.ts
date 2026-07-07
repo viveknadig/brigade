@@ -183,7 +183,11 @@ export const SIDE_BY_SIDE_THRESHOLD = 210;
 // Scaled wordmark column ~122 cells (WORDMARK_INDENT + WORDMARK_WIDTH) + safety.
 export const WORDMARK_MIN_WIDTH = 125;
 // VIDEO_COLS + the WORDMARK_INDENT the ascii-only layout prepends + margin —
-// below this the indented video would wrap and shred the block.
+// below this the indented video would wrap and shred the block. pickLayout
+// additionally requires WORDMARK_SMALL_MIN_WIDTH for this mode so the small
+// wordmark + tagline ALWAYS fit beneath the clip — the brand text must read
+// at every size, so there is no clip-without-wordmark sliver; windows too
+// narrow for the lockup fall through to the wordmark/line marks instead.
 export const ASCII_MIN_WIDTH = 62;
 // One-line mark: "🦁 BRIGADE" ≈ 10 visible cells + margin.
 export const LINE_MIN_WIDTH = 12;
@@ -191,7 +195,9 @@ export const LINE_MIN_WIDTH = 12;
 // Vertical budgets. Video modes need the 30-row clip + padding + ~12 rows for
 // the content below the header; the wordmark modes are budgeted the same way
 // (mark height + padding + room to actually use the app).
-export const VIDEO_MODE_MIN_ROWS = 44; //  2 pad + 30 video + content room
+export const VIDEO_MODE_MIN_ROWS = 44; //  side: 30-row paired block + content room
+export const ASCII_MIN_ROWS = 53; //       ascii-only: 41-row block (2 pad + 30 video
+//                                         + wordmark lockup + tagline) + content room
 export const STACK_MIN_ROWS = 66; //       23 wordmark col + 30 video + content room
 export const WORDMARK_MIN_ROWS = 28; //     2 pad + 12 rows + tagline + content room
 export const WORDMARK_SMALL_MIN_ROWS = 16; // 2 pad + 6 rows + tagline + content room
@@ -202,6 +208,29 @@ export type LayoutMode = "side" | "stack" | "ascii-only" | "wordmark" | "wordmar
 /** Layout modes that include the animated video clip. */
 export function layoutShowsVideo(mode: LayoutMode): boolean {
 	return mode === "side" || mode === "stack" || mode === "ascii-only";
+}
+
+// Rows the content BELOW the header (onboarding prompts, select lists, the
+// chat editor) typically needs on screen simultaneously with the header.
+const ANIMATION_CONTENT_HEADROOM_ROWS = 16;
+
+/**
+ * May the clip ANIMATE at this terminal size? Stricter than pickLayout's
+ * fit thresholds, and the distinction is load-bearing: a STATIC header that
+ * overflows the viewport merely scrolls — harmless. An ANIMATED header whose
+ * top has scrolled into scrollback forces Pi-TUI's differential renderer
+ * into a full clear-and-redraw on every frame (changed lines above the
+ * viewport can't be repainted in place) — the strobe this module exists to
+ * prevent. So animation requires the ACTUAL composed block plus typical
+ * step content to fit the viewport at once, measured from the real frame
+ * rather than estimated from constants so layout changes can't drift it.
+ */
+export function animationFitsViewport(termCols?: number, termRows?: number): boolean {
+	const mode = pickLayout(termCols, termRows);
+	if (!layoutShowsVideo(mode)) return false;
+	const rows = termRows ?? process.stdout.rows ?? 999;
+	const blockLines = composeFrame(VIDEO_FRAME_COUNT - 1, termCols, termRows).split("\n").length;
+	return rows - blockLines >= ANIMATION_CONTENT_HEADROOM_ROWS;
 }
 
 // Pick the layout for the current terminal size. Pi-TUI's TUI exposes the
@@ -217,7 +246,7 @@ export function pickLayout(termCols?: number, termRows?: number): LayoutMode {
 	const rows = termRows ?? process.stdout.rows ?? 999;
 	if (cols >= SIDE_BY_SIDE_THRESHOLD && rows >= VIDEO_MODE_MIN_ROWS) return "side";
 	if (cols >= WORDMARK_MIN_WIDTH && rows >= STACK_MIN_ROWS) return "stack";
-	if (cols >= ASCII_MIN_WIDTH && rows >= VIDEO_MODE_MIN_ROWS) return "ascii-only";
+	if (cols >= Math.max(ASCII_MIN_WIDTH, WORDMARK_SMALL_MIN_WIDTH) && rows >= ASCII_MIN_ROWS) return "ascii-only";
 	if (cols >= WORDMARK_MIN_WIDTH && rows >= WORDMARK_MIN_ROWS) return "wordmark";
 	if (cols >= WORDMARK_SMALL_MIN_WIDTH && rows >= WORDMARK_SMALL_MIN_ROWS) return "wordmark-small";
 	if (cols >= LINE_MIN_WIDTH && rows >= LINE_MIN_ROWS) return "line";
@@ -430,16 +459,12 @@ export function composeFrame(frameIdx: number, termCols?: number, termRows?: num
 		for (const row of videoRows) lines.push(`${videoIndent}${row}`);
 		// The brand TEXT must read at every size, not only in the wide
 		// layouts — lock up the small wordmark + tagline under the clip
-		// whenever the width allows it (movie-title-card arrangement). The
-		// 62–63-col sliver below WORDMARK_SMALL_MIN_WIDTH shows the clip
-		// alone rather than a wrapped, shredded wordmark.
-		const cols = termCols ?? process.stdout.columns ?? 999;
-		if (cols >= WORDMARK_SMALL_MIN_WIDTH) {
-			lines.push("");
-			for (const row of COLORED_WORDMARK_ROWS_SMALL) lines.push(`${videoIndent}${row}`);
-			lines.push("");
-			lines.push(`${videoIndent}${TAGLINE_SMALL}`);
-		}
+		// (movie-title-card arrangement). pickLayout guarantees the width:
+		// ascii-only is only ever chosen at ≥ WORDMARK_SMALL_MIN_WIDTH cols.
+		lines.push("");
+		for (const row of COLORED_WORDMARK_ROWS_SMALL) lines.push(`${videoIndent}${row}`);
+		lines.push("");
+		lines.push(`${videoIndent}${TAGLINE_SMALL}`);
 		return lines.join("\n");
 	}
 	if (mode === "stack") {
@@ -504,6 +529,11 @@ export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): C
 	if (liveHeaderTimer) {
 		clearInterval(liveHeaderTimer);
 		liveHeaderTimer = undefined;
+		// A live timer here means a clip was interrupted mid-play (e.g. the
+		// user advanced an onboarding step). That still counts as this
+		// process's one play — without the latch, every step restart would
+		// replay the intro from frame 0.
+		clipPlayedThisProcess = true;
 	}
 	if (liveHeaderOnResize) {
 		process.stdout.removeListener("resize", liveHeaderOnResize);
@@ -520,14 +550,16 @@ export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): C
 	// Animate only when (a) the caller wants it, (b) the clip hasn't already
 	// played this process, (c) the terminal proved it repaints smoothly
 	// (env allowlist OR a positive DECRQM 2026 probe — see animations.ts),
-	// and (d) the CURRENT layout actually shows the video — on a small window
-	// there are no frames to play, only a static mark, so spinning up the
-	// interval would be pure waste.
+	// and (d) the CURRENT layout shows the video AND the whole block plus
+	// typical content below it fits the viewport at once — animating a block
+	// that can scroll partially off-screen degenerates into per-frame full
+	// redraws (see animationFitsViewport). Static marks have no such
+	// constraint; they simply scroll.
 	const animate =
 		(opts.animate ?? true) &&
 		!clipPlayedThisProcess &&
 		terminalAnimationsEnabled() &&
-		layoutShowsVideo(pickLayout(getCols(), getRows()));
+		animationFitsViewport(getCols(), getRows());
 
 	// Static mode (chat/connect) holds the LAST frame — the clip's resting pose.
 	// Animated mode starts at frame 0 and advances from there.
@@ -626,6 +658,13 @@ export function renderBrandHeader(tui: TUI, opts: { animate?: boolean } = {}): C
 				return;
 			}
 			if (queued > 0) return;
+			// Mid-clip resize can shrink the viewport below the animation
+			// budget (see animationFitsViewport) — finish at the hold pose
+			// instead of strobing full redraws for the rest of the clip.
+			if (!animationFitsViewport(getCols(), getRows())) {
+				frameIdx = VIDEO_FRAME_COUNT - 1;
+				return;
+			}
 			safeRender(composeFrame(frameIdx, getCols(), getRows()));
 		}, tickMs);
 		// Don't keep the event loop alive just for this animation — once the user

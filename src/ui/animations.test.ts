@@ -224,6 +224,29 @@ describe("gate honours the recorded probe result", () => {
 			recordSyncOutputProbe(undefined);
 		}
 	});
+
+	it("precedence pins: suppressors beat probe-yes; probe outranks the mux guard; force-on beats probe-no", () => {
+		try {
+			recordSyncOutputProbe("yes");
+			// SSH / CI / non-TTY stay off no matter what the probe said.
+			assert.equal(terminalAnimationsEnabled({ SSH_TTY: "/dev/pts/0", TERM: "xterm-256color" }, true), false);
+			assert.equal(terminalAnimationsEnabled({ CI: "1", TERM: "xterm-256color" }, true), false);
+			assert.equal(terminalAnimationsEnabled({ TERM: "xterm-256color" }, false), false);
+			// Inside tmux, a positive probe means the MUX itself supports
+			// synchronized output (tmux ≥ 3.7 answers DECRQM) — it must
+			// outrank the leaked-env mux guard, which only exists for the
+			// probe-mute fallback path.
+			assert.equal(terminalAnimationsEnabled({ TMUX: "/tmp/tmux/default,1,0", TERM: "tmux-256color" }, true), true);
+		} finally {
+			recordSyncOutputProbe(undefined);
+		}
+		try {
+			recordSyncOutputProbe("no");
+			assert.equal(terminalAnimationsEnabled({ BRIGADE_ANIM: "1", TERM: "xterm-256color" }, true), true);
+		} finally {
+			recordSyncOutputProbe(undefined);
+		}
+	});
 });
 
 describe("loaderIndicator", () => {

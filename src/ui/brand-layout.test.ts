@@ -22,6 +22,7 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
 import {
+	animationFitsViewport,
 	ASCII_MIN_WIDTH,
 	composeFrame,
 	type LayoutMode,
@@ -46,12 +47,16 @@ describe("pickLayout — realistic terminal sizes", () => {
 		[120, 30, "wordmark-small", "Windows Terminal default"],
 		[140, 30, "wordmark", "wide-but-short editor pane"],
 		[140, 24, "wordmark-small", "wide but too short for the 12-row wordmark"],
-		[200, 50, "ascii-only", "13\" laptop fullscreen — video fits, side pair doesn't"],
-		[100, 50, "ascii-only", "narrow-tall — clip with the small wordmark locked up under it"],
+		[200, 50, "wordmark", "13\" laptop fullscreen — the 41-row clip lockup would crowd out content"],
+		[200, 60, "ascii-only", "tall laptop window — clip + wordmark lockup with room to spare"],
+		[100, 50, "wordmark-small", "narrow-tall but under the ascii-only row budget"],
+		[100, 53, "ascii-only", "exactly at the ascii-only row budget"],
+		[100, 52, "wordmark-small", "one row under the ascii-only budget"],
 		[220, 50, "side", "big desktop terminal"],
 		[220, 40, "wordmark", "wide but under the video's row budget"],
 		[130, 70, "stack", "portrait / rotated monitor"],
 		[60, 20, "line", "split pane — too narrow for the small wordmark"],
+		[62, 50, "line", "video would fit but the wordmark lockup would not — no clip-without-brand sliver"],
 		[40, 10, "line", "quake-style dropdown"],
 		[14, 6, "line", "sliver pane still shows the mark"],
 		[10, 6, "empty", "too narrow for anything"],
@@ -84,6 +89,92 @@ describe("layoutShowsVideo", () => {
 				assert.equal(layoutShowsVideo(mode), false, `${cols}×${rows} chose video mode ${mode}`);
 			}
 		}
+	});
+});
+
+describe("animationFitsViewport — animation needs the block PLUS content to fit", () => {
+	// Static overflow merely scrolls; ANIMATED overflow forces per-frame full
+	// clear-and-redraw (the strobe). Animation therefore requires the real
+	// composed block + 16 rows of content headroom, not just the layout gate.
+	it("never animates a non-video layout", () => {
+		assert.equal(animationFitsViewport(80, 24), false);
+		assert.equal(animationFitsViewport(140, 30), false);
+	});
+
+	it("side layout: 30-row block animates at 50 rows, not at 44", () => {
+		assert.equal(pickLayout(220, 50), "side");
+		assert.equal(animationFitsViewport(220, 50), true);
+		assert.equal(pickLayout(220, 45), "side");
+		assert.equal(animationFitsViewport(220, 45), false);
+	});
+
+	it("ascii-only with the wordmark lockup (41 rows) animates only with 16 spare rows", () => {
+		assert.equal(pickLayout(100, 57), "ascii-only");
+		assert.equal(animationFitsViewport(100, 57), true);
+		// 53-56 rows: the static lockup fits (ascii-only chosen) but the clip
+		// must not play — animating a block that tall would strobe once the
+		// step content below pushes it past the viewport.
+		assert.equal(pickLayout(100, 53), "ascii-only");
+		assert.equal(animationFitsViewport(100, 53), false);
+		assert.equal(animationFitsViewport(100, 50), false);
+	});
+
+	it("stack layout (54 rows) animates at 70 rows, not at 66", () => {
+		assert.equal(pickLayout(130, 70), "stack");
+		assert.equal(animationFitsViewport(130, 70), true);
+		assert.equal(pickLayout(130, 66), "stack");
+		assert.equal(animationFitsViewport(130, 66), false);
+	});
+
+	it("exact boundaries: side flips at 46 rows, ascii lockup at 57, stack at 70", () => {
+		assert.equal(animationFitsViewport(220, 46), true);
+		assert.equal(animationFitsViewport(220, 45), false);
+		assert.equal(animationFitsViewport(100, 57), true);
+		assert.equal(animationFitsViewport(100, 56), false);
+		assert.equal(animationFitsViewport(130, 70), true);
+		assert.equal(animationFitsViewport(130, 69), false);
+	});
+});
+
+describe("brand text presence — the mark reads at every renderable size", () => {
+	const BRAND_TEXT = /crew|ｃｒｅｗ|BRIGADE/i;
+
+	it("every non-empty size carries the brand (sweep incl. threshold edges)", () => {
+		const cols = [12, 13, 20, 39, 40, 61, 62, 63, 64, 66, 80, 100, 124, 125, 140, 209, 210, 240];
+		const rows = [4, 5, 10, 15, 16, 21, 22, 27, 28, 43, 44, 56, 57, 65, 66, 69, 70, 90];
+		for (const c of cols) {
+			for (const r of rows) {
+				const mode = pickLayout(c, r);
+				const block = composeFrame(0, c, r);
+				if (mode === "empty") {
+					assert.equal(block, "", `${c}×${r}: empty mode must compose nothing`);
+					continue;
+				}
+				const plain = block.replace(new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g"), "");
+				assert.ok(
+					BRAND_TEXT.test(plain) || plain.includes("█"),
+					`${c}×${r} (${mode}): no brand text in the composed block`,
+				);
+			}
+		}
+	});
+
+	it("truly tiny surfaces compose nothing at all", () => {
+		assert.equal(composeFrame(0, 11, 20), "");
+		assert.equal(composeFrame(0, 40, 3), "");
+	});
+
+	it("line mode: tagline appears at 40 cols, bare mark below", () => {
+		const at39 = composeFrame(0, 39, 10);
+		const at40 = composeFrame(0, 40, 10);
+		assert.ok(!at39.toLowerCase().includes("crew"));
+		assert.ok(at39.includes("BRIGADE"));
+		assert.ok(at40.toLowerCase().includes("crew"));
+	});
+
+	it("non-video sizes compose identically for every frame index (lazy frames stay untouched)", () => {
+		assert.equal(composeFrame(0, 80, 24), composeFrame(247, 80, 24));
+		assert.equal(composeFrame(0, 140, 30), composeFrame(247, 140, 30));
 	});
 });
 
@@ -159,10 +250,11 @@ describe("composeFrame — the block always fits the terminal", () => {
 		assert.ok(block.toLowerCase().includes("crew"), "tagline present");
 	});
 
-	it("ascii-only locks up the brand text under the clip when width allows", () => {
-		// The brand must READ at every size — the video-only layout still
-		// carries the small wordmark + tagline beneath the clip.
-		const block = composeFrame(0, 100, 50);
+	it("ascii-only locks up the brand text under the clip — always", () => {
+		// The brand must READ at every size — the video layout always carries
+		// the small wordmark + tagline beneath the clip (pickLayout only
+		// chooses it when both fit).
+		const block = composeFrame(0, 100, 60);
 		assert.ok(block.toLowerCase().includes("crew"), "tagline lockup missing under the clip");
 	});
 
