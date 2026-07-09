@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
 	buildClaudeCliArgs,
 	composeClaudeCliSystemPrompt,
+	isStructuredJsonPrompt,
 	buildClaudeCliEnv,
 	CLAUDE_CLI_FORBIDDEN_ENV,
 	resolveCliModelArg,
@@ -11,6 +12,43 @@ import {
 	resolveClaudeCliCommand,
 	__resetBundledClaudeCache,
 } from "./catalog.js";
+import { EXTRACTION_PROMPT } from "../memory/extract.js";
+import { CONSOLIDATION_PROMPT } from "../memory/consolidate.js";
+
+/* ─────────────────────── structured JSON utility mode ─────────────────────── */
+
+test("isStructuredJsonPrompt: fires ONLY on the utility JSON contract", () => {
+	assert.equal(isStructuredJsonPrompt('Return STRICT JSON only:\n{"facts":[]}'), true);
+	assert.equal(isStructuredJsonPrompt("Output STRICT JSON only, no fences"), true);
+	// The REAL distiller prompts must trip it — guards against a phrase reword
+	// silently reverting extraction to the prose-nudged, un-parseable path.
+	assert.equal(isStructuredJsonPrompt(EXTRACTION_PROMPT), true);
+	assert.equal(isStructuredJsonPrompt(CONSOLIDATION_PROMPT), true);
+	// A normal chat persona (or undefined) must NOT trip it.
+	assert.equal(isStructuredJsonPrompt("You are Brigade, a helpful crew."), false);
+	assert.equal(isStructuredJsonPrompt("Please return the data as JSON if you can."), false);
+	assert.equal(isStructuredJsonPrompt(undefined), false);
+});
+
+test("composeClaudeCliSystemPrompt: structured drops the prose nudge, reinforces JSON", () => {
+	const sys = composeClaudeCliSystemPrompt({ systemPrompt: EXTRACTION_PROMPT });
+	assert.doesNotMatch(sys, /do not use tools/i, "prose nudge gone for a JSON distiller");
+	assert.doesNotMatch(sys, /Respond directly in prose/i);
+	assert.match(sys, /Output ONLY the JSON/i);
+	assert.match(sys, /starting with \{ and ending with \}/i);
+});
+
+test("composeClaudeCliSystemPrompt: explicit structured flag overrides detection", () => {
+	const sys = composeClaudeCliSystemPrompt({ systemPrompt: "You are Brigade.", structured: true });
+	assert.doesNotMatch(sys, /do not use tools/i);
+	assert.match(sys, /Output ONLY the JSON/i);
+});
+
+test("buildClaudeCliArgs: a structured turn stays tool-less (distiller must not touch fs)", () => {
+	assert.ok(buildClaudeCliArgs({ modelId: "claude-sonnet-4-6", structured: true }).includes("--disallowedTools"));
+	// auto-derived from the prompt too
+	assert.ok(buildClaudeCliArgs({ modelId: "claude-sonnet-4-6", systemPrompt: EXTRACTION_PROMPT }).includes("--disallowedTools"));
+});
 
 test("stripClaudeCliPrefix: removes provider prefix, leaves bare id", () => {
 	assert.equal(stripClaudeCliPrefix("claude-cli/claude-sonnet-4-6"), "claude-sonnet-4-6");

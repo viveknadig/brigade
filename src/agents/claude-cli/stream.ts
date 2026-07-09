@@ -26,6 +26,7 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import {
 	buildClaudeCliArgs,
 	composeClaudeCliSystemPrompt,
+	isStructuredJsonPrompt,
 	CLAUDE_CLI_API,
 	CLAUDE_CLI_PROVIDER,
 } from "./catalog.js";
@@ -297,10 +298,15 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 			try {
 				const ctx = (context ?? {}) as { systemPrompt?: string; messages?: CtxMessage[] };
 				const prompt = serializeConversationPrompt(ctx.messages ?? []);
-				const args = buildClaudeCliArgs({ modelId: model.id });
-				// System prompt goes via a file (not argv) — see spawn.ts. Composed
-				// here so the conversational nudge is included.
-				const systemPrompt = composeClaudeCliSystemPrompt({ systemPrompt: ctx.systemPrompt });
+				// A structured (JSON-distiller) turn — the memory/skill utility subagents —
+				// must be reinforced toward JSON, never nudged toward prose. Detected from
+				// the pinned system prompt so this backend returns a clean envelope and the
+				// memory extraction cursor can actually advance (see isStructuredJsonPrompt).
+				const structured = isStructuredJsonPrompt(ctx.systemPrompt);
+				const args = buildClaudeCliArgs({ modelId: model.id, structured });
+				// System prompt goes via a file (not argv) — see spawn.ts. Composed here so
+				// the right nudge (prose vs JSON-only) is included.
+				const systemPrompt = composeClaudeCliSystemPrompt({ systemPrompt: ctx.systemPrompt, structured });
 
 				handle = spawnClaudeCli({
 					args,

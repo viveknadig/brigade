@@ -282,6 +282,28 @@ const CLAUDE_CLI_SYSTEM_SUFFIX =
 	"You are answering as part of an ongoing conversation. Respond directly in prose; " +
 	"do not use tools or act on the local filesystem — everything you need is in this conversation.";
 
+// Appended INSTEAD of the prose nudge when the pinned system prompt is one of
+// Brigade's structured-JSON utility distillers (memory extraction /
+// consolidation / relationship relink / behaviour + skill review). Those prompts
+// demand a strict JSON envelope; the conversational nudge above directly
+// contradicts them, so the reply came back as prose, `parseExtractionReply`
+// refused it (correctly — a non-envelope must never advance the cursor), and the
+// extraction cursor stalled forever. The memory graph stayed empty on this
+// backend. Reinforce JSON instead.
+const CLAUDE_CLI_STRUCTURED_SUFFIX =
+	"Output ONLY the JSON described above. No preamble, no explanation, no markdown code " +
+	"fences — your entire response must be the raw JSON value, starting with { and ending with }.";
+
+/**
+ * True when `systemPrompt` is one of Brigade's structured-JSON utility prompts.
+ * Keyed on the "STRICT JSON only" contract every distiller states and that no
+ * chat persona carries. Regression-guarded by a test asserting the real
+ * EXTRACTION_PROMPT / CONSOLIDATION_PROMPT still trip it.
+ */
+export function isStructuredJsonPrompt(systemPrompt: string | undefined): boolean {
+	return typeof systemPrompt === "string" && /\bSTRICT JSON only\b/i.test(systemPrompt);
+}
+
 export interface BuildArgsInput {
 	/** Requested Brigade model id (with or without the `claude-cli/` prefix). */
 	modelId: string;
@@ -293,6 +315,12 @@ export interface BuildArgsInput {
 	 * only for a future agentic mode that intentionally lets the CLI act.
 	 */
 	conversational?: boolean;
+	/**
+	 * This turn is a structured-JSON distiller. Defaults to detection from
+	 * `systemPrompt`. Tool-less like a conversational turn, but reinforced toward
+	 * a raw JSON envelope instead of prose.
+	 */
+	structured?: boolean;
 }
 
 /**
@@ -306,9 +334,19 @@ export interface BuildArgsInput {
 export function composeClaudeCliSystemPrompt(input: {
 	systemPrompt?: string;
 	conversational?: boolean;
+	/** Force structured mode; defaults to detection from `systemPrompt`. */
+	structured?: boolean;
 }): string {
+	const structured = input.structured ?? isStructuredJsonPrompt(input.systemPrompt);
 	const conversational = input.conversational !== false;
-	const parts = [input.systemPrompt?.trim(), conversational ? CLAUDE_CLI_SYSTEM_SUFFIX : ""].filter(
+	// STRUCTURED wins: a JSON distiller must be reinforced toward JSON, never
+	// nudged toward prose. Otherwise conversational behaviour is unchanged.
+	const suffix = structured
+		? CLAUDE_CLI_STRUCTURED_SUFFIX
+		: conversational
+			? CLAUDE_CLI_SYSTEM_SUFFIX
+			: "";
+	const parts = [input.systemPrompt?.trim(), suffix].filter(
 		(p): p is string => !!p && p.length > 0,
 	);
 	return parts.join("\n\n");
@@ -324,8 +362,10 @@ export function composeClaudeCliSystemPrompt(input: {
 export function buildClaudeCliArgs(input: BuildArgsInput): string[] {
 	const args = [...CLAUDE_CLI_BASE_ARGS];
 	args.push("--model", resolveCliModelArg(input.modelId));
+	const structured = input.structured ?? isStructuredJsonPrompt(input.systemPrompt);
 	const conversational = input.conversational !== false;
-	if (conversational) args.push("--disallowedTools", CLAUDE_CLI_DENY_TOOLS);
+	// A distiller is tool-less too — it must emit JSON, never touch the fs.
+	if (conversational || structured) args.push("--disallowedTools", CLAUDE_CLI_DENY_TOOLS);
 	return args;
 }
 
