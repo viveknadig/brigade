@@ -33,6 +33,7 @@ import { FactStore, MEMORY_SEGMENTS, type MemoryRecordOrigin, type MemorySegment
 import { confineUntrustedSegment } from "./write-gate.js";
 import { balancedObjects } from "./json-scan.js";
 import { ensureOllamaNativeApiRegistered } from "../ollama-native/register.js";
+import { installTransportDispatch } from "../transport-dispatch.js";
 import {
 	buildCandidateBlock,
 	DEFAULT_CANDIDATE_K,
@@ -621,6 +622,12 @@ export function makeIsolatedLlm(
 			// as Brigade. Wrap here too so EVERY OpenRouter request Brigade makes
 			// is attributed to Brigade.
 			wrapStreamFnWithPayloadMutations(session as AgentSession);
+			// Dispatch Brigade's OWN transports (claude-cli / ollama) directly. This
+			// isolated session builds its own Pi agent, so it misses the agent-loop's
+			// dispatch — and Pi's registry lookup can read a DIFFERENT `pi-ai` module
+			// instance in a published install ("No API provider registered for api:
+			// claude-cli"). Wraps (never replaces) the streamFn.
+			installTransportDispatch(session);
 			applyPersonaOverrideToSession(session as AgentSession, systemPrompt);
 			// Race the LLM call against a wall-clock timeout. On timeout we
 			// call `session.abort()` (Pi cancels the in-flight stream) and

@@ -99,6 +99,7 @@ import { resolveSessionAccessPolicy } from "./tools/sessions/resolve-access.js";
 import { wrapStreamFnWithPayloadMutations } from "./payload-mutators.js";
 import { CLAUDE_CLI_PROVIDER, CLAUDE_CLI_SENTINEL_KEY } from "./claude-cli/catalog.js";
 import { ensureClaudeCliApiRegistered } from "./claude-cli/register.js";
+import { makeTransportDispatch } from "./transport-dispatch.js";
 import { ensureOllamaNativeApiRegistered } from "./ollama-native/register.js";
 import { migrateOllamaProviderToNative } from "../integrations/ollama.js";
 import { describeModelProbe, probeModelReachable } from "../integrations/provider-discovery.js";
@@ -1071,9 +1072,19 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   if (sessionAgent && typeof sessionAgent.streamFn === "function") {
     const baseStreamFn = sessionAgent.streamFn;
     const idleTimeoutMs = resolveIdleTimeoutMs(args.provider);
+    // Dispatch Brigade's OWN transports (claude-cli, native ollama) directly,
+    // INNERMOST — beneath the wrappers so they still get idle-timeout /
+    // stop-reason / tool-call-repair. Pi resolves a registered api via its
+    // module-global registry, but a published/global install nests a SECOND
+    // `pi-ai` under `pi-coding-agent` (whose `streamSimple` the Agent defaults
+    // to), so our registration lands in one registry and the lookup reads the
+    // other → "No API provider registered for api: claude-cli". Direct dispatch
+    // removes that dependency entirely. Cloud providers still fall through to
+    // `baseStreamFn` — Pi's auth wrapper — which must never be replaced.
+    const dispatchStreamFn = makeTransportDispatch(baseStreamFn);
     const wrappedStreamFn = wrapStreamFnWithIdleTimeout(
       wrapStreamFnWithStopReasonRecovery(
-        wrapStreamFnWithToolCallRepair(baseStreamFn),
+        wrapStreamFnWithToolCallRepair(dispatchStreamFn),
       ),
       { timeoutMs: idleTimeoutMs },
     );
