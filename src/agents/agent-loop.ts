@@ -99,6 +99,7 @@ import { resolveSessionAccessPolicy } from "./tools/sessions/resolve-access.js";
 import { wrapStreamFnWithPayloadMutations } from "./payload-mutators.js";
 import { CLAUDE_CLI_PROVIDER, CLAUDE_CLI_SENTINEL_KEY } from "./claude-cli/catalog.js";
 import { ensureClaudeCliApiRegistered } from "./claude-cli/register.js";
+import { stampClaudeCliToolPlane } from "./claude-cli/tool-plane.js";
 import { makeTransportDispatch } from "./transport-dispatch.js";
 import { ensureOllamaNativeApiRegistered } from "./ollama-native/register.js";
 import { migrateOllamaProviderToNative } from "../integrations/ollama.js";
@@ -1103,7 +1104,19 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // never REPLACE — Pi's auth wrapper stays at the bottom of the stack.
     sessionAgent.streamFn = ((model: { api?: string }, context: unknown, options: unknown) => {
       if (model?.api === "ollama") ensureOllamaNativeApiRegistered();
-      else if (model?.api === "claude-cli") ensureClaudeCliApiRegistered();
+      else if (model?.api === "claude-cli") {
+        ensureClaudeCliApiRegistered();
+        // Stamp the per-turn tool-plane context for the claude-cli transport
+        // (memory MCP on the harness backend — see claude-cli/tool-plane.ts).
+        // `effectiveSenderIsOwner` is the SAME signal the tool registry gates
+        // on (incl. the poisoned-inbox demotion), so the MCP surface can never
+        // be broader than the in-process tool surface. Gated to claude-cli
+        // dispatches only — raw-API providers never see the stamp.
+        stampClaudeCliToolPlane(context, {
+          agentId,
+          senderIsOwner: effectiveSenderIsOwner,
+        });
+      }
       return (wrappedStreamFn as (m: unknown, c: unknown, o: unknown) => unknown)(model, context, options);
     }) as typeof baseStreamFn;
     log.debug("stream wrappers installed", {

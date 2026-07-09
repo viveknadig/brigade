@@ -294,6 +294,23 @@ const CLAUDE_CLI_STRUCTURED_SUFFIX =
 	"Output ONLY the JSON described above. No preamble, no explanation, no markdown code " +
 	"fences — your entire response must be the raw JSON value, starting with { and ending with }.";
 
+// Appended instead of the plain conversational nudge when the spawn carries the
+// Brigade MCP tool-plane (owner chat turns — see tool-plane.ts). The plain
+// suffix says "do not use tools", which would fight the memory tools we just
+// handed the binary; this variant scopes the permission to exactly those.
+const CLAUDE_CLI_TOOL_PLANE_SUFFIX =
+	"You are answering as part of an ongoing conversation. You have Brigade memory tools " +
+	"available via MCP (mcp__brigade__memory_add, mcp__brigade__memory_search, " +
+	"mcp__brigade__memory_context) — use them to save or recall durable facts when relevant. " +
+	"Do not use any other tools or act on the local filesystem; respond directly in prose.";
+
+/** Flag delivering the MCP server config file (the Brigade tool-plane). */
+export const CLAUDE_CLI_MCP_CONFIG_FLAG = "--mcp-config";
+/** Companion flag: ONLY the servers from --mcp-config load — the operator's
+ *  personal MCP servers (from their own claude config) never leak into a
+ *  Brigade turn, and the tool surface stays deterministic. */
+export const CLAUDE_CLI_STRICT_MCP_FLAG = "--strict-mcp-config";
+
 /**
  * True when `systemPrompt` is one of Brigade's structured-JSON utility prompts.
  * Keyed on the "STRICT JSON only" contract every distiller states and that no
@@ -336,16 +353,21 @@ export function composeClaudeCliSystemPrompt(input: {
 	conversational?: boolean;
 	/** Force structured mode; defaults to detection from `systemPrompt`. */
 	structured?: boolean;
+	/** The spawn carries the Brigade MCP tool-plane (owner chat turns). */
+	toolPlane?: boolean;
 }): string {
 	const structured = input.structured ?? isStructuredJsonPrompt(input.systemPrompt);
 	const conversational = input.conversational !== false;
-	// STRUCTURED wins: a JSON distiller must be reinforced toward JSON, never
-	// nudged toward prose. Otherwise conversational behaviour is unchanged.
+	// Precedence: STRUCTURED (a JSON distiller must be reinforced toward JSON,
+	// never nudged toward prose — and never given tools) > TOOL-PLANE (memory
+	// tools allowed, everything else still off) > plain conversational.
 	const suffix = structured
 		? CLAUDE_CLI_STRUCTURED_SUFFIX
-		: conversational
-			? CLAUDE_CLI_SYSTEM_SUFFIX
-			: "";
+		: input.toolPlane === true
+			? CLAUDE_CLI_TOOL_PLANE_SUFFIX
+			: conversational
+				? CLAUDE_CLI_SYSTEM_SUFFIX
+				: "";
 	const parts = [input.systemPrompt?.trim(), suffix].filter(
 		(p): p is string => !!p && p.length > 0,
 	);

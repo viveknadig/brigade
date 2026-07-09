@@ -10,6 +10,8 @@ import path from "node:path";
 
 import {
 	buildClaudeCliEnv,
+	CLAUDE_CLI_MCP_CONFIG_FLAG,
+	CLAUDE_CLI_STRICT_MCP_FLAG,
 	CLAUDE_CLI_SYSTEM_PROMPT_FILE_FLAG,
 	resolveClaudeCliCommand,
 } from "./catalog.js";
@@ -38,6 +40,14 @@ export interface SpawnClaudeCliArgs {
 	 * (`spawn ENAMETOOLONG` on Windows). Omitted/empty ⇒ no system-prompt flag.
 	 */
 	systemPrompt?: string;
+	/**
+	 * Brigade MCP tool-plane config (JSON string — see tool-plane.ts). Written to
+	 * a temp file inside the isolated cwd and passed via `--mcp-config` +
+	 * `--strict-mcp-config`, so the binary sees EXACTLY Brigade's server and never
+	 * the operator's personal MCP config. Omitted => no MCP flags (prior
+	 * behaviour). A write failure fails OPEN: the turn proceeds without tools.
+	 */
+	mcpConfigJson?: string;
 	/** External cancel (turn abort). Aborting SIGKILLs the child. */
 	signal?: AbortSignal;
 	noOutputTimeoutMs?: number;
@@ -94,6 +104,20 @@ export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 		} catch {
 			/* couldn't write the file — proceed without the appended prompt rather
 			   than fail the turn (the CLI still has its own default identity). */
+		}
+	}
+
+	// Brigade MCP tool-plane (memory tools) — same temp-file lifecycle as the
+	// system prompt: lives in the throwaway cwd, removed with it on exit.
+	// `--strict-mcp-config` pins the binary's MCP surface to EXACTLY this file.
+	const mcpJson = args.mcpConfigJson?.trim();
+	if (mcpJson && mcpJson.length > 0) {
+		try {
+			const mcpFile = path.join(cwd, "mcp-config.json");
+			writeFileSync(mcpFile, mcpJson, "utf8");
+			finalArgs.push(CLAUDE_CLI_MCP_CONFIG_FLAG, mcpFile, CLAUDE_CLI_STRICT_MCP_FLAG);
+		} catch {
+			/* fail-open: spawn without the tool-plane rather than fail the turn. */
 		}
 	}
 

@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { test } from "node:test";
 
 import { createClaudeCliStreamFn, serializeConversationPrompt } from "./stream.js";
+import { stampClaudeCliToolPlane } from "./tool-plane.js";
 
 /* ─────────────────────────── fake subprocess ─────────────────────────── */
 
@@ -204,4 +205,45 @@ test("stream fn: auth-shaped stderr on non-zero exit → re-auth message", async
 	const err = events.find((e) => e.type === "error");
 	assert.ok(err);
 	assert.match(err.error.errorMessage, /brigade login claude-cli/);
+});
+
+/* ─────────────────────── MCP tool-plane gates ─────────────────────── */
+
+function ctxWithStamp(over: { senderIsOwner: boolean; systemPrompt?: string }) {
+	const ctx: Record<string, unknown> = {
+		systemPrompt: over.systemPrompt ?? "You are Brigade.",
+		messages: [{ role: "user", content: "hey" }],
+	};
+	stampClaudeCliToolPlane(ctx, { agentId: "main", senderIsOwner: over.senderIsOwner });
+	return ctx as never;
+}
+
+test("tool-plane: OWNER chat turn gets --mcp-config + --strict-mcp-config", async () => {
+	const captured: FakeSpawnScript["captured"] = {};
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }) });
+	await drain(fn(MODEL, ctxWithStamp({ senderIsOwner: true }), undefined) as never);
+	assert.ok(captured.args?.includes("--mcp-config"), "mcp config attached for owner");
+	assert.ok(captured.args?.includes("--strict-mcp-config"), "strict pinning attached");
+});
+
+test("tool-plane: PEER turn gets NO mcp flags (owner-origin isolation)", async () => {
+	const captured: FakeSpawnScript["captured"] = {};
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }) });
+	await drain(fn(MODEL, ctxWithStamp({ senderIsOwner: false }), undefined) as never);
+	assert.ok(!captured.args?.includes("--mcp-config"), "peer must not reach the memory MCP");
+});
+
+test("tool-plane: UNSTAMPED context (isolated distiller sessions) gets NO mcp flags", async () => {
+	const captured: FakeSpawnScript["captured"] = {};
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }) });
+	await drain(fn(MODEL, CTX, undefined) as never);
+	assert.ok(!captured.args?.includes("--mcp-config"));
+});
+
+test("tool-plane: STRUCTURED distiller turn gets NO mcp flags even when owner-stamped", async () => {
+	const captured: FakeSpawnScript["captured"] = {};
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }) });
+	const ctx = ctxWithStamp({ senderIsOwner: true, systemPrompt: 'Distill. Return STRICT JSON only: {"facts":[]}' });
+	await drain(fn(MODEL, ctx, undefined) as never);
+	assert.ok(!captured.args?.includes("--mcp-config"), "distillers stay tool-less on every backend");
 });

@@ -30,6 +30,7 @@ import {
 	CLAUDE_CLI_API,
 	CLAUDE_CLI_PROVIDER,
 } from "./catalog.js";
+import { buildClaudeCliMcpConfig, readClaudeCliToolPlane } from "./tool-plane.js";
 import { spawnClaudeCli, type SpawnClaudeCliArgs } from "./spawn.js";
 import {
 	classifyResultFrame,
@@ -303,15 +304,32 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				// the pinned system prompt so this backend returns a clean envelope and the
 				// memory extraction cursor can actually advance (see isStructuredJsonPrompt).
 				const structured = isStructuredJsonPrompt(ctx.systemPrompt);
+				// Brigade MCP tool-plane (memory/graph on the free-tier engine). THREE
+				// gates, all load-bearing (see tool-plane.ts): the turn was stamped by the
+				// agent loop (claude-cli dispatch only), the sender is the OWNER (the
+				// bundled memory MCP server is owner-origin pinned — a peer turn gets
+				// nothing), and the turn is NOT a structured distiller (those stay
+				// tool-less on every backend). buildClaudeCliMcpConfig itself fails open
+				// (undefined) when the CLI entry path or agent id can't be resolved safely.
+				const toolPlane = readClaudeCliToolPlane(context);
+				const mcpConfigJson =
+					!structured && toolPlane?.senderIsOwner === true
+						? buildClaudeCliMcpConfig(toolPlane.agentId)
+						: undefined;
 				const args = buildClaudeCliArgs({ modelId: model.id, structured });
 				// System prompt goes via a file (not argv) — see spawn.ts. Composed here so
-				// the right nudge (prose vs JSON-only) is included.
-				const systemPrompt = composeClaudeCliSystemPrompt({ systemPrompt: ctx.systemPrompt, structured });
+				// the right nudge (prose vs JSON-only vs memory-tools-allowed) is included.
+				const systemPrompt = composeClaudeCliSystemPrompt({
+					systemPrompt: ctx.systemPrompt,
+					structured,
+					toolPlane: mcpConfigJson !== undefined,
+				});
 
 				handle = spawnClaudeCli({
 					args,
 					stdin: prompt,
 					systemPrompt,
+					...(mcpConfigJson !== undefined ? { mcpConfigJson } : {}),
 					signal: options?.signal as AbortSignal | undefined,
 					spawnFn: opts.spawnFn,
 				});
