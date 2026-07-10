@@ -99,6 +99,10 @@ import { resolveSessionAccessPolicy } from "./tools/sessions/resolve-access.js";
 import { wrapStreamFnWithPayloadMutations } from "./payload-mutators.js";
 import { CLAUDE_CLI_PROVIDER, CLAUDE_CLI_SENTINEL_KEY } from "./claude-cli/catalog.js";
 import { ensureClaudeCliApiRegistered } from "./claude-cli/register.js";
+import { stampClaudeCliToolPlane } from "./claude-cli/tool-plane.js";
+import { makeTransportDispatch } from "./transport-dispatch.js";
+import { claudeCliHarnessBackend } from "./claude-cli/harness-backend.js";
+import { NOOP_HARNESS_HANDLE, type HarnessTurnHandle } from "./harness/types.js";
 import { ensureOllamaNativeApiRegistered } from "./ollama-native/register.js";
 import { migrateOllamaProviderToNative } from "../integrations/ollama.js";
 import { describeModelProbe, probeModelReachable } from "../integrations/provider-discovery.js";
@@ -1043,14 +1047,25 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   // `gateCtxRef.value = {runId, agentId, sessionKey}` once it has those
   // (just before the prompt() call) and clears it in the finally block.
   const gateCtxRef: GuardContextRef = { value: {} };
+  // Captured so the MCP tool-plane (claude-cli harness) can reuse the EXACT same
+  // composed guard for its tool calls — approval/exec-gate/unknown-tool/
+  // path-write/loop, closing over the same gateCtxRef so prompts route to the
+  // right operator. Registered below once gateCtxRef is populated; disposed in
+  // the finally. The harness backend (below) turns it into the guarded tool-plane
+  // it serves to the external binary.
+  let brigadeGuard: BrigadeBeforeToolCallHook | undefined;
+  // A HARNESS backend (claude-cli) installs itself for the turn below. Every other
+  // provider keeps the frozen no-op, so loop backends are byte-identical to before.
+  let harnessHandle: HarnessTurnHandle = NOOP_HARNESS_HANDLE;
   if (sessionWithBeforeHook.agent) {
     // SHARED guard chain — identical to the one buildAgent installs:
     //   unknown-tool guard → loop detector → exec-gate.
-    sessionWithBeforeHook.agent.beforeToolCall = composeBrigadeBeforeToolCall({
+    brigadeGuard = composeBrigadeBeforeToolCall({
       enabledToolNames: allEnabledToolNames,
       gateCtxRef,
       displayCwd: cwd,
     });
+    sessionWithBeforeHook.agent.beforeToolCall = brigadeGuard;
   }
 
   // Compose stream-fn wrappers around Pi's auth-aware streamFn. Order
@@ -1071,9 +1086,19 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   if (sessionAgent && typeof sessionAgent.streamFn === "function") {
     const baseStreamFn = sessionAgent.streamFn;
     const idleTimeoutMs = resolveIdleTimeoutMs(args.provider);
+    // Dispatch Brigade's OWN transports (claude-cli, native ollama) directly,
+    // INNERMOST — beneath the wrappers so they still get idle-timeout /
+    // stop-reason / tool-call-repair. Pi resolves a registered api via its
+    // module-global registry, but a published/global install nests a SECOND
+    // `pi-ai` under `pi-coding-agent` (whose `streamSimple` the Agent defaults
+    // to), so our registration lands in one registry and the lookup reads the
+    // other → "No API provider registered for api: claude-cli". Direct dispatch
+    // removes that dependency entirely. Cloud providers still fall through to
+    // `baseStreamFn` — Pi's auth wrapper — which must never be replaced.
+    const dispatchStreamFn = makeTransportDispatch(baseStreamFn);
     const wrappedStreamFn = wrapStreamFnWithIdleTimeout(
       wrapStreamFnWithStopReasonRecovery(
-        wrapStreamFnWithToolCallRepair(baseStreamFn),
+        wrapStreamFnWithToolCallRepair(dispatchStreamFn),
       ),
       { timeoutMs: idleTimeoutMs },
     );
@@ -1092,7 +1117,13 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // never REPLACE — Pi's auth wrapper stays at the bottom of the stack.
     sessionAgent.streamFn = ((model: { api?: string }, context: unknown, options: unknown) => {
       if (model?.api === "ollama") ensureOllamaNativeApiRegistered();
-      else if (model?.api === "claude-cli") ensureClaudeCliApiRegistered();
+      else if (model?.api === "claude-cli") {
+        ensureClaudeCliApiRegistered();
+        // Hand the transport this turn's harness context (owner flag + tool-plane
+        // callback URL). Gated to claude-cli dispatches — raw-API providers never
+        // see it, and on any other provider the handle is the frozen no-op.
+        harnessHandle.stampContext(context);
+      }
       return (wrappedStreamFn as (m: unknown, c: unknown, o: unknown) => unknown)(model, context, options);
     }) as typeof baseStreamFn;
     log.debug("stream wrappers installed", {
@@ -1517,6 +1548,38 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   };
 
   try {
+  // Install the HARNESS backend for this turn, if one owns it.
+  //
+  // MUST live INSIDE this try: its `finally` is what disposes the handle. A throw
+  // between install and the try would otherwise strand the tool-plane token in the
+  // process-global registry for the gateway lifetime, retaining the whole turn
+  // context (tools + guard + signal).
+  //
+  // The backend registers the guarded tool-plane, threads runId (TUI tool events)
+  // and the transcript sink, and hands back a disposable handle. It fails open: a
+  // peer turn, or the cold `brigade agent` path (no gateway host), registers
+  // nothing and the turn proceeds exactly as before.
+  if (claudeCliHarnessBackend.owns({ provider: args.provider })) {
+    harnessHandle = claudeCliHarnessBackend.installTurn({
+      agentId,
+      provider: args.provider,
+      modelId: args.modelId,
+      cwd,
+      sessionKey: resolved.sessionKey,
+      runId,
+      session,
+      senderIsOwner: effectiveSenderIsOwner,
+      customTools: brigadeCustomTools,
+      builtinToolNames: toolset.builtinToolNames,
+      ...(brigadeGuard ? { guard: brigadeGuard } : {}),
+      ...(args.signal ? { signal: args.signal } : {}),
+      // Mirrors what a Pi-loop sub-agent's real tool events carry, so the TUI
+      // indents a harness sub-agent's calls instead of attributing them to the parent.
+      ...(callerSubagentDepth > 0 ? { subagentDepth: callerSubagentDepth } : {}),
+      ...(args.subagentLabel !== undefined ? { subagentLabel: args.subagentLabel } : {}),
+    });
+  }
+
   log.info("turn starting", {
     agentId,
     sessionId: resolved.sessionId,
@@ -1617,6 +1680,13 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     ctx: { provider: args.provider, model: args.modelId },
     signal: args.signal,
     onAttemptFailed: async (info) => {
+      // A retryable failure (timeout / overloaded / 5xx) re-invokes the attempt,
+      // which for a harness backend RESPAWNS the binary. Its tool calls so far live
+      // only in the JSONL — `appendMessage` never touches `session.messages`, which
+      // is what the next attempt serializes. Drain them in before the respawn, or a
+      // watchdog kill mid-turn makes the retry re-run every side effect it already
+      // committed. Idempotent, and a no-op for every loop backend.
+      harnessHandle.afterTurn();
       const fields = {
         agentId,
         sessionId: resolved.sessionId,
@@ -1754,6 +1824,16 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
                   reason,
                 });
               },
+              // A HARNESS backend runs tools out-of-band, so the assistant message
+              // can never carry toolCall blocks and the recovery heuristics would
+              // read "never acted" on a turn that just ran a deploy. Re-prompting
+              // respawns the binary and repeats every side effect. No-op (false)
+              // for every loop backend.
+              toolActivity: () => harnessHandle.hadToolActivity(),
+              // The slop gate re-prompts even on a harness turn. Drain the harness's
+              // tool records into `session.messages` first, so the rewrite request
+              // carries them and the respawned binary doesn't redo the work.
+              beforeRetry: () => harnessHandle.afterTurn(),
             },
           );
         },
@@ -1800,6 +1880,11 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       sessionId: resolved.sessionId,
       continuationIndex: continuations,
     });
+    // A harness re-prompt RESPAWNS the external binary, which replays the context
+    // and would re-run any tool it can't see it already ran. Flush this attempt's
+    // records into the context first, so the continuation reads `[called tool: X]`
+    // and its result. Idempotent + a no-op for every loop backend.
+    harnessHandle.afterTurn();
     await runWithRetry({
       ctx: { provider: args.provider, model: args.modelId },
       signal: args.signal,
@@ -1867,6 +1952,13 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       ? joinAssistantTextFrom(session as AgentSession, messageCountBeforeTurn)
       : extractLastAssistantText(session as AgentSession);
 
+  // Reconcile whatever the harness recorded out-of-band into the in-memory
+  // context. AFTER `reply` so the synthetic messages (which carry no text) cannot
+  // affect what the operator sees, and after streaming has stopped — mutating
+  // `agent.state.messages` mid-stream would race Pi's own loop. No-op for every
+  // loop backend.
+  harnessHandle.afterTurn();
+
   // After-turn lifecycle:
   //
   // 1. If we just delivered the full bootstrap context to this session
@@ -1907,6 +1999,10 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     // outside a prompt() call (e.g. a steer-triggered tool retry that
     // races the turn boundary).
     gateCtxRef.value = {};
+    // Tear down whatever the harness installed (the tool-plane token), so it can
+    // never outlive the turn — the binary's endpoint 404s the instant we return.
+    harnessHandle.dispose();
+    harnessHandle = NOOP_HARNESS_HANDLE;
   }
 }
 

@@ -60,6 +60,7 @@
 
 import type { BeforeToolCallContext, BeforeToolCallResult } from "@earendil-works/pi-agent-core";
 
+import { createSubsystemLogger } from "../logging/subsystem-logger.js";
 import { BrigadeApprovalFileVersionError, decideApproval } from "../core/exec-approvals.js";
 import { emitAgentEvent } from "./agent-event-bus.js";
 import { isExecAllowAll, setExecAllowAll } from "./exec-session-allow.js";
@@ -78,6 +79,13 @@ import { type BrigadeBeforeToolCallHook, normalizeToolName } from "./tool-guard.
  * here is the only wiring needed.
  */
 const EXEC_GATED_TOOLS = new Set(["bash", "exec", "shell", "sh"]);
+
+// Every shell command the gate lets through, and why. Without this an operator
+// watching a command run has no way to tell "it was allowlisted" from "allow-all
+// is armed" from "the gate never fired" — three very different things, one of
+// which is a bug. Only the truncated single-line preview is logged, the same
+// string the refusal messages already surface.
+const log = createSubsystemLogger("agents/exec-gate");
 
 /**
  * Optional context the gate threads into bus events. The agent-loop
@@ -146,7 +154,7 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 			...(c.sessionKey !== undefined ? { sessionKey: c.sessionKey } : {}),
 		});
 	};
-	return async (ctx: BeforeToolCallContext): Promise<BeforeToolCallResult | undefined> => {
+	return async (ctx: BeforeToolCallContext, signal?: AbortSignal): Promise<BeforeToolCallResult | undefined> => {
 		const rawName = (ctx as { toolCall?: { name?: unknown }; name?: unknown })?.toolCall?.name
 			?? (ctx as { name?: unknown })?.name
 			?? "";
@@ -276,7 +284,16 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 			throw err;
 		}
 
-		if (decision === "allow") return undefined;
+		if (decision === "allow") {
+			log.info("shell command allowed", {
+				tool: name,
+				via: "allowlist",
+				command: previewCommand(cmd),
+				agentId: gateAgentId,
+				sessionKey: ctxRef.value.sessionKey,
+			});
+			return undefined;
+		}
 
 		if (decision === "deny") {
 			const reason =
@@ -297,7 +314,20 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 		// interactive prompt — it can never bypass a protective block. It's
 		// in-memory + per-session (clears on restart) and does NOT cascade to
 		// sub-agents (their gate checks distinct child session keys).
-		if (isExecAllowAll(ctxRef.value.sessionKey)) return undefined;
+		// WARN, not info: the operator armed this, but a command running unasked is
+		// exactly the thing they will later want to explain. This line is the only
+		// record that the prompt was waived deliberately rather than never reached.
+		if (isExecAllowAll(ctxRef.value.sessionKey)) {
+			log.warn("shell command allowed WITHOUT prompting", {
+				tool: name,
+				via: "allow-all",
+				command: previewCommand(cmd),
+				agentId: gateAgentId,
+				sessionKey: ctxRef.value.sessionKey,
+				hint: "/allow-all off to restore approval prompts",
+			});
+			return undefined;
+		}
 
 		// "prompt" — operator hasn't allowlisted this command yet. If a
 		// gateway client is online (the WS bridge is registered), surface
@@ -308,6 +338,14 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 		const bridge = getActiveApprovalBridge();
 		if (bridge) {
 			const preview = previewCommand(cmd);
+			// The prompt is now pending. If it never appears on screen, this line is
+			// how the operator learns the gate DID fire and the UI dropped it.
+			log.info("shell command awaiting approval", {
+				tool: name,
+				command: preview,
+				agentId: gateAgentId,
+				sessionKey: ctxRef.value.sessionKey,
+			});
 			const decisions: ReadonlyArray<ApprovalDecisionKind> = [
 				"allow-once",
 				"allow-always",
@@ -317,7 +355,8 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 			];
 			try {
 				const c = ctxRef.value;
-				const decision = await bridge.requestApproval({
+				const decision = await bridge.requestApproval(
+					{
 					command: cmd,
 					toolName: name,
 					cwd: displayCwd,
@@ -335,7 +374,16 @@ export function makeExecGate(opts: MakeExecGateOptions = {}): BrigadeBeforeToolC
 					// would see (and could answer) someone else's approval.
 					...(c.agentId !== undefined ? { agentId: c.agentId } : {}),
 					...(c.sessionKey !== undefined ? { sessionId: c.sessionKey } : {}),
-				});
+									},
+					signal,
+				);
+				// Turn cancelled while awaiting the operator. Fail CLOSED, and return
+				// before `applyApprovalDecision` so a dead turn can never persist an
+				// allowlist entry. No `emitBlocked`: a cancel is not a policy refusal,
+				// and this result is discarded as the turn unwinds anyway.
+				if (decision.aborted) {
+					return { block: true, reason: "Bash refused: the turn was cancelled before the operator answered." };
+				}
 				if (decision.timedOut) {
 					const reason =
 						`Bash refused: approval timed out (no operator reply within 5 minutes). Command was "${preview}". ` +

@@ -129,6 +129,42 @@ export interface ContentQualityRetryOptions {
 	 *  (empty / reasoning-only / planning-only) always get exactly ONE re-prompt,
 	 *  regardless of this value — looping those is pathological, not a quality bar. */
 	maxSlopRewrites?: number;
+	/**
+	 * Did the turn actually DO something, even though the assistant message shows
+	 * no `toolCall` blocks?
+	 *
+	 * Every recovery heuristic below reads tool activity off the assistant message.
+	 * That is sound when Pi loop dispatched the tools. It is structurally FALSE for
+	 * a HARNESS backend (claude-cli), where an external binary runs the loop and
+	 * calls Brigade tools back over MCP: the assistant message it returns can only
+	 * ever contain text/thinking, so `toolCallBlocks.length === 0` ALWAYS.
+	 *
+	 * Without this, a harness turn that ran `bash ./deploy.sh` and then said "Let me
+	 * run the deploy for you" is judged planning-only, gets re-prompted, and the
+	 * re-prompt RESPAWNS THE BINARY — which runs the deploy a second time. Same for
+	 * a terse or empty reply after real work.
+	 *
+	 * So a backend that executed tools out-of-band reports it here and the recovery
+	 * tier stands down. Omitted (every loop backend) => behaviour unchanged.
+	 */
+	toolActivity?: () => boolean;
+
+	/**
+	 * Flush any out-of-band tool activity into the session transcript BEFORE a
+	 * re-prompt rebuilds the request.
+	 *
+	 * A harness backend records its tool calls to the JSONL as it goes, but they
+	 * only reach `session.messages` — the array a re-prompt serializes — when the
+	 * harness turn is drained. Re-prompting before that drain hands the binary a
+	 * request with no evidence it ever ran `bash ./deploy.sh`, so it runs it again.
+	 *
+	 * This is why the slop gate is safe to keep: after the flush the rewrite request
+	 * carries the toolCall/toolResult pair, exactly as an API backend's would, so the
+	 * model rewrites the prose instead of re-doing the work.
+	 *
+	 * Omitted (every loop backend) => no-op; Pi's loop already persists tool calls.
+	 */
+	beforeRetry?: () => void;
 }
 
 /**
@@ -169,10 +205,20 @@ export async function runWithContentQualityRetry(
 	const issue = inspectLast();
 	if (!issue) return;
 
-	// RECOVERY issues — a single steer re-prompt (Pi's `agent.steer` is for mid-turn
+	// A harness backend ran tools out-of-band, so the assistant message cannot
+	// carry toolCall blocks and the recovery heuristics all misread it as "never
+	// acted". Re-prompting would respawn the binary and re-run every side effect.
+	//
+	// The slop gate still applies, because a rewrite is worth a respawn and
+	// `beforeRetry` puts the turn's tool calls into the request first — so the
+	// binary rewrites its prose rather than repeating the work behind it.
+	if (issue !== "slop" && options.toolActivity?.() === true) return;
+
+	// RECOVERY issues — a single steer re-prompt (Pi `agent.steer` is for mid-turn
 	// injection; this fires AFTER the turn, so we re-prompt directly).
 	if (issue !== "slop") {
 		options.onRetry?.(issue);
+		options.beforeRetry?.();
 		await session.prompt(STEER_FOR[issue]);
 		return;
 	}
@@ -182,6 +228,9 @@ export async function runWithContentQualityRetry(
 	const maxRewrites = Math.max(1, options.maxSlopRewrites ?? 3);
 	for (let attempt = 0; attempt < maxRewrites; attempt++) {
 		options.onRetry?.("slop");
+		// Flush FIRST: a harness backend respawns its binary on every re-prompt, and a
+		// rewrite request that omits the turn's tool calls re-runs their side effects.
+		options.beforeRetry?.();
 		await session.prompt(STEER_FOR.slop);
 		if (inspectLast() !== "slop") return; // cleared the bar — ship it
 	}

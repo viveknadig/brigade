@@ -70,6 +70,8 @@ import { flattenAssistantContent, runResilientTurn, type RunSingleTurnResult } f
 import { BrigadeExtensionRegistry, BUNDLED_MODULES, clearDiscoveryCache, loadModules } from "../agents/extensions/index.js";
 import { setActiveRegistry } from "../agents/extensions/active-registry.js";
 import type { GatewayCaller, GatewayMethodHandler, HttpRoute, Service } from "../agents/extensions/index.js";
+import { createMcpHttpRoute } from "../agents/mcp/http-route.js";
+import { createMcpTurnRegistry, setActiveMcpToolPlaneHost } from "../agents/mcp/tool-plane-host.js";
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_MS, readBodyWithLimit } from "./webhook-guards.js";
 import { extractFrameTags, shouldDeliverFrame } from "./ws-subscription-filter.js";
 import { setActiveChannelManager } from "../agents/channels/active-manager.js";
@@ -1006,7 +1008,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// Module-registered HTTP routes. We carry the full `HttpRoute` (not just the
 	// handler) so the request dispatcher can apply `auth` / `match` / `maxBodyBytes`
 	// / `timeoutMs` per-route before delegating to the plugin's handler.
-	let httpRoutes: HttpRoute[] = [];
+	//
+	// CORE routes (below) are non-extension and must survive a config hot-reload,
+	// which rebuilds `httpRoutes` from the extension registry. The MCP tool-plane
+	// route (`/mcp/<token>`) lets the claude-cli harness backend call Brigade's
+	// full guarded tool surface in-process — so it lives here, ahead of extension
+	// routes, and is re-merged on every rebuild.
+	const mcpTurnRegistry = createMcpTurnRegistry();
+	const coreHttpRoutes: HttpRoute[] = [createMcpHttpRoute(mcpTurnRegistry)];
+	let httpRoutes: HttpRoute[] = [...coreHttpRoutes];
 	const startedServices: { id: string; service: Service }[] = [];
 	let serviceAbort: AbortController | undefined;
 
@@ -1632,10 +1642,14 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			/* session torn down — keep last value */
 		}
 		try {
-			const usage = s.getContextUsage();
-			if (usage?.percent != null) lastContextUsagePercent = usage.percent;
+			// Assign unconditionally, INCLUDING null. Pi returns null right after a
+			// compaction by design (its token estimate needs a fresh response), and a
+			// guard that only overwrote non-null values pinned the pre-compaction
+			// figure forever: a turn compacted at 889% then reported "usage now 889%".
+			// A stale number is worse than no number.
+			lastContextUsagePercent = s.getContextUsage()?.percent ?? null;
 		} catch {
-			/* ignore */
+			/* session torn down — keep last value */
 		}
 		try {
 			cachedSupportsThinking = s.supportsThinking();
@@ -1952,10 +1966,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		//  - sub-agent `pi` frames (subagentDepth>0): they carry the child's own
 		//    session id (a UUID) and live in a separate child transcript the
 		//    parent's `resume` can't backfill — ephemeral nested decoration.
+		//  - SYNTHETIC `pi` frames: the tool events Brigade mints for a claude-cli
+		//    turn (its tools run in the binary's loop, via the MCP route). They are
+		//    not in the JSONL transcript, so `resume` cannot replay them; seq-stamping
+		//    them would make a dropped decoration frame look like a real gap and
+		//    thrash resume. Same category as sub-agent frames.
 		//  - `state` (self-healing cumulative snapshot), `error`, `log` (on disk).
 		const subDepth = event === "pi" ? Number((payload as { subagentDepth?: number }).subagentDepth) || 0 : 0;
+		const isSyntheticPi = event === "pi" && (payload as { synthetic?: boolean }).synthetic === true;
 		const isOrderedFrame =
-			(event === "pi" && subDepth === 0) ||
+			(event === "pi" && subDepth === 0 && !isSyntheticPi) ||
 			event === "approval-request" ||
 			event === "system-event";
 		const seq = isOrderedFrame ? nextSeq(seqCounters, frameSessionId) : undefined;
@@ -2518,14 +2538,20 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// forwarding both paths would duplicate every event.
 	const detachSubagentPiBus = onAgentEvent((event) => {
 		if (event.type !== "pi") return;
-		if (!event.subagentDepth || event.subagentDepth <= 0) return;
+		// Depth-0 Pi events already go out via `attachTurnSession`'s direct
+		// subscribe, so forwarding them here would duplicate every frame. The one
+		// exception is a SYNTHETIC event: Brigade minted it (the claude-cli tool
+		// events), Pi never saw it, so `attachTurnSession` will never broadcast it.
+		const isSynthetic = event.synthetic === true;
+		if (!isSynthetic && (!event.subagentDepth || event.subagentDepth <= 0)) return;
 		// Wave I — forward the parent's agentId + sessionId from the bus
 		// event so child pi frames carry the same routing tags as the
 		// top-level pi frames; the operator's subscription filter applies
 		// identically to top-level and sub-agent events.
 		broadcast("pi", {
 			event: event.piEvent,
-			subagentDepth: event.subagentDepth,
+			...(event.subagentDepth ? { subagentDepth: event.subagentDepth } : {}),
+			...(isSynthetic ? { synthetic: true } : {}),
 			agentId: event.agentId,
 			sessionId: event.sessionId,
 		});
@@ -5281,6 +5307,19 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		});
 	});
 
+	// Publish the MCP tool-plane host now the loopback HTTP server is bound. The
+	// claude-cli harness backend registers each eligible turn's toolset + guard in
+	// `mcpTurnRegistry` and points the binary at `${baseUrl}/mcp/<token>`.
+	//
+	// The server binds loopback, and the route re-checks `remoteAddress`. That is
+	// NOT the same as "unreachable remotely": `brigade expose` proxies HTTP from
+	// 127.0.0.1, so a tunnelled request passes the loopback check. It grants no
+	// INCREMENTAL capability — reaching the tunnel already means holding the expose
+	// bearer token, which carries operator rights over the gateway anyway — and a
+	// caller still needs the ephemeral per-turn 256-bit token. Stated plainly here
+	// so nobody later mistakes the loopback check for a remote-access boundary.
+	setActiveMcpToolPlaneHost({ baseUrl: `http://127.0.0.1:${port}`, registry: mcpTurnRegistry });
+
 	// Phase 7 — agent model resolved. Emits the standard
 	// `agent model: <provider>/<model>` line for the boot agent.
 	{
@@ -5708,7 +5747,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		// HTTP routes — swap in the live list the request handler reads. We carry
 		// the full `HttpRoute` (auth / match / maxBodyBytes / timeoutMs) so the
 		// request dispatcher can apply each route's guards before delegating.
-		httpRoutes = [...registry.httpRoutes];
+		httpRoutes = [...coreHttpRoutes, ...registry.httpRoutes];
 
 		// Channels — inbound runs through the SAME serialized turn queue as TUI
 		// prompts (`runGatewayTurn`), so a channel turn never overlaps a TUI turn.
@@ -6159,6 +6198,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			// Detach the approval bridge so a late-arriving exec-gate call
 			// after stop() doesn't broadcast to dead clients.
 			setActiveApprovalBridge(null);
+			// Detach the MCP tool-plane host so a late claude-cli turn can't
+			// register against a dead gateway (falls back to memory-only stdio).
+			setActiveMcpToolPlaneHost(null);
 			// Disarm the cron timer + detach the active-service singleton so
 			// the agent tool can no longer mutate state and the next CLI
 			// invocation gets a clean "not initialised" error rather than a

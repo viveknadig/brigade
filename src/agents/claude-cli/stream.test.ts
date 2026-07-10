@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { test } from "node:test";
 
 import { createClaudeCliStreamFn, serializeConversationPrompt } from "./stream.js";
+import { stampClaudeCliToolPlane } from "./tool-plane.js";
 
 /* ─────────────────────────── fake subprocess ─────────────────────────── */
 
@@ -135,6 +136,52 @@ test("stream fn: emits start → text deltas → done with accumulated text + us
 	assert.equal(captured.stdin, "hey");
 });
 
+test("usage.input is the FIRST step's prompt, not the binary's cumulative total", async () => {
+	// The binary runs its own tool loop inside one turn: a message_start per internal
+	// step, each with a bigger prompt, and a `result` frame carrying the CUMULATIVE
+	// usage of the whole run (prompt caching re-counts cache_read on every step).
+	//
+	// Pi reads an assistant message's usage as "tokens currently in the context window"
+	// (calculateContextTokens = input + output + cacheRead + cacheWrite) and compacts
+	// when it crosses the threshold. Feeding it the cumulative total made a 39%-full
+	// session report 889% of a 200k window — and Pi "compacted" it twice, discarding
+	// real history both times.
+	const lines = [
+		'{"type":"system","subtype":"init","session_id":"s1"}',
+		// step 1 — the conversation Brigade actually handed the binary
+		'{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":40000,"cache_read_input_tokens":38000}}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"working"}}}',
+		// steps 2..N — the binary's own scratch context, which Pi cannot compact
+		'{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":5000,"cache_read_input_tokens":190000}}}}',
+		'{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":9000,"cache_read_input_tokens":195000}}}}',
+		'{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":12941}}}',
+		// the result frame's usage is a BILLING total for the run, not a context size
+		'{"type":"result","subtype":"success","result":"done","usage":{"input_tokens":54000,"cache_read_input_tokens":1702936,"output_tokens":12941}}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+
+	assert.equal(message.usage.input, 78000, "first step's prompt (40000 + 38000 cached)");
+	assert.notEqual(message.usage.input, 1_756_936, "must NOT be the run's cumulative total");
+	assert.equal(message.usage.output, 12941);
+	// 78k of a 200k window is 39% — the honest figure. The bug reported 889%.
+	assert.ok(message.usage.input / 200_000 < 0.5, "a healthy session must not look overfull");
+});
+
+test("usage.input falls back to the result frame when no partial frames stream", async () => {
+	// An older CLI emits no message_start; the run is a single step, so its cumulative
+	// total IS that step's prompt. Filling in a missing input is correct there.
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}',
+		'{"type":"result","subtype":"success","result":"hi","usage":{"input_tokens":1200,"output_tokens":8}}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.usage.input, 1200);
+	assert.equal(message.usage.output, 8);
+});
+
 test("stream fn: survives stdout chunk splitting mid-line", async () => {
 	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, splitChunks: true }) });
 	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
@@ -204,4 +251,76 @@ test("stream fn: auth-shaped stderr on non-zero exit → re-auth message", async
 	const err = events.find((e) => e.type === "error");
 	assert.ok(err);
 	assert.match(err.error.errorMessage, /brigade login claude-cli/);
+});
+
+/* ─────────────────────── MCP tool-plane gates ─────────────────────── */
+
+function ctxWithStamp(over: { senderIsOwner: boolean; systemPrompt?: string; structured?: boolean }) {
+	const ctx: Record<string, unknown> = {
+		systemPrompt: over.systemPrompt ?? "You are Brigade.",
+		messages: [{ role: "user", content: "hey" }],
+	};
+	stampClaudeCliToolPlane(ctx, {
+		agentId: "main",
+		senderIsOwner: over.senderIsOwner,
+		...(over.structured !== undefined ? { structured: over.structured } : {}),
+	});
+	return ctx as never;
+}
+
+test("tool-plane: OWNER chat turn gets --mcp-config + --strict-mcp-config", async () => {
+	const captured: FakeSpawnScript["captured"] = {};
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }) });
+	await drain(fn(MODEL, ctxWithStamp({ senderIsOwner: true }), undefined) as never);
+	assert.ok(captured.args?.includes("--mcp-config"), "mcp config attached for owner");
+	assert.ok(captured.args?.includes("--strict-mcp-config"), "strict pinning attached");
+});
+
+test("tool-plane: PEER turn gets NO mcp flags (owner-origin isolation)", async () => {
+	const captured: FakeSpawnScript["captured"] = {};
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }) });
+	await drain(fn(MODEL, ctxWithStamp({ senderIsOwner: false }), undefined) as never);
+	assert.ok(!captured.args?.includes("--mcp-config"), "peer must not reach the memory MCP");
+});
+
+test("tool-plane: UNSTAMPED context (isolated distiller sessions) gets NO mcp flags", async () => {
+	const captured: FakeSpawnScript["captured"] = {};
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }) });
+	await drain(fn(MODEL, CTX, undefined) as never);
+	assert.ok(!captured.args?.includes("--mcp-config"));
+});
+
+test("tool-plane: a DECLARED structured turn gets NO mcp flags even when owner-stamped", async () => {
+	const captured: FakeSpawnScript["captured"] = {};
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }) });
+	// Distiller sessions stamp `structured: true` (installStructuredTurnStamp). Even
+	// owner-stamped, they stay tool-less on every backend.
+	const ctx = ctxWithStamp({ senderIsOwner: true, structured: true });
+	await drain(fn(MODEL, ctx, undefined) as never);
+	assert.ok(!captured.args?.includes("--mcp-config"), "distillers stay tool-less on every backend");
+});
+
+test("tool-plane: an owner turn whose PERSONA says 'STRICT JSON only' keeps its tools", async () => {
+	const captured: FakeSpawnScript["captured"] = {};
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }) });
+	// The assembled persona splices in operator-authored files (TOOLS.md, USER.md) and
+	// skill descriptions verbatim. Documenting a JSON API must NOT make the transport
+	// mistake a chat turn for a distiller and strip its whole tool surface — which the
+	// operator would see only as an agent that mysteriously "won't use its tools".
+	const ctx = ctxWithStamp({
+		senderIsOwner: true,
+		structured: false,
+		systemPrompt: "You are Brigade.\n\n## TOOLS.md\nOur /v1/facts endpoint returns STRICT JSON only.",
+	});
+	await drain(fn(MODEL, ctx, undefined) as never);
+	assert.ok(captured.args?.includes("--mcp-config"), "a stamped agent turn keeps its plane regardless of prose");
+});
+
+test("tool-plane: an UNSTAMPED distiller prompt still falls back to the text sniff", async () => {
+	const captured: FakeSpawnScript["captured"] = {};
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }) });
+	// The cold path (no stamp at all) has nothing else to go on.
+	const ctx = { systemPrompt: 'Distill. Return STRICT JSON only: {"facts":[]}', messages: [] };
+	await drain(fn(MODEL, ctx as never, undefined) as never);
+	assert.ok(!captured.args?.includes("--mcp-config"));
 });

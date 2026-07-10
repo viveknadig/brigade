@@ -10,6 +10,8 @@ import path from "node:path";
 
 import {
 	buildClaudeCliEnv,
+	CLAUDE_CLI_MCP_CONFIG_FLAG,
+	CLAUDE_CLI_STRICT_MCP_FLAG,
 	CLAUDE_CLI_SYSTEM_PROMPT_FILE_FLAG,
 	resolveClaudeCliCommand,
 } from "./catalog.js";
@@ -27,6 +29,43 @@ export const CLAUDE_CLI_NO_OUTPUT_TIMEOUT_MS = 180_000;
 /** Hard ceiling on a single turn regardless of trickle output. */
 export const CLAUDE_CLI_OVERALL_TIMEOUT_MS = 600_000;
 
+/**
+ * Timeouts for a spawn carrying the Brigade MCP tool-plane.
+ *
+ * A tool-plane turn can legitimately sit silent for a long time: while the
+ * binary blocks on our `/mcp` response, it writes NOTHING to stdout, so the
+ * no-output watchdog keeps ticking. Two cases make the default 180s fatal:
+ *   • an exec-gated tool (`bash`) awaits the operator's approval for up to 5
+ *     minutes (exec-gate's `timeoutMs`), so a 180s watchdog would SIGKILL our
+ *     own child before the operator could ever answer — the approval prompt
+ *     would resolve into a dead process;
+ *   • a long tool (`spawn_agent` running a whole sub-agent turn, media
+ *     generation) can exceed both defaults.
+ * So a tool-plane spawn gets a no-output grace comfortably ABOVE the approval
+ * ceiling, and a proportionally larger hard ceiling. Non-tool-plane turns keep
+ * the original, tighter numbers — a plain chat turn that goes silent for 3
+ * minutes really is wedged.
+ */
+export const CLAUDE_CLI_TOOL_PLANE_NO_OUTPUT_TIMEOUT_MS = 360_000; // > exec-gate's 300s
+export const CLAUDE_CLI_TOOL_PLANE_OVERALL_TIMEOUT_MS = 1_800_000;
+
+/**
+ * The one deadline a tool call cannot postpone.
+ *
+ * Both watchdogs above are PAUSED while the child waits on a Brigade tool, and the
+ * hard ceiling slides forward by the paused span — correct, because the child is
+ * healthy and we are the slow party. But it means a binary that issues a tool call
+ * at least once per grace window keeps rearming both timers forever: the "hard"
+ * ceiling bounds nothing. Nothing else bounds it either — the child's stdout is
+ * silent (so no-output can't fire), and the MCP token now expires on IDLE time, so
+ * an actively-calling turn refreshes it indefinitely.
+ *
+ * This timer is armed once at spawn and never paused, cleared, or slid. It is not a
+ * liveness check — it is the ceiling on how long one turn may hold the operator's
+ * shell, tokens, and billed tools while looping.
+ */
+export const CLAUDE_CLI_TOOL_PLANE_ABSOLUTE_TIMEOUT_MS = 4 * 60 * 60 * 1000; // 4h
+
 export interface SpawnClaudeCliArgs {
 	args: string[];
 	/** Prompt delivered on stdin (the whole serialized conversation). */
@@ -38,6 +77,20 @@ export interface SpawnClaudeCliArgs {
 	 * (`spawn ENAMETOOLONG` on Windows). Omitted/empty ⇒ no system-prompt flag.
 	 */
 	systemPrompt?: string;
+	/**
+	 * Brigade MCP tool-plane config (JSON string — see tool-plane.ts). Written to
+	 * a temp file inside the isolated cwd and passed via `--mcp-config` +
+	 * `--strict-mcp-config`, so the binary sees EXACTLY Brigade's server and never
+	 * the operator's personal MCP config. Omitted => no MCP flags (prior
+	 * behaviour). A write failure fails OPEN unless `requireMcpConfig`.
+	 */
+	mcpConfigJson?: string;
+	/**
+	 * The caller denied the binary's own built-ins because this plane replaces
+	 * them. Set on a full-plane turn: a failure to attach the plane must then FAIL
+	 * the spawn, not silently produce an agent with no tools at all.
+	 */
+	requireMcpConfig?: boolean;
 	/** External cancel (turn abort). Aborting SIGKILLs the child. */
 	signal?: AbortSignal;
 	noOutputTimeoutMs?: number;
@@ -46,11 +99,14 @@ export interface SpawnClaudeCliArgs {
 	spawnFn?: typeof spawn;
 }
 
-export type SpawnKillReason = "no-output-timeout" | "overall-timeout" | "aborted";
+export type SpawnKillReason = "no-output-timeout" | "overall-timeout" | "absolute-ceiling" | "aborted";
 
 export interface ClaudeCliRunHandle {
 	/** Async iterator of parsed stdout frames (blank/garbage lines skipped). */
 	frames: AsyncGenerator<ClaudeCliFrame>;
+	/** Suspend the liveness watchdogs while the child blocks on a Brigade tool
+	 *  call; the returned fn resumes them. Nested pauses are counted. */
+	pause: () => () => void;
 	/** Resolves once the process exits: its code, and any kill reason we forced. */
 	done: Promise<{ code: number | null; killReason?: SpawnKillReason; stderr: string }>;
 }
@@ -63,8 +119,15 @@ export interface ClaudeCliRunHandle {
  */
 export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 	const command = resolveClaudeCliCommand();
-	const noOutputMs = args.noOutputTimeoutMs ?? CLAUDE_CLI_NO_OUTPUT_TIMEOUT_MS;
-	const overallMs = args.overallTimeoutMs ?? CLAUDE_CLI_OVERALL_TIMEOUT_MS;
+	// A tool-plane spawn blocks silently while Brigade executes its tools (and
+	// possibly waits on an operator approval), so it needs the wider watchdogs.
+	const hasToolPlane = (args.mcpConfigJson?.trim().length ?? 0) > 0;
+	const noOutputMs =
+		args.noOutputTimeoutMs ??
+		(hasToolPlane ? CLAUDE_CLI_TOOL_PLANE_NO_OUTPUT_TIMEOUT_MS : CLAUDE_CLI_NO_OUTPUT_TIMEOUT_MS);
+	const overallMs =
+		args.overallTimeoutMs ??
+		(hasToolPlane ? CLAUDE_CLI_TOOL_PLANE_OVERALL_TIMEOUT_MS : CLAUDE_CLI_OVERALL_TIMEOUT_MS);
 	const doSpawn = args.spawnFn ?? spawn;
 
 	// Isolated, empty working dir — the tool-containment boundary.
@@ -97,6 +160,30 @@ export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 		}
 	}
 
+	// Brigade MCP tool-plane (memory tools) — same temp-file lifecycle as the
+	// system prompt: lives in the throwaway cwd, removed with it on exit.
+	// `--strict-mcp-config` pins the binary's MCP surface to EXACTLY this file.
+	const mcpJson = args.mcpConfigJson?.trim();
+	if (mcpJson && mcpJson.length > 0) {
+		try {
+			const mcpFile = path.join(cwd, "mcp-config.json");
+			writeFileSync(mcpFile, mcpJson, "utf8");
+			finalArgs.push(CLAUDE_CLI_MCP_CONFIG_FLAG, mcpFile, CLAUDE_CLI_STRICT_MCP_FLAG);
+		} catch (err) {
+			// Fail-open is only safe when the binary keeps its own tools. On a FULL-PLANE
+			// turn the caller already denied every built-in (the plane replaces them), so
+			// spawning without the plane hands the model ZERO tools while its system prompt
+			// promises a filesystem — it would confidently report work it cannot do.
+			// Fail LOUD instead: the retry layer respawns, and the operator sees why.
+			if (args.requireMcpConfig === true) {
+				throw new Error(
+					`claude-cli: could not write the tool-plane config; refusing to spawn a tool-less agent: ${String(err)}`,
+				);
+			}
+			/* memory-only plane: the binary keeps its own tools, so proceed without ours. */
+		}
+	}
+
 	const child: ChildProcessWithoutNullStreams = doSpawn(command, finalArgs, {
 		cwd,
 		env: buildClaudeCliEnv(process.env, { configDir }),
@@ -113,6 +200,16 @@ export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 	// ── watchdog timers ──
 	let noOutputTimer: NodeJS.Timeout | undefined;
 	let overallTimer: NodeJS.Timeout | undefined;
+	// Armed once, never paused and never slid — see CLAUDE_CLI_TOOL_PLANE_ABSOLUTE_TIMEOUT_MS.
+	// Only a tool-plane spawn can chain pauses, so only it needs the ceiling; a plain
+	// turn is already bounded by `overallMs`.
+	let absoluteTimer: NodeJS.Timeout | undefined;
+	// Nested pause depth + the wall-clock deadline for the hard ceiling. Time spent
+	// PAUSED (i.e. time Brigade spent executing a tool the child asked for) does not
+	// count against the child's budget — the deadline slides forward by that much.
+	let pauseDepth = 0;
+	let pausedAt = 0;
+	let overallDeadline = Date.now() + overallMs;
 	const clearTimers = () => {
 		if (noOutputTimer) clearTimeout(noOutputTimer);
 		if (overallTimer) clearTimeout(overallTimer);
@@ -128,14 +225,52 @@ export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 			/* already gone */
 		}
 	};
+	// Only a tool-plane spawn can chain pauses and slide its ceiling; a plain turn is
+	// already bounded by `overallMs`, so it needs no second, unpausable deadline.
+	if (hasToolPlane) {
+		absoluteTimer = setTimeout(() => kill("absolute-ceiling"), CLAUDE_CLI_TOOL_PLANE_ABSOLUTE_TIMEOUT_MS);
+		absoluteTimer.unref?.();
+	}
 	const armNoOutput = () => {
+		if (pauseDepth > 0) return; // Brigade is working; the child is not wedged.
 		if (noOutputTimer) clearTimeout(noOutputTimer);
 		noOutputTimer = setTimeout(() => kill("no-output-timeout"), noOutputMs);
 		// Don't keep the event loop alive purely for the watchdog.
 		noOutputTimer.unref?.();
 	};
-	overallTimer = setTimeout(() => kill("overall-timeout"), overallMs);
-	overallTimer.unref?.();
+	const armOverall = (ms: number) => {
+		if (overallTimer) clearTimeout(overallTimer);
+		overallTimer = setTimeout(() => kill("overall-timeout"), Math.max(ms, 0));
+		overallTimer.unref?.();
+	};
+
+	/**
+	 * Suspend both watchdogs while the child blocks on a Brigade tool call. The
+	 * child writes NOTHING to stdout for that whole window — a `spawn_agent` may
+	 * run a full sub-agent turn, a `generate_video` has its own 20-minute budget,
+	 * an exec-gated `bash` waits on the operator — so the liveness timers would
+	 * otherwise kill a perfectly healthy process for waiting on us. Brigade bounds
+	 * that time itself (every tool carries its own timeout).
+	 */
+	const pauseWatchdogs = (): (() => void) => {
+		if (settled) return () => {};
+		if (pauseDepth++ === 0) {
+			pausedAt = Date.now();
+			clearTimers();
+		}
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			if (--pauseDepth > 0 || settled) return;
+			// Give back the time we spent working, then rearm.
+			overallDeadline += Date.now() - pausedAt;
+			armNoOutput();
+			armOverall(overallDeadline - Date.now());
+		};
+	};
+
+	armOverall(overallMs);
 	armNoOutput();
 
 	const onAbort = () => kill("aborted");
@@ -185,6 +320,10 @@ export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 				if (settled) return;
 				settled = true;
 				clearTimers();
+				// Deliberately NOT in clearTimers(): that runs on every pause, and the
+				// absolute ceiling is the one deadline a tool call may not postpone.
+				if (absoluteTimer) clearTimeout(absoluteTimer);
+				absoluteTimer = undefined;
 				if (args.signal) args.signal.removeEventListener("abort", onAbort);
 				// Flush a final unterminated line.
 				const tail = parseClaudeCliLine(buffer);
@@ -226,5 +365,5 @@ export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 		}
 	}
 
-	return { frames: frames(), done: exit };
+	return { frames: frames(), done: exit, pause: pauseWatchdogs };
 }

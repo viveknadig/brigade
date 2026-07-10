@@ -26,9 +26,15 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import {
 	buildClaudeCliArgs,
 	composeClaudeCliSystemPrompt,
+	isStructuredJsonPrompt,
 	CLAUDE_CLI_API,
 	CLAUDE_CLI_PROVIDER,
 } from "./catalog.js";
+import { buildClaudeCliHttpMcpConfig, buildClaudeCliMcpConfig, readClaudeCliToolPlane } from "./tool-plane.js";
+import { registerHarnessWatchdog, unregisterHarnessWatchdog } from "../harness/watchdog.js";
+import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
+
+const log = createSubsystemLogger("claude-cli");
 import { spawnClaudeCli, type SpawnClaudeCliArgs } from "./spawn.js";
 import {
 	classifyResultFrame,
@@ -262,7 +268,18 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				switch (ev.type) {
 					case "message_start": {
 						const u = foldUsage(ev.message?.usage);
-						if (u.input) usageInput = u.input;
+						// FIRST step only. Pi reads an assistant message's `usage.input` as
+						// "how many tokens are in the context window right now"
+						// (`calculateContextTokens` = input + output + cacheRead + cacheWrite)
+						// and compacts when that crosses its threshold.
+						//
+						// The binary runs its OWN tool loop inside one turn, emitting a
+						// message_start per internal step whose prompt has grown by its own
+						// tool output. Only the FIRST step's prompt is the conversation
+						// Brigade handed it — the context Pi owns and can actually compact.
+						// Taking the last step (or the cumulative total) reports the binary's
+						// private scratch space as our context.
+						if (u.input && usageInput === 0) usageInput = u.input;
 						break;
 					}
 					case "content_block_delta": {
@@ -294,21 +311,91 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 			};
 
 			let handle: ReturnType<typeof spawnClaudeCli> | undefined;
+			let watchdogToken = "";
 			try {
 				const ctx = (context ?? {}) as { systemPrompt?: string; messages?: CtxMessage[] };
 				const prompt = serializeConversationPrompt(ctx.messages ?? []);
-				const args = buildClaudeCliArgs({ modelId: model.id });
-				// System prompt goes via a file (not argv) — see spawn.ts. Composed
-				// here so the conversational nudge is included.
-				const systemPrompt = composeClaudeCliSystemPrompt({ systemPrompt: ctx.systemPrompt });
+				// A structured (JSON-distiller) turn — the memory/skill utility subagents —
+				// must be reinforced toward JSON, never nudged toward prose. Detected from
+				// the pinned system prompt so this backend returns a clean envelope and the
+				// memory extraction cursor can actually advance (see isStructuredJsonPrompt).
+				// Brigade MCP tool-plane (memory/graph on the free-tier engine). THREE
+				// gates, all load-bearing (see tool-plane.ts): the turn was stamped by the
+				// agent loop (claude-cli dispatch only), the sender is the OWNER (the
+				// bundled memory MCP server is owner-origin pinned — a peer turn gets
+				// nothing), and the turn is NOT a structured distiller (those stay
+				// tool-less on every backend). buildClaudeCliMcpConfig itself fails open
+				// (undefined) when the CLI entry path or agent id can't be resolved safely.
+				const toolPlane = readClaudeCliToolPlane(context);
+				const mcpHttpUrl = toolPlane?.mcpHttpUrl;
+
+				// A structured (JSON-distiller) turn — the memory/skill utility subagents —
+				// must be reinforced toward JSON, never nudged toward prose, or the memory
+				// extraction cursor can never advance (see isStructuredJsonPrompt).
+				//
+				// The DECLARATION decides. A stamped turn states what it is: distiller
+				// sessions stamp `structured: true`, the agent loop stamps agent turns. The
+				// prompt-text sniff is the fallback for an unstamped (cold) context only —
+				// on an agent turn `ctx.systemPrompt` is the assembled persona, which
+				// splices operator-authored files and skill descriptions in verbatim, so the
+				// words "STRICT JSON only" in TOOLS.md would silently strip a chat turn's
+				// entire tool-plane and leave an agent that "won't use its tools".
+				const structured = toolPlane ? toolPlane.structured === true : isStructuredJsonPrompt(ctx.systemPrompt);
+				// Precedence: a STRUCTURED distiller turn gets NO tools (every backend).
+				// Otherwise, if the gateway registered this turn's FULL guarded surface,
+				// hand the binary that loopback HTTP endpoint; else fall back to the owner
+				// memory-only stdio server. Both fail open to undefined.
+				const mcpConfigJson = structured
+					? undefined
+					: toolPlane?.mcpHttpUrl
+						? buildClaudeCliHttpMcpConfig(toolPlane.mcpHttpUrl)
+						: toolPlane?.senderIsOwner === true
+							? buildClaudeCliMcpConfig(toolPlane.agentId)
+							: undefined;
+
+				const fullPlane = mcpConfigJson !== undefined && toolPlane?.mcpHttpUrl !== undefined;
+				// Which surface did this turn actually get? Without this line a silent
+				// fallback (no stamp, no gateway host, a rejected config) is invisible —
+				// the operator only sees an agent that "won't use its tools".
+				log.debug("spawn tool-plane", {
+					mode: structured ? "none (distiller)" : fullPlane ? "full (http)" : mcpConfigJson ? "memory (stdio)" : "none",
+					owner: toolPlane?.senderIsOwner === true,
+					stamped: toolPlane !== undefined,
+				});
+				// A full-plane spawn denies EVERY built-in the binary ships: Brigade serves
+				// guarded equivalents bound to the REAL cwd, while the binary's own would
+				// act on the throwaway one it is sandboxed in.
+				const args = buildClaudeCliArgs({ modelId: model.id, structured, fullPlane });
+				// System prompt goes via a file (not argv) — see spawn.ts. Composed here so
+				// the right nudge (prose vs JSON-only vs which tools) is included.
+				const systemPrompt = composeClaudeCliSystemPrompt({
+					systemPrompt: ctx.systemPrompt,
+					structured,
+					toolPlane: mcpConfigJson !== undefined,
+					fullPlane,
+				});
 
 				handle = spawnClaudeCli({
 					args,
 					stdin: prompt,
 					systemPrompt,
+					...(mcpConfigJson !== undefined ? { mcpConfigJson } : {}),
+					// The args above already denied every built-in. If the plane can't attach,
+					// the model would have nothing to act with — fail the spawn instead.
+					...(fullPlane ? { requireMcpConfig: true } : {}),
 					signal: options?.signal as AbortSignal | undefined,
 					spawnFn: opts.spawnFn,
 				});
+
+				// While the binary blocks on one of OUR tool calls it writes nothing to
+				// stdout, so its liveness watchdogs would eventually kill a perfectly
+				// healthy child for waiting on us (a `spawn_agent` runs a whole sub-agent
+				// turn; `generate_video` has its own 20-minute budget). Publish the
+				// child's pause control under this turn's tool-plane token so the MCP
+				// route can suspend them for exactly that window. Full-plane turns only —
+				// the memory-only stdio config carries no token.
+				watchdogToken = mcpHttpUrl ? (/\/mcp\/([0-9a-f]{64})$/.exec(mcpHttpUrl)?.[1] ?? "") : "";
+				if (watchdogToken) registerHarnessWatchdog(watchdogToken, { pause: handle.pause });
 
 				for await (const frame of handle.frames) {
 					switch (frame.type) {
@@ -335,7 +422,18 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 									onTextDelta(rf.result);
 								}
 								const u = foldUsage(rf.usage);
-								if (u.input) usageInput = u.input;
+								// The result frame's usage is CUMULATIVE over every internal
+								// step of the binary's loop — with prompt caching, its
+								// `cache_read_input_tokens` is re-counted on each one. It is a
+								// BILLING total, never a context size: a 40-step turn on a
+								// 39%-full transcript reported 1,756,936 input tokens, which Pi
+								// read as 889% of a 200k window and "compacted" a healthy
+								// session, twice, discarding real history each time.
+								//
+								// So it may only ever FILL IN a missing input (an older CLI that
+								// streams no partial frames, where the run is a single step and
+								// the cumulative total IS that step's prompt).
+								if (u.input && usageInput === 0) usageInput = u.input;
 								if (u.output) usageOutput = u.output;
 							}
 							break;
@@ -353,6 +451,14 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				if (killReason === "no-output-timeout" || killReason === "overall-timeout") {
 					throw new Error(
 						`claude-cli ${killReason}: the CLI produced no output for too long (it may be waiting on an interactive prompt).`,
+					);
+				}
+				if (killReason === "absolute-ceiling") {
+					// Phrased to avoid the word the error classifier reads as a transient
+					// timeout: this turn ran for HOURS, so respawning it on the same model
+					// would just start the next four. Classified `unknown` => not retried.
+					throw new Error(
+						"claude-cli exceeded its absolute run ceiling and was stopped. The turn kept calling tools without finishing.",
 					);
 				}
 				if (limitHit) {
@@ -409,6 +515,8 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 					}),
 				});
 			} finally {
+				// The child is gone; its pause control must not outlive it.
+				if (watchdogToken) unregisterHarnessWatchdog(watchdogToken);
 				stream.end();
 			}
 		};

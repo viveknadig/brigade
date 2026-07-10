@@ -222,6 +222,21 @@ export const CLAUDE_CLI_CLEAR_ENV: readonly string[] = [
 export const CLAUDE_CLI_FORBIDDEN_ENV = "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST";
 
 /**
+ * How long the binary's MCP client waits on one Brigade `tools/call`.
+ *
+ * This must exceed every budget on OUR side, because whoever times out first
+ * decides — and the binary timing out first is the bad outcome: it closes the
+ * socket, which aborts our handler, which tells the model the tool failed, all
+ * while the operator is still reading the approval prompt that would have let it
+ * succeed. Matched to the harness's absolute ceiling so Brigade's own deadlines
+ * (exec-gate 5m, per-tool budgets, the route's wedge guard) are always the ones
+ * that fire. An operator-set value wins.
+ */
+export const CLAUDE_CLI_MCP_TOOL_TIMEOUT_MS = 4 * 60 * 60 * 1000; // 4h — matches the absolute ceiling
+/** Handshake budget: the server is in-process, so a slow one means something is wrong. */
+export const CLAUDE_CLI_MCP_STARTUP_TIMEOUT_MS = 30_000;
+
+/**
  * Build the scrubbed environment for the child `claude` process from a base
  * env (usually `process.env`). Deletes every clear-list var + the forbidden
  * host-managed marker. Pure: returns a new object, never mutates the input.
@@ -243,6 +258,14 @@ export function buildClaudeCliEnv(
 	if (opts.configDir && opts.configDir.trim().length > 0) {
 		next.CLAUDE_CONFIG_DIR = opts.configDir;
 	}
+	// A Brigade tool call can legitimately block for a long time: `bash` waits on the
+	// operator's exec approval (5 min), `generate_video` has a ~20 min budget. Left to
+	// its default, the binary's MCP client could abandon the request first — closing
+	// the socket, aborting our handler, and telling the model the tool failed WHILE the
+	// operator is still reading the approval prompt. Pin both budgets above ours so
+	// Brigade's own timeouts are always the ones that decide. Operator env wins.
+	next.MCP_TOOL_TIMEOUT ??= String(CLAUDE_CLI_MCP_TOOL_TIMEOUT_MS);
+	next.MCP_TIMEOUT ??= String(CLAUDE_CLI_MCP_STARTUP_TIMEOUT_MS);
 	return next;
 }
 
@@ -266,21 +289,128 @@ const CLAUDE_CLI_BASE_ARGS: readonly string[] = [
 	"bypassPermissions",
 ];
 
-// Mutating + network tools we deny as defense-in-depth. `bypassPermissions`
-// (kept so the CLI never blocks on an unanswerable approval prompt) overrides
-// the allow/deny lists for read-only tools, so a deny list can't make the CLI
-// perfectly tool-free — but it still keeps the strongest footguns (shell,
-// file writes, edits, network) off the table. The real containment is the
-// isolated empty spawn cwd (see spawn.ts): any tool the CLI does reach acts on
-// a throwaway directory, so a conversational turn stays harmless. The system-
-// prompt nudge (appended below) asks it to just answer.
-const CLAUDE_CLI_DENY_TOOLS = "Bash Edit Write MultiEdit NotebookEdit WebFetch WebSearch";
+/**
+ * Every name the vendor's sub-agent tool answers to.
+ *
+ * The binary carries a legacy→canonical rename map (`{Task:"Agent",
+ * KillShell:"TaskStop", BashOutputTool:"TaskOutput", …}`): the tool's canonical
+ * name is `Agent` and `Task` is merely an alias it still accepts. Denying only
+ * `Task` therefore bets the whole containment on the deny-matcher normalizing
+ * aliases before it compares — which is undocumented, and which the very
+ * existence of that map shows can change under us.
+ *
+ * So deny every spelling. A name the binary doesn't ship is ignored, which costs
+ * nothing; a name we omit is a tool the model can still reach.
+ */
+const CLAUDE_CLI_SUBAGENT_TOOLS = "Agent Task TaskStop TaskOutput KillShell KillBash BashOutput BashOutputTool";
+
+// Mutating + network tools we deny as defense-in-depth, plus the binary's own
+// sub-agent (which would run unguarded, off-transcript, outside Brigade's crew).
+//
+// `--permission-mode bypassPermissions` is kept so the CLI never blocks on an
+// approval prompt nobody can answer. Whether it also overrides the deny list for
+// read-only tools is NOT settled: the binary ships deny-rule enforcement (it
+// carries a "was blocked by a deny rule" message), but nothing in the package
+// states the precedence, and it is compiled. Treat the deny list as best-effort.
+//
+// The containment we can actually prove is the isolated empty spawn cwd (see
+// spawn.ts): any built-in the CLI does reach acts on a throwaway directory, so a
+// conversational turn stays harmless either way. The system-prompt nudge
+// (appended below) asks it to just answer.
+const CLAUDE_CLI_DENY_TOOLS = `Bash Edit Write MultiEdit NotebookEdit WebFetch WebSearch ${CLAUDE_CLI_SUBAGENT_TOOLS}`;
+
+/**
+ * The deny list for a FULL-PLANE turn: every built-in that could act instead of
+ * Brigade's `mcp__brigade__*`, so the plane is the model's one way to do work.
+ *
+ * Denying the mutating ones was never enough. The binary's READ-side tools
+ * (`Read`, `Grep`, `Glob`) still worked — but they act on the isolated throwaway
+ * cwd we spawn it in, NOT the operator's workspace. The model would read an empty
+ * directory and conclude the file does not exist. The sub-agent tool would spin up
+ * the binary's own executor instead of Brigade's `spawn_agent` (no guards, no
+ * transcript, no crew). And none of them pass through the exec-gate, the
+ * path-write guard, or the origin scoping.
+ *
+ * Brigade serves guarded equivalents (see mcp/builtin-tools.ts) bound to the turn's
+ * REAL cwd, so the binary loses nothing by being denied these.
+ *
+ * This is NOT "every built-in the vendor ships" — the binary carries dozens, and
+ * the rest are either inert without `Bash`, scoped to our own server by
+ * `--strict-mcp-config`, or non-acting (plan mode, onboarding). It is every
+ * built-in that can touch the filesystem, the shell, the network, or spawn an
+ * unguarded agent. And per CLAUDE_CLI_DENY_TOOLS, enforcement under
+ * `bypassPermissions` is unproven — the empty spawn cwd is the load-bearing
+ * containment; this list is the belt.
+ */
+const CLAUDE_CLI_FULL_PLANE_DENY_TOOLS =
+	`Bash Glob Grep Read Edit Write MultiEdit NotebookEdit WebFetch WebSearch TodoWrite ${CLAUDE_CLI_SUBAGENT_TOOLS}`;
 
 // Appended to Brigade's system prompt for claude-cli turns: this backend is a
 // conversational voice, not an autonomous coder in the (throwaway) spawn cwd.
 const CLAUDE_CLI_SYSTEM_SUFFIX =
 	"You are answering as part of an ongoing conversation. Respond directly in prose; " +
 	"do not use tools or act on the local filesystem — everything you need is in this conversation.";
+
+// Appended INSTEAD of the prose nudge when the pinned system prompt is a machine
+// JSON-output contract (the memory/skill utility subagents: extraction,
+// consolidation, relink, behaviour/skill review). The chat-assistant base prompt
+// baked into the `claude` binary biases toward prose + code fences; for a
+// distiller that must return a bare `{"facts":[…]}` envelope, that prose bias is
+// exactly what breaks parsing — the reply comes back un-parseable, the extraction
+// cursor HOLDS forever, and the memory graph never fills. So we drop the prose
+// nudge and hard-pin JSON-only output for these turns.
+const CLAUDE_CLI_STRUCTURED_SUFFIX =
+	"Output ONLY the JSON described above. No preamble, no explanation, no markdown code " +
+	"fences — your entire response must be the raw JSON value, starting with { and ending with }.";
+
+// Appended instead of the plain conversational nudge when the spawn carries the
+// Brigade MCP tool-plane (owner chat turns — see tool-plane.ts). The plain
+// suffix says "do not use tools", which would fight the memory tools we just
+// handed the binary; this variant scopes the permission to exactly those.
+const CLAUDE_CLI_TOOL_PLANE_SUFFIX =
+	"You are answering as part of an ongoing conversation. You have Brigade memory tools " +
+	"available via MCP (mcp__brigade__memory_add, mcp__brigade__memory_search, " +
+	"mcp__brigade__memory_context) — use them to save or recall durable facts when relevant. " +
+	"Do not use any other tools or act on the local filesystem; respond directly in prose.";
+
+// Appended when the GATEWAY tool-plane is attached: Brigade's whole guarded tool
+// surface is served over MCP as `mcp__brigade__<tool>`. The memory-only suffix
+// above must NOT be reused here — it forbids "any other tools", which would tell
+// the model to ignore the 31 tools we just handed it (and it obeys: it answers in
+// prose and apologises that it cannot act).
+//
+// The binary's OWN built-ins stay denied — they would act on the throwaway temp
+// cwd rather than the operator's workspace, and they bypass Brigade's guards
+// entirely. The plane instead serves Brigade's GUARDED equivalents (see
+// mcp/builtin-tools.ts): `mcp__brigade__bash` runs through the exec-gate (which
+// may pause for the operator's approval) and `mcp__brigade__write` through the
+// path-write guard. So the model is told it HAS a filesystem + shell, and told
+// that a pause is expected rather than a failure.
+const CLAUDE_CLI_FULL_PLANE_SUFFIX =
+	"You are answering as part of an ongoing conversation. Brigade's tools are available to you " +
+	"over MCP, named `mcp__brigade__<tool>` — including read, write, edit, bash, grep and ls on the " +
+	"operator's real workspace, plus memory, sub-agents, channels, cron and media generation. Call " +
+	"them whenever they help; do not describe what you would do instead of doing it. Your own " +
+	"built-in tools are disabled — always use the `mcp__brigade__` ones. Some commands (via bash) " +
+	"may pause for the operator's approval before they run; that is expected, so wait for the " +
+	"result rather than assuming it failed.";
+
+/** Flag delivering the MCP server config file (the Brigade tool-plane). */
+export const CLAUDE_CLI_MCP_CONFIG_FLAG = "--mcp-config";
+/** Companion flag: ONLY the servers from --mcp-config load — the operator's
+ *  personal MCP servers (from their own claude config) never leak into a
+ *  Brigade turn, and the tool surface stays deterministic. */
+export const CLAUDE_CLI_STRICT_MCP_FLAG = "--strict-mcp-config";
+
+/**
+ * True when `systemPrompt` is one of Brigade's structured-JSON utility prompts.
+ * Keyed on the "STRICT JSON only" contract every distiller states and that no
+ * chat persona carries. Regression-guarded by a test asserting the real
+ * EXTRACTION_PROMPT / CONSOLIDATION_PROMPT still trip it.
+ */
+export function isStructuredJsonPrompt(systemPrompt: string | undefined): boolean {
+	return typeof systemPrompt === "string" && /\bSTRICT JSON only\b/i.test(systemPrompt);
+}
 
 export interface BuildArgsInput {
 	/** Requested Brigade model id (with or without the `claude-cli/` prefix). */
@@ -293,6 +423,18 @@ export interface BuildArgsInput {
 	 * only for a future agentic mode that intentionally lets the CLI act.
 	 */
 	conversational?: boolean;
+	/**
+	 * This turn is a structured-JSON distiller. Defaults to detection from
+	 * `systemPrompt`. Tool-less like a conversational turn, but reinforced toward
+	 * a raw JSON envelope instead of prose.
+	 */
+	structured?: boolean;
+	/**
+	 * This spawn carries the gateway-hosted FULL tool-plane. The binary's own
+	 * built-ins are denied wholesale so it uses Brigade's guarded equivalents,
+	 * which act on the operator's real workspace rather than the throwaway cwd.
+	 */
+	fullPlane?: boolean;
 }
 
 /**
@@ -306,9 +448,28 @@ export interface BuildArgsInput {
 export function composeClaudeCliSystemPrompt(input: {
 	systemPrompt?: string;
 	conversational?: boolean;
+	/** Force structured mode; defaults to detection from `systemPrompt`. */
+	structured?: boolean;
+	/** The spawn carries the memory-only MCP tool-plane (owner chat turns). */
+	toolPlane?: boolean;
+	/** The spawn carries the gateway-hosted FULL guarded tool surface. */
+	fullPlane?: boolean;
 }): string {
+	const structured = input.structured ?? isStructuredJsonPrompt(input.systemPrompt);
 	const conversational = input.conversational !== false;
-	const parts = [input.systemPrompt?.trim(), conversational ? CLAUDE_CLI_SYSTEM_SUFFIX : ""].filter(
+	// Precedence: STRUCTURED (a JSON distiller must be reinforced toward JSON,
+	// never nudged toward prose — and never given tools) > FULL PLANE (every
+	// Brigade tool, use them) > memory-only TOOL-PLANE > plain conversational.
+	const suffix = structured
+		? CLAUDE_CLI_STRUCTURED_SUFFIX
+		: input.fullPlane === true
+			? CLAUDE_CLI_FULL_PLANE_SUFFIX
+			: input.toolPlane === true
+				? CLAUDE_CLI_TOOL_PLANE_SUFFIX
+				: conversational
+					? CLAUDE_CLI_SYSTEM_SUFFIX
+					: "";
+	const parts = [input.systemPrompt?.trim(), suffix].filter(
 		(p): p is string => !!p && p.length > 0,
 	);
 	return parts.join("\n\n");
@@ -324,8 +485,16 @@ export function composeClaudeCliSystemPrompt(input: {
 export function buildClaudeCliArgs(input: BuildArgsInput): string[] {
 	const args = [...CLAUDE_CLI_BASE_ARGS];
 	args.push("--model", resolveCliModelArg(input.modelId));
+	const structured = input.structured ?? isStructuredJsonPrompt(input.systemPrompt);
 	const conversational = input.conversational !== false;
-	if (conversational) args.push("--disallowedTools", CLAUDE_CLI_DENY_TOOLS);
+	// A distiller is tool-less too — it must emit JSON, never touch the fs.
+	// A full-plane turn denies EVERY built-in: Brigade serves guarded equivalents
+	// bound to the real cwd, and the binary's own would act on the throwaway one.
+	if (!structured && input.fullPlane === true) {
+		args.push("--disallowedTools", CLAUDE_CLI_FULL_PLANE_DENY_TOOLS);
+	} else if (conversational || structured) {
+		args.push("--disallowedTools", CLAUDE_CLI_DENY_TOOLS);
+	}
 	return args;
 }
 
