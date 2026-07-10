@@ -160,6 +160,19 @@ export function createMcpHttpRoute(registry: McpTurnRegistry): HttpRoute {
 			rpc?.method === "tools/call"
 				? (rpc.params as { name?: unknown } | undefined)?.name
 				: undefined;
+
+		// The handshake is the ONE unambiguous proof that the binary loaded our
+		// server. It matters: a full-plane spawn denies every built-in the binary
+		// ships, so if the MCP config were ever rejected the agent would have NO
+		// tools at all — which looks exactly like an agent that won't use them.
+		// Seeing this line (and its tool count) settles that in one glance.
+		if (rpc?.method === "initialize") {
+			log.info("tool-plane connected", {
+				agentId: turn.agentId,
+				...(turn.sessionKey !== undefined ? { sessionKey: turn.sessionKey } : {}),
+				tools: turn.customTools.length,
+			});
+		}
 		// Per-call cancellation. The turn's signal alone is not enough: if the
 		// `claude` child dies (watchdog SIGKILL, turn abort) the socket closes, and
 		// without this the tool would keep running — executing a shell command or a
