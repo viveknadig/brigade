@@ -329,6 +329,7 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 						: toolPlane?.senderIsOwner === true
 							? buildClaudeCliMcpConfig(toolPlane.agentId)
 							: undefined;
+
 				const fullPlane = mcpConfigJson !== undefined && toolPlane?.mcpHttpUrl !== undefined;
 				// Which surface did this turn actually get? Without this line a silent
 				// fallback (no stamp, no gateway host, a rejected config) is invisible —
@@ -338,7 +339,10 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 					owner: toolPlane?.senderIsOwner === true,
 					stamped: toolPlane !== undefined,
 				});
-				const args = buildClaudeCliArgs({ modelId: model.id, structured });
+				// A full-plane spawn denies EVERY built-in the binary ships: Brigade serves
+				// guarded equivalents bound to the REAL cwd, while the binary's own would
+				// act on the throwaway one it is sandboxed in.
+				const args = buildClaudeCliArgs({ modelId: model.id, structured, fullPlane });
 				// System prompt goes via a file (not argv) — see spawn.ts. Composed here so
 				// the right nudge (prose vs JSON-only vs which tools) is included.
 				const systemPrompt = composeClaudeCliSystemPrompt({

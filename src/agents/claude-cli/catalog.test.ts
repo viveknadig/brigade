@@ -208,3 +208,34 @@ test("composeClaudeCliSystemPrompt: precedence structured > fullPlane > toolPlan
 	const mem = composeClaudeCliSystemPrompt({ systemPrompt: "x", toolPlane: true });
 	assert.match(mem, /mcp__brigade__memory_add/);
 });
+
+/* ──────── full-plane containment: the binary must use OUR tools ──────── */
+
+test("a FULL-PLANE turn denies every built-in the binary ships", () => {
+	const args = buildClaudeCliArgs({ modelId: "claude-opus-4-8", fullPlane: true });
+	const i = args.indexOf("--disallowedTools");
+	assert.ok(i >= 0, "full-plane turns still deny");
+	const denied = (args[i + 1] ?? "").split(" ");
+	// Read-side tools matter as much as the mutating ones: the binary is spawned in
+	// a THROWAWAY cwd, so its own Read/Grep/Glob would inspect an empty directory
+	// and it would conclude the operator's files don't exist. `Task` would spin up
+	// its own unguarded sub-agent instead of Brigade's spawn_agent.
+	for (const t of ["Task", "Bash", "Glob", "Grep", "Read", "Edit", "Write", "WebFetch", "WebSearch", "TodoWrite"]) {
+		assert.ok(denied.includes(t), `full plane must deny the binary's own ${t}`);
+	}
+});
+
+test("a plain chat / memory-only turn keeps the narrower deny list", () => {
+	const args = buildClaudeCliArgs({ modelId: "claude-opus-4-8" });
+	const denied = (args[args.indexOf("--disallowedTools") + 1] ?? "").split(" ");
+	assert.ok(denied.includes("Bash"), "mutating tools still denied");
+	assert.ok(!denied.includes("Read"), "a chat turn has no Brigade read tool to fall back on");
+	assert.ok(!denied.includes("Task"));
+});
+
+test("a distiller stays tool-less even if fullPlane is somehow set", () => {
+	const args = buildClaudeCliArgs({ modelId: "claude-opus-4-8", structured: true, fullPlane: true });
+	const denied = (args[args.indexOf("--disallowedTools") + 1] ?? "").split(" ");
+	assert.ok(denied.includes("Bash"));
+	assert.ok(!denied.includes("Read"), "distillers use the narrow list; they have no plane at all");
+});

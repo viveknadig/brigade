@@ -276,6 +276,26 @@ const CLAUDE_CLI_BASE_ARGS: readonly string[] = [
 // prompt nudge (appended below) asks it to just answer.
 const CLAUDE_CLI_DENY_TOOLS = "Bash Edit Write MultiEdit NotebookEdit WebFetch WebSearch";
 
+/**
+ * The deny list for a FULL-PLANE turn — every built-in the binary ships, so the
+ * only tools it can reach are Brigade's own `mcp__brigade__*`.
+ *
+ * Denying the mutating ones was never enough. The binary's READ-side tools
+ * (`Read`, `Grep`, `Glob`) still worked — but they act on the isolated throwaway
+ * cwd we spawn it in, NOT the operator's workspace. The model would read an empty
+ * directory and conclude the file does not exist. `Task` would spin up the
+ * binary's own sub-agent instead of Brigade's `spawn_agent` (no guards, no
+ * transcript, no crew). And none of them pass through the exec-gate, the
+ * path-write guard, or the origin scoping.
+ *
+ * Brigade serves guarded equivalents for all of them (see mcp/builtin-tools.ts),
+ * bound to the turn's REAL cwd, so the binary loses nothing by being denied these.
+ * Only names the vendor actually ships are listed — an unknown name would be
+ * silently ignored, but listing one would be a lie about what we contain.
+ */
+const CLAUDE_CLI_FULL_PLANE_DENY_TOOLS =
+	"Task Bash Glob Grep Read Edit Write MultiEdit NotebookEdit WebFetch WebSearch TodoWrite";
+
 // Appended to Brigade's system prompt for claude-cli turns: this backend is a
 // conversational voice, not an autonomous coder in the (throwaway) spawn cwd.
 const CLAUDE_CLI_SYSTEM_SUFFIX =
@@ -360,6 +380,12 @@ export interface BuildArgsInput {
 	 * a raw JSON envelope instead of prose.
 	 */
 	structured?: boolean;
+	/**
+	 * This spawn carries the gateway-hosted FULL tool-plane. The binary's own
+	 * built-ins are denied wholesale so it uses Brigade's guarded equivalents,
+	 * which act on the operator's real workspace rather than the throwaway cwd.
+	 */
+	fullPlane?: boolean;
 }
 
 /**
@@ -413,7 +439,13 @@ export function buildClaudeCliArgs(input: BuildArgsInput): string[] {
 	const structured = input.structured ?? isStructuredJsonPrompt(input.systemPrompt);
 	const conversational = input.conversational !== false;
 	// A distiller is tool-less too — it must emit JSON, never touch the fs.
-	if (conversational || structured) args.push("--disallowedTools", CLAUDE_CLI_DENY_TOOLS);
+	// A full-plane turn denies EVERY built-in: Brigade serves guarded equivalents
+	// bound to the real cwd, and the binary's own would act on the throwaway one.
+	if (!structured && input.fullPlane === true) {
+		args.push("--disallowedTools", CLAUDE_CLI_FULL_PLANE_DENY_TOOLS);
+	} else if (conversational || structured) {
+		args.push("--disallowedTools", CLAUDE_CLI_DENY_TOOLS);
+	}
 	return args;
 }
 
