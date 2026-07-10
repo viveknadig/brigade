@@ -650,6 +650,11 @@ export interface EventPayload {
 		 *  child sub-agent; the TUI indents nested rendering by this value.
 		 *  Top-level turns leave it undefined. */
 		subagentDepth?: number;
+		/** Minted by Brigade rather than emitted by Pi's loop — today, the tool
+		 *  events for a claude-cli turn, whose tools run in the binary's loop via
+		 *  the MCP route. Excluded from the seq'd stream (see `broadcast`): a
+		 *  `resume` cannot replay them, so they must never create a seq gap. */
+		synthetic?: boolean;
 		/** P1#3 (Wave H) — agent that produced this Pi event. Lets the gateway
 		 *  filter broadcast to subscribers of THIS agent only. */
 		agentId?: string;

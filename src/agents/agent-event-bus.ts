@@ -39,6 +39,22 @@ export type AgentBusEvent =
 			 *  undefined) for the top-level turn; ≥ 1 for child sub-agent runs.
 			 *  Surfaced to the WS so connect-mode TUIs can indent nested rendering. */
 			subagentDepth?: number;
+			/**
+			 * SYNTHETIC: Brigade minted this event; Pi's loop did not emit it.
+			 *
+			 * On the claude-cli harness backend the `claude` binary runs the loop and
+			 * calls Brigade's tools back over the MCP route, so Pi never dispatches a
+			 * tool and never emits `tool_execution_*`. The TUI therefore showed a
+			 * silent gap while a tool ran. The MCP route mints the same events so the
+			 * existing renderer lights up unchanged.
+			 *
+			 * The gateway forwards these (they are depth-0, which the sub-agent bus
+			 * forwarder otherwise skips) but must NOT put them in the seq'd, ordered
+			 * stream: they are not in the JSONL transcript, so `resume` cannot
+			 * reproduce them, and a seq'd decoration frame would trip false
+			 * gap-detection. Same rule as sub-agent frames.
+			 */
+			synthetic?: true;
 	  }
 	| {
 			type: "turn-start";

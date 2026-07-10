@@ -1587,6 +1587,8 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
         ...(args.signal ? { signal: args.signal } : {}),
         agentId,
         sessionKey: resolved.sessionKey,
+        // Lets the MCP route mint pi-shaped tool events for the TUI.
+        runId,
       });
       mcpToolPlaneUrl = `${mcpHost.baseUrl}/mcp/${reg.token}`;
       mcpToolPlaneDispose = reg.dispose;

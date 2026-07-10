@@ -44,6 +44,9 @@ export interface McpTurnContext {
 	/** For diagnostics / logging correlation only — never a trust input. */
 	agentId: string;
 	sessionKey?: string;
+	/** The turn's run id. Present when the loop registered us (always, in the
+	 *  gateway); required to mint pi-shaped tool events the TUI can render. */
+	runId?: string;
 }
 
 /** A live registration. `dispose()` is idempotent; the agent-loop calls it in

@@ -1962,10 +1962,16 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 		//  - sub-agent `pi` frames (subagentDepth>0): they carry the child's own
 		//    session id (a UUID) and live in a separate child transcript the
 		//    parent's `resume` can't backfill — ephemeral nested decoration.
+		//  - SYNTHETIC `pi` frames: the tool events Brigade mints for a claude-cli
+		//    turn (its tools run in the binary's loop, via the MCP route). They are
+		//    not in the JSONL transcript, so `resume` cannot replay them; seq-stamping
+		//    them would make a dropped decoration frame look like a real gap and
+		//    thrash resume. Same category as sub-agent frames.
 		//  - `state` (self-healing cumulative snapshot), `error`, `log` (on disk).
 		const subDepth = event === "pi" ? Number((payload as { subagentDepth?: number }).subagentDepth) || 0 : 0;
+		const isSyntheticPi = event === "pi" && (payload as { synthetic?: boolean }).synthetic === true;
 		const isOrderedFrame =
-			(event === "pi" && subDepth === 0) ||
+			(event === "pi" && subDepth === 0 && !isSyntheticPi) ||
 			event === "approval-request" ||
 			event === "system-event";
 		const seq = isOrderedFrame ? nextSeq(seqCounters, frameSessionId) : undefined;
@@ -2528,14 +2534,20 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// forwarding both paths would duplicate every event.
 	const detachSubagentPiBus = onAgentEvent((event) => {
 		if (event.type !== "pi") return;
-		if (!event.subagentDepth || event.subagentDepth <= 0) return;
+		// Depth-0 Pi events already go out via `attachTurnSession`'s direct
+		// subscribe, so forwarding them here would duplicate every frame. The one
+		// exception is a SYNTHETIC event: Brigade minted it (the claude-cli tool
+		// events), Pi never saw it, so `attachTurnSession` will never broadcast it.
+		const isSynthetic = event.synthetic === true;
+		if (!isSynthetic && (!event.subagentDepth || event.subagentDepth <= 0)) return;
 		// Wave I — forward the parent's agentId + sessionId from the bus
 		// event so child pi frames carry the same routing tags as the
 		// top-level pi frames; the operator's subscription filter applies
 		// identically to top-level and sub-agent events.
 		broadcast("pi", {
 			event: event.piEvent,
-			subagentDepth: event.subagentDepth,
+			...(event.subagentDepth ? { subagentDepth: event.subagentDepth } : {}),
+			...(isSynthetic ? { synthetic: true } : {}),
 			agentId: event.agentId,
 			sessionId: event.sessionId,
 		});

@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { Type } from "typebox";
 
 import { buildMcpTurnServer } from "./route.js";
+import { onAgentEvent } from "../agent-event-bus.js";
 import type { McpTurnContext } from "./tool-plane-host.js";
 import type { AnyBrigadeTool } from "../tools/types.js";
 
@@ -176,4 +177,81 @@ test("image results pass through as MCP image content, not a placeholder", async
 	const content = (res?.result as any).content;
 	assert.equal(content[0].type, "text");
 	assert.deepEqual(content[1], { type: "image", data: "AAAA", mimeType: "image/jpeg" });
+});
+
+/* ────────── synthetic tool events (live TUI chips on claude-cli) ────────── */
+
+function captureBusEvents(): { events: any[]; stop: () => void } {
+	const events: any[] = [];
+	const stop = onAgentEvent((e: any) => {
+		if (e.type === "pi") events.push(e);
+	});
+	return { events, stop };
+}
+
+test("a tool call mints synthetic pi start/end events the TUI already renders", async () => {
+	const { events, stop } = captureBusEvents();
+	try {
+		const server = buildMcpTurnServer(
+			turn({ customTools: [fakeTool("write_memory")], agentId: "main", sessionKey: "agent:main:main", runId: "run-1" }),
+		);
+		await server.handle(req("tools/call", { name: "write_memory", arguments: { text: "hi" } }));
+	} finally {
+		stop();
+	}
+	assert.equal(events.length, 2, "exactly one start and one end");
+	const [start, end] = events;
+	assert.equal(start.synthetic, true, "must be marked synthetic (excluded from seq)");
+	assert.equal(start.runId, "run-1");
+	assert.equal(start.sessionId, "agent:main:main");
+	assert.equal(start.piEvent.type, "tool_execution_start");
+	assert.equal(start.piEvent.toolName, "write_memory");
+	assert.equal(end.piEvent.type, "tool_execution_end");
+	assert.equal(end.piEvent.isError, false);
+	// the TUI correlates the chip by toolCallId — they must match
+	assert.equal(start.piEvent.toolCallId, end.piEvent.toolCallId);
+	// connect.ts feeds `result` to summarizeToolResult(): needs Pi's {content:[…]} shape
+	assert.equal(end.piEvent.result.content[0].text, "write_memory ran");
+});
+
+test("a BLOCKED call emits no tool events (matches Pi: a block yields no start/end)", async () => {
+	const { events, stop } = captureBusEvents();
+	try {
+		const guard = async () => ({ block: true as const, reason: "needs approval" });
+		const server = buildMcpTurnServer(turn({ customTools: [fakeTool("bash")], guard, runId: "run-2" }));
+		await server.handle(req("tools/call", { name: "bash", arguments: { text: "x" } }));
+	} finally {
+		stop();
+	}
+	assert.deepEqual(events, [], "no chip for a call that never ran");
+});
+
+test("a failing tool ends with isError so the TUI paints ✗", async () => {
+	const { events, stop } = captureBusEvents();
+	try {
+		const boom = fakeTool("bad", {
+			execute: async () => {
+				throw new Error("kaboom");
+			},
+		});
+		const server = buildMcpTurnServer(turn({ customTools: [boom], runId: "run-3" }));
+		await server.handle(req("tools/call", { name: "bad", arguments: {} }));
+	} finally {
+		stop();
+	}
+	const end = events.at(-1);
+	assert.equal(end.piEvent.isError, true);
+	assert.match(end.piEvent.result.content[0].text, /kaboom/);
+});
+
+test("no runId (cold `brigade agent` path) → no events, no crash", async () => {
+	const { events, stop } = captureBusEvents();
+	try {
+		const server = buildMcpTurnServer(turn({ customTools: [fakeTool("write_memory")] })); // runId undefined
+		const res = await server.handle(req("tools/call", { name: "write_memory", arguments: {} }));
+		assert.equal((res?.result as any).content[0].text, "write_memory ran", "tool still runs");
+	} finally {
+		stop();
+	}
+	assert.deepEqual(events, []);
 });

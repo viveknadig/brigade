@@ -18,6 +18,7 @@ import { randomBytes } from "node:crypto";
 import type { BeforeToolCallContext } from "@earendil-works/pi-agent-core";
 import { validateToolArguments } from "@earendil-works/pi-ai/base";
 
+import { emitAgentEvent } from "../agent-event-bus.js";
 import { createMcpServer, type McpServer, type McpContentBlock, type McpToolResult, type McpServerTool } from "./protocol.js";
 import type { McpTurnContext } from "./tool-plane-host.js";
 
@@ -92,11 +93,43 @@ export function buildMcpTurnServer(turn: McpTurnContext, opts: { serverName?: st
 
 			// (4) EXECUTE the turn's OWN tool (ownerOnly wrap + origin already baked in).
 			const callId = `mcp-${randomBytes(6).toString("hex")}`;
+
+			// Mint the pi-shaped tool events Pi's loop would have emitted. On this
+			// backend the binary runs the loop, so Pi dispatches no tool and the TUI
+			// showed a silent gap — often many seconds — while a file was read or a
+			// command ran. connect.ts already renders these by `toolCallId`; nothing
+			// downstream changes. Emitted only AFTER the guard passes, matching Pi
+			// (a blocked call produces no start/end; the block surfaces separately).
+			const emitTool = (piEvent: Record<string, unknown>): void => {
+				if (!turn.runId) return; // cold path (no gateway) — nothing to render
+				emitAgentEvent({
+					type: "pi",
+					runId: turn.runId,
+					agentId: turn.agentId,
+					sessionId: turn.sessionKey ?? "",
+					synthetic: true,
+					piEvent,
+				});
+			};
+			emitTool({ type: "tool_execution_start", toolCallId: callId, toolName: tool.name, args: validated });
+
 			try {
 				const result = await tool.execute(callId, validated as never, signal);
-				return { content: mapContent((result as { content?: unknown })?.content) };
+				const content = mapContent((result as { content?: unknown })?.content);
+				// Pi's `result` shape — connect.ts feeds it to summarizeToolResult().
+				emitTool({ type: "tool_execution_end", toolCallId: callId, toolName: tool.name, args: validated, result: { content }, isError: false });
+				return { content };
 			} catch (e) {
-				return errorResult((e as Error).message);
+				const message = (e as Error).message;
+				emitTool({
+					type: "tool_execution_end",
+					toolCallId: callId,
+					toolName: tool.name,
+					args: validated,
+					result: { content: [{ type: "text", text: message }] },
+					isError: true,
+				});
+				return errorResult(message);
 			}
 		},
 	}));
