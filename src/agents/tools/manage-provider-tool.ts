@@ -43,6 +43,7 @@ import {
 	upsertApiKeyProfile,
 	upsertApiKeyRefProfile,
 } from "../../auth/profiles.js";
+import { MEDIA_ONLY_KEY_PROVIDER_IDS } from "../media-understanding/config.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { jsonResult } from "./common.js";
 import type { AgentToolResult, BrigadeTool } from "./types.js";
@@ -108,6 +109,19 @@ export interface MakeManageProviderToolOptions {
 
 const KNOWN_PROVIDER_IDS = new Set(PROVIDERS.map((p) => p.id));
 
+/**
+ * Providers whose key we can STORE. A superset of the LLM catalog: speech, music
+ * and transcription providers (ElevenLabs, MiniMax, Deepgram, Sarvam) hold real API
+ * keys but have no chat models, so they never appear in `PROVIDERS`.
+ *
+ * Before this, `manage_provider save-key provider=elevenlabs` answered "Unknown
+ * provider" while `generate_music` told the model, in its own error, to "add a
+ * Google, MiniMax, or ElevenLabs key" — and `brigade onboard` offered none of them.
+ * `resolveMediaProviderKey` reads exactly the store `upsertApiKeyProfile` writes, so
+ * the credential always worked; there was simply no supported way to put it there.
+ */
+const KEYABLE_PROVIDER_IDS = new Set<string>([...KNOWN_PROVIDER_IDS, ...MEDIA_ONLY_KEY_PROVIDER_IDS]);
+
 export function makeManageProviderTool(
 	opts: MakeManageProviderToolOptions = {},
 ): BrigadeTool<typeof ManageProviderParams, ManageProviderDetails> {
@@ -150,12 +164,20 @@ export function makeManageProviderTool(
 					message: "`provider` is required.",
 				} satisfies ManageProviderDetails) as AgentToolResult<ManageProviderDetails>;
 			}
-			if (!KNOWN_PROVIDER_IDS.has(provider)) {
+			// `save-key` accepts any provider we can hold a credential for — including the
+			// media-only ones. `set-agent-model` cannot: those providers have no chat
+			// models to select.
+			const allowed = action === "save-key" ? KEYABLE_PROVIDER_IDS : KNOWN_PROVIDER_IDS;
+			if (!allowed.has(provider)) {
+				const isMediaOnly = MEDIA_ONLY_KEY_PROVIDER_IDS.includes(provider);
 				return jsonResult({
 					action,
 					ok: false,
 					provider,
-					message: `Unknown provider "${provider}". Known: ${[...KNOWN_PROVIDER_IDS].sort().join(", ")}.`,
+					message: isMediaOnly
+						? `"${provider}" is a media provider (speech / music / transcription) and has no chat models, ` +
+							`so it cannot be used with ${action}. Store its key with action "save-key".`
+						: `Unknown provider "${provider}". Known: ${[...allowed].sort().join(", ")}.`,
 				} satisfies ManageProviderDetails) as AgentToolResult<ManageProviderDetails>;
 			}
 

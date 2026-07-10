@@ -93,6 +93,33 @@ describe("manage_provider — save-key", () => {
 		assert.equal(parsed.ok, false);
 		assert.match(String(parsed.message), /Unknown provider/);
 	});
+
+	// The operator gave Brigade an ElevenLabs key and `generate_music` still reported
+	// "No music provider configured" — because `manage_provider save-key` answered
+	// "Unknown provider elevenlabs", while the music tool's own error told the model to
+	// add exactly that key. There was no supported way to store it: not this tool, not
+	// `brigade onboard` (which never mentions ElevenLabs), only hand-editing the
+	// credential file. Meanwhile `resolveMediaProviderKey` reads the very store
+	// `upsertApiKeyProfile` writes.
+	for (const provider of ["elevenlabs", "minimax", "deepgram", "sarvam"]) {
+		it(`save-key accepts the media-only provider "${provider}"`, async () => {
+			const tool = makeManageProviderTool({ requesterAgentId: "main" });
+			const parsed = parse(await tool.execute("t3", { action: "save-key", provider, key: TEST_KEY }));
+			assert.equal(parsed.ok, true, String(parsed.message));
+			assert.equal(parsed.provider, provider);
+		});
+	}
+
+	it("set-agent-model still refuses a media provider, and says why", async () => {
+		// ElevenLabs has no chat models. Accepting it here would store nonsense.
+		const tool = makeManageProviderTool({ requesterAgentId: "main" });
+		const parsed = parse(
+			await tool.execute("t4", { action: "set-agent-model", provider: "elevenlabs", agentId: "main", model: "x" }),
+		);
+		assert.equal(parsed.ok, false);
+		assert.match(String(parsed.message), /media provider/);
+		assert.match(String(parsed.message), /save-key/, "and it names the action that does work");
+	});
 });
 
 describe("manage_provider — set-agent-model", () => {

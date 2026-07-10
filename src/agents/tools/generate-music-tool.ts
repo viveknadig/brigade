@@ -132,7 +132,7 @@ export function makeGenerateMusicTool(
 					message:
 						providers.length > 0
 							? `${providers.length} music provider(s) configured: ${providers.join(", ")}.`
-							: "No music provider configured. Add a Google, MiniMax, or ElevenLabs key with `brigade onboard`.",
+							: "No music provider configured. Store a Google, MiniMax, or ElevenLabs key with the `manage_provider` tool (action: \"save-key\"), or set GEMINI_API_KEY / MINIMAX_API_KEY / ELEVENLABS_API_KEY.",
 				} satisfies GenerateMusicDetails) as AgentToolResult<GenerateMusicDetails>;
 			}
 
@@ -164,7 +164,7 @@ export function makeGenerateMusicTool(
 			if (!provider) {
 				return fail(
 					action,
-					"No music provider is configured. Add a Google, MiniMax, or ElevenLabs API key with `brigade onboard` (then this tool auto-selects it).",
+					"No music provider is configured. Store a Google, MiniMax, or ElevenLabs key with the `manage_provider` tool (action: \"save-key\"), or set GEMINI_API_KEY / MINIMAX_API_KEY / ELEVENLABS_API_KEY. This tool then auto-selects it.",
 				);
 			}
 
