@@ -34,7 +34,8 @@ import {
 } from "../../agents/session-registry.js";
 import { resolveAgentIdFromSessionKey } from "../../agents/routing/session-key.js";
 import { spawnSubagentDirect } from "../../agents/subagent-spawn.js";
-import { readSessionStore, upsertSessionEntry } from "../../sessions/session-store.js";
+import { listSessionEntries, readSessionStore, upsertSessionEntry } from "../../sessions/session-store.js";
+import { DEFAULT_AGENT_ID } from "../../config/paths.js";
 
 /**
  * Wave O0.5: server-side access guard.
@@ -139,7 +140,56 @@ export async function handleSessionsList(
 			})
 		: filtered;
 	const rows = visible.map((entry) => buildRow(entry, deps));
-	return { sessions: rows, count: rows.length };
+
+	// `listLiveSessions()` is the in-memory RUN registry: sessions with a turn in
+	// flight or just finished. It empties on every gateway restart. So this answered
+	// "which sessions are running", while every caller — `/sessions`, `--session`, an
+	// operator asking "where is my thread?" — is asking "which threads do I HAVE".
+	// After a restart it reported none while a 16 MB conversation sat on disk, and
+	// `--session` refused to open the very thread it was pointed at.
+	//
+	// The persisted store is the source of truth for existence. Merge it in; live rows
+	// win (they carry runtime state); the same access guard applies.
+	const liveKeys = new Set(rows.map((r) => r.sessionKey));
+	const agentIds = params.agentId
+		? [params.agentId]
+		: [...new Set([DEFAULT_AGENT_ID, ...live.map((e) => e.agentId).filter((a): a is string => !!a)])];
+
+	const persisted: SessionListRow[] = [];
+	for (const agentId of agentIds) {
+		let entries: ReturnType<typeof listSessionEntries>;
+		try {
+			entries = listSessionEntries(agentId);
+		} catch {
+			continue; // an unreadable store must never fail the list
+		}
+		for (const { sessionKey, entry } of entries) {
+			if (liveKeys.has(sessionKey)) continue;
+			// Sub-agent and isolated-cron threads are machinery, not conversations an
+			// operator picks up — they never appeared in the live view either.
+			if (entry.subagent) continue;
+			if (sessionKey.startsWith("isolated:")) continue;
+			if (deps.accessCheck && !deps.accessCheck({ action: "list", targetSessionKey: sessionKey }).allowed) {
+				continue;
+			}
+			const startedAt = Date.parse(String(entry.createdAt ?? ""));
+			const updatedAt = Date.parse(String(entry.lastUsedAt ?? ""));
+			persisted.push({
+				sessionKey,
+				agentId,
+				state: "idle",
+				...(Number.isFinite(startedAt) ? { startedAt } : {}),
+				...(Number.isFinite(updatedAt) ? { updatedAt } : {}),
+				...(typeof entry.modelId === "string" ? { model: entry.modelId } : {}),
+			});
+		}
+	}
+
+	// Most recently used first — the thread you were just in is the one you want.
+	persisted.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+	let all = [...rows, ...persisted];
+	if (typeof params.limit === "number" && params.limit > 0) all = all.slice(0, params.limit);
+	return { sessions: all, count: all.length };
 }
 
 function applyFilters(rows: LiveSessionRecord[], params: SessionsListParams): LiveSessionRecord[] {

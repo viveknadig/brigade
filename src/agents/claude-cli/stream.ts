@@ -237,7 +237,14 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				thinkingEnded = true;
 				stream.push({ type: "thinking_end", contentIndex: 0, content: accumulatedThinking, partial: partial() });
 			};
-			const textIdx = () => (thinkingStarted ? 1 : 0);
+			// PINNED at `text_start`, never recomputed. It used to be
+			// `() => (thinkingStarted ? 1 : 0)` — a function of MUTABLE state. When a step
+			// emitted text before ever thinking, and a LATER step opened a thinking block,
+			// the same logical text block reported `text_start` at index 0 and its
+			// `text_delta`/`text_end` at index 1. A consumer that keyed on `contentIndex`
+			// would have torn the block in half.
+			let textContentIndex = 0;
+			const textIdx = () => textContentIndex;
 			const closeText = () => {
 				if (!textStarted || textClosed) return;
 				textClosed = true;
@@ -257,10 +264,56 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				ensureStarted();
 				if (!textStarted) {
 					textStarted = true;
+					// Pin the index for the whole block: whether thinking preceded us is
+					// settled NOW and cannot change under later steps.
+					textContentIndex = thinkingStarted ? 1 : 0;
 					stream.push({ type: "text_start", contentIndex: textIdx(), partial: partial() });
 				}
 				accumulatedText += delta;
 				stream.push({ type: "text_delta", contentIndex: textIdx(), delta, partial: partial() });
+			};
+
+			/**
+			 * Put a paragraph break between two text blocks of the same turn.
+			 *
+			 * Routed through `onTextDelta` so the break streams to the TUI like any other
+			 * text — appending it straight to `accumulatedText` would leave the rendered
+			 * block one delta behind the string we finally return.
+			 *
+			 * No-ops before any text, and when the text already ends in a blank line: the
+			 * binary often closes a block with its own newlines and we must not stack them.
+			 */
+			const separateTextBlock = (): void => {
+				if (!accumulatedText) return;
+				if (/\n\s*\n$/.test(accumulatedText)) return;
+				onTextDelta(accumulatedText.endsWith("\n") ? "\n" : "\n\n");
+			};
+
+			/**
+			 * The same break between two THINKING blocks. Steps 2..N of the binary's own
+			 * loop each open one, and without this the model's separate trains of thought
+			 * fuse: "hmm" + "second thought" → "hmmsecond thought", in the transcript and in
+			 * `/reasoning`.
+			 *
+			 * Appended straight to the accumulator rather than pushed as a `thinking_delta`:
+			 * by the time a later thinking block opens, `thinking_end` has already been
+			 * emitted, and adding another delta after it would make the stream more
+			 * malformed, not less. `partial()` rebuilds its content from this accumulator on
+			 * the next event either way, so the operator still sees it.
+			 *
+			 * On that malformation, deliberately left alone: because the binary runs several
+			 * internal steps inside ONE Brigade turn, a later step's thinking deltas are
+			 * emitted after we already sent `thinking_end`. The event LABELS are therefore
+			 * out of order. The payloads are not, and only the payloads are read — Pi's loop
+			 * treats every block event identically (`partialMessage = event.partial`) and
+			 * takes the final message from `response.result()` (pi-agent-core/dist/
+			 * agent-loop.js:196-240). Re-indexing the blocks to satisfy a consumer that
+			 * doesn't exist would be risk without benefit.
+			 */
+			const separateThinkingBlock = (): void => {
+				if (!accumulatedThinking) return;
+				if (/\n\s*\n$/.test(accumulatedThinking)) return;
+				accumulatedThinking += accumulatedThinking.endsWith("\n") ? "\n" : "\n\n";
 			};
 
 			const handleStreamEvent = (ev: AnthropicStreamEvent | undefined) => {
@@ -280,6 +333,21 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 						// Taking the last step (or the cumulative total) reports the binary's
 						// private scratch space as our context.
 						if (u.input && usageInput === 0) usageInput = u.input;
+						break;
+					}
+					case "content_block_start": {
+						// A NEW text block opens. The binary runs its own tool loop, so one
+						// Brigade turn is many internal steps, each with its own text blocks —
+						// "…let me look." → tool_use → "Good, real assets:". We accumulate them
+						// all into one string, and without a separator here the two sentences
+						// fuse: "let me look.Good, real assets:". Every screenshot of a
+						// tool-using turn was littered with them.
+						//
+						// A blank line, not a space: these are separate utterances, one before
+						// the model acted and one after. Markdown renders them as paragraphs,
+						// which is what they are.
+						if (ev.content_block?.type === "text") separateTextBlock();
+						else if (ev.content_block?.type === "thinking") separateThinkingBlock();
 						break;
 					}
 					case "content_block_delta": {
@@ -305,6 +373,11 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				if (!msg || accumulatedText) return;
 				for (const block of msg.content ?? []) {
 					if (block?.type === "text" && typeof block.text === "string" && block.text) {
+						// Separate here too. A frame can carry several text blocks, and the
+						// streaming path would have put a paragraph break between them — this
+						// fallback (an older CLI that emits no partial frames) must not render
+						// "block1block2" where the streaming path renders two paragraphs.
+						separateTextBlock();
 						onTextDelta(block.text);
 					}
 				}
@@ -430,11 +503,17 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 								// read as 889% of a 200k window and "compacted" a healthy
 								// session, twice, discarding real history each time.
 								//
-								// So it may only ever FILL IN a missing input (an older CLI that
+								// So it may only ever FILL IN a missing value (an older CLI that
 								// streams no partial frames, where the run is a single step and
-								// the cumulative total IS that step's prompt).
+								// the cumulative total IS that step's usage).
+								//
+								// BOTH fields, symmetrically. `output_tokens` on this same frame is
+								// just as cumulative as `input_tokens` — every step's generation,
+								// tool-call JSON included — and `calculateContextTokens` is
+								// `input + output`. Guarding only the input left the other half of
+								// the very inflation this guard exists to prevent.
 								if (u.input && usageInput === 0) usageInput = u.input;
-								if (u.output) usageOutput = u.output;
+								if (u.output && usageOutput === 0) usageOutput = u.output;
 							}
 							break;
 						}

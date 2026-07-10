@@ -113,6 +113,113 @@ const HAPPY_LINES = [
 	'{"type":"result","subtype":"success","result":"Hello there","usage":{"input_tokens":10,"output_tokens":3}}',
 ];
 
+test("text blocks separated by a tool call get a paragraph break, not a fused sentence", async () => {
+	// The binary runs its own tool loop, so one Brigade turn is many internal steps,
+	// each opening its own text block. Accumulating them without a separator produced
+	// exactly this, all over a working turn:
+	//
+	//   "Let me load my tools and look.Good — real assets: the lion mascot set…"
+	//   "…study the reference video's style.The reference is Anthropic's launch video"
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Let me load my tools and look."}}}',
+		// the model acts…
+		'{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","name":"mcp__brigade__read"}}}',
+		// …then resumes in a NEW text block
+		'{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Good — real assets."}}}',
+		'{"type":"result","subtype":"success","result":"x"}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	const text = message.content.find((c: any) => c.type === "text")?.text;
+	assert.equal(text, "Let me load my tools and look.\n\nGood — real assets.");
+	assert.equal(text.includes("look.Good"), false, "the two utterances must not fuse");
+});
+
+test("a text block opening on already-broken text does not stack blank lines", async () => {
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Done.\\n\\n"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Next."}}}',
+		'{"type":"result","subtype":"success","result":"x"}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.content.find((c: any) => c.type === "text")?.text, "Done.\n\nNext.");
+});
+
+test("the FIRST text block never opens with a leading blank line", async () => {
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}}',
+		'{"type":"result","subtype":"success","result":"Hello"}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.content.find((c: any) => c.type === "text")?.text, "Hello");
+});
+
+test("two thinking blocks across a tool call do not fuse either", async () => {
+	// Steps 2..N of the binary's loop each open their own thinking block. Fused, the
+	// model's separate trains of thought read as one: "hmm" + "second thought" →
+	// "hmmsecond thought", in the transcript and in `/reasoning`.
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Looking."}}}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","name":"mcp__brigade__read"}}}',
+		// step 2: a fresh thinking block, then fresh text
+		'{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"second thought"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Found it."}}}',
+		'{"type":"result","subtype":"success","result":"Found it."}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.content.find((c: any) => c.type === "thinking")?.thinking, "hmm\n\nsecond thought");
+	assert.equal(message.content.find((c: any) => c.type === "text")?.text, "Looking.\n\nFound it.");
+});
+
+test("no tool_use block ever reaches the returned message's content", async () => {
+	// Pi's runLoop executes `message.content.filter(c => c.type === "toolCall")`. If a
+	// tool_use block survived into the returned message, Pi would re-run every tool the
+	// binary already ran — `bash ./deploy.sh` twice.
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu_1","name":"mcp__brigade__bash"}}}',
+		'{"type":"assistant","message":{"content":[{"type":"text","text":"ok"},{"type":"tool_use","id":"tu_1","name":"mcp__brigade__bash"}]}}',
+		'{"type":"result","subtype":"success","result":"ok"}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	const types = message.content.map((c: any) => c.type);
+	assert.deepEqual(types.filter((t: string) => t === "toolCall" || t === "tool_use"), []);
+	assert.ok(types.every((t: string) => t === "text" || t === "thinking"), `unexpected block: ${types.join(",")}`);
+});
+
+test("a thinking block opening does not inject a paragraph break into the text", async () => {
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Answer."}}}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"thinking"}}}',
+		'{"type":"result","subtype":"success","result":"Answer."}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.content.find((c: any) => c.type === "text")?.text, "Answer.");
+});
+
 test("stream fn: emits start → text deltas → done with accumulated text + usage", async () => {
 	const captured: FakeSpawnScript["captured"] = {};
 	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }) });
@@ -166,6 +273,58 @@ test("usage.input is the FIRST step's prompt, not the binary's cumulative total"
 	assert.equal(message.usage.output, 12941);
 	// 78k of a 200k window is 39% — the honest figure. The bug reported 889%.
 	assert.ok(message.usage.input / 200_000 < 0.5, "a healthy session must not look overfull");
+});
+
+test("usage.output is the streamed value, NOT the result frame's cumulative total", async () => {
+	// The `result` frame's usage is cumulative over every internal step — that is why
+	// `input` is guarded. `output_tokens` on the SAME object is just as cumulative
+	// (every step's generation, tool-call JSON included), and `calculateContextTokens`
+	// is `input + output`. Overwriting output re-opened half of the very inflation the
+	// input guard exists to prevent.
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":40000}}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}',
+		'{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":300}}}',
+		'{"type":"result","subtype":"success","result":"hi","usage":{"input_tokens":999999,"output_tokens":90000}}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.usage.input, 40000, "first step's prompt");
+	assert.equal(message.usage.output, 300, "the streamed per-step value, not 90000");
+	assert.notEqual(message.usage.output, 90000, "the run's cumulative generation must not become our context");
+});
+
+test("text_start and text_end agree on contentIndex even when thinking arrives later", async () => {
+	// `textIdx()` used to be a function of MUTABLE state (`thinkingStarted ? 1 : 0`).
+	// A step that wrote text BEFORE ever thinking, followed by a later step that opened
+	// a thinking block, reported text_start@0 and text_end@1 for the same block.
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"acting first"}}}',
+		// a later internal step finally thinks
+		'{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"thinking"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}}',
+		'{"type":"result","subtype":"success","result":"acting first"}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { events } = await drain(fn(MODEL, CTX, undefined) as never);
+	const start = events.find((e: any) => e.type === "text_start");
+	const end = events.find((e: any) => e.type === "text_end");
+	assert.equal(start.contentIndex, 0);
+	assert.equal(end.contentIndex, 0, "the same logical block cannot change index mid-flight");
+});
+
+test("the no-partials fallback separates multiple text blocks like the streaming path", async () => {
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"assistant","message":{"content":[{"type":"text","text":"First."},{"type":"text","text":"Second."}]}}',
+		'{"type":"result","subtype":"success","result":"First.\\n\\nSecond."}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.content.find((c: any) => c.type === "text")?.text, "First.\n\nSecond.");
 });
 
 test("usage.input falls back to the result frame when no partial frames stream", async () => {

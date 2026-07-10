@@ -36,7 +36,28 @@ const PROVIDER_ENV: Record<string, string[]> = {
 	google: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
 	anthropic: ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"],
 	sarvam: ["SARVAM_API_KEY"],
+	// MEDIA-ONLY providers. They serve speech / music / transcription and have no
+	// chat models, so they are absent from the LLM catalog — which means
+	// `envVarsFromCatalog` finds nothing for them and, without these entries, the
+	// obvious `ELEVENLABS_API_KEY=…` did nothing at all.
+	elevenlabs: ["ELEVENLABS_API_KEY"],
+	minimax: ["MINIMAX_API_KEY"],
+	deepgram: ["DEEPGRAM_API_KEY"],
 };
+
+/**
+ * Providers that hold an API key for MEDIA work only — speech, music,
+ * transcription — and have no chat models, so they never appear in the LLM
+ * `PROVIDERS` catalog.
+ *
+ * They are still first-class credentials: `resolveMediaProviderKey` reads them
+ * from the same per-agent credential store. Anything that validates a provider id
+ * before STORING a key must accept these, or the operator is told "Unknown
+ * provider" for a provider our own tools name in their error messages.
+ *
+ * (`command` and `edge` are deliberately absent: they are keyless local engines.)
+ */
+export const MEDIA_ONLY_KEY_PROVIDER_IDS: readonly string[] = ["elevenlabs", "minimax", "deepgram", "sarvam"];
 
 /**
  * Preference order for the Pi path's provider sweep. Vision-strong, widely-keyed

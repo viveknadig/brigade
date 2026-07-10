@@ -42,6 +42,12 @@ export interface ChatCommandOptions {
 	noEnvDetect?: boolean;
 	/** Bind the TUI to this agent at startup (forwarded to the connect TUI). */
 	agentId?: string;
+	/**
+	 * Open an existing thread at startup instead of the agent's main one —
+	 * `brigade tui --session t-0bf7c8e1`. Forwarded to the connect TUI, which
+	 * canonicalises the key and verifies it exists before the UI engages.
+	 */
+	sessionKey?: string;
 }
 
 /**
@@ -105,5 +111,10 @@ export async function runChatCommand(opts: ChatCommandOptions = {}): Promise<Con
 	// auto-spawned the gateway it talks to. `--agent` forwards straight
 	// through so `brigade --agent <id>` / `npm run tui -- --agent <id>`
 	// open pre-bound to that agent.
-	return runConnectCommand({ host, port, ...(opts.agentId ? { agentId: opts.agentId } : {}) });
+	return runConnectCommand({
+		host,
+		port,
+		...(opts.agentId ? { agentId: opts.agentId } : {}),
+		...(opts.sessionKey ? { sessionKey: opts.sessionKey } : {}),
+	});
 }

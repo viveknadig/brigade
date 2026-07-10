@@ -264,7 +264,16 @@ export function buildProgram(): Command {
     .option("-h, --host <host>", "gateway host to connect to / spawn on (default: 127.0.0.1)")
     .option("-p, --port <port>", "gateway port (default: 7777)", (v) => parseInt(v, 10))
     .option("--agent <id>", "bind the TUI to this agent at startup (skips the /agent step)")
-    .action(async (agentArg: string | undefined, opts: { envDetect?: boolean; host?: string; port?: number; agent?: string }) => {
+    // Open straight into an existing THREAD instead of the agent's main one.
+    // Takes the short label the header shows (`t-0bf7c8e1`) or the full key; the
+    // short form is expanded against the bound agent. Verified against the gateway
+    // before the UI engages — an unknown key would start an EMPTY thread of that
+    // name, and "please continue" would land in a conversation with no history.
+    .option(
+      "--session <key>",
+      "open an existing thread at startup, e.g. --session t-0bf7c8e1 (skips the /session step)",
+    )
+    .action(async (agentArg: string | undefined, opts: { envDetect?: boolean; host?: string; port?: number; agent?: string; session?: string }) => {
       // FOOTGUN GUARD. `tui` is the DEFAULT command, so a mistyped or unknown
       // command (`brigade upgarde`, `brigade foo`) doesn't error — Commander
       // routes the unknown word here as the positional [agent]. Without this
@@ -299,6 +308,7 @@ export function buildProgram(): Command {
         host: opts.host,
         port: opts.port,
         ...(agentId ? { agentId } : {}),
+        ...(opts.session ? { sessionKey: opts.session } : {}),
       });
       // Hold the action handler open — `runChatCommand` resolves once the
       // editor is wired; without this pin, the entry-point exit hook
@@ -955,6 +965,42 @@ export function buildProgram(): Command {
     .action(async (name: string, opts: { json?: boolean }) => {
       const { runSkillsInfo } = await import("../commands/skills.js");
       await exitAfterFlush(await runSkillsInfo({ name }, { json: opts.json }));
+    });
+
+  /* ───────────────────────────── video ───────────────────────────── */
+  // `brigade video <install|status>` — the OPTIONAL motion-graphics render engine.
+  // NOT an extension: no manifest, nothing to load, just a plain npm library Brigade
+  // drives programmatically. It installs into `~/.brigade/engines`, a directory
+  // Brigade owns and gives its own package.json, because `npm i @hyperframes/producer`
+  // run from the operator's shell walks UP to the first package.json it finds — their
+  // home directory — and leaves the engine where Brigade will never resolve it.
+  const video = program
+    .command("video")
+    .description("Manage the optional motion-graphics render engine (`render_video`)");
+
+  video
+    .command("install")
+    .description(
+      "Install the render engine so the `render_video` tool becomes available.\n" +
+        "  Examples:\n" +
+        "    brigade video install           # install into ~/.brigade/engines\n" +
+        "    brigade video install --force   # reinstall even if already present\n" +
+        "    brigade video install --json    # machine-readable",
+    )
+    .option("--force", "reinstall even when the engine already resolves", false)
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { force?: boolean; json?: boolean }) => {
+      const { runVideoInstallCommand } = await import("../commands/video.js");
+      await exitAfterFlush(await runVideoInstallCommand({ force: opts.force, json: opts.json }));
+    });
+
+  video
+    .command("status")
+    .description("Report whether `render_video` is available, and what is missing")
+    .option("--json", "emit JSON instead of human-readable text", false)
+    .action(async (opts: { json?: boolean }) => {
+      const { runVideoStatusCommand } = await import("../commands/video.js");
+      await exitAfterFlush(await runVideoStatusCommand({ json: opts.json }));
     });
 
   /* ───────────────────────────── extensions ───────────────────────────── */

@@ -157,7 +157,7 @@ export function makeGenerateSpeechTool(
 					message:
 						providers.length > 0
 							? `${providers.length} TTS provider(s) available: ${providers.join(", ")} (edge is free, no key).`
-							: "No TTS provider available. Add an OpenAI/ElevenLabs/Google key with `brigade onboard` (or edge works free).",
+							: "No TTS provider available. Store an OpenAI/ElevenLabs/Google key with the `manage_provider` tool (action: \"save-key\") — or use the free `edge` provider, which needs no key.",
 				} satisfies GenerateSpeechDetails) as AgentToolResult<GenerateSpeechDetails>;
 			}
 
@@ -182,7 +182,7 @@ export function makeGenerateSpeechTool(
 			if (!provider) {
 				return fail(
 					action,
-					"No TTS provider is available. Add an OpenAI/ElevenLabs/Google API key with `brigade onboard` — or use the free `edge` provider (no key needed).",
+					"No TTS provider is available. Store an OpenAI/ElevenLabs/Google key with the `manage_provider` tool (action: \"save-key\") — or use the free `edge` provider, which needs no key.",
 				);
 			}
 

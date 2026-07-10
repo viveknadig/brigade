@@ -47,9 +47,10 @@ import { markTuiActive, restoreTerminal } from "../../ui/terminal-cleanup.js";
 import { brand, editorTheme, markdownTheme } from "../../ui/theme.js";
 import { summarizeToolResult } from "../../ui/tool-result.js";
 import { BrigadeClient } from "../../tui/client.js";
+import { DEFAULT_AGENT_ID } from "../../config/paths.js";
 import { loadConfig } from "../../core/config.js";
 import { resolveClientToken } from "../../core/gateway-auth.js";
-import { asstKey, clipOneLine, extractUserText, joinToolResultText } from "./connect-transcript.js";
+import { asstKey, clipOneLine, extractUserText } from "./connect-transcript.js";
 import { UPDATE_PRESERVES_MESSAGE } from "../../core/update-check.js";
 import { runUpdateCommand } from "./update.js";
 import { ApprovalPrompt, type ApprovalResolution } from "../../tui/approval-prompt.js";
@@ -110,6 +111,21 @@ export interface ConnectCommandOptions {
 	 * would think they were talking to X while actually talking to main).
 	 */
 	agentId?: string;
+	/**
+	 * Open straight into an existing THREAD — `brigade tui --session t-0bf7c8e1`,
+	 * equivalent to launching and immediately running `/session <key>`.
+	 *
+	 * Accepts the short label the header shows (`t-0bf7c8e1`) or the canonical key
+	 * (`agent:main:t-0bf7c8e1`); the short form is expanded against the bound agent.
+	 * Validated against `sessions.list` BEFORE the UI engages: an unknown key would
+	 * otherwise create a brand-new EMPTY thread of that name, and the operator's next
+	 * message — "please continue" — would land in a conversation that has never seen a
+	 * word, while their real thread sat untouched on disk.
+	 *
+	 * Binding is what gives the AGENT its context: every prompt carries this session
+	 * key, the gateway resolves that session, and the turn runs against its history.
+	 */
+	sessionKey?: string;
 }
 
 export interface ConnectHandle {
@@ -262,7 +278,44 @@ export async function runConnectCommand(opts: ConnectCommandOptions = {}): Promi
 		}
 	}
 
-	chatHandle = await wireConnectUi(tui, client, initialAgentId);
+	// Startup `--session <key>` binding. Same discipline as `--agent`, for a sharper
+	// reason: an unknown AGENT falls back to `main` — wrong, but a real conversation.
+	// An unknown SESSION KEY creates a brand-new EMPTY thread under that name, so
+	// "please continue" lands in a conversation that has never seen a word while the
+	// real thread sits on disk untouched. Resolve it, verify it, or stop.
+	let initialSessionKey: string | undefined;
+	if (opts.sessionKey) {
+		const agentForKey = initialAgentId ?? DEFAULT_AGENT_ID;
+		const target = opts.sessionKey.startsWith("agent:")
+			? opts.sessionKey
+			: `agent:${agentForKey}:${opts.sessionKey}`;
+		try {
+			const res: unknown = await client.request(
+				"sessions.list",
+				initialAgentId !== undefined ? { agentId: initialAgentId } : {},
+			);
+			const list = Array.isArray(res)
+				? (res as SessionSummary[])
+				: ((res as { sessions?: SessionSummary[] }).sessions ?? []);
+			if (!list.some((s) => s.sessionKey === target)) {
+				tui.stop();
+				restoreTerminal();
+				console.error(chalk.red(`✗ No thread with key "${target}".`));
+				console.error(chalk.dim("  Opening an unknown key would start an EMPTY thread of that name."));
+				const available = list.map((s) => s.sessionKey).slice(0, 12);
+				console.error(chalk.dim(`  Your threads:\n    ${available.join("\n    ") || "(none)"}`));
+				console.error(chalk.dim("  (`brigade sessions list` shows them all)"));
+				process.exit(1);
+			}
+			initialSessionKey = target;
+		} catch {
+			// Lenient, exactly like `--agent`: a transient RPC hiccup must not block a
+			// launch. `/session` inside the TUI re-validates.
+			initialSessionKey = target;
+		}
+	}
+
+	chatHandle = await wireConnectUi(tui, client, initialAgentId, initialSessionKey);
 	return chatHandle;
 }
 
@@ -275,6 +328,7 @@ export async function wireConnectUi(
 	tui: TUI,
 	client: BrigadeClient,
 	initialAgentId?: string,
+	initialSessionKey?: string,
 ): Promise<ConnectHandle> {
 	// Static (last-frame) wordmark — `brigade connect` is the chat surface
 	// just like `brigade chat`, so we want the same still rendering here. The
@@ -323,7 +377,9 @@ export async function wireConnectUi(
 	// `agent:main:whatsapp:<jid>`) so abort / steer / compact / set-model
 	// target THAT lane instead of the boot agent's `main`. Seeded from the
 	// first snapshot, overridden by `/session <key>`.
-	let boundSessionKey: string | undefined = undefined;
+	// Seeded by `--session <key>` (already resolved + verified against sessions.list).
+	// Left undefined, the first `state` snapshot seeds it with the agent's main thread.
+	let boundSessionKey: string | undefined = initialSessionKey;
 	// Residual P0 (post-Wave K integration audit) — the WS broadcast filter
 	// at server.ts:903 keys on per-connection subscription Sets populated by
 	// the `subscribe` RPC. Without an explicit subscribe, the filter falls
@@ -947,8 +1003,9 @@ export async function wireConnectUi(
 	// `message_update` that arrives after the rebuild updates the rebuilt block
 	// in place rather than spawning a copy.
 
-	// `extractUserText`, `joinToolResultText`, `clipOneLine` are imported from
-	// `connect-transcript.js` (pure + unit-tested).
+	// `extractUserText`, `clipOneLine` are imported from `connect-transcript.js`
+	// (pure + unit-tested). Tool-result previews go through the SHARED
+	// `summarizeToolResult`, so the resume view and the live view cannot drift.
 
 	/** Remove the rendered transcript (everything between the header+divider
 	 *  chrome and the editor); the editor + trailing chrome stay. Resets the
@@ -1029,8 +1086,13 @@ export async function wireConnectUi(
 		if (m.role === "toolResult" && typeof m.toolCallId === "string") {
 			const mark = m.isError ? brand.error("✗") : brand.tool("✓");
 			const name = typeof m.toolName === "string" ? m.toolName : "tool";
-			// Join → scrub terminal escapes → collapse/clip to one line.
-			const clipped = clipOneLine(scrubRenderable(joinToolResultText(m.content)));
+			// The SAME summariser the live path uses, not a second one. This view used
+			// `joinToolResultText` + `clipOneLine` with an 80-char budget while live used
+			// 120, so a `resume` silently re-clipped every tool result — and
+			// `joinToolResultText` filters to text blocks, so an image-only result
+			// rendered as a bare chip here and `[image …]` there. A transcript that
+			// disagrees with what you just watched is worse than no transcript.
+			const clipped = scrubRenderable(summarizeToolResult(m.content, { preserveNewlines: false }).preview);
 			const preview = clipped ? ` ${brand.dim(`· ${clipped}`)}` : "";
 			const line = `  ${mark} ${brand.tool(name)}${preview}`;
 			const indicator = pendingTools.get(m.toolCallId);
@@ -1200,7 +1262,23 @@ export async function wireConnectUi(
 	// themselves.
 
 	// State snapshots from the gateway — every mutation pushes one.
-	client.on("state", (snap) => {
+	//
+	// Extracted from the `on("state")` listener so startup can PULL one, because the
+	// PUSH is a race we do not always win.
+	//
+	// The gateway sends one snapshot immediately after `helloOk` (server.ts) — before
+	// any user action. `runConnectCommand` then registers this listener. With no flags
+	// there is nothing between `connect()` and registration, so the frame lands. But
+	// `--agent` awaits `agents.list` and `--session` awaits `sessions.list` FIRST; each
+	// await yields to I/O, the snapshot is dispatched with no listener attached, and it
+	// is gone. Nothing re-sends it.
+	//
+	// This listener is also where the lane subscription fires and where `doResume()`
+	// loads the thread's history. So the flagged launches sat blank — header `? · ?`,
+	// no transcript — until the operator typed something and a state CHANGE finally
+	// triggered a broadcast. `--session` made it undeniable: it opened exactly the
+	// right thread and showed none of it.
+	const applyStateSnapshot = (snap: SessionStateSnapshot): void => {
 		lastSnapshot = snap;
 		maybeAnnounceUpdate(snap.updateAvailable ?? null);
 		// `snap.isAgentRunning` is AGENT-wide — it goes true when ANY session
@@ -1260,7 +1338,22 @@ export async function wireConnectUi(
 			});
 		}
 		updateHeader();
-	});
+	};
+	client.on("state", applyStateSnapshot);
+
+	// Ask, rather than depend on having caught the push. Idempotent with the broadcast
+	// above (same handler, latest snapshot wins), and it makes the launch deterministic
+	// whether or not a pre-wiring `await` swallowed the connect-time frame. This is what
+	// seeds the binding, fires the lane subscription, and drives `doResume()`.
+	// Best-effort: a gateway that cannot answer `get-state` leaves the old behaviour.
+	void (async () => {
+		try {
+			const snap = (await client.request("get-state")) as SessionStateSnapshot | undefined;
+			if (snap) applyStateSnapshot(snap);
+		} catch {
+			/* the next broadcast will do it */
+		}
+	})();
 
 	// Tool-approval prompt — the gateway broadcasts an `approval-request`
 	// event when a gated tool (today: `bash`) needs operator consent. We
@@ -1336,8 +1429,36 @@ export async function wireConnectUi(
 		if (isOffLane(payload.agentId, payload.sessionId, subagentDepth)) return;
 		const depth = typeof subagentDepth === "number" ? subagentDepth : 0;
 		const subIndent = depth > 0 ? "  ".repeat(depth) : "";
+		// A CHILD turn (`spawn_agent`) streams its own lifecycle: agent_start when it
+		// begins, agent_end when it finishes. Those events describe the child, not this
+		// turn — and the handlers below tear down THIS turn's state.
+		//
+		// Unguarded, a sub-agent finishing ran the parent's teardown mid-flight:
+		// `activeAssistants.clear()` dropped the parent's streaming block identity, so
+		// when the parent resumed it opened a FRESH block holding the whole message and
+		// re-rendered its entire answer from the top; `pendingTools.clear()` orphaned the
+		// parent's own `⚡ spawn_agent` chip so it never turned `✓`; `isAgentRunning=false`
+		// and `disableSubmit=false` told the operator the turn was over while it ran on.
+		// A child's agent_start was no better: it overwrote `activeLoader`, leaking the
+		// parent's spinner widget into the transcript, and reset the elapsed clock.
+		//
+		// The child's WORK is still shown — its text, tool chips and approval prompts all
+		// carry `depth` and render indented under `sub-agent`. Only the turn-lifecycle
+		// bookkeeping is the parent's alone.
+		const isChildTurn = depth > 0;
 		switch (event?.type) {
 			case "agent_start": {
+				if (isChildTurn) {
+					// Mark the handoff. Without it, a `spawn_agent` that thinks for a minute
+					// before writing anything is a minute of blank screen under a `⚡` chip,
+					// and when the child's prose finally arrives there is nothing saying
+					// whose prose it is.
+					insertBeforeEditor(
+						new Text(`${subIndent}  ${brand.dim("↳ sub-agent working…")}`, 0, 0),
+					);
+					tui.requestRender();
+					break;
+				}
 				isAgentRunning = true;
 				agentStartedAt = Date.now();
 				whimsicalIdx = 0; // reset so the first phrase is always "thinking"
@@ -1385,7 +1506,11 @@ export async function wireConnectUi(
 				asstKeyByDepth.set(depth, contKey);
 				const cont = asstContinuation.get(contKey);
 				if (cont) {
-					const tail = text.slice(cont.prefixLen);
+					// Strip the leading break the transport inserts between two text blocks
+					// (see `separateTextBlock`). It belongs BETWEEN the blocks, and this
+					// continuation IS the block boundary — kept, it would open the new block
+					// with a blank line under its own label.
+					const tail = text.slice(cont.prefixLen).replace(/^\n+/, "");
 					// Nothing new since the chip — the model is still thinking. Leave the
 					// spinner up and paint nothing.
 					if (!tail.trim()) break;
@@ -1567,17 +1692,26 @@ export async function wireConnectUi(
 				break;
 			}
 			case "compaction_start": {
-				const pct = lastSnapshot?.contextUsagePercent != null
-					? `${Math.round(lastSnapshot.contextUsagePercent)}%`
-					: "high";
+				// A CHILD's context, not ours — never quote the parent's percentage for it.
+				const pct = isChildTurn
+					? "high"
+					: lastSnapshot?.contextUsagePercent != null
+						? `${Math.round(lastSnapshot.contextUsagePercent)}%`
+						: "high";
 				insertBeforeEditor(
-					new Text(`  ${brand.dim(`⚡ compacting context (was ${pct})…`)}`, 0, 0),
+					new Text(`${subIndent}  ${brand.dim(`⚡ compacting context (was ${pct})…`)}`, 0, 0),
 				);
 				break;
 			}
 			case "compaction_end": {
 				if (event.aborted) {
-					insertBeforeEditor(new Text(`  ${brand.dim("compaction aborted")}`, 0, 0));
+					insertBeforeEditor(new Text(`${subIndent}  ${brand.dim("compaction aborted")}`, 0, 0));
+				} else if (isChildTurn) {
+					// The child compacted its OWN context. Say so, and leave the parent's
+					// header figure alone — it still describes the parent's session.
+					insertBeforeEditor(
+						new Text(`${subIndent}  ${brand.amber("✓")} ${brand.dim("compacted")}`, 0, 0),
+					);
 				} else {
 					// Do NOT read `lastSnapshot` for an "after" figure. Pi's
 					// getContextUsage() returns null right after compaction by design
@@ -1617,7 +1751,7 @@ export async function wireConnectUi(
 				const because = why ? ` ${brand.dim(`· ${why}`)}` : "";
 				insertBeforeEditor(
 					new Text(
-						`  ${brand.dim(`↻ retrying (attempt ${attempt}/${max}, waiting ${waitS}s)…`)}${because}`,
+						`${subIndent}  ${brand.dim(`↻ retrying (attempt ${attempt}/${max}, waiting ${waitS}s)…`)}${because}`,
 						0,
 						0,
 					),
@@ -1628,7 +1762,7 @@ export async function wireConnectUi(
 				if (event.success === false) {
 					insertBeforeEditor(
 						new Text(
-							`  ${brand.error("✗")} ${brand.error(`gave up after ${event.attempt} attempts`)}`,
+							`${subIndent}  ${brand.error("✗")} ${brand.error(`gave up after ${event.attempt} attempts`)}`,
 							0,
 							0,
 						),
@@ -1637,6 +1771,21 @@ export async function wireConnectUi(
 				break;
 			}
 			case "agent_end": {
+				if (isChildTurn) {
+					// The child is done. Its final text has already streamed; the parent's
+					// `✓ spawn_agent` chip lands when the tool returns. Touch no parent state —
+					// just close the child's section so the operator can see the seam.
+					flushStreamingRender();
+					// …except the spinner, which is a single shared widget. A loader armed by
+					// the CHILD's last `tool_execution_end` would otherwise linger across the
+					// seam and read as the parent thinking, until the parent's next paint.
+					dismissLoader();
+					insertBeforeEditor(
+						new Text(`${subIndent}  ${brand.dim("↲ sub-agent done — back to the main agent")}`, 0, 0),
+					);
+					tui.requestRender();
+					break;
+				}
 				isAgentRunning = false;
 				agentStartedAt = null;
 				editor.disableSubmit = false;
@@ -1653,6 +1802,19 @@ export async function wireConnectUi(
 				// `tool_execution_end` — a long session can accumulate these
 				// when a model aborts mid-tool and they otherwise pin a Text
 				// node in the children list per orphaned tool.
+				// These clear EVERY depth, not just this turn's. That is deliberate — a
+				// child completes inside its parent's turn, so by the time the parent's
+				// `agent_end` lands, the child's blocks and chips are finished artifacts.
+				//
+				// It is also the one asymmetry in the depth guard: the child cannot tear
+				// down the parent, but the parent still tears down every depth. Safe only
+				// because a sub-agent is fully awaited before the parent's turn ends —
+				// `spawn_agent` awaits `runSubagent`, and `spawn_agents` awaits
+				// `Promise.allSettled`. If a future fan-out lets a descendant's frames
+				// arrive AFTER the parent's `agent_end`, that child would find its render
+				// maps wiped, re-open a fresh block, and re-render its answer from the top:
+				// exactly the bug the depth guard above exists to prevent. Gate these by
+				// depth before shipping any detached sub-agent.
 				pendingTools.clear();
 				clearHarnessContinuations();
 				updateHeader();
@@ -1869,9 +2031,9 @@ export async function wireConnectUi(
 		// context), clears the screen, and re-subscribes. This is the ONE true
 		// clean-slate affordance: a normal launch lands you back in your existing
 		// thread WITH its (bounded) history — the best-in-class default — and
-		// `/new` is how you deliberately start over. Mirrors OpenClaw's `/new` and
-		// Claude.ai/ChatGPT "new chat"; `/sessions` lists threads, `/session <key>`
-		// jumps back to one.
+		// `/new` is how you deliberately start over — the same affordance as the
+		// "new chat" button in Claude.ai / ChatGPT. `/sessions` lists threads,
+		// `/session <key>` jumps back to one.
 		if (trimmed === "/new") {
 			editor.setText("");
 			const agentForNew = boundAgentId ?? lastSnapshot?.agentId ?? "main";
@@ -1900,14 +2062,52 @@ export async function wireConnectUi(
 				);
 				return;
 			}
-			boundSessionKey = arg;
+			// Canonicalise, then tell the truth about what you just bound to.
+			//
+			// This took the key verbatim. The header shows a thread as `t-0bf7c8e1`, so
+			// `/session t-0bf7c8e1` is the obvious thing to type — and it bound to a
+			// LITERAL key of that name, not the canonical `agent:main:t-0bf7c8e1`. The
+			// gateway created a brand-new empty session under it, the next message
+			// ("please continue…") landed in a thread with no history, and a 16 MB
+			// conversation was silently orphaned on disk.
+			const agentForKey = boundAgentId ?? lastSnapshot?.agentId ?? DEFAULT_AGENT_ID;
+			const target = arg.startsWith("agent:") ? arg : `agent:${agentForKey}:${arg}`;
+
+			// A `/session` onto an unknown key is legal — that is how you name a new
+			// thread — but it must never look like resuming an old one.
+			let known: boolean | undefined;
+			try {
+				const res: unknown = await client.request(
+					"sessions.list",
+					boundAgentId !== undefined ? { agentId: boundAgentId } : {},
+				);
+				const list = Array.isArray(res)
+					? (res as SessionSummary[])
+					: ((res as { sessions?: SessionSummary[] }).sessions ?? []);
+				known = list.some((s) => s.sessionKey === target);
+			} catch {
+				known = undefined; // gateway couldn't answer; claim nothing
+			}
+
+			boundSessionKey = target;
 			insertBeforeEditor(
 				new Text(
-					`  ${brand.amber("✓")} ${brand.dim("bound to session")} ${brand.amber(arg)}`,
+					`  ${brand.amber("✓")} ${brand.dim("bound to session")} ${brand.amber(target)}`,
 					0,
 					0,
 				),
 			);
+			if (known === false) {
+				insertBeforeEditor(
+					new Text(
+						`    ${brand.amber("⚠")} ${brand.dim(
+							"no thread with that key — this starts an EMPTY one. `/sessions` lists your threads.",
+						)}`,
+						0,
+						0,
+					),
+				);
+			}
 			updateHeader();
 			void applySubscription();
 			return;
