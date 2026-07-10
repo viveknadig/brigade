@@ -44,6 +44,26 @@ function turnServer(turn: McpTurnContext): McpServer {
 /** The URL prefix the tool-plane is served under. */
 export const MCP_ROUTE_PREFIX = "/mcp";
 
+/**
+ * Wall-clock budget for one `tools/call`.
+ *
+ * The gateway dispatcher races every route handler against
+ * `route.timeoutMs ?? DEFAULT_TIMEOUT_MS` (30s) and, on expiry, writes a 408 —
+ * but `Promise.race` does NOT cancel the loser. With the default the plane was
+ * badly broken: any tool slower than 30s (an exec-gated `bash` awaiting the
+ * operator's 5-minute approval; `generate_video`, whose OWN budget is 1_220_000
+ * ms) would hand the binary a non-JSON-RPC 408 while the tool kept running to
+ * completion. The model is told the call failed, the side effect happens anyway
+ * — a billed render discarded, or a shell command executed after the model gave
+ * up on it, inviting a double-execution on retry.
+ *
+ * So we own the budget explicitly: larger than the largest per-tool ceiling, and
+ * far larger than the approval window. Each tool still enforces its OWN timeout
+ * (`wrapToolExecutionTimeout`), which is what should bound a call — this exists
+ * only so the dispatcher can never guillotine an in-flight tool.
+ */
+export const MCP_ROUTE_TIMEOUT_MS = 1_800_000; // 30m > generate_video's 1_220_000ms
+
 function isLoopback(remote: string | undefined): boolean {
 	return (
 		remote === "127.0.0.1" ||
@@ -53,10 +73,28 @@ function isLoopback(remote: string | undefined): boolean {
 	);
 }
 
+/**
+ * Write a response ONLY if we still own it. Defence in depth: if anything ever
+ * ends the response out from under us (a dispatcher timeout, a disconnected
+ * client), a late write would throw ERR_STREAM_WRITE_AFTER_END deep inside an
+ * orphaned promise chain — an unhandled rejection that can take the gateway
+ * down. Dropping the write is always the right call: the peer is gone.
+ */
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
+	if (res.headersSent || res.writableEnded) {
+		log.debug("dropping mcp response — peer already gone");
+		return;
+	}
 	const text = JSON.stringify(body);
 	res.statusCode = status;
 	res.setHeader("Content-Type", "application/json; charset=utf-8");
+	res.end(text);
+}
+
+function endPlain(res: ServerResponse, status: number, text?: string, headers?: Record<string, string>): void {
+	if (res.headersSent || res.writableEnded) return;
+	res.statusCode = status;
+	for (const [k, v] of Object.entries(headers ?? {})) res.setHeader(k, v);
 	res.end(text);
 }
 
@@ -69,6 +107,7 @@ export function createMcpHttpRoute(registry: McpTurnRegistry): HttpRoute {
 		// Loopback only — the bind is already 127.0.0.1; this is belt-and-suspenders
 		// in case the bind guard is ever relaxed (same posture as auth:"operator").
 		if (!isLoopback(req.socket.remoteAddress ?? "")) {
+			log.warn("refused non-loopback mcp caller", { remote: req.socket.remoteAddress ?? "unknown" });
 			sendJson(res, 401, { error: "Unauthorized" });
 			return;
 		}
@@ -83,29 +122,23 @@ export function createMcpHttpRoute(registry: McpTurnRegistry): HttpRoute {
 			// Unknown/expired/malformed token — 404 (no distinction: no oracle).
 			// Never log the token itself; it is a live credential.
 			log.debug("rejected mcp request with unknown/expired token");
-			res.statusCode = 404;
-			res.end("Not found");
+			endPlain(res, 404, "Not found");
 			return;
 		}
 
 		const method = (req.method ?? "GET").toUpperCase();
 		if (method === "GET") {
 			// Optional server→client SSE channel — we never push, so decline.
-			res.statusCode = 405;
-			res.setHeader("Allow", "POST");
-			res.end("Method Not Allowed");
+			endPlain(res, 405, "Method Not Allowed", { Allow: "POST" });
 			return;
 		}
 		if (method === "DELETE") {
 			// Session teardown — the turn's lifecycle owns disposal; ack politely.
-			res.statusCode = 200;
-			res.end();
+			endPlain(res, 200);
 			return;
 		}
 		if (method !== "POST") {
-			res.statusCode = 405;
-			res.setHeader("Allow", "POST");
-			res.end("Method Not Allowed");
+			endPlain(res, 405, "Method Not Allowed", { Allow: "POST" });
 			return;
 		}
 
@@ -126,9 +159,34 @@ export function createMcpHttpRoute(registry: McpTurnRegistry): HttpRoute {
 			rpc?.method === "tools/call"
 				? (rpc.params as { name?: unknown } | undefined)?.name
 				: undefined;
+		// Per-call cancellation. The turn's signal alone is not enough: if the
+		// `claude` child dies (watchdog SIGKILL, turn abort) the socket closes, and
+		// without this the tool would keep running — executing a shell command or a
+		// billed render whose result nobody will ever read. Chain BOTH sources.
+		const ac = new AbortController();
+		const abort = (): void => {
+			if (!ac.signal.aborted) ac.abort();
+		};
+		if (turn.signal) {
+			if (turn.signal.aborted) abort();
+			else turn.signal.addEventListener("abort", abort, { once: true });
+		}
+		const onClose = (): void => {
+			// `close` also fires on a normal completed response — only abort when the
+			// peer vanished before we answered.
+			if (!res.writableEnded) abort();
+		};
+		req.on("close", onClose);
+
 		const started = Date.now();
-		const server = turnServer(turn);
-		const response = await server.handle(rpc, turn.signal);
+		let response: Awaited<ReturnType<McpServer["handle"]>>;
+		try {
+			const server = turnServer(turn);
+			response = await server.handle(rpc, ac.signal);
+		} finally {
+			req.off("close", onClose);
+			turn.signal?.removeEventListener("abort", abort);
+		}
 		if (typeof calledTool === "string") {
 			const result = (response?.result ?? {}) as { isError?: boolean };
 			log.info("tool call", {
@@ -155,6 +213,9 @@ export function createMcpHttpRoute(registry: McpTurnRegistry): HttpRoute {
 		match: "prefix",
 		auth: "none", // own token + loopback check inside the handler
 		skipSessionGuard: true, // JSON-RPC body has no sessionKey/agentId targeting
+		// Own the wall-clock budget — the 30s default would 408 the binary out from
+		// under a still-running tool. See MCP_ROUTE_TIMEOUT_MS.
+		timeoutMs: MCP_ROUTE_TIMEOUT_MS,
 		handler: handler as HttpRoute["handler"],
 	};
 }

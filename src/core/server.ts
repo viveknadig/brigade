@@ -5293,8 +5293,15 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 
 	// Publish the MCP tool-plane host now the loopback HTTP server is bound. The
 	// claude-cli harness backend registers each eligible turn's toolset + guard in
-	// `mcpTurnRegistry` and points the binary at `${baseUrl}/mcp/<token>`. Bound to
-	// loopback — the token-gated route is never remotely reachable.
+	// `mcpTurnRegistry` and points the binary at `${baseUrl}/mcp/<token>`.
+	//
+	// The server binds loopback, and the route re-checks `remoteAddress`. That is
+	// NOT the same as "unreachable remotely": `brigade expose` proxies HTTP from
+	// 127.0.0.1, so a tunnelled request passes the loopback check. It grants no
+	// INCREMENTAL capability — reaching the tunnel already means holding the expose
+	// bearer token, which carries operator rights over the gateway anyway — and a
+	// caller still needs the ephemeral per-turn 256-bit token. Stated plainly here
+	// so nobody later mistakes the loopback check for a remote-access boundary.
 	setActiveMcpToolPlaneHost({ baseUrl: `http://127.0.0.1:${port}`, registry: mcpTurnRegistry });
 
 	// Phase 7 — agent model resolved. Emits the standard
