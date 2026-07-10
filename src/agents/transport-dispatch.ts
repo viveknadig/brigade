@@ -90,3 +90,16 @@ export function __resetTransportDispatchCache(): void {
 	claudeCliStreamFn = undefined;
 	ollamaStreamFn = undefined;
 }
+
+/**
+ * Test seam — pre-seed the memoized transport for `api`.
+ *
+ * A dispatch test must observe ROUTING, not run the transport: invoking the real
+ * claude-cli one spawns the `claude` binary and writes to its stdin, and a test that
+ * abandons that child leaves the pipe to die after the test ends — which Node raises
+ * as an uncaught `write EPIPE`. Green locally, and it failed an npm publish in CI.
+ */
+export function __setBrigadeTransportForTests(api: unknown, fn: BrigadeStreamFn | undefined): void {
+	if (api === CLAUDE_CLI_API) claudeCliStreamFn = fn;
+	else if (api === OLLAMA_NATIVE_API) ollamaStreamFn = fn;
+}

@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import {
 	__resetTransportDispatchCache,
+	__setBrigadeTransportForTests,
 	installTransportDispatch,
 	makeTransportDispatch,
 	resolveBrigadeTransport,
@@ -44,15 +45,28 @@ test("makeTransportDispatch: a claude-cli model NEVER reaches Pi's base (no regi
 		calls.push("base");
 		throw new Error("No API provider registered for api: claude-cli");
 	}) as never;
-	const dispatch = makeTransportDispatch(base);
-	// The custom transport is returned instead — it spawns lazily, so simply
-	// asserting we didn't hit `base` proves the registry is out of the path.
-	assert.doesNotThrow(() => {
-		const res = (dispatch as any)({ api: "claude-cli", id: "claude-opus-4-8" }, { messages: [] }, undefined);
-		// It returns the transport's stream object (async); don't drain it here.
-		assert.ok(res !== undefined);
-	});
-	assert.deepEqual(calls, [], "base streamFn must not be consulted for claude-cli");
+	// Seed a FAKE transport. Invoking the REAL one spawns the `claude` binary and
+	// writes to its stdin; a test that abandons that child leaves the pipe to die
+	// after the test ends, which Node raises as an uncaught `write EPIPE`. That passed
+	// on a developer machine and failed the npm publish job in CI.
+	const seen: unknown[] = [];
+	const fake = ((...args: unknown[]) => {
+		seen.push(...args);
+		return "from-brigade-transport";
+	}) as never;
+	__resetTransportDispatchCache();
+	__setBrigadeTransportForTests("claude-cli", fake);
+
+	try {
+		const dispatch = makeTransportDispatch(base);
+		const model = { api: "claude-cli", id: "claude-opus-4-8" };
+		const ctx = { messages: [] };
+		assert.equal((dispatch as any)(model, ctx, undefined), "from-brigade-transport");
+		assert.deepEqual(calls, [], "base streamFn must not be consulted for claude-cli");
+		assert.deepEqual(seen, [model, ctx, undefined], "args reach the transport positionally");
+	} finally {
+		__resetTransportDispatchCache();
+	}
 });
 
 test("makeTransportDispatch: forwards all args positionally", () => {
