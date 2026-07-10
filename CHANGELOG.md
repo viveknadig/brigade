@@ -1,5 +1,39 @@
 # Changelog
 
+## [1.26.0](https://github.com/spinabot/brigade/compare/brigade-v1.25.3...brigade-v1.26.0) (2026-07-10)
+
+
+### Features
+
+* **agents:** harness-transcript layer — record what an external loop did ([af8f50c](https://github.com/spinabot/brigade/commit/af8f50c2de9bd8eea3447a53ce3900ed62557b4e))
+* claude-cli harness backend with Brigade's guarded tool-plane ([142be5f](https://github.com/spinabot/brigade/commit/142be5f2367cd3d4ae22f0bc152ca1cb55add58f))
+* **claude-cli:** live tool activity in the TUI ([1a2d2df](https://github.com/spinabot/brigade/commit/1a2d2dffcc8b5877ef57ab67726676de97026460))
+* **claude-cli:** memory MCP tool-plane on the harness backend ([5670190](https://github.com/spinabot/brigade/commit/56701906b4f2cfd022be77746ee3f1f1ffaf2a59))
+* **doctor:** warn when the memory moat is dark ([4999a76](https://github.com/spinabot/brigade/commit/4999a76611aa2ef480ca00719b0072509281a39e))
+* **exec-gate:** say why a shell command was allowed ([8b297e7](https://github.com/spinabot/brigade/commit/8b297e76ac440471f8ef79a9292c40936b2e877f))
+* **harness:** first-class harness backends; fix double-execution on re-prompt ([efd8048](https://github.com/spinabot/brigade/commit/efd804854750d5a55b707ca229c7521622d9cd2e))
+* **mcp:** gateway-hosted guarded tool-plane for the claude-cli harness ([15e8102](https://github.com/spinabot/brigade/commit/15e81021846bb8b1e47604f6ba970125711a3599))
+* **mcp:** log the tool-plane handshake so attachment is provable at a glance ([c4d3658](https://github.com/spinabot/brigade/commit/c4d365861fb096d51eaf9cf43efdc30fb3e3c8e1))
+* **mcp:** serve Brigade's guarded builtins so claude-cli has a filesystem ([849e2f1](https://github.com/spinabot/brigade/commit/849e2f1772b305e9421c16e674fa11caefeccddf))
+
+
+### Bug Fixes
+
+* **agents:** dispatch own transports directly, immune to duplicate pi-ai copies ([08046a4](https://github.com/spinabot/brigade/commit/08046a4c2070234d6af02c9afebde8a446b502ff))
+* **approvals:** cancel a pending approval when its turn is aborted ([3f92e7d](https://github.com/spinabot/brigade/commit/3f92e7de2dee3240c41446a2b68d9e159851e1da))
+* **claude-cli,mcp:** correct the bounds, containment and Pi-parity the audit disproved ([c039c5f](https://github.com/spinabot/brigade/commit/c039c5fdad96d77e509400ec6af6a935cfde0c4b))
+* **claude-cli:** contain the binary to Brigade's guarded tools; pin MCP conformance ([4e6011f](https://github.com/spinabot/brigade/commit/4e6011f2f903ff9917be42ce03fdfb447b559e69))
+* **claude-cli:** reinforce JSON for structured distiller turns ([41ee88f](https://github.com/spinabot/brigade/commit/41ee88fd2f9e3bfb185f928171878632e2156fd4))
+* **claude-cli:** report the turn's context size, not the binary's billing total ([3913f10](https://github.com/spinabot/brigade/commit/3913f10ef82004c2fa66fdc69c5da4255e73dbf0))
+* **claude-cli:** stop the full tool-plane telling the model not to use tools ([e83fbf7](https://github.com/spinabot/brigade/commit/e83fbf7a891a0dd31a87b606fd513bc2adc62d09))
+* **ctx:** stop reporting the pre-compaction context figure as the post one ([657b4a7](https://github.com/spinabot/brigade/commit/657b4a7a98dc29688810f9ac07d61a29a208761a))
+* **harness:** an in-turn retry must not re-run the tools the turn already ran ([5810a8a](https://github.com/spinabot/brigade/commit/5810a8acbaf90ec4ba26bf42122ebfb5c1e076b9))
+* **harness:** don't kill a child that is waiting on Brigade ([4326b56](https://github.com/spinabot/brigade/commit/4326b56fd57c58848f6de430806236a4fba490a3))
+* **mcp:** harden the tool-plane for long-lived gateways ([59c1e45](https://github.com/spinabot/brigade/commit/59c1e4555274645ddbde211e14dc805e5ed392fb))
+* **mcp:** mirror Pi's tool-call pipeline exactly (validate, abort, images) ([91cbc3b](https://github.com/spinabot/brigade/commit/91cbc3b3def867a8421424490d1bba0bf4329b31))
+* **mcp:** stop the 30s dispatcher timeout guillotining in-flight tools ([2fdca27](https://github.com/spinabot/brigade/commit/2fdca27d0c02570d6ef82cbd097e598783f76673))
+* **tui:** a harness turn's post-tool text rendered above its own tool chip ([be34804](https://github.com/spinabot/brigade/commit/be3480486c146f1f0d53410d6e9ff6f36d9bb584))
+
 ## [1.25.3](https://github.com/spinabot/brigade/compare/brigade-v1.25.2...brigade-v1.25.3) (2026-07-07)
 
 
