@@ -1262,7 +1262,23 @@ export async function wireConnectUi(
 	// themselves.
 
 	// State snapshots from the gateway — every mutation pushes one.
-	client.on("state", (snap) => {
+	//
+	// Extracted from the `on("state")` listener so startup can PULL one, because the
+	// PUSH is a race we do not always win.
+	//
+	// The gateway sends one snapshot immediately after `helloOk` (server.ts) — before
+	// any user action. `runConnectCommand` then registers this listener. With no flags
+	// there is nothing between `connect()` and registration, so the frame lands. But
+	// `--agent` awaits `agents.list` and `--session` awaits `sessions.list` FIRST; each
+	// await yields to I/O, the snapshot is dispatched with no listener attached, and it
+	// is gone. Nothing re-sends it.
+	//
+	// This listener is also where the lane subscription fires and where `doResume()`
+	// loads the thread's history. So the flagged launches sat blank — header `? · ?`,
+	// no transcript — until the operator typed something and a state CHANGE finally
+	// triggered a broadcast. `--session` made it undeniable: it opened exactly the
+	// right thread and showed none of it.
+	const applyStateSnapshot = (snap: SessionStateSnapshot): void => {
 		lastSnapshot = snap;
 		maybeAnnounceUpdate(snap.updateAvailable ?? null);
 		// `snap.isAgentRunning` is AGENT-wide — it goes true when ANY session
@@ -1322,7 +1338,22 @@ export async function wireConnectUi(
 			});
 		}
 		updateHeader();
-	});
+	};
+	client.on("state", applyStateSnapshot);
+
+	// Ask, rather than depend on having caught the push. Idempotent with the broadcast
+	// above (same handler, latest snapshot wins), and it makes the launch deterministic
+	// whether or not a pre-wiring `await` swallowed the connect-time frame. This is what
+	// seeds the binding, fires the lane subscription, and drives `doResume()`.
+	// Best-effort: a gateway that cannot answer `get-state` leaves the old behaviour.
+	void (async () => {
+		try {
+			const snap = (await client.request("get-state")) as SessionStateSnapshot | undefined;
+			if (snap) applyStateSnapshot(snap);
+		} catch {
+			/* the next broadcast will do it */
+		}
+	})();
 
 	// Tool-approval prompt — the gateway broadcasts an `approval-request`
 	// event when a gated tool (today: `bash`) needs operator consent. We
