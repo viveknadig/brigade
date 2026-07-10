@@ -275,6 +275,58 @@ test("usage.input is the FIRST step's prompt, not the binary's cumulative total"
 	assert.ok(message.usage.input / 200_000 < 0.5, "a healthy session must not look overfull");
 });
 
+test("usage.output is the streamed value, NOT the result frame's cumulative total", async () => {
+	// The `result` frame's usage is cumulative over every internal step — that is why
+	// `input` is guarded. `output_tokens` on the SAME object is just as cumulative
+	// (every step's generation, tool-call JSON included), and `calculateContextTokens`
+	// is `input + output`. Overwriting output re-opened half of the very inflation the
+	// input guard exists to prevent.
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":40000}}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}',
+		'{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":300}}}',
+		'{"type":"result","subtype":"success","result":"hi","usage":{"input_tokens":999999,"output_tokens":90000}}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.usage.input, 40000, "first step's prompt");
+	assert.equal(message.usage.output, 300, "the streamed per-step value, not 90000");
+	assert.notEqual(message.usage.output, 90000, "the run's cumulative generation must not become our context");
+});
+
+test("text_start and text_end agree on contentIndex even when thinking arrives later", async () => {
+	// `textIdx()` used to be a function of MUTABLE state (`thinkingStarted ? 1 : 0`).
+	// A step that wrote text BEFORE ever thinking, followed by a later step that opened
+	// a thinking block, reported text_start@0 and text_end@1 for the same block.
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"acting first"}}}',
+		// a later internal step finally thinks
+		'{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"thinking"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}}',
+		'{"type":"result","subtype":"success","result":"acting first"}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { events } = await drain(fn(MODEL, CTX, undefined) as never);
+	const start = events.find((e: any) => e.type === "text_start");
+	const end = events.find((e: any) => e.type === "text_end");
+	assert.equal(start.contentIndex, 0);
+	assert.equal(end.contentIndex, 0, "the same logical block cannot change index mid-flight");
+});
+
+test("the no-partials fallback separates multiple text blocks like the streaming path", async () => {
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"assistant","message":{"content":[{"type":"text","text":"First."},{"type":"text","text":"Second."}]}}',
+		'{"type":"result","subtype":"success","result":"First.\\n\\nSecond."}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.content.find((c: any) => c.type === "text")?.text, "First.\n\nSecond.");
+});
+
 test("usage.input falls back to the result frame when no partial frames stream", async () => {
 	// An older CLI emits no message_start; the run is a single step, so its cumulative
 	// total IS that step's prompt. Filling in a missing input is correct there.

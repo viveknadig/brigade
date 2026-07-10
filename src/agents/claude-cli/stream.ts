@@ -237,7 +237,14 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				thinkingEnded = true;
 				stream.push({ type: "thinking_end", contentIndex: 0, content: accumulatedThinking, partial: partial() });
 			};
-			const textIdx = () => (thinkingStarted ? 1 : 0);
+			// PINNED at `text_start`, never recomputed. It used to be
+			// `() => (thinkingStarted ? 1 : 0)` — a function of MUTABLE state. When a step
+			// emitted text before ever thinking, and a LATER step opened a thinking block,
+			// the same logical text block reported `text_start` at index 0 and its
+			// `text_delta`/`text_end` at index 1. A consumer that keyed on `contentIndex`
+			// would have torn the block in half.
+			let textContentIndex = 0;
+			const textIdx = () => textContentIndex;
 			const closeText = () => {
 				if (!textStarted || textClosed) return;
 				textClosed = true;
@@ -257,6 +264,9 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				ensureStarted();
 				if (!textStarted) {
 					textStarted = true;
+					// Pin the index for the whole block: whether thinking preceded us is
+					// settled NOW and cannot change under later steps.
+					textContentIndex = thinkingStarted ? 1 : 0;
 					stream.push({ type: "text_start", contentIndex: textIdx(), partial: partial() });
 				}
 				accumulatedText += delta;
@@ -363,6 +373,11 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				if (!msg || accumulatedText) return;
 				for (const block of msg.content ?? []) {
 					if (block?.type === "text" && typeof block.text === "string" && block.text) {
+						// Separate here too. A frame can carry several text blocks, and the
+						// streaming path would have put a paragraph break between them — this
+						// fallback (an older CLI that emits no partial frames) must not render
+						// "block1block2" where the streaming path renders two paragraphs.
+						separateTextBlock();
 						onTextDelta(block.text);
 					}
 				}
@@ -488,11 +503,17 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 								// read as 889% of a 200k window and "compacted" a healthy
 								// session, twice, discarding real history each time.
 								//
-								// So it may only ever FILL IN a missing input (an older CLI that
+								// So it may only ever FILL IN a missing value (an older CLI that
 								// streams no partial frames, where the run is a single step and
-								// the cumulative total IS that step's prompt).
+								// the cumulative total IS that step's usage).
+								//
+								// BOTH fields, symmetrically. `output_tokens` on this same frame is
+								// just as cumulative as `input_tokens` — every step's generation,
+								// tool-call JSON included — and `calculateContextTokens` is
+								// `input + output`. Guarding only the input left the other half of
+								// the very inflation this guard exists to prevent.
 								if (u.input && usageInput === 0) usageInput = u.input;
-								if (u.output) usageOutput = u.output;
+								if (u.output && usageOutput === 0) usageOutput = u.output;
 							}
 							break;
 						}
