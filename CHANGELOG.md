@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.27.1](https://github.com/spinabot/brigade/compare/brigade-v1.27.0...brigade-v1.27.1) (2026-07-10)
+
+
+### Bug Fixes
+
+* **observability:** a sub-agent turn was invisible in the gateway console ([4ef52a7](https://github.com/spinabot/brigade/commit/4ef52a78228897903c01688ccae586d3b3693bb6))
+* **observability:** make a sub-agent turn visible in the gateway console ([25778a5](https://github.com/spinabot/brigade/commit/25778a5bfb97a824aebecf6be36effb14422b1b7))
+
 ## [1.27.0](https://github.com/spinabot/brigade/compare/brigade-v1.26.1...brigade-v1.27.0) (2026-07-10)
 
 
