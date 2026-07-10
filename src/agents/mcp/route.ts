@@ -16,22 +16,33 @@
 import { randomBytes } from "node:crypto";
 
 import type { BeforeToolCallContext } from "@earendil-works/pi-agent-core";
+import { validateToolArguments } from "@earendil-works/pi-ai/base";
 
-import { createMcpServer, type McpServer, type McpToolResult, type McpServerTool } from "./protocol.js";
+import { createMcpServer, type McpServer, type McpContentBlock, type McpToolResult, type McpServerTool } from "./protocol.js";
 import type { McpTurnContext } from "./tool-plane-host.js";
 
-/** Map a Brigade tool result's content blocks to MCP text content. Non-text
- *  blocks (images) are summarized — the tool-plane consumes text. */
+/**
+ * Map a Brigade tool result's content blocks to MCP content. Pi's loop hands the
+ * model text AND image blocks; MCP carries both, so an image result (e.g.
+ * `analyze_media`) passes through intact instead of degrading to a placeholder.
+ */
 function mapContent(content: unknown): McpToolResult["content"] {
 	if (!Array.isArray(content)) return [{ type: "text", text: "" }];
-	const out: McpToolResult["content"] = [];
+	const out: McpContentBlock[] = [];
 	for (const block of content) {
-		const b = block as { type?: unknown; text?: unknown };
-		if (b?.type === "text" && typeof b.text === "string") out.push({ type: "text", text: b.text });
-		else out.push({ type: "text", text: `[${String(b?.type ?? "non-text")} content omitted]` });
+		const b = block as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
+		if (b?.type === "text" && typeof b.text === "string") {
+			out.push({ type: "text", text: b.text });
+		} else if (b?.type === "image" && typeof b.data === "string") {
+			out.push({ type: "image", data: b.data, mimeType: typeof b.mimeType === "string" ? b.mimeType : "image/png" });
+		} else {
+			out.push({ type: "text", text: `[${String(b?.type ?? "non-text")} content omitted]` });
+		}
 	}
 	return out.length > 0 ? out : [{ type: "text", text: "" }];
 }
+
+const errorResult = (text: string): McpToolResult => ({ content: [{ type: "text", text }], isError: true });
 
 /**
  * Build the MCP server that fronts ONE turn's toolset. Each MCP tool's handler:
@@ -49,20 +60,43 @@ export function buildMcpTurnServer(turn: McpTurnContext, opts: { serverName?: st
 		// serialization, leaving a clean `{type:"object", properties, required}`.
 		inputSchema: tool.parameters as unknown as McpServerTool["inputSchema"],
 		handler: async (args: Record<string, unknown>, signal?: AbortSignal): Promise<McpToolResult> => {
-			// (1) GUARD — same composed chain the Pi loop installs, closing over the
-			// turn's gateCtxRef. Construct the ctx shape the guard reads defensively.
-			const guardCtx = { toolCall: { name: tool.name, arguments: args } } as unknown as BeforeToolCallContext;
-			const verdict = await turn.guard(guardCtx, signal);
-			if (verdict?.block) {
-				return { content: [{ type: "text", text: verdict.reason ?? "Tool call blocked." }], isError: true };
+			// Mirror Pi's own `prepareToolCall` pipeline exactly — validate, guard on
+			// the VALIDATED args, re-check abort, then execute. Skipping any step
+			// makes an MCP call subtly different from a Pi-loop dispatch, which is
+			// precisely the guarantee this plane is built on.
+
+			// (1) VALIDATE + COERCE against the tool's schema, using Pi's own
+			// validator. Pi does this BEFORE the guard, so the guard sees coerced
+			// args (exec-gate reads `command` as a string). Without it, a malformed
+			// call from the binary reaches `execute` raw. A failure is a tool error
+			// carrying the validator's message — exactly what Pi surfaces.
+			let validated: Record<string, unknown>;
+			try {
+				validated = validateToolArguments(tool as never, {
+					name: tool.name,
+					arguments: args,
+				} as never) as Record<string, unknown>;
+			} catch (e) {
+				return errorResult((e as Error).message);
 			}
-			// (2) EXECUTE the turn's OWN tool (ownerOnly wrap + origin already baked in).
+
+			// (2) GUARD — the turn's composed chain, closing over its gateCtxRef.
+			const guardCtx = { toolCall: { name: tool.name, arguments: validated }, args: validated } as unknown as BeforeToolCallContext;
+			const verdict = await turn.guard(guardCtx, signal);
+			if (verdict?.block) return errorResult(verdict.reason ?? "Tool call blocked.");
+
+			// (3) ABORT between guard and execute — an approval can take minutes, and
+			// the turn (or the binary) may die while we wait. Pi checks here too; without
+			// it an aborted turn still runs the tool.
+			if (signal?.aborted) return errorResult("Operation aborted");
+
+			// (4) EXECUTE the turn's OWN tool (ownerOnly wrap + origin already baked in).
 			const callId = `mcp-${randomBytes(6).toString("hex")}`;
 			try {
-				const result = await tool.execute(callId, args as never, signal);
+				const result = await tool.execute(callId, validated as never, signal);
 				return { content: mapContent((result as { content?: unknown })?.content) };
 			} catch (e) {
-				return { content: [{ type: "text", text: (e as Error).message }], isError: true };
+				return errorResult((e as Error).message);
 			}
 		},
 	}));

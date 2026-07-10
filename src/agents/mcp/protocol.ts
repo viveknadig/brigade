@@ -32,9 +32,16 @@ export interface JsonRpcResponse {
 	error?: { code: number; message: string };
 }
 
+/** One MCP content block. Images are first-class in the MCP spec, so a tool that
+ *  returns them (e.g. `analyze_media`) can hand them to the model intact rather
+ *  than degrading to a "[image omitted]" placeholder. */
+export type McpContentBlock =
+	| { type: "text"; text: string }
+	| { type: "image"; data: string; mimeType: string };
+
 /** MCP `CallToolResult` shape — `content` is the model-facing payload. */
 export interface McpToolResult {
-	content: Array<{ type: "text"; text: string }>;
+	content: McpContentBlock[];
 	isError?: boolean;
 }
 

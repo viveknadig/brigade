@@ -74,7 +74,9 @@ test("ownerOnly refusal (execute throws) surfaces as isError with the message", 
 	assert.match((res?.result as any).content[0].text, /restricted to the workspace owner/);
 });
 
-test("the abort signal threads into BOTH guard and execute", async () => {
+test("an already-aborted signal reaches the guard, and execute is short-circuited", async () => {
+	// Matches Pi's prepareToolCall: the signal is threaded into the guard, then
+	// re-checked before execute — so an aborted turn never runs the tool.
 	const seen: Record<string, boolean> = {};
 	const tool = fakeTool("slow", {
 		execute: async (_id: string, _p: unknown, signal?: AbortSignal) => {
@@ -89,12 +91,89 @@ test("the abort signal threads into BOTH guard and execute", async () => {
 	const server = buildMcpTurnServer(turn({ customTools: [tool], guard }));
 	const ac = new AbortController();
 	ac.abort();
-	await server.handle(req("tools/call", { name: "slow", arguments: {} }), ac.signal);
-	assert.deepEqual(seen, { guard: true, execute: true });
+	const res = await server.handle(req("tools/call", { name: "slow", arguments: {} }), ac.signal);
+	assert.equal(seen.guard, true, "guard still sees the signal");
+	assert.equal(seen.execute, undefined, "execute must NOT run for an aborted turn");
+	assert.equal((res?.result as any).isError, true);
+	assert.match((res?.result as any).content[0].text, /aborted/i);
 });
 
 test("a tool not in the turn's set is unknown (-32602), never fabricated", async () => {
 	const server = buildMcpTurnServer(turn({ customTools: [fakeTool("write_memory")] }));
 	const res = await server.handle(req("tools/call", { name: "send_message", arguments: {} }));
 	assert.equal(res?.error?.code, -32602);
+});
+
+/* ────────── parity with Pi's prepareToolCall pipeline (agent-loop.js) ────────── */
+
+function strictTool(seen: any[] = []): AnyBrigadeTool {
+	return {
+		name: "shell",
+		label: "shell",
+		description: "runs a command",
+		parameters: Type.Object({ command: Type.String() }),
+		execute: async (_id: string, params: any, signal?: AbortSignal) => {
+			seen.push({ params, aborted: signal?.aborted });
+			return { content: [{ type: "text", text: "ran" }], details: undefined };
+		},
+	} as AnyBrigadeTool;
+}
+
+test("args are validated against the schema BEFORE execute (missing required → tool error)", async () => {
+	const seen: any[] = [];
+	const server = buildMcpTurnServer(turn({ customTools: [strictTool(seen)] }));
+	const res = await server.handle(req("tools/call", { name: "shell", arguments: {} }));
+	assert.equal((res?.result as any).isError, true);
+	assert.match((res?.result as any).content[0].text, /required/i);
+	assert.deepEqual(seen, [], "execute must not run on invalid args");
+});
+
+test("the GUARD sees Pi-coerced args, not raw MCP args (exec-gate reads command as a string)", async () => {
+	const guardSaw: unknown[] = [];
+	const seen: any[] = [];
+	const guard = async (ctx: any) => {
+		guardSaw.push(ctx.toolCall.arguments);
+		return undefined;
+	};
+	const server = buildMcpTurnServer(turn({ customTools: [strictTool(seen)], guard }));
+	// binary sends a number; Pi's validator coerces to "42" before anything sees it
+	await server.handle(req("tools/call", { name: "shell", arguments: { command: 42 } }));
+	assert.deepEqual(guardSaw, [{ command: "42" }], "guard receives validated+coerced args");
+	assert.equal(seen[0].params.command, "42", "execute receives the same validated args");
+});
+
+test("an abort between guard and execute prevents the tool from running", async () => {
+	const seen: any[] = [];
+	const ac = new AbortController();
+	// the guard is where an approval would block; abort while it is 'waiting'
+	const guard = async () => {
+		ac.abort();
+		return undefined;
+	};
+	const server = buildMcpTurnServer(turn({ customTools: [strictTool(seen)], guard }));
+	const res = await server.handle(req("tools/call", { name: "shell", arguments: { command: "rm -rf /" } }), ac.signal);
+	assert.equal((res?.result as any).isError, true);
+	assert.match((res?.result as any).content[0].text, /aborted/i);
+	assert.deepEqual(seen, [], "no ghost execution after abort");
+});
+
+test("image results pass through as MCP image content, not a placeholder", async () => {
+	const imgTool = {
+		name: "analyze_media",
+		label: "analyze_media",
+		description: "img",
+		parameters: Type.Object({}),
+		execute: async () => ({
+			content: [
+				{ type: "text", text: "here it is" },
+				{ type: "image", data: "AAAA", mimeType: "image/jpeg" },
+			],
+			details: undefined,
+		}),
+	} as unknown as AnyBrigadeTool;
+	const server = buildMcpTurnServer(turn({ customTools: [imgTool] }));
+	const res = await server.handle(req("tools/call", { name: "analyze_media", arguments: {} }));
+	const content = (res?.result as any).content;
+	assert.equal(content[0].type, "text");
+	assert.deepEqual(content[1], { type: "image", data: "AAAA", mimeType: "image/jpeg" });
 });

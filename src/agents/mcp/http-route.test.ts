@@ -204,7 +204,9 @@ test("client disconnect aborts the in-flight tool (no ghost execution)", async (
 	const p = (route.handler as any)(req, res);
 	(req as any).emit("close"); // peer vanished (claude child SIGKILLed / turn aborted)
 	await p;
-	assert.equal(sawAborted, true, "tool must observe the abort when the peer disconnects");
+	// Stronger than "the tool saw the signal": it must not run at all. A billed
+	// render or a shell command whose result nobody will read must never start.
+	assert.equal(sawAborted, undefined, "no ghost execution once the peer is gone");
 });
 
 test("turn-level abort propagates into the tool call", async () => {
@@ -223,10 +225,11 @@ test("turn-level abort propagates into the tool call", async () => {
 	ac.abort();
 	const { registry, token } = registerTurn({ customTools: [tool], signal: ac.signal });
 	const route = createMcpHttpRoute(registry);
-	const { res } = fakeRes();
+	const { res, state } = fakeRes();
 	await (route.handler as any)(
 		fakeReq({ url: `/mcp/${token}`, body: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "probe", arguments: {} } } }),
 		res,
 	);
-	assert.equal(sawAborted, true);
+	assert.equal(sawAborted, undefined, "an aborted turn must not execute the tool");
+	assert.match(JSON.parse(state.body).result.content[0].text, /aborted/i);
 });
