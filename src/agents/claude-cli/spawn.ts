@@ -81,6 +81,9 @@ export type SpawnKillReason = "no-output-timeout" | "overall-timeout" | "aborted
 export interface ClaudeCliRunHandle {
 	/** Async iterator of parsed stdout frames (blank/garbage lines skipped). */
 	frames: AsyncGenerator<ClaudeCliFrame>;
+	/** Suspend the liveness watchdogs while the child blocks on a Brigade tool
+	 *  call; the returned fn resumes them. Nested pauses are counted. */
+	pause: () => () => void;
 	/** Resolves once the process exits: its code, and any kill reason we forced. */
 	done: Promise<{ code: number | null; killReason?: SpawnKillReason; stderr: string }>;
 }
@@ -164,6 +167,12 @@ export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 	// ── watchdog timers ──
 	let noOutputTimer: NodeJS.Timeout | undefined;
 	let overallTimer: NodeJS.Timeout | undefined;
+	// Nested pause depth + the wall-clock deadline for the hard ceiling. Time spent
+	// PAUSED (i.e. time Brigade spent executing a tool the child asked for) does not
+	// count against the child's budget — the deadline slides forward by that much.
+	let pauseDepth = 0;
+	let pausedAt = 0;
+	let overallDeadline = Date.now() + overallMs;
 	const clearTimers = () => {
 		if (noOutputTimer) clearTimeout(noOutputTimer);
 		if (overallTimer) clearTimeout(overallTimer);
@@ -180,13 +189,45 @@ export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 		}
 	};
 	const armNoOutput = () => {
+		if (pauseDepth > 0) return; // Brigade is working; the child is not wedged.
 		if (noOutputTimer) clearTimeout(noOutputTimer);
 		noOutputTimer = setTimeout(() => kill("no-output-timeout"), noOutputMs);
 		// Don't keep the event loop alive purely for the watchdog.
 		noOutputTimer.unref?.();
 	};
-	overallTimer = setTimeout(() => kill("overall-timeout"), overallMs);
-	overallTimer.unref?.();
+	const armOverall = (ms: number) => {
+		if (overallTimer) clearTimeout(overallTimer);
+		overallTimer = setTimeout(() => kill("overall-timeout"), Math.max(ms, 0));
+		overallTimer.unref?.();
+	};
+
+	/**
+	 * Suspend both watchdogs while the child blocks on a Brigade tool call. The
+	 * child writes NOTHING to stdout for that whole window — a `spawn_agent` may
+	 * run a full sub-agent turn, a `generate_video` has its own 20-minute budget,
+	 * an exec-gated `bash` waits on the operator — so the liveness timers would
+	 * otherwise kill a perfectly healthy process for waiting on us. Brigade bounds
+	 * that time itself (every tool carries its own timeout).
+	 */
+	const pauseWatchdogs = (): (() => void) => {
+		if (settled) return () => {};
+		if (pauseDepth++ === 0) {
+			pausedAt = Date.now();
+			clearTimers();
+		}
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			if (--pauseDepth > 0 || settled) return;
+			// Give back the time we spent working, then rearm.
+			overallDeadline += Date.now() - pausedAt;
+			armNoOutput();
+			armOverall(overallDeadline - Date.now());
+		};
+	};
+
+	armOverall(overallMs);
 	armNoOutput();
 
 	const onAbort = () => kill("aborted");
@@ -277,5 +318,5 @@ export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 		}
 	}
 
-	return { frames: frames(), done: exit };
+	return { frames: frames(), done: exit, pause: pauseWatchdogs };
 }

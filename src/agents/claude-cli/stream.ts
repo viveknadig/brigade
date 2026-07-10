@@ -31,6 +31,7 @@ import {
 	CLAUDE_CLI_PROVIDER,
 } from "./catalog.js";
 import { buildClaudeCliHttpMcpConfig, buildClaudeCliMcpConfig, readClaudeCliToolPlane } from "./tool-plane.js";
+import { registerHarnessWatchdog, unregisterHarnessWatchdog } from "../harness/watchdog.js";
 import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 
 const log = createSubsystemLogger("claude-cli");
@@ -299,6 +300,7 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 			};
 
 			let handle: ReturnType<typeof spawnClaudeCli> | undefined;
+			let watchdogToken = "";
 			try {
 				const ctx = (context ?? {}) as { systemPrompt?: string; messages?: CtxMessage[] };
 				const prompt = serializeConversationPrompt(ctx.messages ?? []);
@@ -315,6 +317,7 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				// tool-less on every backend). buildClaudeCliMcpConfig itself fails open
 				// (undefined) when the CLI entry path or agent id can't be resolved safely.
 				const toolPlane = readClaudeCliToolPlane(context);
+				const mcpHttpUrl = toolPlane?.mcpHttpUrl;
 				// Precedence: a STRUCTURED distiller turn gets NO tools (every backend).
 				// Otherwise, if the gateway registered this turn's FULL guarded surface,
 				// hand the binary that loopback HTTP endpoint; else fall back to the owner
@@ -353,6 +356,16 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 					signal: options?.signal as AbortSignal | undefined,
 					spawnFn: opts.spawnFn,
 				});
+
+				// While the binary blocks on one of OUR tool calls it writes nothing to
+				// stdout, so its liveness watchdogs would eventually kill a perfectly
+				// healthy child for waiting on us (a `spawn_agent` runs a whole sub-agent
+				// turn; `generate_video` has its own 20-minute budget). Publish the
+				// child's pause control under this turn's tool-plane token so the MCP
+				// route can suspend them for exactly that window. Full-plane turns only —
+				// the memory-only stdio config carries no token.
+				watchdogToken = mcpHttpUrl ? (/\/mcp\/([0-9a-f]{64})$/.exec(mcpHttpUrl)?.[1] ?? "") : "";
+				if (watchdogToken) registerHarnessWatchdog(watchdogToken, { pause: handle.pause });
 
 				for await (const frame of handle.frames) {
 					switch (frame.type) {
@@ -453,6 +466,8 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 					}),
 				});
 			} finally {
+				// The child is gone; its pause control must not outlive it.
+				if (watchdogToken) unregisterHarnessWatchdog(watchdogToken);
 				stream.end();
 			}
 		};

@@ -24,6 +24,7 @@ import type { HttpRoute } from "../extensions/types.js";
 import { buildMcpTurnServer } from "./route.js";
 import type { JsonRpcRequest, McpServer } from "./protocol.js";
 import type { McpTurnContext, McpTurnRegistry } from "./tool-plane-host.js";
+import { pauseHarnessWatchdog } from "../harness/watchdog.js";
 
 const log = createSubsystemLogger("mcp/tool-plane");
 
@@ -178,12 +179,22 @@ export function createMcpHttpRoute(registry: McpTurnRegistry): HttpRoute {
 		};
 		req.on("close", onClose);
 
+		// While WE run the tool, the harness child sits silent, blocked on this
+		// response. Its liveness watchdogs would kill it for waiting on us — a
+		// `spawn_agent` runs a whole sub-agent turn (which may itself pause on two
+		// five-minute approvals), `generate_video` has a 20-minute budget of its
+		// own. Suspend them for exactly this window; every tool already carries its
+		// own timeout, so the child is never left unbounded. No-op for the
+		// memory-only stdio plane, which has no token.
+		const resumeWatchdog = typeof calledTool === "string" ? pauseHarnessWatchdog(token) : () => {};
+
 		const started = Date.now();
 		let response: Awaited<ReturnType<McpServer["handle"]>>;
 		try {
 			const server = turnServer(turn);
 			response = await server.handle(rpc, ac.signal);
 		} finally {
+			resumeWatchdog();
 			req.off("close", onClose);
 			turn.signal?.removeEventListener("abort", abort);
 		}
