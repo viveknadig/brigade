@@ -147,6 +147,7 @@ import { bootRuntimeContext, enableConfigLiveRefresh } from "../storage/boot.js"
 import { onConfigCachePrimed } from "../storage/config-cache.js";
 import { tryGetRuntimeContext } from "../storage/runtime-context.js";
 import { createSubsystemLogger } from "../logging/subsystem-logger.js";
+import { checkForUpdate } from "./update-check.js";
 import {
 	DEFAULT_AGENT_ID,
 	resolveAgentDir,
@@ -1627,6 +1628,9 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// session between turns we cache the last-known values: seeded from the
 	// model at boot, refreshed from the in-flight session during each turn.
 	let lastContextUsagePercent: number | null = null;
+	// Filled once, in the background, shortly after listen. Rides every subsequent
+	// state snapshot so an attaching client can ASK the operator. Never acted on here.
+	let latestUpdate: { current: string; latest: string } | undefined;
 	let lastMessageCount = 0;
 	let cachedSupportsThinking = !!args.model.reasoning;
 	let cachedThinkingLevels: string[] = deriveThinkingLevels(args.model);
@@ -1741,6 +1745,7 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			thinkingLevel: rt.thinkingLevel,
 			supportsThinking,
 			availableThinkingLevels,
+			...(latestUpdate ? { updateAvailable: latestUpdate } : {}),
 			contextUsagePercent: lastContextUsagePercent,
 			totalTokensIn: totalIn,
 			totalTokensOut: totalOut,
@@ -5319,6 +5324,25 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 	// caller still needs the ephemeral per-turn 256-bit token. Stated plainly here
 	// so nobody later mistakes the loopback check for a remote-access boundary.
 	setActiveMcpToolPlaneHost({ baseUrl: `http://127.0.0.1:${port}`, registry: mcpTurnRegistry });
+
+	// Is a newer Brigade published? Fire-and-forget: a listening gateway must never
+	// wait on the npm registry, and an offline machine must boot in silence. The
+	// result rides the next state snapshot to every attached client, which ASKS the
+	// operator — we never update anything on our own. See `core/update-check.ts`.
+	void checkForUpdate()
+		.then((found) => {
+			if (!found) return;
+			latestUpdate = found;
+			createSubsystemLogger("update").info("a newer Brigade is available", {
+				current: found.current,
+				latest: found.latest,
+				hint: "run `brigade update` when convenient — nothing under ~/.brigade is touched",
+			});
+			broadcastStateAllBindings();
+		})
+		.catch(() => {
+			/* checkForUpdate never rejects; this is belt for a future refactor */
+		});
 
 	// Phase 7 — agent model resolved. Emits the standard
 	// `agent model: <provider>/<model>` line for the boot agent.

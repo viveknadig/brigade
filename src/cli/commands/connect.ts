@@ -50,6 +50,8 @@ import { BrigadeClient } from "../../tui/client.js";
 import { loadConfig } from "../../core/config.js";
 import { resolveClientToken } from "../../core/gateway-auth.js";
 import { asstKey, clipOneLine, extractUserText, joinToolResultText } from "./connect-transcript.js";
+import { UPDATE_PRESERVES_MESSAGE } from "../../core/update-check.js";
+import { runUpdateCommand } from "./update.js";
 import { ApprovalPrompt, type ApprovalResolution } from "../../tui/approval-prompt.js";
 import type { AgentSummary, EventPayload, ModelSummary, SessionStateSnapshot, SessionSummary } from "../../protocol.js";
 import {
@@ -477,6 +479,28 @@ export async function wireConnectUi(
 		removeChild(activeLoader);
 		activeLoader = null;
 	};
+
+	// A newer Brigade is published. Say so ONCE per attach — every state mutation
+	// pushes a snapshot, and a notice that reprints on each one is an advert.
+	//
+	// It asks; it never acts. An update restarts the gateway, and the operator may be
+	// mid-turn. It also answers the question they will actually have — "will this eat
+	// my work?" — before they have to ask it.
+	let announcedUpdate = false;
+	const maybeAnnounceUpdate = (upd: { current: string; latest: string } | null): void => {
+		if (!upd || announcedUpdate) return;
+		announcedUpdate = true;
+		insertBeforeEditor(
+			new Text(
+				`  ${brand.amber("↑")} ${brand.dim(`Brigade ${upd.latest} is available — you're on ${upd.current}.`)}\n` +
+					`    ${brand.dim(UPDATE_PRESERVES_MESSAGE)}\n` +
+					`    ${brand.dim("Update now?")} ${chalk.bold("/update")} ${brand.dim("· or later, from any shell:")} ${chalk.bold("brigade update")}`,
+				0,
+				0,
+			),
+		);
+		tui.requestRender();
+	};
 	// `asstKey` (identity key for an assistant block) is imported from
 	// `connect-transcript.js` so the live path + the resume rebuild + the unit
 	// tests all share one definition.
@@ -662,6 +686,10 @@ export async function wireConnectUi(
 					.filter((v) => v.startsWith(prefix.toLowerCase()))
 					.map((v) => ({ value: v, label: v }));
 			},
+		},
+		{
+			name: "update",
+			description: "install the newer Brigade (your sessions, memory and config are untouched)",
 		},
 		{
 			name: "allow-all",
@@ -1174,6 +1202,7 @@ export async function wireConnectUi(
 	// State snapshots from the gateway — every mutation pushes one.
 	client.on("state", (snap) => {
 		lastSnapshot = snap;
+		maybeAnnounceUpdate(snap.updateAvailable ?? null);
 		// `snap.isAgentRunning` is AGENT-wide — it goes true when ANY session
 		// of this agent has a turn running (a WhatsApp chat, spawned
 		// sub-agents, a cron run). Taking it as-is flipped THIS lane into
@@ -1797,6 +1826,7 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/provider [<name>]")} — switch model provider, or add a new one with an API key (no arg = list)\n` +
 						`- ${chalk.bold("/thinking <level>")} — set reasoning effort (off|minimal|low|medium|high|xhigh)\n` +
 						`- ${chalk.bold("/compact")} — summarize older turns to free up context\n` +
+						`- ${chalk.bold("/update")} — install a newer Brigade (sessions, memory and config are untouched)\n` +
 						`- ${chalk.bold("/allow-all <on|off>")} — skip shell-approval prompts for this session (safety guards still apply)\n` +
 						`- ${chalk.bold("/grant-skill <name> [--yes]")} — preview/approve a skill's declared commands so the agent runs them without asking\n` +
 						`- ${chalk.bold("/revoke-skill <name>")} — remove a skill's granted commands\n` +
@@ -2392,6 +2422,32 @@ export async function wireConnectUi(
 				);
 			}
 			return;
+		}
+
+		// /update — the operator answered "yes" to the update notice.
+		//
+		// Runs the REAL updater in this process, not a detached child: the TUI owns the
+		// terminal, so we hand it back first and let `brigade update` print its own npm
+		// output. It restarts the gateway itself. Nothing under ~/.brigade is touched,
+		// which is the thing the operator actually wants to know.
+		if (trimmed === "/update") {
+			editor.setText("");
+			const upd = lastSnapshot?.updateAvailable;
+			if (!upd) {
+				insertBeforeEditor(
+					new Text(`  ${brand.dim("You're on the latest published version.")}`, 0, 0),
+				);
+				tui.requestRender();
+				return true;
+			}
+			tui.stop();
+			process.stdout.write(
+				`\n${chalk.hex("#E8B34A")("↑")} Updating Brigade ${upd.current} → ${upd.latest}\n` +
+					`${chalk.dim(UPDATE_PRESERVES_MESSAGE)}\n` +
+					`${chalk.dim("The gateway restarts when this finishes; reconnect with")} ${chalk.bold("brigade connect")}.\n\n`,
+			);
+			const code = await runUpdateCommand({});
+			process.exit(code);
 		}
 
 		// /allow-all <on|off> — arm/disarm session-scoped exec approval bypass.

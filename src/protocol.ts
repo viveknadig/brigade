@@ -751,6 +751,13 @@ export interface SessionStateSnapshot {
 	isAgentRunning: boolean;
 	messageCount: number;
 	/**
+	 * A newer Brigade is published. Present only when one genuinely is: the check is
+	 * skipped for source checkouts, silent when the registry is unreachable, and never
+	 * offers a prerelease or a downgrade. The gateway REPORTS; the operator decides,
+	 * because updating restarts their gateway and they may be mid-turn.
+	 */
+	updateAvailable?: { current: string; latest: string } | null;
+	/**
 	 * True when the agent is in fresh-bootstrap mode AND no turn has happened
 	 * yet — i.e. BOOTSTRAP.md still exists on disk, IDENTITY.md has no Name
 	 * field set, and `messageCount === 0`. The connect TUI uses this to auto-
