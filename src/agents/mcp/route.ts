@@ -113,22 +113,35 @@ export function buildMcpTurnServer(turn: McpTurnContext, opts: { serverName?: st
 			};
 			emitTool({ type: "tool_execution_start", toolCallId: callId, toolName: tool.name, args: validated });
 
+			// Report the call to the harness-transcript layer, so the session records
+			// what the binary did. A transcript write must never break a tool call.
+			const record = (content: McpContentBlock[], isError: boolean): void => {
+				try {
+					turn.recordToolCall?.({ toolCallId: callId, toolName: tool.name, args: validated, content, isError });
+				} catch {
+					/* best-effort */
+				}
+			};
+
 			try {
 				const result = await tool.execute(callId, validated as never, signal);
 				const content = mapContent((result as { content?: unknown })?.content);
 				// Pi's `result` shape — connect.ts feeds it to summarizeToolResult().
 				emitTool({ type: "tool_execution_end", toolCallId: callId, toolName: tool.name, args: validated, result: { content }, isError: false });
+				record(content, false);
 				return { content };
 			} catch (e) {
 				const message = (e as Error).message;
+				const content: McpContentBlock[] = [{ type: "text", text: message }];
 				emitTool({
 					type: "tool_execution_end",
 					toolCallId: callId,
 					toolName: tool.name,
 					args: validated,
-					result: { content: [{ type: "text", text: message }] },
+					result: { content },
 					isError: true,
 				});
+				record(content, true);
 				return errorResult(message);
 			}
 		},

@@ -97,11 +97,16 @@ import {
 // exact same derivation this build uses.
 import { resolveSessionAccessPolicy } from "./tools/sessions/resolve-access.js";
 import { wrapStreamFnWithPayloadMutations } from "./payload-mutators.js";
-import { CLAUDE_CLI_PROVIDER, CLAUDE_CLI_SENTINEL_KEY } from "./claude-cli/catalog.js";
+import { CLAUDE_CLI_API, CLAUDE_CLI_PROVIDER, CLAUDE_CLI_SENTINEL_KEY } from "./claude-cli/catalog.js";
 import { ensureClaudeCliApiRegistered } from "./claude-cli/register.js";
 import { stampClaudeCliToolPlane } from "./claude-cli/tool-plane.js";
 import { makeTransportDispatch } from "./transport-dispatch.js";
 import { getActiveMcpToolPlaneHost } from "./mcp/tool-plane-host.js";
+import {
+  mergeHarnessRecordsIntoSession,
+  recordHarnessToolCall,
+  type HarnessToolRecord,
+} from "./harness-transcript.js";
 import { createGuardedBuiltinTools } from "./mcp/builtin-tools.js";
 import { ensureOllamaNativeApiRegistered } from "./ollama-native/register.js";
 import { migrateOllamaProviderToNative } from "../integrations/ollama.js";
@@ -1056,6 +1061,10 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   let brigadeGuard: BrigadeBeforeToolCallHook | undefined;
   let mcpToolPlaneUrl: string | undefined;
   let mcpToolPlaneDispose: (() => void) | undefined;
+  // Tool calls the external harness (the claude-cli binary) made on our behalf.
+  // Written to the JSONL as they happen; merged into the in-memory context once
+  // the turn stops streaming. See ./harness-transcript.ts.
+  const harnessToolMessages: unknown[] = [];
   if (sessionWithBeforeHook.agent) {
     // SHARED guard chain — identical to the one buildAgent installs:
     //   unknown-tool guard → loop detector → exec-gate.
@@ -1589,6 +1598,18 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
         sessionKey: resolved.sessionKey,
         // Lets the MCP route mint pi-shaped tool events for the TUI.
         runId,
+        // ...and record what the binary actually did into the transcript, so a
+        // resumed session, compaction and the next turn's replayed context all
+        // know a file was written / a command was run.
+        recordToolCall: (rec: HarnessToolRecord) => {
+          harnessToolMessages.push(
+            ...recordHarnessToolCall(session, rec, {
+              api: CLAUDE_CLI_API,
+              provider: args.provider,
+              model: args.modelId,
+            }),
+          );
+        },
       });
       mcpToolPlaneUrl = `${mcpHost.baseUrl}/mcp/${reg.token}`;
       mcpToolPlaneDispose = reg.dispose;
@@ -1944,6 +1965,12 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
     continuations > 0
       ? joinAssistantTextFrom(session as AgentSession, messageCountBeforeTurn)
       : extractLastAssistantText(session as AgentSession);
+
+  // Reconcile the in-memory context with the tool records already written to the
+  // JSONL. Done AFTER `reply` so the synthetic messages (which carry no text)
+  // cannot affect what the operator sees, and after streaming has stopped —
+  // mutating `agent.state.messages` mid-stream would race Pi's own loop.
+  mergeHarnessRecordsIntoSession(session, harnessToolMessages);
 
   // After-turn lifecycle:
   //

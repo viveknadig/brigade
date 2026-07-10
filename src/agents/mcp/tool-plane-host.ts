@@ -24,6 +24,7 @@ import { randomBytes } from "node:crypto";
 
 import type { BrigadeBeforeToolCallHook } from "../tool-guard.js";
 import type { AnyBrigadeTool } from "../tools/types.js";
+import type { HarnessToolRecord } from "../harness-transcript.js";
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 
 /**
@@ -47,6 +48,13 @@ export interface McpTurnContext {
 	/** The turn's run id. Present when the loop registered us (always, in the
 	 *  gateway); required to mint pi-shaped tool events the TUI can render. */
 	runId?: string;
+	/**
+	 * Report a completed tool call so the harness-transcript layer can record it
+	 * (see `../harness-transcript.ts`). Without this the session transcript for a
+	 * claude-cli turn holds only the model's prose — a resumed session would not
+	 * know a file was written. Best-effort: never throws into the tool call.
+	 */
+	recordToolCall?: (rec: HarnessToolRecord) => void;
 }
 
 /** A live registration. `dispose()` is idempotent; the agent-loop calls it in
