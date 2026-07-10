@@ -31,6 +31,9 @@ import {
 	CLAUDE_CLI_PROVIDER,
 } from "./catalog.js";
 import { buildClaudeCliHttpMcpConfig, buildClaudeCliMcpConfig, readClaudeCliToolPlane } from "./tool-plane.js";
+import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
+
+const log = createSubsystemLogger("claude-cli");
 import { spawnClaudeCli, type SpawnClaudeCliArgs } from "./spawn.js";
 import {
 	classifyResultFrame,
@@ -323,13 +326,23 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 						: toolPlane?.senderIsOwner === true
 							? buildClaudeCliMcpConfig(toolPlane.agentId)
 							: undefined;
+				const fullPlane = mcpConfigJson !== undefined && toolPlane?.mcpHttpUrl !== undefined;
+				// Which surface did this turn actually get? Without this line a silent
+				// fallback (no stamp, no gateway host, a rejected config) is invisible —
+				// the operator only sees an agent that "won't use its tools".
+				log.debug("spawn tool-plane", {
+					mode: structured ? "none (distiller)" : fullPlane ? "full (http)" : mcpConfigJson ? "memory (stdio)" : "none",
+					owner: toolPlane?.senderIsOwner === true,
+					stamped: toolPlane !== undefined,
+				});
 				const args = buildClaudeCliArgs({ modelId: model.id, structured });
 				// System prompt goes via a file (not argv) — see spawn.ts. Composed here so
-				// the right nudge (prose vs JSON-only vs memory-tools-allowed) is included.
+				// the right nudge (prose vs JSON-only vs which tools) is included.
 				const systemPrompt = composeClaudeCliSystemPrompt({
 					systemPrompt: ctx.systemPrompt,
 					structured,
 					toolPlane: mcpConfigJson !== undefined,
+					fullPlane,
 				});
 
 				handle = spawnClaudeCli({

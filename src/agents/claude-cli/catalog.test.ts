@@ -177,3 +177,33 @@ test("resolveClaudeCliCommand: falls back to `claude` on PATH when no override +
 		__resetBundledClaudeCache();
 	}
 });
+
+test("composeClaudeCliSystemPrompt: the FULL plane tells the model to USE its tools", () => {
+	const sys = composeClaudeCliSystemPrompt({ systemPrompt: "You are Brigade.", fullPlane: true });
+	// The regression that shipped: the full plane reused the memory-only suffix,
+	// which forbids "any other tools" — so the model obediently refused to act.
+	assert.doesNotMatch(sys, /Do not use any other tools/i, "must not forbid the tools we just served");
+	assert.doesNotMatch(sys, /respond directly in prose/i, "must not be nudged into prose-only");
+	assert.match(sys, /mcp__brigade__/, "names the MCP tool namespace");
+	assert.match(sys, /Call them whenever they help/i);
+	// ...and it is honest about the one capability it genuinely lacks.
+	assert.match(sys, /NO filesystem or shell access/i);
+});
+
+test("composeClaudeCliSystemPrompt: precedence structured > fullPlane > toolPlane", () => {
+	// a distiller never gets tools, even if both plane flags are set
+	const distiller = composeClaudeCliSystemPrompt({
+		systemPrompt: 'Return STRICT JSON only: {"facts":[]}',
+		toolPlane: true,
+		fullPlane: true,
+	});
+	assert.match(distiller, /Output ONLY the JSON/i);
+	assert.doesNotMatch(distiller, /mcp__brigade/);
+	// full plane wins over the memory-only plane
+	const full = composeClaudeCliSystemPrompt({ systemPrompt: "x", toolPlane: true, fullPlane: true });
+	assert.match(full, /Call them whenever they help/i);
+	assert.doesNotMatch(full, /memory_context/, "not the memory-only suffix");
+	// memory-only plane still works on its own (the cold/stdio path)
+	const mem = composeClaudeCliSystemPrompt({ systemPrompt: "x", toolPlane: true });
+	assert.match(mem, /mcp__brigade__memory_add/);
+});

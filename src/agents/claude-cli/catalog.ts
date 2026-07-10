@@ -304,6 +304,26 @@ const CLAUDE_CLI_TOOL_PLANE_SUFFIX =
 	"mcp__brigade__memory_context) — use them to save or recall durable facts when relevant. " +
 	"Do not use any other tools or act on the local filesystem; respond directly in prose.";
 
+// Appended when the GATEWAY tool-plane is attached: Brigade's whole guarded tool
+// surface is served over MCP as `mcp__brigade__<tool>`. The memory-only suffix
+// above must NOT be reused here — it forbids "any other tools", which would tell
+// the model to ignore the 31 tools we just handed it (and it obeys: it answers in
+// prose and apologises that it cannot act).
+//
+// It also states the real limits honestly. The binary's own built-ins are denied
+// (they would act on a throwaway temp cwd, not the operator's workspace), and
+// Brigade's Pi builtins (read/write/edit/bash/grep/ls) are executed by Pi's loop,
+// which does not run on this backend — so there is genuinely no filesystem/shell
+// capability here yet. Telling the model to say so plainly beats letting it
+// invent a `bash` call that cannot exist.
+const CLAUDE_CLI_FULL_PLANE_SUFFIX =
+	"You are answering as part of an ongoing conversation. Brigade's tools are available to you " +
+	"over MCP, named `mcp__brigade__<tool>` (memory, sub-agents, channels, cron, media generation, " +
+	"and more). Call them whenever they help — that is what they are for; do not describe what you " +
+	"would do instead of doing it. Your own built-in tools are disabled: use the Brigade ones. " +
+	"You currently have NO filesystem or shell access on this backend, so if a request needs one, " +
+	"say so plainly rather than pretending you ran something.";
+
 /** Flag delivering the MCP server config file (the Brigade tool-plane). */
 export const CLAUDE_CLI_MCP_CONFIG_FLAG = "--mcp-config";
 /** Companion flag: ONLY the servers from --mcp-config load — the operator's
@@ -353,21 +373,25 @@ export function composeClaudeCliSystemPrompt(input: {
 	conversational?: boolean;
 	/** Force structured mode; defaults to detection from `systemPrompt`. */
 	structured?: boolean;
-	/** The spawn carries the Brigade MCP tool-plane (owner chat turns). */
+	/** The spawn carries the memory-only MCP tool-plane (owner chat turns). */
 	toolPlane?: boolean;
+	/** The spawn carries the gateway-hosted FULL guarded tool surface. */
+	fullPlane?: boolean;
 }): string {
 	const structured = input.structured ?? isStructuredJsonPrompt(input.systemPrompt);
 	const conversational = input.conversational !== false;
 	// Precedence: STRUCTURED (a JSON distiller must be reinforced toward JSON,
-	// never nudged toward prose — and never given tools) > TOOL-PLANE (memory
-	// tools allowed, everything else still off) > plain conversational.
+	// never nudged toward prose — and never given tools) > FULL PLANE (every
+	// Brigade tool, use them) > memory-only TOOL-PLANE > plain conversational.
 	const suffix = structured
 		? CLAUDE_CLI_STRUCTURED_SUFFIX
-		: input.toolPlane === true
-			? CLAUDE_CLI_TOOL_PLANE_SUFFIX
-			: conversational
-				? CLAUDE_CLI_SYSTEM_SUFFIX
-				: "";
+		: input.fullPlane === true
+			? CLAUDE_CLI_FULL_PLANE_SUFFIX
+			: input.toolPlane === true
+				? CLAUDE_CLI_TOOL_PLANE_SUFFIX
+				: conversational
+					? CLAUDE_CLI_SYSTEM_SUFFIX
+					: "";
 	const parts = [input.systemPrompt?.trim(), suffix].filter(
 		(p): p is string => !!p && p.length > 0,
 	);
