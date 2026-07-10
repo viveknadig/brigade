@@ -19,10 +19,27 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 
+import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
 import type { HttpRoute } from "../extensions/types.js";
 import { buildMcpTurnServer } from "./route.js";
-import type { JsonRpcRequest } from "./protocol.js";
-import type { McpTurnRegistry } from "./tool-plane-host.js";
+import type { JsonRpcRequest, McpServer } from "./protocol.js";
+import type { McpTurnContext, McpTurnRegistry } from "./tool-plane-host.js";
+
+const log = createSubsystemLogger("mcp/tool-plane");
+
+// One MCP server per TURN, not per request. `buildMcpTurnServer` maps every tool
+// (31 of them) into MCP shape; rebuilding that on each `tools/call` is pure
+// waste on a chatty turn. Keyed by the turn context object, so it dies with the
+// turn — no eviction needed.
+const serverByTurn = new WeakMap<McpTurnContext, McpServer>();
+function turnServer(turn: McpTurnContext): McpServer {
+	let s = serverByTurn.get(turn);
+	if (!s) {
+		s = buildMcpTurnServer(turn);
+		serverByTurn.set(turn, s);
+	}
+	return s;
+}
 
 /** The URL prefix the tool-plane is served under. */
 export const MCP_ROUTE_PREFIX = "/mcp";
@@ -64,6 +81,8 @@ export function createMcpHttpRoute(registry: McpTurnRegistry): HttpRoute {
 		const turn = registry.lookup(token);
 		if (!turn) {
 			// Unknown/expired/malformed token — 404 (no distinction: no oracle).
+			// Never log the token itself; it is a live credential.
+			log.debug("rejected mcp request with unknown/expired token");
 			res.statusCode = 404;
 			res.end("Not found");
 			return;
@@ -100,8 +119,27 @@ export function createMcpHttpRoute(registry: McpTurnRegistry): HttpRoute {
 			return;
 		}
 
-		const server = buildMcpTurnServer(turn);
+		// Observability: without this the tool-plane is a black box — an operator
+		// seeing "the agent didn't use its tools" has nothing to look at. Log the
+		// tool NAME only (arguments can carry user content; the token is a secret).
+		const calledTool =
+			rpc?.method === "tools/call"
+				? (rpc.params as { name?: unknown } | undefined)?.name
+				: undefined;
+		const started = Date.now();
+		const server = turnServer(turn);
 		const response = await server.handle(rpc, turn.signal);
+		if (typeof calledTool === "string") {
+			const result = (response?.result ?? {}) as { isError?: boolean };
+			log.info("tool call", {
+				tool: calledTool,
+				agentId: turn.agentId,
+				...(turn.sessionKey !== undefined ? { sessionKey: turn.sessionKey } : {}),
+				ms: Date.now() - started,
+				...(result.isError ? { blockedOrFailed: true } : {}),
+				...(response?.error ? { rpcError: response.error.code } : {}),
+			});
+		}
 		if (response === null) {
 			// Notification — accepted, no body.
 			res.statusCode = 202;

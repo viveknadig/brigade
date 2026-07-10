@@ -60,14 +60,52 @@ export interface McpTurnRegistry {
 	size(): number;
 }
 
+/**
+ * Backstop bounds. The agent-loop disposes every token in its `finally`, so in
+ * normal operation the registry holds only the in-flight turns. These caps exist
+ * because a leaked entry retains the WHOLE turn context (customTools + guard +
+ * signal) for the gateway's lifetime — a slow leak would be a real memory
+ * problem on a long-lived daemon. The TTL is deliberately far longer than a turn
+ * can legitimately run (see CLAUDE_CLI_TOOL_PLANE_OVERALL_TIMEOUT_MS) so it can
+ * never evict a live turn's token mid-call.
+ */
+export const MCP_TURN_REGISTRY_MAX_ENTRIES = 128;
+export const MCP_TURN_REGISTRY_TTL_MS = 60 * 60 * 1000; // 1h
+
+interface Entry {
+	ctx: McpTurnContext;
+	createdAt: number;
+}
+
 /** In-memory single-use token registry. Tokens are 256-bit; lookups are exact. */
-export function createMcpTurnRegistry(): McpTurnRegistry {
-	const entries = new Map<string, McpTurnContext>();
+export function createMcpTurnRegistry(
+	opts: { maxEntries?: number; ttlMs?: number; now?: () => number } = {},
+): McpTurnRegistry {
+	const entries = new Map<string, Entry>();
+	const maxEntries = opts.maxEntries ?? MCP_TURN_REGISTRY_MAX_ENTRIES;
+	const ttlMs = opts.ttlMs ?? MCP_TURN_REGISTRY_TTL_MS;
+	const now = opts.now ?? (() => Date.now());
+
+	const pruneExpired = (): void => {
+		const cutoff = now() - ttlMs;
+		for (const [token, e] of entries) {
+			if (e.createdAt <= cutoff) entries.delete(token);
+		}
+	};
+
 	return {
 		register(ctx: McpTurnContext): McpTurnRegistration {
+			pruneExpired();
+			// Hard cap: if a bug ever stops disposing, evict the OLDEST rather than
+			// growing without bound. Insertion order == age (Map preserves it).
+			while (entries.size >= maxEntries) {
+				const oldest = entries.keys().next();
+				if (oldest.done) break;
+				entries.delete(oldest.value);
+			}
 			// 32 bytes = 256 bits of CSPRNG entropy → unguessable path token.
 			const token = randomBytes(32).toString("hex");
-			entries.set(token, ctx);
+			entries.set(token, { ctx, createdAt: now() });
 			let disposed = false;
 			return {
 				token,
@@ -82,7 +120,13 @@ export function createMcpTurnRegistry(): McpTurnRegistry {
 			// Reject anything that isn't a well-formed token BEFORE the map hit, so a
 			// malformed/empty path segment can never alias a live entry.
 			if (typeof token !== "string" || !/^[0-9a-f]{64}$/.test(token)) return undefined;
-			return entries.get(token);
+			const e = entries.get(token);
+			if (!e) return undefined;
+			if (e.createdAt <= now() - ttlMs) {
+				entries.delete(token);
+				return undefined;
+			}
+			return e.ctx;
 		},
 		size(): number {
 			return entries.size;

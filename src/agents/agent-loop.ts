@@ -1515,29 +1515,6 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
       ? { channelRoute: args.channelApprovalRoute }
       : {}),
   };
-  // Register this turn's toolset + guard with the gateway MCP tool-plane so the
-  // claude-cli binary can call Brigade's FULL guarded surface (not just the 3
-  // memory tools). Gated identically to the memory stamp: claude-cli provider +
-  // OWNER turn. Requires the in-process host — present ONLY in the gateway
-  // process; on the cold `brigade agent` path getActiveMcpToolPlaneHost() is null
-  // and we skip (memory-only stdio still applies). We reuse the turn's OWN
-  // `brigadeCustomTools` (already ownerOnly-wrapped + origin-bound) and the SAME
-  // guard captured above (now closing over the freshly-populated gateCtxRef), so
-  // an MCP tool call is byte-identical to a Pi-loop dispatch.
-  if (args.provider === CLAUDE_CLI_PROVIDER && effectiveSenderIsOwner && brigadeGuard) {
-    const mcpHost = getActiveMcpToolPlaneHost();
-    if (mcpHost) {
-      const reg = mcpHost.registry.register({
-        customTools: brigadeCustomTools,
-        guard: brigadeGuard,
-        ...(args.signal ? { signal: args.signal } : {}),
-        agentId,
-        sessionKey: resolved.sessionKey,
-      });
-      mcpToolPlaneUrl = `${mcpHost.baseUrl}/mcp/${reg.token}`;
-      mcpToolPlaneDispose = reg.dispose;
-    }
-  }
   // Duck-typed Pi session subscription. We assert the SHAPE we want
   // rather than coupling to a specific Pi version's exported type. If
   // a future Pi changes `subscribe` to return `Promise<() => void>` or
@@ -1579,6 +1556,35 @@ async function runSingleTurnLocked(p: RunSingleTurnLockedArgs): Promise<RunSingl
   };
 
   try {
+  // Register this turn's toolset + guard with the gateway MCP tool-plane so the
+  // claude-cli binary can call Brigade's FULL guarded surface (not just the 3
+  // memory tools). Gated identically to the memory stamp: claude-cli provider +
+  // OWNER turn. Requires the in-process host — present ONLY in the gateway
+  // process; on the cold `brigade agent` path getActiveMcpToolPlaneHost() is null
+  // and we skip (memory-only stdio still applies). We reuse the turn's OWN
+  // `brigadeCustomTools` (already ownerOnly-wrapped + origin-bound) and the SAME
+  // guard (closing over the populated gateCtxRef), so an MCP tool call is
+  // byte-identical to a Pi-loop dispatch.
+  //
+  // MUST live INSIDE this try: its `finally` is what disposes the token. Any
+  // throw between registration and the try would otherwise strand the entry in
+  // the process-global registry for the gateway's lifetime, retaining the whole
+  // turn context (tools + guard + signal).
+  if (args.provider === CLAUDE_CLI_PROVIDER && effectiveSenderIsOwner && brigadeGuard) {
+    const mcpHost = getActiveMcpToolPlaneHost();
+    if (mcpHost) {
+      const reg = mcpHost.registry.register({
+        customTools: brigadeCustomTools,
+        guard: brigadeGuard,
+        ...(args.signal ? { signal: args.signal } : {}),
+        agentId,
+        sessionKey: resolved.sessionKey,
+      });
+      mcpToolPlaneUrl = `${mcpHost.baseUrl}/mcp/${reg.token}`;
+      mcpToolPlaneDispose = reg.dispose;
+    }
+  }
+
   log.info("turn starting", {
     agentId,
     sessionId: resolved.sessionId,

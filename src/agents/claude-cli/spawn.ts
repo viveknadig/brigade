@@ -29,6 +29,26 @@ export const CLAUDE_CLI_NO_OUTPUT_TIMEOUT_MS = 180_000;
 /** Hard ceiling on a single turn regardless of trickle output. */
 export const CLAUDE_CLI_OVERALL_TIMEOUT_MS = 600_000;
 
+/**
+ * Timeouts for a spawn carrying the Brigade MCP tool-plane.
+ *
+ * A tool-plane turn can legitimately sit silent for a long time: while the
+ * binary blocks on our `/mcp` response, it writes NOTHING to stdout, so the
+ * no-output watchdog keeps ticking. Two cases make the default 180s fatal:
+ *   • an exec-gated tool (`bash`) awaits the operator's approval for up to 5
+ *     minutes (exec-gate's `timeoutMs`), so a 180s watchdog would SIGKILL our
+ *     own child before the operator could ever answer — the approval prompt
+ *     would resolve into a dead process;
+ *   • a long tool (`spawn_agent` running a whole sub-agent turn, media
+ *     generation) can exceed both defaults.
+ * So a tool-plane spawn gets a no-output grace comfortably ABOVE the approval
+ * ceiling, and a proportionally larger hard ceiling. Non-tool-plane turns keep
+ * the original, tighter numbers — a plain chat turn that goes silent for 3
+ * minutes really is wedged.
+ */
+export const CLAUDE_CLI_TOOL_PLANE_NO_OUTPUT_TIMEOUT_MS = 360_000; // > exec-gate's 300s
+export const CLAUDE_CLI_TOOL_PLANE_OVERALL_TIMEOUT_MS = 1_800_000;
+
 export interface SpawnClaudeCliArgs {
 	args: string[];
 	/** Prompt delivered on stdin (the whole serialized conversation). */
@@ -73,8 +93,15 @@ export interface ClaudeCliRunHandle {
  */
 export function spawnClaudeCli(args: SpawnClaudeCliArgs): ClaudeCliRunHandle {
 	const command = resolveClaudeCliCommand();
-	const noOutputMs = args.noOutputTimeoutMs ?? CLAUDE_CLI_NO_OUTPUT_TIMEOUT_MS;
-	const overallMs = args.overallTimeoutMs ?? CLAUDE_CLI_OVERALL_TIMEOUT_MS;
+	// A tool-plane spawn blocks silently while Brigade executes its tools (and
+	// possibly waits on an operator approval), so it needs the wider watchdogs.
+	const hasToolPlane = (args.mcpConfigJson?.trim().length ?? 0) > 0;
+	const noOutputMs =
+		args.noOutputTimeoutMs ??
+		(hasToolPlane ? CLAUDE_CLI_TOOL_PLANE_NO_OUTPUT_TIMEOUT_MS : CLAUDE_CLI_NO_OUTPUT_TIMEOUT_MS);
+	const overallMs =
+		args.overallTimeoutMs ??
+		(hasToolPlane ? CLAUDE_CLI_TOOL_PLANE_OVERALL_TIMEOUT_MS : CLAUDE_CLI_OVERALL_TIMEOUT_MS);
 	const doSpawn = args.spawnFn ?? spawn;
 
 	// Isolated, empty working dir — the tool-containment boundary.
