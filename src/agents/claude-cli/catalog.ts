@@ -282,14 +282,14 @@ const CLAUDE_CLI_SYSTEM_SUFFIX =
 	"You are answering as part of an ongoing conversation. Respond directly in prose; " +
 	"do not use tools or act on the local filesystem — everything you need is in this conversation.";
 
-// Appended INSTEAD of the prose nudge when the pinned system prompt is one of
-// Brigade's structured-JSON utility distillers (memory extraction /
-// consolidation / relationship relink / behaviour + skill review). Those prompts
-// demand a strict JSON envelope; the conversational nudge above directly
-// contradicts them, so the reply came back as prose, `parseExtractionReply`
-// refused it (correctly — a non-envelope must never advance the cursor), and the
-// extraction cursor stalled forever. The memory graph stayed empty on this
-// backend. Reinforce JSON instead.
+// Appended INSTEAD of the prose nudge when the pinned system prompt is a machine
+// JSON-output contract (the memory/skill utility subagents: extraction,
+// consolidation, relink, behaviour/skill review). The chat-assistant base prompt
+// baked into the `claude` binary biases toward prose + code fences; for a
+// distiller that must return a bare `{"facts":[…]}` envelope, that prose bias is
+// exactly what breaks parsing — the reply comes back un-parseable, the extraction
+// cursor HOLDS forever, and the memory graph never fills. So we drop the prose
+// nudge and hard-pin JSON-only output for these turns.
 const CLAUDE_CLI_STRUCTURED_SUFFIX =
 	"Output ONLY the JSON described above. No preamble, no explanation, no markdown code " +
 	"fences — your entire response must be the raw JSON value, starting with { and ending with }.";

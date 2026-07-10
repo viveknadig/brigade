@@ -112,6 +112,7 @@ export function createMcpHttpRoute(registry: McpTurnRegistry): HttpRoute {
 	};
 
 	return {
+		method: undefined, // accept POST/GET/DELETE; the handler branches
 		path: MCP_ROUTE_PREFIX,
 		match: "prefix",
 		auth: "none", // own token + loopback check inside the handler

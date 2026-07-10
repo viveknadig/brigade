@@ -612,7 +612,8 @@ function checkMemoryFreshness(): CheckResult {
 			message: `moat is DARK — ${sessionCount} session${sessionCount === 1 ? "" : "s"} on disk but 0 facts and extraction has never advanced`,
 			hint:
 				"Memory extraction has produced nothing. Ensure the gateway is running (it drives the background sweep) and " +
-				"check its logs for `[memory/extract]` warnings.",
+				"check its logs for `[memory/extract]` warnings. On the claude-cli backend, structured extraction now returns " +
+				"clean JSON; adding a JSON-reliable provider via `brigade login` also works.",
 		};
 	}
 	// Cursor advanced but no facts kept = genuinely nothing durable was said. Fine.

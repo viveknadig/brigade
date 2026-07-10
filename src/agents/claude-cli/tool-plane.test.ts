@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+	buildClaudeCliHttpMcpConfig,
 	buildClaudeCliMcpConfig,
 	readClaudeCliToolPlane,
 	stampClaudeCliToolPlane,
 } from "./tool-plane.js";
+
+const TOKEN = "a".repeat(64);
 
 test("stamp/read round-trips on a plain context object", () => {
 	const ctx: Record<string, unknown> = { systemPrompt: "x", messages: [] };
@@ -68,4 +71,33 @@ test("buildClaudeCliMcpConfig: unsafe agent ids fail OPEN (undefined, no config)
 	assert.equal(buildClaudeCliMcpConfig("a b"), undefined);
 	assert.equal(buildClaudeCliMcpConfig('x";rm -rf'), undefined);
 	assert.equal(buildClaudeCliMcpConfig(""), undefined);
+});
+
+/* ─────────────────────── full-plane HTTP config (P2) ─────────────────────── */
+
+test("buildClaudeCliHttpMcpConfig: emits an {type:http,url} server for a valid loopback URL", () => {
+	const json = buildClaudeCliHttpMcpConfig(`http://127.0.0.1:7777/mcp/${TOKEN}`);
+	assert.ok(json);
+	const cfg = JSON.parse(json as string);
+	assert.equal(cfg.mcpServers.brigade.type, "http");
+	assert.equal(cfg.mcpServers.brigade.url, `http://127.0.0.1:7777/mcp/${TOKEN}`);
+});
+
+test("buildClaudeCliHttpMcpConfig: refuses non-loopback / malformed URLs (fail-open)", () => {
+	assert.equal(buildClaudeCliHttpMcpConfig(`http://8.8.8.8:7777/mcp/${TOKEN}`), undefined, "never off-host");
+	assert.equal(buildClaudeCliHttpMcpConfig(`https://127.0.0.1/mcp/${TOKEN}`), undefined, "https not emitted");
+	assert.equal(buildClaudeCliHttpMcpConfig("http://127.0.0.1:7777/mcp/short"), undefined);
+	assert.equal(buildClaudeCliHttpMcpConfig("http://127.0.0.1:7777/evil"), undefined);
+	assert.equal(buildClaudeCliHttpMcpConfig(""), undefined);
+});
+
+test("stamp/read carries mcpHttpUrl (the full-plane signal) when present", () => {
+	const url = `http://127.0.0.1:7777/mcp/${TOKEN}`;
+	const ctx: Record<string, unknown> = {};
+	stampClaudeCliToolPlane(ctx, { agentId: "main", senderIsOwner: true, mcpHttpUrl: url });
+	assert.equal(readClaudeCliToolPlane(ctx)?.mcpHttpUrl, url);
+	// absent by default (memory-only stdio path)
+	const ctx2: Record<string, unknown> = {};
+	stampClaudeCliToolPlane(ctx2, { agentId: "main", senderIsOwner: true });
+	assert.equal(readClaudeCliToolPlane(ctx2)?.mcpHttpUrl, undefined);
 });

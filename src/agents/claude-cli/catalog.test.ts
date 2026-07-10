@@ -44,6 +44,21 @@ test("composeClaudeCliSystemPrompt: explicit structured flag overrides detection
 	assert.match(sys, /Output ONLY the JSON/i);
 });
 
+test("composeClaudeCliSystemPrompt: toolPlane turn allows the memory MCP tools, still no fs", () => {
+	const sys = composeClaudeCliSystemPrompt({ systemPrompt: "You are Brigade.", toolPlane: true });
+	assert.match(sys, /mcp__brigade__memory_add/);
+	assert.match(sys, /mcp__brigade__memory_search/);
+	assert.match(sys, /Do not use any other tools/i);
+	assert.doesNotMatch(sys, /Respond directly in prose; do not use tools/, "plain nudge replaced");
+	// STRUCTURED still wins over toolPlane (distillers never get tools).
+	const both = composeClaudeCliSystemPrompt({
+		systemPrompt: 'Return STRICT JSON only: {"facts":[]}',
+		toolPlane: true,
+	});
+	assert.match(both, /Output ONLY the JSON/i);
+	assert.doesNotMatch(both, /mcp__brigade/);
+});
+
 test("buildClaudeCliArgs: a structured turn stays tool-less (distiller must not touch fs)", () => {
 	assert.ok(buildClaudeCliArgs({ modelId: "claude-sonnet-4-6", structured: true }).includes("--disallowedTools"));
 	// auto-derived from the prompt too
