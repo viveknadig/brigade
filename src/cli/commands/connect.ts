@@ -1575,12 +1575,20 @@ export async function wireConnectUi(
 				// Pi auto-retries transient provider errors (rate limit, 5xx,
 				// connection drop). Tell the user it's happening — without this,
 				// a slow retry looks like the connection is just hanging.
+				//
+				// And say WHY. The event has carried `errorMessage` all along and we
+				// dropped it, so a turn that died and restarted itself was reported as a
+				// bare "retrying" — indistinguishable from a slow model. The reason is
+				// the difference between "the provider hiccuped" and "your turn is being
+				// killed and re-run from the top".
 				const attempt = event.attempt ?? 1;
 				const max = event.maxAttempts ?? 1;
 				const waitS = Math.round((event.delayMs ?? 0) / 100) / 10;
+				const why = clipOneLine(scrubRenderable(event.errorMessage ?? ""), 90);
+				const because = why ? ` ${brand.dim(`· ${why}`)}` : "";
 				insertBeforeEditor(
 					new Text(
-						`  ${brand.dim(`↻ retrying (attempt ${attempt}/${max}, waiting ${waitS}s)…`)}`,
+						`  ${brand.dim(`↻ retrying (attempt ${attempt}/${max}, waiting ${waitS}s)…`)}${because}`,
 						0,
 						0,
 					),

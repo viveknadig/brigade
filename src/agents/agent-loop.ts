@@ -158,12 +158,30 @@ const DEFAULT_LLM_IDLE_TIMEOUT_MS = 90_000;
 // The explicit env override still wins for both.
 const DEFAULT_LOCAL_LLM_IDLE_TIMEOUT_MS = 300_000;
 
-function resolveIdleTimeoutMs(provider?: string): number {
+export function resolveIdleTimeoutMs(provider?: string): number {
   const raw = process.env.BRIGADE_LLM_IDLE_TIMEOUT_SECONDS?.trim();
   if (raw) {
     const n = Number(raw);
     if (Number.isFinite(n) && n >= 0) return Math.floor(n * 1000);
   }
+  // A HARNESS backend owns its own liveness, and this timer would fight it.
+  //
+  // The idle window measures silence on the STREAM. For a cloud provider that is a
+  // sound proxy for a hung connection. For an external binary running its own tool
+  // loop it is not: the child writes nothing to stdout while it thinks, and nothing
+  // at all while it BLOCKS ON ONE OF OUR TOOL CALLS — a `bash` waiting on the
+  // operator's approval, an `analyze_media` chewing through a PDF, a `spawn_agent`
+  // running a whole sub-agent turn. Every one of those is a healthy child.
+  //
+  // We already pause the CHILD's watchdogs for exactly that window
+  // (`pauseHarnessWatchdog`). This timer lives on the parent's side of the pipe and
+  // cannot be paused, so at 90s it killed the attempt, Pi auto-retried, the binary
+  // respawned, and the turn restarted from the top — repeatedly, invisibly.
+  //
+  // Liveness is not lost: the child carries a no-output watchdog (360s, paused for
+  // tool windows), a sliding hard ceiling, and an unpausable absolute ceiling. Those
+  // are tool-aware; this one cannot be.
+  if (provider !== undefined && claudeCliHarnessBackend.owns({ provider })) return 0;
   return provider === "ollama" ? DEFAULT_LOCAL_LLM_IDLE_TIMEOUT_MS : DEFAULT_LLM_IDLE_TIMEOUT_MS;
 }
 

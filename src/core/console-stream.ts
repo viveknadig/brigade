@@ -237,10 +237,15 @@ export function createConsoleStream(opts: ConsoleStreamOptions = {}): ConsoleStr
 					if (ev.aborted) levelFor = "warn";
 					break;
 				case "auto_retry_start":
+					// `reason` is the whole point of the line: a turn just died and is being
+					// re-run from the top. Without it the operator sees a stall and cannot
+					// tell a provider hiccup from a killed attempt. (event-logger already
+					// persists `errorMessage`; the console was the only place dropping it.)
 					body = `${arrow("event")} auto_retry_start ${fields({
 						attempt: ev.attempt,
 						max: ev.maxAttempts,
 						delayMs: ev.delayMs,
+						reason: ev.errorMessage,
 					})}`;
 					levelFor = "warn";
 					break;
