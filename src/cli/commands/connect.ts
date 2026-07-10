@@ -47,6 +47,7 @@ import { markTuiActive, restoreTerminal } from "../../ui/terminal-cleanup.js";
 import { brand, editorTheme, markdownTheme } from "../../ui/theme.js";
 import { summarizeToolResult } from "../../ui/tool-result.js";
 import { BrigadeClient } from "../../tui/client.js";
+import { DEFAULT_AGENT_ID } from "../../config/paths.js";
 import { loadConfig } from "../../core/config.js";
 import { resolveClientToken } from "../../core/gateway-auth.js";
 import { asstKey, clipOneLine, extractUserText } from "./connect-transcript.js";
@@ -110,6 +111,21 @@ export interface ConnectCommandOptions {
 	 * would think they were talking to X while actually talking to main).
 	 */
 	agentId?: string;
+	/**
+	 * Open straight into an existing THREAD — `brigade tui --session t-0bf7c8e1`,
+	 * equivalent to launching and immediately running `/session <key>`.
+	 *
+	 * Accepts the short label the header shows (`t-0bf7c8e1`) or the canonical key
+	 * (`agent:main:t-0bf7c8e1`); the short form is expanded against the bound agent.
+	 * Validated against `sessions.list` BEFORE the UI engages: an unknown key would
+	 * otherwise create a brand-new EMPTY thread of that name, and the operator's next
+	 * message — "please continue" — would land in a conversation that has never seen a
+	 * word, while their real thread sat untouched on disk.
+	 *
+	 * Binding is what gives the AGENT its context: every prompt carries this session
+	 * key, the gateway resolves that session, and the turn runs against its history.
+	 */
+	sessionKey?: string;
 }
 
 export interface ConnectHandle {
@@ -262,7 +278,44 @@ export async function runConnectCommand(opts: ConnectCommandOptions = {}): Promi
 		}
 	}
 
-	chatHandle = await wireConnectUi(tui, client, initialAgentId);
+	// Startup `--session <key>` binding. Same discipline as `--agent`, for a sharper
+	// reason: an unknown AGENT falls back to `main` — wrong, but a real conversation.
+	// An unknown SESSION KEY creates a brand-new EMPTY thread under that name, so
+	// "please continue" lands in a conversation that has never seen a word while the
+	// real thread sits on disk untouched. Resolve it, verify it, or stop.
+	let initialSessionKey: string | undefined;
+	if (opts.sessionKey) {
+		const agentForKey = initialAgentId ?? DEFAULT_AGENT_ID;
+		const target = opts.sessionKey.startsWith("agent:")
+			? opts.sessionKey
+			: `agent:${agentForKey}:${opts.sessionKey}`;
+		try {
+			const res: unknown = await client.request(
+				"sessions.list",
+				initialAgentId !== undefined ? { agentId: initialAgentId } : {},
+			);
+			const list = Array.isArray(res)
+				? (res as SessionSummary[])
+				: ((res as { sessions?: SessionSummary[] }).sessions ?? []);
+			if (!list.some((s) => s.sessionKey === target)) {
+				tui.stop();
+				restoreTerminal();
+				console.error(chalk.red(`✗ No thread with key "${target}".`));
+				console.error(chalk.dim("  Opening an unknown key would start an EMPTY thread of that name."));
+				const available = list.map((s) => s.sessionKey).slice(0, 12);
+				console.error(chalk.dim(`  Your threads:\n    ${available.join("\n    ") || "(none)"}`));
+				console.error(chalk.dim("  (`brigade sessions list` shows them all)"));
+				process.exit(1);
+			}
+			initialSessionKey = target;
+		} catch {
+			// Lenient, exactly like `--agent`: a transient RPC hiccup must not block a
+			// launch. `/session` inside the TUI re-validates.
+			initialSessionKey = target;
+		}
+	}
+
+	chatHandle = await wireConnectUi(tui, client, initialAgentId, initialSessionKey);
 	return chatHandle;
 }
 
@@ -275,6 +328,7 @@ export async function wireConnectUi(
 	tui: TUI,
 	client: BrigadeClient,
 	initialAgentId?: string,
+	initialSessionKey?: string,
 ): Promise<ConnectHandle> {
 	// Static (last-frame) wordmark — `brigade connect` is the chat surface
 	// just like `brigade chat`, so we want the same still rendering here. The
@@ -323,7 +377,9 @@ export async function wireConnectUi(
 	// `agent:main:whatsapp:<jid>`) so abort / steer / compact / set-model
 	// target THAT lane instead of the boot agent's `main`. Seeded from the
 	// first snapshot, overridden by `/session <key>`.
-	let boundSessionKey: string | undefined = undefined;
+	// Seeded by `--session <key>` (already resolved + verified against sessions.list).
+	// Left undefined, the first `state` snapshot seeds it with the agent's main thread.
+	let boundSessionKey: string | undefined = initialSessionKey;
 	// Residual P0 (post-Wave K integration audit) — the WS broadcast filter
 	// at server.ts:903 keys on per-connection subscription Sets populated by
 	// the `subscribe` RPC. Without an explicit subscribe, the filter falls
@@ -1975,14 +2031,52 @@ export async function wireConnectUi(
 				);
 				return;
 			}
-			boundSessionKey = arg;
+			// Canonicalise, then tell the truth about what you just bound to.
+			//
+			// This took the key verbatim. The header shows a thread as `t-0bf7c8e1`, so
+			// `/session t-0bf7c8e1` is the obvious thing to type — and it bound to a
+			// LITERAL key of that name, not the canonical `agent:main:t-0bf7c8e1`. The
+			// gateway created a brand-new empty session under it, the next message
+			// ("please continue…") landed in a thread with no history, and a 16 MB
+			// conversation was silently orphaned on disk.
+			const agentForKey = boundAgentId ?? lastSnapshot?.agentId ?? DEFAULT_AGENT_ID;
+			const target = arg.startsWith("agent:") ? arg : `agent:${agentForKey}:${arg}`;
+
+			// A `/session` onto an unknown key is legal — that is how you name a new
+			// thread — but it must never look like resuming an old one.
+			let known: boolean | undefined;
+			try {
+				const res: unknown = await client.request(
+					"sessions.list",
+					boundAgentId !== undefined ? { agentId: boundAgentId } : {},
+				);
+				const list = Array.isArray(res)
+					? (res as SessionSummary[])
+					: ((res as { sessions?: SessionSummary[] }).sessions ?? []);
+				known = list.some((s) => s.sessionKey === target);
+			} catch {
+				known = undefined; // gateway couldn't answer; claim nothing
+			}
+
+			boundSessionKey = target;
 			insertBeforeEditor(
 				new Text(
-					`  ${brand.amber("✓")} ${brand.dim("bound to session")} ${brand.amber(arg)}`,
+					`  ${brand.amber("✓")} ${brand.dim("bound to session")} ${brand.amber(target)}`,
 					0,
 					0,
 				),
 			);
+			if (known === false) {
+				insertBeforeEditor(
+					new Text(
+						`    ${brand.amber("⚠")} ${brand.dim(
+							"no thread with that key — this starts an EMPTY one. `/sessions` lists your threads.",
+						)}`,
+						0,
+						0,
+					),
+				);
+			}
 			updateHeader();
 			void applySubscription();
 			return;

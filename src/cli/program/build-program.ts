@@ -264,7 +264,16 @@ export function buildProgram(): Command {
     .option("-h, --host <host>", "gateway host to connect to / spawn on (default: 127.0.0.1)")
     .option("-p, --port <port>", "gateway port (default: 7777)", (v) => parseInt(v, 10))
     .option("--agent <id>", "bind the TUI to this agent at startup (skips the /agent step)")
-    .action(async (agentArg: string | undefined, opts: { envDetect?: boolean; host?: string; port?: number; agent?: string }) => {
+    // Open straight into an existing THREAD instead of the agent's main one.
+    // Takes the short label the header shows (`t-0bf7c8e1`) or the full key; the
+    // short form is expanded against the bound agent. Verified against the gateway
+    // before the UI engages — an unknown key would start an EMPTY thread of that
+    // name, and "please continue" would land in a conversation with no history.
+    .option(
+      "--session <key>",
+      "open an existing thread at startup, e.g. --session t-0bf7c8e1 (skips the /session step)",
+    )
+    .action(async (agentArg: string | undefined, opts: { envDetect?: boolean; host?: string; port?: number; agent?: string; session?: string }) => {
       // FOOTGUN GUARD. `tui` is the DEFAULT command, so a mistyped or unknown
       // command (`brigade upgarde`, `brigade foo`) doesn't error — Commander
       // routes the unknown word here as the positional [agent]. Without this
@@ -299,6 +308,7 @@ export function buildProgram(): Command {
         host: opts.host,
         port: opts.port,
         ...(agentId ? { agentId } : {}),
+        ...(opts.session ? { sessionKey: opts.session } : {}),
       });
       // Hold the action handler open — `runChatCommand` resolves once the
       // editor is wired; without this pin, the entry-point exit hook
