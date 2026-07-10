@@ -129,18 +129,25 @@ test("args are validated against the schema BEFORE execute (missing required →
 	assert.deepEqual(seen, [], "execute must not run on invalid args");
 });
 
-test("the GUARD sees Pi-coerced args, not raw MCP args (exec-gate reads command as a string)", async () => {
-	const guardSaw: unknown[] = [];
+test("the guard context mirrors Pi's split exactly: RAW in toolCall, VALIDATED in args", async () => {
+	const guardSawToolCall: unknown[] = [];
+	const guardSawArgs: unknown[] = [];
 	const seen: any[] = [];
 	const guard = async (ctx: any) => {
-		guardSaw.push(ctx.toolCall.arguments);
+		guardSawToolCall.push(ctx.toolCall.arguments);
+		guardSawArgs.push(ctx.args);
 		return undefined;
 	};
 	const server = buildMcpTurnServer(turn({ customTools: [strictTool(seen)], guard }));
-	// binary sends a number; Pi's validator coerces to "42" before anything sees it
+	// The binary sends a number. Pi's own loop hands `beforeToolCall` the ORIGINAL
+	// toolCall and puts the coerced args only in `ctx.args` (agent-loop.js passes
+	// `toolCall`, not `preparedToolCall`). Brigade's guards read `ctx.toolCall.arguments`
+	// first, so coercing there would make the exec-gate see "42" over MCP but 42 in a
+	// Pi-loop turn — a different branch, and a different loop-detector hash.
 	await server.handle(req("tools/call", { name: "shell", arguments: { command: 42 } }));
-	assert.deepEqual(guardSaw, [{ command: "42" }], "guard receives validated+coerced args");
-	assert.equal(seen[0].params.command, "42", "execute receives the same validated args");
+	assert.deepEqual(guardSawToolCall, [{ command: 42 }], "toolCall carries the RAW arguments, as Pi's does");
+	assert.deepEqual(guardSawArgs, [{ command: "42" }], "ctx.args carries the validated+coerced arguments");
+	assert.equal(seen[0].params.command, "42", "execute still receives the validated args");
 });
 
 test("an abort between guard and execute prevents the tool from running", async () => {
@@ -212,6 +219,69 @@ test("a tool call mints synthetic pi start/end events the TUI already renders", 
 	assert.equal(start.piEvent.toolCallId, end.piEvent.toolCallId);
 	// connect.ts feeds `result` to summarizeToolResult(): needs Pi's {content:[…]} shape
 	assert.equal(end.piEvent.result.content[0].text, "write_memory ran");
+});
+
+test("a tool's onUpdate progress is teed onto the bus, as Pi's loop does", async () => {
+	const { events, stop } = captureBusEvents();
+	try {
+		// Pi passes `onUpdate` as the 4th arg to execute; `bash` streams partial output
+		// through it and `web-fetch` reports "fetching → extracting". Dropping it made a
+		// long tool look like a hang: a start chip, silence, then a result.
+		const streaming: AnyBrigadeTool = {
+			name: "bash",
+			label: "bash",
+			description: "runs a command",
+			parameters: Type.Object({ command: Type.Optional(Type.String()) }),
+			execute: async (_id: string, _p: unknown, _sig: unknown, onUpdate?: (u: unknown) => void) => {
+				onUpdate?.({ type: "output", text: "compiling…" });
+				onUpdate?.({ type: "output", text: "linking…" });
+				return { content: [{ type: "text", text: "done" }], details: undefined };
+			},
+		} as unknown as AnyBrigadeTool;
+		const server = buildMcpTurnServer(turn({ customTools: [streaming], runId: "run-1" }));
+		await server.handle(req("tools/call", { name: "bash", arguments: { command: "make" } }));
+	} finally {
+		stop();
+	}
+	const updates = events.filter((e: any) => e.piEvent.type === "tool_execution_update");
+	assert.equal(updates.length, 2, "both progress updates reached the TUI");
+	assert.equal(updates[0].piEvent.update.text, "compiling…");
+	assert.equal(updates[0].synthetic, true, "still excluded from the seq'd stream");
+	// order: start → update → update → end
+	assert.deepEqual(
+		events.map((e: any) => e.piEvent.type),
+		["tool_execution_start", "tool_execution_update", "tool_execution_update", "tool_execution_end"],
+	);
+});
+
+test("a SUB-AGENT's tool events carry its depth, so the TUI indents them", async () => {
+	const { events, stop } = captureBusEvents();
+	try {
+		// Without this a claude-cli sub-agent's `bash` renders at top level, exactly as
+		// if the parent had run it. A Pi-loop sub-agent's real events carry the depth.
+		const server = buildMcpTurnServer(
+			turn({ customTools: [fakeTool("read")], runId: "run-1", subagentDepth: 1, subagentLabel: "researcher" }),
+		);
+		await server.handle(req("tools/call", { name: "read", arguments: {} }));
+	} finally {
+		stop();
+	}
+	assert.ok(events.length > 0);
+	for (const e of events as any[]) {
+		assert.equal(e.subagentDepth, 1);
+		assert.equal(e.subagentLabel, "researcher");
+	}
+});
+
+test("a top-level turn's events carry NO depth (absent, not zero)", async () => {
+	const { events, stop } = captureBusEvents();
+	try {
+		const server = buildMcpTurnServer(turn({ customTools: [fakeTool("read")], runId: "run-1" }));
+		await server.handle(req("tools/call", { name: "read", arguments: {} }));
+	} finally {
+		stop();
+	}
+	for (const e of events as any[]) assert.equal("subagentDepth" in e, false);
 });
 
 test("a BLOCKED call emits no tool events (matches Pi: a block yields no start/end)", async () => {

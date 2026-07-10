@@ -67,10 +67,9 @@ export function buildMcpTurnServer(turn: McpTurnContext, opts: { serverName?: st
 			// precisely the guarantee this plane is built on.
 
 			// (1) VALIDATE + COERCE against the tool's schema, using Pi's own
-			// validator. Pi does this BEFORE the guard, so the guard sees coerced
-			// args (exec-gate reads `command` as a string). Without it, a malformed
-			// call from the binary reaches `execute` raw. A failure is a tool error
-			// carrying the validator's message — exactly what Pi surfaces.
+			// validator. Without it, a malformed call from the binary reaches
+			// `execute` raw. A failure is a tool error carrying the validator's
+			// message — exactly what Pi surfaces.
 			let validated: Record<string, unknown>;
 			try {
 				validated = validateToolArguments(tool as never, {
@@ -82,7 +81,16 @@ export function buildMcpTurnServer(turn: McpTurnContext, opts: { serverName?: st
 			}
 
 			// (2) GUARD — the turn's composed chain, closing over its gateCtxRef.
-			const guardCtx = { toolCall: { name: tool.name, arguments: validated }, args: validated } as unknown as BeforeToolCallContext;
+			//
+			// Pi hands `beforeToolCall` the ORIGINAL toolCall (raw arguments) and puts
+			// the validated args only in `ctx.args` (agent-loop.js: `beforeToolCall({
+			// toolCall, args: validatedArgs })`). Every Brigade guard reads
+			// `ctx.toolCall.arguments` first, so passing validated args in BOTH slots
+			// would make guards see coerced values here and raw values in a Pi-loop
+			// turn — e.g. `command: 123` reaches the exec-gate as "123" over MCP but
+			// hits its non-string branch natively, and the loop-detector hashes differ.
+			// Same objects, same guard, same inputs: mirror Pi's split exactly.
+			const guardCtx = { toolCall: { name: tool.name, arguments: args }, args: validated } as unknown as BeforeToolCallContext;
 			const verdict = await turn.guard(guardCtx, signal);
 			if (verdict?.block) return errorResult(verdict.reason ?? "Tool call blocked.");
 
@@ -108,10 +116,24 @@ export function buildMcpTurnServer(turn: McpTurnContext, opts: { serverName?: st
 					agentId: turn.agentId,
 					sessionId: turn.sessionKey ?? "",
 					synthetic: true,
+					// A sub-agent's tool calls must render indented, exactly as a Pi-loop
+					// sub-agent's do. Without this they arrive at depth 0 and a child's
+					// `bash` is indistinguishable from the parent running it.
+					...(turn.subagentDepth !== undefined ? { subagentDepth: turn.subagentDepth } : {}),
+					...(turn.subagentLabel !== undefined ? { subagentLabel: turn.subagentLabel } : {}),
 					piEvent,
 				});
 			};
 			emitTool({ type: "tool_execution_start", toolCallId: callId, toolName: tool.name, args: validated });
+
+			// Pi passes `onUpdate` as the 4th arg to every `execute`, and tools use it to
+			// stream progress (`bash` partial output, `web-fetch`'s "fetching → extracting").
+			// Dropping it made a long tool look like a hang: a start chip, silence, a result.
+			// The binary can't consume partials (an MCP `tools/call` is one response), but
+			// the operator's TUI can — so tee them onto the bus, exactly as Pi's loop does.
+			const onUpdate = (update: unknown): void => {
+				emitTool({ type: "tool_execution_update", toolCallId: callId, toolName: tool.name, update });
+			};
 
 			// Report the call to the harness-transcript layer, so the session records
 			// what the binary did. A transcript write must never break a tool call.
@@ -124,7 +146,7 @@ export function buildMcpTurnServer(turn: McpTurnContext, opts: { serverName?: st
 			};
 
 			try {
-				const result = await tool.execute(callId, validated as never, signal);
+				const result = await tool.execute(callId, validated as never, signal, onUpdate as never);
 				const content = mapContent((result as { content?: unknown })?.content);
 				// Pi's `result` shape — connect.ts feeds it to summarizeToolResult().
 				emitTool({ type: "tool_execution_end", toolCallId: callId, toolName: tool.name, args: validated, result: { content }, isError: false });

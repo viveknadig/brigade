@@ -49,6 +49,14 @@ export interface McpTurnContext {
 	 *  gateway); required to mint pi-shaped tool events the TUI can render. */
 	runId?: string;
 	/**
+	 * Sub-agent nesting of the turn we serve, mirrored onto every synthetic tool
+	 * event. A Pi-loop sub-agent's tool events carry these, and the TUI indents by
+	 * them; a harness sub-agent's calls would otherwise render as if the parent had
+	 * made them. Absent on a top-level turn.
+	 */
+	subagentDepth?: number;
+	subagentLabel?: string;
+	/**
 	 * Report a completed tool call so the harness-transcript layer can record it
 	 * (see `../harness-transcript.ts`). Without this the session transcript for a
 	 * claude-cli turn holds only the model's prose — a resumed session would not
@@ -76,16 +84,30 @@ export interface McpTurnRegistry {
  * normal operation the registry holds only the in-flight turns. These caps exist
  * because a leaked entry retains the WHOLE turn context (customTools + guard +
  * signal) for the gateway's lifetime — a slow leak would be a real memory
- * problem on a long-lived daemon. The TTL is deliberately far longer than a turn
- * can legitimately run (see CLAUDE_CLI_TOOL_PLANE_OVERALL_TIMEOUT_MS) so it can
- * never evict a live turn's token mid-call.
+ * problem on a long-lived daemon.
+ *
+ * The TTL measures IDLE time, not age. It cannot be an age cap: a turn's wall
+ * clock is unbounded by design, because the child's watchdogs are PAUSED for the
+ * duration of every tool call (see `pauseHarnessWatchdog`) and the hard ceiling
+ * slides by the paused span. A turn that chains three `generate_video` calls
+ * (~20m each) legitimately outlives any fixed age cap, and evicting its token
+ * mid-turn would 404 every subsequent `tools/call` — stripping a full-plane agent
+ * of its ENTIRE tool surface, since the binary's own builtins are denied.
+ *
+ * Idle time is the honest signal: a live turn touches its token on every call.
+ * The longest gap between touches is one tool's own duration, which no constant
+ * here can bound (see MCP_ROUTE_TIMEOUT_MS). What DOES bound it is the harness's
+ * unpausable absolute ceiling: no child survives past it, so a TTL matched to it
+ * can never evict a token whose turn is still alive. Leaks are still collected —
+ * within one ceiling, and under the hard cap.
  */
 export const MCP_TURN_REGISTRY_MAX_ENTRIES = 128;
-export const MCP_TURN_REGISTRY_TTL_MS = 60 * 60 * 1000; // 1h
+export const MCP_TURN_REGISTRY_TTL_MS = 4 * 60 * 60 * 1000; // 4h idle — matches the harness ceiling
 
 interface Entry {
 	ctx: McpTurnContext;
-	createdAt: number;
+	/** Last time this token was looked up. Refreshed per call — the liveness signal. */
+	lastSeenAt: number;
 }
 
 /** In-memory single-use token registry. Tokens are 256-bit; lookups are exact. */
@@ -100,23 +122,32 @@ export function createMcpTurnRegistry(
 	const pruneExpired = (): void => {
 		const cutoff = now() - ttlMs;
 		for (const [token, e] of entries) {
-			if (e.createdAt <= cutoff) entries.delete(token);
+			if (e.lastSeenAt <= cutoff) entries.delete(token);
 		}
 	};
 
 	return {
 		register(ctx: McpTurnContext): McpTurnRegistration {
 			pruneExpired();
-			// Hard cap: if a bug ever stops disposing, evict the OLDEST rather than
-			// growing without bound. Insertion order == age (Map preserves it).
+			// Hard cap: if a bug ever stops disposing, evict rather than grow without
+			// bound — but evict the LEAST-RECENTLY-SEEN, never merely the oldest.
+			// Insertion order is age, and age says nothing about liveness: the oldest
+			// entry is often the long-running turn that is still actively calling tools.
 			while (entries.size >= maxEntries) {
-				const oldest = entries.keys().next();
-				if (oldest.done) break;
-				entries.delete(oldest.value);
+				let stalest: string | undefined;
+				let stalestAt = Number.POSITIVE_INFINITY;
+				for (const [token, e] of entries) {
+					if (e.lastSeenAt < stalestAt) {
+						stalestAt = e.lastSeenAt;
+						stalest = token;
+					}
+				}
+				if (stalest === undefined) break;
+				entries.delete(stalest);
 			}
 			// 32 bytes = 256 bits of CSPRNG entropy → unguessable path token.
 			const token = randomBytes(32).toString("hex");
-			entries.set(token, { ctx, createdAt: now() });
+			entries.set(token, { ctx, lastSeenAt: now() });
 			let disposed = false;
 			return {
 				token,
@@ -133,10 +164,12 @@ export function createMcpTurnRegistry(
 			if (typeof token !== "string" || !/^[0-9a-f]{64}$/.test(token)) return undefined;
 			const e = entries.get(token);
 			if (!e) return undefined;
-			if (e.createdAt <= now() - ttlMs) {
+			if (e.lastSeenAt <= now() - ttlMs) {
 				entries.delete(token);
 				return undefined;
 			}
+			// Touch: this token is demonstrably live, so the idle clock restarts.
+			e.lastSeenAt = now();
 			return e.ctx;
 		},
 		size(): number {

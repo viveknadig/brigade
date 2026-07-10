@@ -33,6 +33,7 @@ import { FactStore, MEMORY_SEGMENTS, type MemoryRecordOrigin, type MemorySegment
 import { confineUntrustedSegment } from "./write-gate.js";
 import { balancedObjects } from "./json-scan.js";
 import { ensureOllamaNativeApiRegistered } from "../ollama-native/register.js";
+import { installStructuredTurnStamp } from "../claude-cli/tool-plane.js";
 import { installTransportDispatch } from "../transport-dispatch.js";
 import {
 	buildCandidateBlock,
@@ -628,6 +629,11 @@ export function makeIsolatedLlm(
 			// instance in a published install ("No API provider registered for api:
 			// claude-cli"). Wraps (never replaces) the streamFn.
 			installTransportDispatch(session);
+			// Declare what this session IS: a structured JSON distiller. The claude-cli
+			// transport must reinforce JSON and stay tool-less, and it should not have to
+			// infer that from the prompt text — a persona that merely mentions "STRICT
+			// JSON only" would then be mistaken for a distiller. Wraps the streamFn.
+			installStructuredTurnStamp(session);
 			applyPersonaOverrideToSession(session as AgentSession, systemPrompt);
 			// Race the LLM call against a wall-clock timeout. On timeout we
 			// call `session.abort()` (Pi cancels the in-flight stream) and

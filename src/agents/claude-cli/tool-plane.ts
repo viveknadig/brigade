@@ -41,6 +41,18 @@ export interface ClaudeCliToolPlane {
 	 * Owner-gated + gateway-only upstream.
 	 */
 	mcpHttpUrl?: string;
+	/**
+	 * This turn is a structured JSON distiller (memory/skill extraction): reinforce
+	 * it toward JSON, keep it tool-less, never nudge it toward prose.
+	 *
+	 * DECLARED by the caller, never inferred from the prompt. The text sniff
+	 * (`isStructuredJsonPrompt`) survives only as the fallback for an UNSTAMPED
+	 * context, because an agent turn's system prompt is the assembled persona — it
+	 * splices in operator-authored files and skill descriptions verbatim. A sentence
+	 * like "return STRICT JSON only" in TOOLS.md would otherwise mark a CHAT turn as
+	 * a distiller and silently strip its entire tool surface.
+	 */
+	structured?: boolean;
 }
 
 // Property key used to stamp the tool-plane onto Pi's per-turn context object.
@@ -69,14 +81,48 @@ export function readClaudeCliToolPlane(context: unknown): ClaudeCliToolPlane | u
 	if (!context || typeof context !== "object") return undefined;
 	const v = (context as Record<string, unknown>)[TOOL_PLANE_KEY];
 	if (!v || typeof v !== "object") return undefined;
-	const plane = v as { agentId?: unknown; senderIsOwner?: unknown; mcpHttpUrl?: unknown };
+	const plane = v as {
+		agentId?: unknown;
+		senderIsOwner?: unknown;
+		mcpHttpUrl?: unknown;
+		structured?: unknown;
+	};
 	if (typeof plane.agentId !== "string" || plane.agentId.length === 0) return undefined;
 	return {
 		agentId: plane.agentId,
 		senderIsOwner: plane.senderIsOwner === true,
+		...(plane.structured === true ? { structured: true } : {}),
 		...(typeof plane.mcpHttpUrl === "string" && plane.mcpHttpUrl.length > 0
 			? { mcpHttpUrl: plane.mcpHttpUrl }
 			: {}),
+	};
+}
+
+/** The agent id stamped on an isolated distiller session — it has no real agent. */
+export const CLAUDE_CLI_DISTILLER_AGENT_ID = "distiller";
+
+/**
+ * Mark every dispatch from an isolated distiller session as `structured`.
+ *
+ * The distillers run on their own `AgentSession` (see `makeIsolatedLlm`), which the
+ * agent loop never stamps — so without this the transport must guess from the prompt
+ * text. Stamping makes the contract explicit AND keeps the defense-in-depth: a
+ * distiller stays tool-less even if it ever runs on a stamped path.
+ *
+ * WRAPS the session's streamFn, never replaces it: replacing loses Pi's auth wrapping
+ * (and any transport dispatch installed beneath), so every call would go out keyless.
+ */
+export function installStructuredTurnStamp(session: unknown): void {
+	const agent = (session as { agent?: { streamFn?: unknown } } | undefined)?.agent;
+	if (!agent || typeof agent.streamFn !== "function") return;
+	const base = agent.streamFn as (...a: unknown[]) => unknown;
+	agent.streamFn = (...args: unknown[]): unknown => {
+		stampClaudeCliToolPlane(args[1], {
+			agentId: CLAUDE_CLI_DISTILLER_AGENT_ID,
+			senderIsOwner: false,
+			structured: true,
+		});
+		return base(...args);
 	};
 }
 

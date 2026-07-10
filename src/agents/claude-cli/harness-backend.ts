@@ -30,7 +30,8 @@ import {
 	type HarnessTurn,
 	type HarnessTurnHandle,
 } from "../harness/types.js";
-import { createGuardedBuiltinTools } from "../mcp/builtin-tools.js";
+import { createSubsystemLogger } from "../../logging/subsystem-logger.js";
+import { createGuardedBuiltinTools, readBuiltinToolSettings } from "../mcp/builtin-tools.js";
 import { getActiveMcpToolPlaneHost } from "../mcp/tool-plane-host.js";
 import { CLAUDE_CLI_API, CLAUDE_CLI_PROVIDER, CLAUDE_CLI_SENTINEL_KEY } from "./catalog.js";
 import { ensureClaudeCliApiRegistered } from "./register.js";
@@ -38,6 +39,8 @@ import { createClaudeCliStreamFn } from "./stream.js";
 import { stampClaudeCliToolPlane } from "./tool-plane.js";
 
 let memoizedStreamFn: StreamFn | undefined;
+
+const log = createSubsystemLogger("agents/harness");
 
 export const claudeCliHarnessBackend: HarnessBackend = {
 	id: "claude-cli",
@@ -99,7 +102,13 @@ export const claudeCliHarnessBackend: HarnessBackend = {
 			// tools, so this backend has a filesystem + shell at all. Every call still
 			// runs the turn's guard: bash → exec-gate (approval), write/edit →
 			// path-write + config-write guards.
-			const builtinTools = createGuardedBuiltinTools({ cwd: turn.cwd, allow: turn.builtinToolNames });
+			// Same options Pi's own `_buildRuntime` threads in (shell prefix / shell path /
+			// image auto-resize), so a builtin behaves identically on both backends.
+			const builtinTools = createGuardedBuiltinTools({
+				cwd: turn.cwd,
+				allow: turn.builtinToolNames,
+				settings: readBuiltinToolSettings(turn.session),
+			});
 			const reg = host.registry.register({
 				customTools: [...turn.customTools, ...builtinTools],
 				guard: turn.guard,
@@ -108,6 +117,10 @@ export const claudeCliHarnessBackend: HarnessBackend = {
 				sessionKey: turn.sessionKey,
 				// Lets the MCP route mint pi-shaped tool events for the TUI.
 				runId: turn.runId,
+				// ...tagged with this turn's nesting, so a sub-agent's tool chips indent
+				// rather than masquerading as the parent's.
+				...(turn.subagentDepth !== undefined ? { subagentDepth: turn.subagentDepth } : {}),
+				...(turn.subagentLabel !== undefined ? { subagentLabel: turn.subagentLabel } : {}),
 				// ...and record what the binary actually did into the transcript, so a
 				// resumed session, compaction and the next turn's replayed context all
 				// know a file was written / a command was run.
@@ -122,8 +135,22 @@ export const claudeCliHarnessBackend: HarnessBackend = {
 					);
 				},
 			});
-			mcpHttpUrl = `${host.baseUrl}/mcp/${reg.token}`;
+			// Capture the disposer BEFORE anything else can throw. The agent-loop's
+			// `finally` disposes through the returned handle, so a throw between
+			// `register()` and `return` would leak the registration — retaining the
+			// whole turn context (tools + guard + signal) for the gateway's lifetime.
 			disposeToken = reg.dispose;
+			try {
+				mcpHttpUrl = `${host.baseUrl}/mcp/${reg.token}`;
+			} catch (err) {
+				reg.dispose();
+				disposeToken = undefined;
+				mcpHttpUrl = undefined;
+				log.warn("tool-plane registration failed; falling back to the memory plane", {
+					agentId: turn.agentId,
+					error: String(err),
+				});
+			}
 		}
 
 		return {

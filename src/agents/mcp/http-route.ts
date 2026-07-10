@@ -58,12 +58,20 @@ export const MCP_ROUTE_PREFIX = "/mcp";
  * — a billed render discarded, or a shell command executed after the model gave
  * up on it, inviting a double-execution on retry.
  *
- * So we own the budget explicitly: larger than the largest per-tool ceiling, and
- * far larger than the approval window. Each tool still enforces its OWN timeout
- * (`wrapToolExecutionTimeout`), which is what should bound a call — this exists
- * only so the dispatcher can never guillotine an in-flight tool.
+ * So we own the budget explicitly. It is NOT sized against "the largest tool":
+ * that number doesn't exist. `resolveSpawnToolTimeoutMs`, `resolveSessionsSendTimeoutMs`
+ * and `resolveOAuthAuthorizeTimeoutMs` derive their budgets from CALLER arguments
+ * with no ceiling, so any constant picked from today's fixed maxima (`generate_video`'s
+ * 1_220_000ms) is one `spawn_agent --timeout-seconds 1800` away from guillotining a
+ * live tool again.
+ *
+ * What actually bounds a call is the abort chain: the turn's own signal, the child's
+ * socket closing, and each tool's own `wrapToolExecutionTimeout`. This budget is a
+ * wedge guard of last resort — a socket that would otherwise be held forever by a
+ * handler that never settles. It is deliberately far above any plausible tool, and
+ * matched to the harness's absolute ceiling so the two agree on the outer bound.
  */
-export const MCP_ROUTE_TIMEOUT_MS = 1_800_000; // 30m > generate_video's 1_220_000ms
+export const MCP_ROUTE_TIMEOUT_MS = 4 * 60 * 60 * 1000; // 4h wedge guard, not a tool budget
 
 function isLoopback(remote: string | undefined): boolean {
 	return (
@@ -223,9 +231,9 @@ export function createMcpHttpRoute(registry: McpTurnRegistry): HttpRoute {
 			});
 		}
 		if (response === null) {
-			// Notification — accepted, no body.
-			res.statusCode = 202;
-			res.end();
+			// Notification — accepted, no body. Through the guarded helper like every
+			// other write: the response may already be gone (socket closed, abort).
+			endPlain(res, 202);
 			return;
 		}
 		sendJson(res, 200, response);

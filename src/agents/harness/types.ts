@@ -66,6 +66,10 @@ export interface HarnessTurn {
 	/** The turn's composed `beforeToolCall` chain (closes over its `gateCtxRef`). */
 	guard?: BrigadeBeforeToolCallHook;
 	signal?: AbortSignal;
+	/** Sub-agent nesting, so a harness's tool events render indented like a Pi
+	 *  sub-agent's rather than as the parent's own calls. Absent at top level. */
+	subagentDepth?: number;
+	subagentLabel?: string;
 }
 
 /**

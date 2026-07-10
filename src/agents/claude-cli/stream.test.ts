@@ -209,12 +209,16 @@ test("stream fn: auth-shaped stderr on non-zero exit → re-auth message", async
 
 /* ─────────────────────── MCP tool-plane gates ─────────────────────── */
 
-function ctxWithStamp(over: { senderIsOwner: boolean; systemPrompt?: string }) {
+function ctxWithStamp(over: { senderIsOwner: boolean; systemPrompt?: string; structured?: boolean }) {
 	const ctx: Record<string, unknown> = {
 		systemPrompt: over.systemPrompt ?? "You are Brigade.",
 		messages: [{ role: "user", content: "hey" }],
 	};
-	stampClaudeCliToolPlane(ctx, { agentId: "main", senderIsOwner: over.senderIsOwner });
+	stampClaudeCliToolPlane(ctx, {
+		agentId: "main",
+		senderIsOwner: over.senderIsOwner,
+		...(over.structured !== undefined ? { structured: over.structured } : {}),
+	});
 	return ctx as never;
 }
 
@@ -240,10 +244,37 @@ test("tool-plane: UNSTAMPED context (isolated distiller sessions) gets NO mcp fl
 	assert.ok(!captured.args?.includes("--mcp-config"));
 });
 
-test("tool-plane: STRUCTURED distiller turn gets NO mcp flags even when owner-stamped", async () => {
+test("tool-plane: a DECLARED structured turn gets NO mcp flags even when owner-stamped", async () => {
 	const captured: FakeSpawnScript["captured"] = {};
 	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }) });
-	const ctx = ctxWithStamp({ senderIsOwner: true, systemPrompt: 'Distill. Return STRICT JSON only: {"facts":[]}' });
+	// Distiller sessions stamp `structured: true` (installStructuredTurnStamp). Even
+	// owner-stamped, they stay tool-less on every backend.
+	const ctx = ctxWithStamp({ senderIsOwner: true, structured: true });
 	await drain(fn(MODEL, ctx, undefined) as never);
 	assert.ok(!captured.args?.includes("--mcp-config"), "distillers stay tool-less on every backend");
+});
+
+test("tool-plane: an owner turn whose PERSONA says 'STRICT JSON only' keeps its tools", async () => {
+	const captured: FakeSpawnScript["captured"] = {};
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }) });
+	// The assembled persona splices in operator-authored files (TOOLS.md, USER.md) and
+	// skill descriptions verbatim. Documenting a JSON API must NOT make the transport
+	// mistake a chat turn for a distiller and strip its whole tool surface — which the
+	// operator would see only as an agent that mysteriously "won't use its tools".
+	const ctx = ctxWithStamp({
+		senderIsOwner: true,
+		structured: false,
+		systemPrompt: "You are Brigade.\n\n## TOOLS.md\nOur /v1/facts endpoint returns STRICT JSON only.",
+	});
+	await drain(fn(MODEL, ctx, undefined) as never);
+	assert.ok(captured.args?.includes("--mcp-config"), "a stamped agent turn keeps its plane regardless of prose");
+});
+
+test("tool-plane: an UNSTAMPED distiller prompt still falls back to the text sniff", async () => {
+	const captured: FakeSpawnScript["captured"] = {};
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }) });
+	// The cold path (no stamp at all) has nothing else to go on.
+	const ctx = { systemPrompt: 'Distill. Return STRICT JSON only: {"facts":[]}', messages: [] };
+	await drain(fn(MODEL, ctx as never, undefined) as never);
+	assert.ok(!captured.args?.includes("--mcp-config"));
 });

@@ -308,7 +308,6 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				// must be reinforced toward JSON, never nudged toward prose. Detected from
 				// the pinned system prompt so this backend returns a clean envelope and the
 				// memory extraction cursor can actually advance (see isStructuredJsonPrompt).
-				const structured = isStructuredJsonPrompt(ctx.systemPrompt);
 				// Brigade MCP tool-plane (memory/graph on the free-tier engine). THREE
 				// gates, all load-bearing (see tool-plane.ts): the turn was stamped by the
 				// agent loop (claude-cli dispatch only), the sender is the OWNER (the
@@ -318,6 +317,19 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				// (undefined) when the CLI entry path or agent id can't be resolved safely.
 				const toolPlane = readClaudeCliToolPlane(context);
 				const mcpHttpUrl = toolPlane?.mcpHttpUrl;
+
+				// A structured (JSON-distiller) turn — the memory/skill utility subagents —
+				// must be reinforced toward JSON, never nudged toward prose, or the memory
+				// extraction cursor can never advance (see isStructuredJsonPrompt).
+				//
+				// The DECLARATION decides. A stamped turn states what it is: distiller
+				// sessions stamp `structured: true`, the agent loop stamps agent turns. The
+				// prompt-text sniff is the fallback for an unstamped (cold) context only —
+				// on an agent turn `ctx.systemPrompt` is the assembled persona, which
+				// splices operator-authored files and skill descriptions in verbatim, so the
+				// words "STRICT JSON only" in TOOLS.md would silently strip a chat turn's
+				// entire tool-plane and leave an agent that "won't use its tools".
+				const structured = toolPlane ? toolPlane.structured === true : isStructuredJsonPrompt(ctx.systemPrompt);
 				// Precedence: a STRUCTURED distiller turn gets NO tools (every backend).
 				// Otherwise, if the gateway registered this turn's FULL guarded surface,
 				// hand the binary that loopback HTTP endpoint; else fall back to the owner
@@ -357,6 +369,9 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 					stdin: prompt,
 					systemPrompt,
 					...(mcpConfigJson !== undefined ? { mcpConfigJson } : {}),
+					// The args above already denied every built-in. If the plane can't attach,
+					// the model would have nothing to act with — fail the spawn instead.
+					...(fullPlane ? { requireMcpConfig: true } : {}),
 					signal: options?.signal as AbortSignal | undefined,
 					spawnFn: opts.spawnFn,
 				});
@@ -414,6 +429,14 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				if (killReason === "no-output-timeout" || killReason === "overall-timeout") {
 					throw new Error(
 						`claude-cli ${killReason}: the CLI produced no output for too long (it may be waiting on an interactive prompt).`,
+					);
+				}
+				if (killReason === "absolute-ceiling") {
+					// Phrased to avoid the word the error classifier reads as a transient
+					// timeout: this turn ran for HOURS, so respawning it on the same model
+					// would just start the next four. Classified `unknown` => not retried.
+					throw new Error(
+						"claude-cli exceeded its absolute run ceiling and was stopped. The turn kept calling tools without finishing.",
 					);
 				}
 				if (limitHit) {

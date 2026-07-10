@@ -76,11 +76,26 @@ test("register: prunes expired entries and never grows past the cap", () => {
 	const reg = createMcpTurnRegistry({ maxEntries: 3, ttlMs: 10_000, now: () => t });
 	const tokens = [reg.register(fakeCtx("a")).token, reg.register(fakeCtx("b")).token, reg.register(fakeCtx("c")).token];
 	assert.equal(reg.size(), 3);
-	// A 4th registration must evict the OLDEST rather than grow unbounded.
+	// A 4th registration must evict rather than grow unbounded.
 	const fourth = reg.register(fakeCtx("d")).token;
 	assert.equal(reg.size(), 3, "cap holds");
-	assert.equal(reg.lookup(tokens[0] as string), undefined, "oldest evicted");
+	assert.equal(reg.lookup(tokens[0] as string), undefined, "least-recently-seen evicted");
 	assert.ok(reg.lookup(fourth), "newest present");
+});
+
+test("the cap evicts the STALEST entry, never the oldest-but-still-active turn", () => {
+	let t = 0;
+	const reg = createMcpTurnRegistry({ maxEntries: 2, ttlMs: 10_000, now: () => t });
+	const busy = reg.register(fakeCtx("long-running")).token; // registered first…
+	t += 10;
+	const idle = reg.register(fakeCtx("idle")).token;
+	t += 10;
+	// …but it is the one actively calling tools. Age would evict it; liveness must not.
+	assert.ok(reg.lookup(busy), "still calling");
+	t += 10;
+	reg.register(fakeCtx("new"));
+	assert.ok(reg.lookup(busy), "the active turn kept its tools");
+	assert.equal(reg.lookup(idle), undefined, "the idle one was reclaimed instead");
 });
 
 test("register: TTL pruning reclaims leaked entries (a turn that never disposed)", () => {
@@ -99,4 +114,30 @@ test("a live turn's token survives well past a normal turn length", () => {
 	const { token } = reg.register(fakeCtx());
 	t += 30 * 60 * 1000; // the tool-plane hard ceiling
 	assert.ok(reg.lookup(token), "TTL must never evict a still-running turn");
+});
+
+// A turn's wall clock is NOT bounded by the hard ceiling: the child's watchdogs are
+// paused for every tool call and the ceiling slides by the paused span. Three chained
+// `generate_video` calls (~20m each) outlive any fixed age cap. With an age TTL, the
+// turn's next `tools/call` 404s — and because a full-plane spawn denies the binary's
+// own builtins, the agent loses its ENTIRE tool surface mid-turn. The TTL must measure
+// IDLE time. (This is why the test above, which advances exactly to the static ceiling,
+// could never have caught it.)
+test("a turn that keeps calling tools is never evicted, however long it runs", () => {
+	let t = 0;
+	const reg = createMcpTurnRegistry({ now: () => t }); // production defaults
+	const { token } = reg.register(fakeCtx());
+	for (let i = 0; i < 12; i++) {
+		t += 20 * 60 * 1000; // a long tool call
+		assert.ok(reg.lookup(token), `still live after ${((i + 1) * 20) / 60}h of chained tool calls`);
+	}
+});
+
+test("…but a token whose turn went silent is still reclaimed", () => {
+	let t = 0;
+	const reg = createMcpTurnRegistry({ now: () => t });
+	const { token } = reg.register(fakeCtx());
+	assert.ok(reg.lookup(token));
+	t += 4 * 60 * 60 * 1000 + 1; // one idle span past the ceiling
+	assert.equal(reg.lookup(token), undefined, "an abandoned registration must not leak");
 });

@@ -222,6 +222,21 @@ export const CLAUDE_CLI_CLEAR_ENV: readonly string[] = [
 export const CLAUDE_CLI_FORBIDDEN_ENV = "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST";
 
 /**
+ * How long the binary's MCP client waits on one Brigade `tools/call`.
+ *
+ * This must exceed every budget on OUR side, because whoever times out first
+ * decides — and the binary timing out first is the bad outcome: it closes the
+ * socket, which aborts our handler, which tells the model the tool failed, all
+ * while the operator is still reading the approval prompt that would have let it
+ * succeed. Matched to the harness's absolute ceiling so Brigade's own deadlines
+ * (exec-gate 5m, per-tool budgets, the route's wedge guard) are always the ones
+ * that fire. An operator-set value wins.
+ */
+export const CLAUDE_CLI_MCP_TOOL_TIMEOUT_MS = 4 * 60 * 60 * 1000; // 4h — matches the absolute ceiling
+/** Handshake budget: the server is in-process, so a slow one means something is wrong. */
+export const CLAUDE_CLI_MCP_STARTUP_TIMEOUT_MS = 30_000;
+
+/**
  * Build the scrubbed environment for the child `claude` process from a base
  * env (usually `process.env`). Deletes every clear-list var + the forbidden
  * host-managed marker. Pure: returns a new object, never mutates the input.
@@ -243,6 +258,14 @@ export function buildClaudeCliEnv(
 	if (opts.configDir && opts.configDir.trim().length > 0) {
 		next.CLAUDE_CONFIG_DIR = opts.configDir;
 	}
+	// A Brigade tool call can legitimately block for a long time: `bash` waits on the
+	// operator's exec approval (5 min), `generate_video` has a ~20 min budget. Left to
+	// its default, the binary's MCP client could abandon the request first — closing
+	// the socket, aborting our handler, and telling the model the tool failed WHILE the
+	// operator is still reading the approval prompt. Pin both budgets above ours so
+	// Brigade's own timeouts are always the ones that decide. Operator env wins.
+	next.MCP_TOOL_TIMEOUT ??= String(CLAUDE_CLI_MCP_TOOL_TIMEOUT_MS);
+	next.MCP_TIMEOUT ??= String(CLAUDE_CLI_MCP_STARTUP_TIMEOUT_MS);
 	return next;
 }
 
@@ -266,35 +289,61 @@ const CLAUDE_CLI_BASE_ARGS: readonly string[] = [
 	"bypassPermissions",
 ];
 
-// Mutating + network tools we deny as defense-in-depth. `bypassPermissions`
-// (kept so the CLI never blocks on an unanswerable approval prompt) overrides
-// the allow/deny lists for read-only tools, so a deny list can't make the CLI
-// perfectly tool-free — but it still keeps the strongest footguns (shell,
-// file writes, edits, network) off the table. The real containment is the
-// isolated empty spawn cwd (see spawn.ts): any tool the CLI does reach acts on
-// a throwaway directory, so a conversational turn stays harmless. The system-
-// prompt nudge (appended below) asks it to just answer.
-const CLAUDE_CLI_DENY_TOOLS = "Bash Edit Write MultiEdit NotebookEdit WebFetch WebSearch";
+/**
+ * Every name the vendor's sub-agent tool answers to.
+ *
+ * The binary carries a legacy→canonical rename map (`{Task:"Agent",
+ * KillShell:"TaskStop", BashOutputTool:"TaskOutput", …}`): the tool's canonical
+ * name is `Agent` and `Task` is merely an alias it still accepts. Denying only
+ * `Task` therefore bets the whole containment on the deny-matcher normalizing
+ * aliases before it compares — which is undocumented, and which the very
+ * existence of that map shows can change under us.
+ *
+ * So deny every spelling. A name the binary doesn't ship is ignored, which costs
+ * nothing; a name we omit is a tool the model can still reach.
+ */
+const CLAUDE_CLI_SUBAGENT_TOOLS = "Agent Task TaskStop TaskOutput KillShell KillBash BashOutput BashOutputTool";
+
+// Mutating + network tools we deny as defense-in-depth, plus the binary's own
+// sub-agent (which would run unguarded, off-transcript, outside Brigade's crew).
+//
+// `--permission-mode bypassPermissions` is kept so the CLI never blocks on an
+// approval prompt nobody can answer. Whether it also overrides the deny list for
+// read-only tools is NOT settled: the binary ships deny-rule enforcement (it
+// carries a "was blocked by a deny rule" message), but nothing in the package
+// states the precedence, and it is compiled. Treat the deny list as best-effort.
+//
+// The containment we can actually prove is the isolated empty spawn cwd (see
+// spawn.ts): any built-in the CLI does reach acts on a throwaway directory, so a
+// conversational turn stays harmless either way. The system-prompt nudge
+// (appended below) asks it to just answer.
+const CLAUDE_CLI_DENY_TOOLS = `Bash Edit Write MultiEdit NotebookEdit WebFetch WebSearch ${CLAUDE_CLI_SUBAGENT_TOOLS}`;
 
 /**
- * The deny list for a FULL-PLANE turn — every built-in the binary ships, so the
- * only tools it can reach are Brigade's own `mcp__brigade__*`.
+ * The deny list for a FULL-PLANE turn: every built-in that could act instead of
+ * Brigade's `mcp__brigade__*`, so the plane is the model's one way to do work.
  *
  * Denying the mutating ones was never enough. The binary's READ-side tools
  * (`Read`, `Grep`, `Glob`) still worked — but they act on the isolated throwaway
  * cwd we spawn it in, NOT the operator's workspace. The model would read an empty
- * directory and conclude the file does not exist. `Task` would spin up the
- * binary's own sub-agent instead of Brigade's `spawn_agent` (no guards, no
+ * directory and conclude the file does not exist. The sub-agent tool would spin up
+ * the binary's own executor instead of Brigade's `spawn_agent` (no guards, no
  * transcript, no crew). And none of them pass through the exec-gate, the
  * path-write guard, or the origin scoping.
  *
- * Brigade serves guarded equivalents for all of them (see mcp/builtin-tools.ts),
- * bound to the turn's REAL cwd, so the binary loses nothing by being denied these.
- * Only names the vendor actually ships are listed — an unknown name would be
- * silently ignored, but listing one would be a lie about what we contain.
+ * Brigade serves guarded equivalents (see mcp/builtin-tools.ts) bound to the turn's
+ * REAL cwd, so the binary loses nothing by being denied these.
+ *
+ * This is NOT "every built-in the vendor ships" — the binary carries dozens, and
+ * the rest are either inert without `Bash`, scoped to our own server by
+ * `--strict-mcp-config`, or non-acting (plan mode, onboarding). It is every
+ * built-in that can touch the filesystem, the shell, the network, or spawn an
+ * unguarded agent. And per CLAUDE_CLI_DENY_TOOLS, enforcement under
+ * `bypassPermissions` is unproven — the empty spawn cwd is the load-bearing
+ * containment; this list is the belt.
  */
 const CLAUDE_CLI_FULL_PLANE_DENY_TOOLS =
-	"Task Bash Glob Grep Read Edit Write MultiEdit NotebookEdit WebFetch WebSearch TodoWrite";
+	`Bash Glob Grep Read Edit Write MultiEdit NotebookEdit WebFetch WebSearch TodoWrite ${CLAUDE_CLI_SUBAGENT_TOOLS}`;
 
 // Appended to Brigade's system prompt for claude-cli turns: this backend is a
 // conversational voice, not an autonomous coder in the (throwaway) spawn cwd.

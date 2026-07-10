@@ -44,7 +44,9 @@ import type { AnyBrigadeTool } from "../tools/types.js";
  * an agent that cannot search or list. Building each by name also means we only
  * ever construct what the turn actually allows.
  */
-const BUILTIN_FACTORIES: Readonly<Record<string, (cwd: string) => unknown>> = {
+// Each factory takes its OWN options type; we only ever pass the shapes Pi passes
+// (`optionsFor`), so the call site casts rather than modelling six unions.
+const BUILTIN_FACTORIES: Readonly<Record<string, (cwd: string, options?: never) => unknown>> = {
 	read: createReadTool,
 	write: createWriteTool,
 	edit: createEditTool,
@@ -52,6 +54,34 @@ const BUILTIN_FACTORIES: Readonly<Record<string, (cwd: string) => unknown>> = {
 	grep: createGrepTool,
 	ls: createLsTool,
 };
+
+/**
+ * The operator settings Pi threads into the two builtins that take options.
+ *
+ * Pi's own `_buildRuntime` calls `createAllToolDefinitions(cwd, { read:
+ * {autoResizeImages}, bash: {commandPrefix, shellPath} })` — and passes nothing
+ * for edit/write/grep/ls. Constructing them here without those options was a
+ * silent behavioural fork: an operator who set a shell prefix (`set -euo
+ * pipefail`) or a non-default shell would have it honoured on a Pi-loop turn and
+ * ignored on a harness turn, same agent, same command.
+ */
+export interface BuiltinToolSettings {
+	autoResizeImages?: boolean;
+	commandPrefix?: string;
+	shellPath?: string;
+}
+
+/** Per-tool options, shaped exactly as Pi shapes them. */
+function optionsFor(name: string, s: BuiltinToolSettings): unknown {
+	if (name === "read") return s.autoResizeImages === undefined ? undefined : { autoResizeImages: s.autoResizeImages };
+	if (name === "bash") {
+		const bash: Record<string, unknown> = {};
+		if (s.commandPrefix !== undefined) bash.commandPrefix = s.commandPrefix;
+		if (s.shellPath !== undefined) bash.shellPath = s.shellPath;
+		return Object.keys(bash).length > 0 ? bash : undefined;
+	}
+	return undefined; // Pi passes nothing for edit/write/grep/ls — match it exactly.
+}
 
 /**
  * The turn's builtin tools as callable objects, restricted to `allow` — which is
@@ -66,19 +96,51 @@ const BUILTIN_FACTORIES: Readonly<Record<string, (cwd: string) => unknown>> = {
 export function createGuardedBuiltinTools(opts: {
 	cwd: string;
 	allow: readonly string[];
+	settings?: BuiltinToolSettings;
 }): AnyBrigadeTool[] {
 	if (!opts.cwd || opts.allow.length === 0) return [];
+	const settings = opts.settings ?? {};
 	const out: AnyBrigadeTool[] = [];
 	for (const raw of opts.allow) {
 		const name = raw.trim().toLowerCase();
 		const factory = BUILTIN_FACTORIES[name];
 		if (!factory) continue; // not a builtin (a native tool, or one Pi doesn't have)
 		try {
-			const tool = factory(opts.cwd) as AnyBrigadeTool;
+			const options = optionsFor(name, settings);
+			const tool = (options === undefined ? factory(opts.cwd) : factory(opts.cwd, options as never)) as AnyBrigadeTool;
 			if (tool && typeof tool.execute === "function") out.push(tool);
 		} catch {
 			/* skip this builtin; the rest of the plane still works */
 		}
 	}
 	return out;
+}
+
+/**
+ * Lift the settings Pi would have applied off the live session, best-effort.
+ *
+ * Read defensively: `settingsManager` is Pi-internal, and a version that renames
+ * or drops a getter must degrade to Pi's own defaults (both shell settings are
+ * `undefined` out of the box), never throw into a turn.
+ */
+export function readBuiltinToolSettings(session: unknown): BuiltinToolSettings {
+	const sm = (session as { settingsManager?: Record<string, unknown> } | undefined)?.settingsManager;
+	if (!sm) return {};
+	const call = <T>(method: string): T | undefined => {
+		const fn = sm[method];
+		if (typeof fn !== "function") return undefined;
+		try {
+			return (fn as () => T).call(sm);
+		} catch {
+			return undefined;
+		}
+	};
+	const autoResizeImages = call<boolean>("getImageAutoResize");
+	const commandPrefix = call<string>("getShellCommandPrefix");
+	const shellPath = call<string>("getShellPath");
+	return {
+		...(autoResizeImages !== undefined ? { autoResizeImages } : {}),
+		...(commandPrefix !== undefined ? { commandPrefix } : {}),
+		...(shellPath !== undefined ? { shellPath } : {}),
+	};
 }

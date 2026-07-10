@@ -43,7 +43,10 @@ function realToolset(): { native: AnyBrigadeTool[]; builtins: AnyBrigadeTool[]; 
 
 test("the plane serves the native tools AND Pi's builtins", () => {
 	const { native, builtins, builtinNames } = realToolset();
-	assert.ok(native.length > 15, `expected the full native surface, got ${native.length}`);
+	// A real floor, not a token one: an owner turn assembles 25 native tools today.
+	// `> 15` would let a silent drop to 16 — a tool quietly falling out of the toolset —
+	// sail through green, which is the exact failure this file exists to catch.
+	assert.ok(native.length >= 25, `expected the full native surface (>=25), got ${native.length}`);
 	assert.deepEqual(
 		builtins.map((t) => t.name).sort(),
 		[...builtinNames].sort(),
