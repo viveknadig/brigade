@@ -279,6 +279,33 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				onTextDelta(accumulatedText.endsWith("\n") ? "\n" : "\n\n");
 			};
 
+			/**
+			 * The same break between two THINKING blocks. Steps 2..N of the binary's own
+			 * loop each open one, and without this the model's separate trains of thought
+			 * fuse: "hmm" + "second thought" → "hmmsecond thought", in the transcript and in
+			 * `/reasoning`.
+			 *
+			 * Appended straight to the accumulator rather than pushed as a `thinking_delta`:
+			 * by the time a later thinking block opens, `thinking_end` has already been
+			 * emitted, and adding another delta after it would make the stream more
+			 * malformed, not less. `partial()` rebuilds its content from this accumulator on
+			 * the next event either way, so the operator still sees it.
+			 *
+			 * On that malformation, deliberately left alone: because the binary runs several
+			 * internal steps inside ONE Brigade turn, a later step's thinking deltas are
+			 * emitted after we already sent `thinking_end`. The event LABELS are therefore
+			 * out of order. The payloads are not, and only the payloads are read — Pi's loop
+			 * treats every block event identically (`partialMessage = event.partial`) and
+			 * takes the final message from `response.result()` (pi-agent-core/dist/
+			 * agent-loop.js:196-240). Re-indexing the blocks to satisfy a consumer that
+			 * doesn't exist would be risk without benefit.
+			 */
+			const separateThinkingBlock = (): void => {
+				if (!accumulatedThinking) return;
+				if (/\n\s*\n$/.test(accumulatedThinking)) return;
+				accumulatedThinking += accumulatedThinking.endsWith("\n") ? "\n" : "\n\n";
+			};
+
 			const handleStreamEvent = (ev: AnthropicStreamEvent | undefined) => {
 				if (!ev || typeof ev.type !== "string") return;
 				switch (ev.type) {
@@ -310,6 +337,7 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 						// the model acted and one after. Markdown renders them as paragraphs,
 						// which is what they are.
 						if (ev.content_block?.type === "text") separateTextBlock();
+						else if (ev.content_block?.type === "thinking") separateThinkingBlock();
 						break;
 					}
 					case "content_block_delta": {

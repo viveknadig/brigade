@@ -1413,7 +1413,11 @@ export async function wireConnectUi(
 				asstKeyByDepth.set(depth, contKey);
 				const cont = asstContinuation.get(contKey);
 				if (cont) {
-					const tail = text.slice(cont.prefixLen);
+					// Strip the leading break the transport inserts between two text blocks
+					// (see `separateTextBlock`). It belongs BETWEEN the blocks, and this
+					// continuation IS the block boundary — kept, it would open the new block
+					// with a blank line under its own label.
+					const tail = text.slice(cont.prefixLen).replace(/^\n+/, "");
 					// Nothing new since the chip — the model is still thinking. Leave the
 					// spinner up and paint nothing.
 					if (!tail.trim()) break;

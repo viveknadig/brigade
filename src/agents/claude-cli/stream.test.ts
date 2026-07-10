@@ -164,6 +164,49 @@ test("the FIRST text block never opens with a leading blank line", async () => {
 	assert.equal(message.content.find((c: any) => c.type === "text")?.text, "Hello");
 });
 
+test("two thinking blocks across a tool call do not fuse either", async () => {
+	// Steps 2..N of the binary's loop each open their own thinking block. Fused, the
+	// model's separate trains of thought read as one: "hmm" + "second thought" →
+	// "hmmsecond thought", in the transcript and in `/reasoning`.
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Looking."}}}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","name":"mcp__brigade__read"}}}',
+		// step 2: a fresh thinking block, then fresh text
+		'{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"second thought"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Found it."}}}',
+		'{"type":"result","subtype":"success","result":"Found it."}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.content.find((c: any) => c.type === "thinking")?.thinking, "hmm\n\nsecond thought");
+	assert.equal(message.content.find((c: any) => c.type === "text")?.text, "Looking.\n\nFound it.");
+});
+
+test("no tool_use block ever reaches the returned message's content", async () => {
+	// Pi's runLoop executes `message.content.filter(c => c.type === "toolCall")`. If a
+	// tool_use block survived into the returned message, Pi would re-run every tool the
+	// binary already ran — `bash ./deploy.sh` twice.
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu_1","name":"mcp__brigade__bash"}}}',
+		'{"type":"assistant","message":{"content":[{"type":"text","text":"ok"},{"type":"tool_use","id":"tu_1","name":"mcp__brigade__bash"}]}}',
+		'{"type":"result","subtype":"success","result":"ok"}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	const types = message.content.map((c: any) => c.type);
+	assert.deepEqual(types.filter((t: string) => t === "toolCall" || t === "tool_use"), []);
+	assert.ok(types.every((t: string) => t === "text" || t === "thinking"), `unexpected block: ${types.join(",")}`);
+});
+
 test("a thinking block opening does not inject a paragraph break into the text", async () => {
 	const lines = [
 		'{"type":"system","subtype":"init"}',
