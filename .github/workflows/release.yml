@@ -21,6 +21,17 @@ name: Release
 on:
   push:
     branches: [main]
+  # Escape hatch. `publish-npm` only fires when release-please CREATES a release, so
+  # when the publish step itself fails (a broken runner npm, an npm outage, an expired
+  # token) the tag and GitHub Release exist while npm never receives the package — and
+  # re-running the job just replays the same failing commit. This lets an operator
+  # publish whatever version `main` currently declares, once the cause is fixed.
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the version in package.json to npm"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -52,7 +63,7 @@ jobs:
 
   publish-npm:
     needs: release-please
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    if: ${{ needs.release-please.outputs.release_created == 'true' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
     runs-on: ubuntu-latest
     environment: npm-release
     permissions:
@@ -67,8 +78,33 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           cache: npm
 
-      - name: Ensure recent npm (provenance + trusted publishing)
-        run: npm install -g npm@latest
+      # Do NOT `npm install -g npm@latest` here. npm overwriting itself in the runner's
+      # tool-cache leaves its own dependency tree half-written, and the first thing to
+      # notice is `npm publish --provenance`:
+      #
+      #   npm error Cannot find module 'sigstore'
+      #   npm error - .../npm/node_modules/libnpmpublish/lib/provenance.js
+      #
+      # That failed the 1.26.0 AND 1.26.1 publishes after every test had passed. Node 24
+      # already ships an npm new enough for provenance + trusted publishing, so verify
+      # rather than upgrade — and fail with a readable reason if a future runner regresses.
+      - name: Verify npm supports provenance + trusted publishing
+        run: |
+          set -euo pipefail
+          v="$(npm --version)"
+          echo "runner npm: $v"
+          node -e '
+            const [maj, min, pat] = process.argv[1].split(".").map(Number);
+            const ok = maj > 11 || (maj === 11 && (min > 5 || (min === 5 && pat >= 1)));
+            if (!ok) {
+              console.error(`npm ${process.argv[1]} is too old — provenance + trusted publishing need >= 11.5.1`);
+              process.exit(1);
+            }
+          ' "$v"
+          # Advisory only — `npm publish` is the real check, and a false negative here
+          # must never block a healthy release.
+          node -e "require.resolve('sigstore', { paths: [require('node:child_process').execSync('npm root -g').toString().trim() + '/npm/node_modules/libnpmpublish'] }); console.log('sigstore resolvable')" \
+            || echo "::warning::could not resolve 'sigstore' from this runner's npm — provenance may fail at publish time"
 
       - name: Install dependencies
         run: npm ci
