@@ -1336,8 +1336,36 @@ export async function wireConnectUi(
 		if (isOffLane(payload.agentId, payload.sessionId, subagentDepth)) return;
 		const depth = typeof subagentDepth === "number" ? subagentDepth : 0;
 		const subIndent = depth > 0 ? "  ".repeat(depth) : "";
+		// A CHILD turn (`spawn_agent`) streams its own lifecycle: agent_start when it
+		// begins, agent_end when it finishes. Those events describe the child, not this
+		// turn — and the handlers below tear down THIS turn's state.
+		//
+		// Unguarded, a sub-agent finishing ran the parent's teardown mid-flight:
+		// `activeAssistants.clear()` dropped the parent's streaming block identity, so
+		// when the parent resumed it opened a FRESH block holding the whole message and
+		// re-rendered its entire answer from the top; `pendingTools.clear()` orphaned the
+		// parent's own `⚡ spawn_agent` chip so it never turned `✓`; `isAgentRunning=false`
+		// and `disableSubmit=false` told the operator the turn was over while it ran on.
+		// A child's agent_start was no better: it overwrote `activeLoader`, leaking the
+		// parent's spinner widget into the transcript, and reset the elapsed clock.
+		//
+		// The child's WORK is still shown — its text, tool chips and approval prompts all
+		// carry `depth` and render indented under `sub-agent`. Only the turn-lifecycle
+		// bookkeeping is the parent's alone.
+		const isChildTurn = depth > 0;
 		switch (event?.type) {
 			case "agent_start": {
+				if (isChildTurn) {
+					// Mark the handoff. Without it, a `spawn_agent` that thinks for a minute
+					// before writing anything is a minute of blank screen under a `⚡` chip,
+					// and when the child's prose finally arrives there is nothing saying
+					// whose prose it is.
+					insertBeforeEditor(
+						new Text(`${subIndent}  ${brand.dim("↳ sub-agent working…")}`, 0, 0),
+					);
+					tui.requestRender();
+					break;
+				}
 				isAgentRunning = true;
 				agentStartedAt = Date.now();
 				whimsicalIdx = 0; // reset so the first phrase is always "thinking"
@@ -1567,17 +1595,26 @@ export async function wireConnectUi(
 				break;
 			}
 			case "compaction_start": {
-				const pct = lastSnapshot?.contextUsagePercent != null
-					? `${Math.round(lastSnapshot.contextUsagePercent)}%`
-					: "high";
+				// A CHILD's context, not ours — never quote the parent's percentage for it.
+				const pct = isChildTurn
+					? "high"
+					: lastSnapshot?.contextUsagePercent != null
+						? `${Math.round(lastSnapshot.contextUsagePercent)}%`
+						: "high";
 				insertBeforeEditor(
-					new Text(`  ${brand.dim(`⚡ compacting context (was ${pct})…`)}`, 0, 0),
+					new Text(`${subIndent}  ${brand.dim(`⚡ compacting context (was ${pct})…`)}`, 0, 0),
 				);
 				break;
 			}
 			case "compaction_end": {
 				if (event.aborted) {
-					insertBeforeEditor(new Text(`  ${brand.dim("compaction aborted")}`, 0, 0));
+					insertBeforeEditor(new Text(`${subIndent}  ${brand.dim("compaction aborted")}`, 0, 0));
+				} else if (isChildTurn) {
+					// The child compacted its OWN context. Say so, and leave the parent's
+					// header figure alone — it still describes the parent's session.
+					insertBeforeEditor(
+						new Text(`${subIndent}  ${brand.amber("✓")} ${brand.dim("compacted")}`, 0, 0),
+					);
 				} else {
 					// Do NOT read `lastSnapshot` for an "after" figure. Pi's
 					// getContextUsage() returns null right after compaction by design
@@ -1617,7 +1654,7 @@ export async function wireConnectUi(
 				const because = why ? ` ${brand.dim(`· ${why}`)}` : "";
 				insertBeforeEditor(
 					new Text(
-						`  ${brand.dim(`↻ retrying (attempt ${attempt}/${max}, waiting ${waitS}s)…`)}${because}`,
+						`${subIndent}  ${brand.dim(`↻ retrying (attempt ${attempt}/${max}, waiting ${waitS}s)…`)}${because}`,
 						0,
 						0,
 					),
@@ -1628,7 +1665,7 @@ export async function wireConnectUi(
 				if (event.success === false) {
 					insertBeforeEditor(
 						new Text(
-							`  ${brand.error("✗")} ${brand.error(`gave up after ${event.attempt} attempts`)}`,
+							`${subIndent}  ${brand.error("✗")} ${brand.error(`gave up after ${event.attempt} attempts`)}`,
 							0,
 							0,
 						),
@@ -1637,6 +1674,17 @@ export async function wireConnectUi(
 				break;
 			}
 			case "agent_end": {
+				if (isChildTurn) {
+					// The child is done. Its final text has already streamed; the parent's
+					// `✓ spawn_agent` chip lands when the tool returns. Touch no parent state —
+					// just close the child's section so the operator can see the seam.
+					flushStreamingRender();
+					insertBeforeEditor(
+						new Text(`${subIndent}  ${brand.dim("↲ sub-agent done — back to the main agent")}`, 0, 0),
+					);
+					tui.requestRender();
+					break;
+				}
 				isAgentRunning = false;
 				agentStartedAt = null;
 				editor.disableSubmit = false;

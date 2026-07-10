@@ -263,6 +263,22 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				stream.push({ type: "text_delta", contentIndex: textIdx(), delta, partial: partial() });
 			};
 
+			/**
+			 * Put a paragraph break between two text blocks of the same turn.
+			 *
+			 * Routed through `onTextDelta` so the break streams to the TUI like any other
+			 * text — appending it straight to `accumulatedText` would leave the rendered
+			 * block one delta behind the string we finally return.
+			 *
+			 * No-ops before any text, and when the text already ends in a blank line: the
+			 * binary often closes a block with its own newlines and we must not stack them.
+			 */
+			const separateTextBlock = (): void => {
+				if (!accumulatedText) return;
+				if (/\n\s*\n$/.test(accumulatedText)) return;
+				onTextDelta(accumulatedText.endsWith("\n") ? "\n" : "\n\n");
+			};
+
 			const handleStreamEvent = (ev: AnthropicStreamEvent | undefined) => {
 				if (!ev || typeof ev.type !== "string") return;
 				switch (ev.type) {
@@ -280,6 +296,20 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 						// Taking the last step (or the cumulative total) reports the binary's
 						// private scratch space as our context.
 						if (u.input && usageInput === 0) usageInput = u.input;
+						break;
+					}
+					case "content_block_start": {
+						// A NEW text block opens. The binary runs its own tool loop, so one
+						// Brigade turn is many internal steps, each with its own text blocks —
+						// "…let me look." → tool_use → "Good, real assets:". We accumulate them
+						// all into one string, and without a separator here the two sentences
+						// fuse: "let me look.Good, real assets:". Every screenshot of a
+						// tool-using turn was littered with them.
+						//
+						// A blank line, not a space: these are separate utterances, one before
+						// the model acted and one after. Markdown renders them as paragraphs,
+						// which is what they are.
+						if (ev.content_block?.type === "text") separateTextBlock();
 						break;
 					}
 					case "content_block_delta": {

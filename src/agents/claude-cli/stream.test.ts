@@ -113,6 +113,70 @@ const HAPPY_LINES = [
 	'{"type":"result","subtype":"success","result":"Hello there","usage":{"input_tokens":10,"output_tokens":3}}',
 ];
 
+test("text blocks separated by a tool call get a paragraph break, not a fused sentence", async () => {
+	// The binary runs its own tool loop, so one Brigade turn is many internal steps,
+	// each opening its own text block. Accumulating them without a separator produced
+	// exactly this, all over a working turn:
+	//
+	//   "Let me load my tools and look.Good — real assets: the lion mascot set…"
+	//   "…study the reference video's style.The reference is Anthropic's launch video"
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Let me load my tools and look."}}}',
+		// the model acts…
+		'{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","name":"mcp__brigade__read"}}}',
+		// …then resumes in a NEW text block
+		'{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Good — real assets."}}}',
+		'{"type":"result","subtype":"success","result":"x"}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	const text = message.content.find((c: any) => c.type === "text")?.text;
+	assert.equal(text, "Let me load my tools and look.\n\nGood — real assets.");
+	assert.equal(text.includes("look.Good"), false, "the two utterances must not fuse");
+});
+
+test("a text block opening on already-broken text does not stack blank lines", async () => {
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Done.\\n\\n"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Next."}}}',
+		'{"type":"result","subtype":"success","result":"x"}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.content.find((c: any) => c.type === "text")?.text, "Done.\n\nNext.");
+});
+
+test("the FIRST text block never opens with a leading blank line", async () => {
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}}',
+		'{"type":"result","subtype":"success","result":"Hello"}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.content.find((c: any) => c.type === "text")?.text, "Hello");
+});
+
+test("a thinking block opening does not inject a paragraph break into the text", async () => {
+	const lines = [
+		'{"type":"system","subtype":"init"}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}',
+		'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Answer."}}}',
+		'{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"thinking"}}}',
+		'{"type":"result","subtype":"success","result":"Answer."}',
+	];
+	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: lines }) });
+	const { message } = await drain(fn(MODEL, CTX, undefined) as never);
+	assert.equal(message.content.find((c: any) => c.type === "text")?.text, "Answer.");
+});
+
 test("stream fn: emits start → text deltas → done with accumulated text + usage", async () => {
 	const captured: FakeSpawnScript["captured"] = {};
 	const fn = createClaudeCliStreamFn({ spawnFn: makeFakeSpawn({ stdoutLines: HAPPY_LINES, captured }) });
