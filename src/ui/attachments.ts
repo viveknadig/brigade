@@ -43,7 +43,7 @@
  * pasted code block).
  */
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -648,6 +648,127 @@ export function clipboardUnavailableReason(): string | null {
 	return "no clipboard tool found — install wl-clipboard (Wayland) or xclip (X11) to paste images.";
 }
 
+/* ────────────────────── clipboard WATCHER (auto-attach) ───────────────── */
+
+/**
+ * Watch the OS clipboard and hand back any IMAGE the moment it appears.
+ *
+ * ── Why this exists, when Ctrl+V would be the obvious answer ──────────────
+ * It cannot be done with Ctrl+V. Every mainstream terminal — Windows Terminal,
+ * VS Code, iTerm — binds Ctrl+V to its OWN paste action and consumes the key.
+ * That paste inserts the clipboard's TEXT; when the clipboard holds only a
+ * screenshot there IS no text, so it inserts nothing and sends nothing. The
+ * application receives no keystroke at all. There is no byte to hook, no
+ * sequence to match, nothing. An app cannot intercept a key the terminal ate.
+ *
+ * So we stop trying to observe the KEYPRESS and observe the CLIPBOARD instead.
+ * Take a screenshot and it simply appears as an attachment — no key, no command.
+ * That is strictly better than the thing that couldn't work.
+ *
+ * ── Why it isn't a polling loop that shells out ───────────────────────────
+ * Spawning `powershell.exe` on a timer would cost ~100 ms of CPU every tick,
+ * forever, to answer a question that is almost always "no". Instead ONE
+ * long-lived PowerShell holds the watch and polls `GetClipboardSequenceNumber()`
+ * — a Win32 counter that ticks on any clipboard change and costs nothing to read.
+ * It only touches the clipboard when that number actually moves, saves the bitmap
+ * itself, and prints the path. Node just reads a line.
+ */
+export interface ClipboardWatcher {
+	stop(): void;
+}
+
+/**
+ * Start watching. `onImage` fires with a staged attachment for each NEW image
+ * placed on the clipboard while the TUI is running.
+ *
+ * Returns a no-op watcher on platforms where we can't do this cheaply — a caller
+ * must never depend on it having started, only benefit when it did.
+ */
+export function watchClipboardImages(
+	onImage: (att: StagedAttachment) => void,
+): ClipboardWatcher {
+	if (process.platform !== "win32") return { stop: () => {} };
+	// No terminal, no watcher. This is a convenience for a human sitting in front of
+	// a TUI; there is nobody to convenience in a test, a pipe, or a cron run — and
+	// starting a never-exiting child process in those contexts is how you hang a
+	// suite (it did) or leak a background process nobody knows to kill.
+	if (!process.stdout.isTTY) return { stop: () => {} };
+
+	const dir = spoolDir().replace(/'/g, "''");
+	// The Win32 sequence number is the whole trick: a free integer that changes
+	// whenever ANY process writes to the clipboard. We only pay for a clipboard read
+	// when it moves, so the steady-state cost of this watcher is one integer compare
+	// every 400 ms inside a process that is already running.
+	const script = `
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class BrigadeClip {
+  [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
+}
+"@
+$last = [BrigadeClip]::GetClipboardSequenceNumber()
+while ($true) {
+  Start-Sleep -Milliseconds 400
+  $n = [BrigadeClip]::GetClipboardSequenceNumber()
+  if ($n -ne $last) {
+    $last = $n
+    $img = [Windows.Forms.Clipboard]::GetImage()
+    if ($img -ne $null) {
+      $p = Join-Path '${dir}' ("clipboard-" + $n + ".png")
+      $img.Save($p, [System.Drawing.Imaging.ImageFormat]::Png)
+      $img.Dispose()
+      Write-Output ("IMAGE " + $p)
+    }
+  }
+}`.trim();
+
+	let child: ReturnType<typeof spawn> | undefined;
+	try {
+		child = spawn(
+			"powershell.exe",
+			["-NoProfile", "-NonInteractive", "-STA", "-Command", script],
+			{ stdio: ["ignore", "pipe", "ignore"], windowsHide: true },
+		);
+		// UNREF, or this watcher — which by design never exits — becomes a reference
+		// that keeps its parent's event loop alive forever. That is not a theoretical
+		// leak: it hung the entire test suite the first time, because the e2e test
+		// boots the real UI and node:test then had a live handle it could never
+		// close. Any short-lived CLI that touched this code would hang the same way.
+		// The watcher is a convenience; it must never be the reason a process lives.
+		child.unref();
+	} catch {
+		return { stop: () => {} };
+	}
+
+	let buf = "";
+	child.stdout?.on("data", (chunk: Buffer) => {
+		buf += chunk.toString("utf8");
+		let nl: number;
+		while ((nl = buf.indexOf("\n")) >= 0) {
+			const line = buf.slice(0, nl).trim();
+			buf = buf.slice(nl + 1);
+			if (!line.startsWith("IMAGE ")) continue;
+			const att = stageAttachment(line.slice("IMAGE ".length).trim());
+			if (att) onImage(att);
+		}
+	});
+	// A dead watcher must never take the TUI down with it.
+	child.on("error", () => {});
+
+	return {
+		stop: () => {
+			try {
+				child?.kill();
+			} catch {
+				/* already gone */
+			}
+		},
+	};
+}
+
 /** AppleScript string literals escape with a backslash, same as C. */
 function escapeAppleScript(s: string): string {
 	return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
@@ -718,6 +839,93 @@ export async function readClipboardFiles(): Promise<StagedAttachment[]> {
 		/* fall through */
 	}
 	return [];
+}
+
+/**
+ * The clipboard's TEXT, when that text is a path to a real file.
+ *
+ * The third clipboard mechanism, and the one that actually matters on Windows.
+ * "Copy as path" in Explorer, a path copied out of a log, or a terminal's own
+ * Ctrl+V handling of a copied file all put a PATH on the clipboard as plain text
+ * — not an image, and not a file-drop reference. Without this, `/paste` says
+ * "nothing to attach" while the operator is staring at a perfectly good path they
+ * just copied.
+ *
+ * Absolute-only, and it has to name a real file — the same rule as everywhere
+ * else, so copying the word "hello" can never attach something out of the cwd.
+ */
+export async function readClipboardPathText(): Promise<StagedAttachment | null> {
+	const text = await readClipboardText();
+	if (!text) return null;
+	const candidate = decodeCandidate(text.trim().replace(/^["'](.*)["']$/, "$1"));
+	if (!candidate || !path.isAbsolute(expandHome(candidate))) return null;
+	return stageAttachment(candidate);
+}
+
+/** Raw clipboard text, or "" when there is none / no tooling to read it. */
+async function readClipboardText(): Promise<string> {
+	try {
+		if (process.platform === "win32") {
+			const { stdout } = await execFileAsync(
+				"powershell.exe",
+				["-NoProfile", "-NonInteractive", "-STA", "-Command", "Get-Clipboard -Raw"],
+				{ timeout: 10_000 },
+			);
+			return stdout;
+		}
+		if (process.platform === "darwin") {
+			const { stdout } = await execFileAsync("pbpaste", [], { timeout: 10_000 });
+			return stdout;
+		}
+		for (const [bin, args] of [
+			["wl-paste", ["--no-newline"]],
+			["xclip", ["-selection", "clipboard", "-o"]],
+		] as Array<[string, string[]]>) {
+			try {
+				const { stdout } = await execFileAsync(bin, args, { timeout: 10_000 });
+				if (stdout) return stdout;
+			} catch {
+				continue;
+			}
+		}
+	} catch {
+		/* nothing readable */
+	}
+	return "";
+}
+
+/**
+ * What IS on the clipboard, in the operator's words — used only when a paste came
+ * back with nothing.
+ *
+ * "Nothing to attach" is a useless error: it tells you the outcome and not the
+ * cause, and it is indistinguishable from a bug in Brigade. Naming what the
+ * clipboard actually holds ("it has text, not an image") turns a dead end into an
+ * instruction.
+ */
+export async function describeClipboard(): Promise<string> {
+	if (process.platform !== "win32") {
+		const text = await readClipboardText();
+		return text.trim() ? "it holds text, not an image or a file." : "it appears to be empty.";
+	}
+	try {
+		const { stdout } = await execFileAsync(
+			"powershell.exe",
+			[
+				"-NoProfile",
+				"-NonInteractive",
+				"-STA",
+				"-Command",
+				"Add-Type -AssemblyName System.Windows.Forms; $d=[Windows.Forms.Clipboard]::GetDataObject(); if ($d) { $d.GetFormats() -join ',' }",
+			],
+			{ timeout: 10_000 },
+		);
+		const formats = stdout.trim();
+		if (!formats) return "it appears to be empty.";
+		return `it holds: ${formats.split(",").slice(0, 6).join(", ")} — but no image and no file.`;
+	} catch {
+		return "and Brigade couldn't read it at all.";
+	}
 }
 
 function stageAll(lines: string[]): StagedAttachment[] {

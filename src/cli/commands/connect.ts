@@ -36,12 +36,15 @@ import { BrigadeEditor } from "../../ui/editor.js";
 import {
 	attachmentIcon,
 	clipboardUnavailableReason,
+	describeClipboard,
+	readClipboardPathText,
 	extractAttachmentPaths,
 	formatBytes as formatAttachmentBytes,
 	MAX_STAGED_ATTACHMENTS,
 	readClipboardFiles,
 	readClipboardImage,
 	stageAttachment,
+	watchClipboardImages,
 	toPromptAttachments,
 	type StagedAttachment,
 } from "../../ui/attachments.js";
@@ -2264,27 +2267,40 @@ export async function wireConnectUi(
 	 */
 	const pasteFromClipboard = async (opts?: { quiet?: boolean }): Promise<void> => {
 		const before = stagedAttachments.length;
+		// THREE clipboard mechanisms, tried in the order that respects what the
+		// operator most likely meant:
+		//   1. a file REFERENCE (copied in Explorer/Finder) — only the path moves, so
+		//      a 400 MB video is free. Tried first because copying a file in Explorer
+		//      also exposes a thumbnail bitmap, and they meant the file, not its
+		//      thumbnail.
+		//   2. raw BITMAP data (a screenshot) — no file exists, so we spool one.
+		//   3. TEXT that happens to be a PATH — "Copy as path", a path out of a log,
+		//      or a terminal's own Ctrl+V of a copied file. Without this, /paste says
+		//      "nothing to attach" while the operator stares at a path they just
+		//      copied.
 		const files = await readClipboardFiles();
 		if (files.length > 0) {
 			stagePaths(files.map((f) => f.path));
 		} else {
-			const img = await readClipboardImage();
-			if (!img) {
-				if (!opts?.quiet) {
-					insertBeforeEditor(
-						new Text(
-							`  ${brand.dim(clipboardUnavailableReason() ?? "nothing to attach — the clipboard holds no image or file.")}`,
-							0,
-							0,
-						),
-					);
-				}
-				return;
-			}
 			// Through `stagePaths`, not straight onto the array — otherwise a pasted
 			// image would sidestep the count cap, the dedupe and the remote-gateway
 			// refusal that every other route honours.
-			stagePaths([img.path]);
+			const img = await readClipboardImage();
+			if (img) stagePaths([img.path]);
+			else {
+				const fromText = await readClipboardPathText();
+				if (fromText) stagePaths([fromText.path]);
+				else {
+					if (!opts?.quiet) {
+						// Name what the clipboard ACTUALLY holds. "Nothing to attach" states
+						// the outcome and hides the cause, and is indistinguishable from a bug
+						// in Brigade — which is exactly how it was read.
+						const why = clipboardUnavailableReason() ?? `clipboard: ${await describeClipboard()}`;
+						insertBeforeEditor(new Text(`  ${brand.dim(why)}`, 0, 0));
+					}
+					return;
+				}
+			}
 		}
 		// Drop a VISIBLE marker into the line you're typing, the way a chat client
 		// shows an inline attachment pill. Without it, Ctrl+V looks like it did
@@ -2299,11 +2315,41 @@ export async function wireConnectUi(
 	};
 
 	// Ctrl+V / Alt+V. Ctrl+V only reaches us in terminals that don't bind it to their
-	// own paste (Windows Terminal does); Alt+V nobody binds, so it always arrives.
-	// `/paste` remains the guaranteed path. See `BrigadeEditor.onImagePaste`.
+	// own paste (Windows Terminal and VS Code both do). See `BrigadeEditor.onImagePaste`.
 	editor.onImagePaste = () => {
 		void pasteFromClipboard({ quiet: false });
 	};
+
+	/**
+	 * AUTO-ATTACH a screenshot the moment it hits the clipboard.
+	 *
+	 * This is the answer to "I should just be able to paste, without a command",
+	 * and it exists because Ctrl+V CANNOT be made to work: the terminal owns that
+	 * key, its paste inserts the clipboard's TEXT, and a screenshot has no text — so
+	 * it sends nothing and the application never sees a keystroke to hook. There is
+	 * no byte to intercept.
+	 *
+	 * So we stop watching the keypress and watch the CLIPBOARD. Snip a screenshot
+	 * and it is simply there, staged, pilled, visible in the bar — no key, no
+	 * command. Which is less work than Ctrl+V would have been.
+	 *
+	 * It announces itself in the bar rather than attaching in silence: an image you
+	 * copied for some entirely unrelated reason must not sneak into your next
+	 * message without you noticing, and `/detach` is one word away.
+	 */
+	const clipboardWatcher = watchClipboardImages((att) => {
+		if (!gatewayIsLocal) return;
+		if (stagedAttachments.some((s) => s.path === att.path)) return;
+		if (stagePaths([att.path]) === 0) return;
+		insertBeforeEditor(
+			new Text(
+				`  ${brand.amber("📋")} ${brand.dim("image from your clipboard attached —")} ${brand.amber("/detach")} ${brand.dim("if you didn't mean to.")}`,
+				0,
+				0,
+			),
+		);
+		tui.requestRender();
+	});
 
 	/**
 	 * DRAG-AND-DROP, resolved the instant the file lands.
@@ -3666,6 +3712,11 @@ export async function wireConnectUi(
 			return true;
 		},
 		close: async () => {
+			// The clipboard watcher is a long-lived child process. Leaving one behind on
+			// every TUI exit would quietly accumulate PowerShell processes polling the
+			// clipboard forever, which is exactly the kind of thing nobody notices until
+			// there are forty of them.
+			clipboardWatcher.stop();
 			client.close();
 		},
 	};
