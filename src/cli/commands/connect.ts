@@ -906,7 +906,7 @@ export async function wireConnectUi(
 	);
 	tui.addChild(
 		new Text(
-			brand.dim("  Enter to send · Ctrl+C abort · attach: drag a file in · @path · /paste or Alt+V for a screenshot · /help"),
+			brand.dim("  Enter to send · Ctrl+C abort · attach: drag a file · @path · paste a path · screenshot → /paste · /help"),
 			0,
 			0,
 		),
@@ -2420,14 +2420,21 @@ export async function wireConnectUi(
 		}
 		insertBeforeEditor(
 			new Text(
-				`  ${brand.dim("note: Ctrl+V is consumed by your terminal (it binds it to its own paste), so Brigade")}`,
+				`  ${brand.dim("note: Ctrl+V pastes TEXT and copied file paths fine (your terminal does that itself,")}`,
 				0,
 				0,
 			),
 		);
 		insertBeforeEditor(
 			new Text(
-				`  ${brand.dim("never receives the key. Use")} ${brand.amber("/paste")}${brand.dim(", or just take a screenshot — it attaches itself.")}`,
+				`  ${brand.dim("and Brigade auto-attaches a pasted path). It can't carry a raw screenshot — an image")}`,
+				0,
+				0,
+			),
+		);
+		insertBeforeEditor(
+			new Text(
+				`  ${brand.dim("has no text form, so take a screenshot and it auto-attaches, or use")} ${brand.amber("/paste")}${brand.dim(".")}`,
 				0,
 				0,
 			),
@@ -2561,8 +2568,8 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/compact")} — summarize older turns to free up context\n` +
 					`- ${chalk.bold("/attach [<path>]")} — attach a file to the next turn (no arg = show staged files)\n` +
 					`- ${chalk.bold("/paste")} — attach the image or file on your clipboard (screenshot → /paste)\n` +
-					`  ${brand.dim("Alt+V does the same. Ctrl+V only reaches Brigade in terminals that don't bind it to")}\n` +
-					`  ${brand.dim("their own paste — VS Code and Windows Terminal both do, so it never arrives. /paste always works.")}\n` +
+					`  ${brand.dim("Ctrl+V pastes text and copied file paths normally (Brigade auto-attaches a pasted path);")}\n` +
+					`  ${brand.dim("it just can't carry a raw screenshot. For a screenshot: take it and it auto-attaches, or /paste.")}\n` +
 					`- ${chalk.bold("/detach [<n>|all]")} — unstage an attached file\n` +
 					`  ${brand.dim("…or just type")} ${chalk.bold("@path/to/file")} ${brand.dim("in your message, or drag a file onto the terminal.")}\n` +
 						`- ${chalk.bold("/update")} — install a newer Brigade (sessions, memory and config are untouched)\n` +

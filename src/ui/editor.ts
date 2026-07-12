@@ -72,19 +72,21 @@ const NO_REQUIRED_ARG = new Set([
 
 export class BrigadeEditor extends Editor {
 	/**
-	 * Fired on a raw Ctrl+V (0x16) — "paste an image from the clipboard".
+	 * Fired on a raw Ctrl+V (0x16) / Alt+V — "there may be an IMAGE on the clipboard;
+	 * go ask the OS".
 	 *
-	 * A terminal forwards keystrokes and TEXT; it never forwards binary clipboard
-	 * data. So an image paste cannot arrive as input — we have to notice the
-	 * keypress and go ask the OS ourselves. That is the whole trick.
+	 * The precise model, because it is easy to get wrong: a terminal's paste can only
+	 * carry TEXT. Plain text and a copied file's PATH both have a text form, so those
+	 * paste normally — Ctrl+V "works" for them, and the pasted text arrives as
+	 * ordinary input (a dropped/pasted path is then auto-attached by `onTextChanged`).
+	 * A raw screenshot has NO text form, so the terminal's paste injects nothing and
+	 * there is no input to see.
 	 *
-	 * The catch, stated plainly because it decides how we document this: many
-	 * terminals (Windows Terminal among them) bind Ctrl+V to their OWN paste and
-	 * consume it, so 0x16 never reaches us — and when the clipboard holds an image
-	 * with no text, their paste inserts nothing and we see no input at all. There
-	 * is no way for an application to intercept a keystroke the terminal ate. So
-	 * `/paste` exists as the guaranteed path, and this handles every terminal that
-	 * does forward the key.
+	 * That image gap is the only thing this hook is for. Two wrinkles: on terminals
+	 * that bind Ctrl+V to their own paste (Windows Terminal, VS Code) the 0x16 byte is
+	 * consumed and never reaches us, so the hook can't fire there — which is why the
+	 * clipboard WATCHER (auto-attach on copy) and `/paste` are the real answers, and
+	 * this is a bonus for terminals that do forward the key.
 	 */
 	onImagePaste?: () => void;
 
