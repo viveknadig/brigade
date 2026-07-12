@@ -156,6 +156,265 @@ while ($true) {
 }
 `.trim();
 
+/**
+ * The macOS / Linux worker.
+ *
+ * ── Why a shell script and not "the same thing as Windows" ────────────────
+ * The Windows cost was never the clipboard, it was PowerShell: a 200-500 ms
+ * interpreter boot, paid per call. `pbpaste`, `osascript`, `wl-paste` and `xclip`
+ * are small C programs that spawn in 5-30 ms, so the per-spawn tax here is an
+ * order of magnitude smaller. What actually hurt on every platform was the SHAPE:
+ * four separate reads (files, image, text, formats) issued as four separate
+ * processes, in series, for one paste.
+ *
+ * So this worker fixes the shape. It stays resident and answers a whole snapshot
+ * in ONE round-trip, gathering everything in a single pass.
+ *
+ * ── Why the response isn't JSON ───────────────────────────────────────────
+ * Emitting correct JSON from shell means escaping quotes, backslashes, newlines
+ * and control bytes in clipboard TEXT that came from anywhere at all. That is a
+ * quoting bug waiting to happen, and quoting bugs in this feature have already
+ * cost a day. A line-block protocol with the text base64'd cannot be broken by its
+ * own payload:
+ *
+ *     S <id> BEGIN
+ *     I <image path, or empty>
+ *     F <file path>            (0..n)
+ *     T <base64 of the text>
+ *     X <format name>          (0..n)
+ *     S <id> END
+ *
+ * ── Change notification is NOT here ───────────────────────────────────────
+ * Polling the clipboard from this loop would mean spawning `osascript` every tick
+ * — the exact per-tick process cost the whole design exists to avoid. Push stays
+ * with the platform's own cheap primitive (`wl-paste --watch` is genuinely
+ * event-driven; a single long-lived osascript `repeat` loop covers macOS), wired
+ * separately in `startClipboardService`.
+ */
+const POSIX_WORKER = String.raw`
+set -u
+set -f
+
+# NOTE FOR ANYONE EDITING THIS SCRIPT: it must contain NO dollar-sign followed by
+# an opening brace. It lives inside a JS template literal, and String.raw STILL
+# performs interpolation — so a shell parameter expansion (the kind that strips a
+# prefix or a suffix) is read by JavaScript as an expression and the file will not
+# even parse. It must also contain no backticks, which would close the literal.
+# Argument parsing below therefore uses "set --" plus IFS, which needs neither.
+# (This comment originally broke both rules, which is how they were learned.)
+
+PLAT="$1"
+
+read_darwin() {
+  dest="$1"
+  FMTS=$(osascript -e 'try
+return (clipboard info) as string
+on error
+return ""
+end try' 2>/dev/null)
+  case "$FMTS" in
+    *PNGf*|*TIFF*|*GIFf*)
+      osascript -e "try
+set png to (the clipboard as «class PNGf»)
+set fp to (open for access POSIX file \"$dest\" with write permission)
+write png to fp
+close access fp
+end try" >/dev/null 2>&1
+      if [ -s "$dest" ]; then IMG="$dest"; fi
+      ;;
+  esac
+  FILES=$(osascript -e 'set out to {}
+try
+set items_ to (the clipboard as list)
+repeat with i in items_
+try
+set end of out to POSIX path of (i as alias)
+end try
+end repeat
+end try
+set text item delimiters to linefeed
+return out as text' 2>/dev/null)
+  TXT=$(pbpaste 2>/dev/null)
+}
+
+read_linux() {
+  dest="$1"
+  if command -v wl-paste >/dev/null 2>&1; then
+    FMTS=$(wl-paste --list-types 2>/dev/null)
+    case "$FMTS" in
+      *image/png*|*image/bmp*)
+        wl-paste --no-newline --type image/png > "$dest" 2>/dev/null
+        if [ -s "$dest" ]; then IMG="$dest"; fi
+        ;;
+    esac
+    FILES=$(wl-paste --no-newline --type text/uri-list 2>/dev/null)
+    TXT=$(wl-paste --no-newline 2>/dev/null)
+  elif command -v xclip >/dev/null 2>&1; then
+    FMTS=$(xclip -selection clipboard -t TARGETS -o 2>/dev/null)
+    case "$FMTS" in
+      *image/png*|*image/bmp*)
+        xclip -selection clipboard -t image/png -o > "$dest" 2>/dev/null
+        if [ -s "$dest" ]; then IMG="$dest"; fi
+        ;;
+    esac
+    FILES=$(xclip -selection clipboard -t text/uri-list -o 2>/dev/null)
+    TXT=$(xclip -selection clipboard -o 2>/dev/null)
+  fi
+}
+
+snapshot() {
+  id="$1"
+  dest="$2"
+  IMG=""
+  FILES=""
+  TXT=""
+  FMTS=""
+  if [ "$PLAT" = "darwin" ]; then
+    read_darwin "$dest"
+  else
+    read_linux "$dest"
+  fi
+  printf 'S %s BEGIN\n' "$id"
+  printf 'I %s\n' "$IMG"
+  printf '%s\n' "$FILES" | while IFS= read -r f; do
+    if [ -n "$f" ]; then printf 'F %s\n' "$f"; fi
+  done
+  # base64, so clipboard text containing a newline, a quote or a control byte can
+  # never break the protocol carrying it.
+  printf 'T %s\n' "$(printf '%s' "$TXT" | base64 | tr -d '\n')"
+  printf '%s\n' "$FMTS" | while IFS= read -r x; do
+    if [ -n "$x" ]; then printf 'X %s\n' "$x"; fi
+  done
+  printf 'S %s END\n' "$id"
+}
+
+echo READY
+
+while IFS= read -r line; do
+  case "$line" in
+    EXIT)
+      exit 0
+      ;;
+    SNAPSHOT*)
+      oldIFS="$IFS"
+      IFS='|'
+      set -- $line
+      IFS="$oldIFS"
+      snapshot "$2" "$3"
+      ;;
+  esac
+done
+`.trim();
+
+/** What a worker line turned out to mean. */
+export type WorkerEvent =
+	| { type: "ready" }
+	| { type: "image"; path: string }
+	| { type: "snapshot"; id: number; snapshot: ClipboardSnapshot };
+
+/**
+ * Parses BOTH worker protocols, line by line, with no I/O.
+ *
+ * Pure on purpose. The POSIX worker cannot be exercised on a Windows dev box and
+ * the Windows one cannot be exercised on a Mac, so the parsing — where the real
+ * bugs hide (a one-element array collapsed to a scalar; clipboard text containing
+ * a newline) — is the part that must be testable everywhere, without an
+ * interpreter and without the OS it targets.
+ */
+export class SnapshotAssembler {
+	/** The POSIX line-block currently being received. */
+	private block: { id: number; snap: ClipboardSnapshot } | undefined;
+
+	feed(line: string): WorkerEvent | null {
+		if (!line) return null;
+		if (line === "READY") return { type: "ready" };
+
+		// The push channel — an image landed on the clipboard. Identical on both.
+		if (line.startsWith("IMAGE ")) {
+			const p = line.slice("IMAGE ".length).trim();
+			return p ? { type: "image", path: p } : null;
+		}
+
+		// ── Windows: one JSON line, `SNAPSHOT <id> {…}` ────────────────────
+		if (line.startsWith("SNAPSHOT ")) {
+			const rest = line.slice("SNAPSHOT ".length);
+			const sp = rest.indexOf(" ");
+			if (sp < 0) return null;
+			const id = Number.parseInt(rest.slice(0, sp), 10);
+			if (Number.isNaN(id)) return null;
+			try {
+				const raw = JSON.parse(rest.slice(sp + 1)) as {
+					imagePath?: string | null;
+					files?: string[] | string | null;
+					text?: string | null;
+					formats?: string[] | string | null;
+				};
+				// PowerShell's ConvertTo-Json collapses a ONE-element array to a bare
+				// scalar. Normalising is not pedantry: without it a single copied file
+				// arrives as a string and `files.map` throws on the very common case of
+				// copying exactly one file.
+				const arr = (v: string[] | string | null | undefined): string[] =>
+					Array.isArray(v) ? v : typeof v === "string" && v ? [v] : [];
+				return {
+					type: "snapshot",
+					id,
+					snapshot: {
+						...(raw.imagePath ? { imagePath: raw.imagePath } : {}),
+						files: arr(raw.files),
+						text: typeof raw.text === "string" ? raw.text : "",
+						formats: arr(raw.formats),
+					},
+				};
+			} catch {
+				return { type: "snapshot", id, snapshot: { files: [], text: "", formats: [] } };
+			}
+		}
+
+		// ── POSIX: a line block. Correct JSON out of shell means escaping whatever
+		//    happens to be on the operator's clipboard, which is a quoting bug waiting
+		//    to happen; the text rides base64 instead and cannot break its own frame.
+		if (line.startsWith("S ")) {
+			const parts = line.split(" ");
+			const id = Number.parseInt(parts[1] ?? "", 10);
+			if (Number.isNaN(id)) return null;
+			if (parts[2] === "BEGIN") {
+				this.block = { id, snap: { files: [], text: "", formats: [] } };
+				return null;
+			}
+			if (parts[2] === "END" && this.block?.id === id) {
+				const snapshot = this.block.snap;
+				this.block = undefined;
+				return { type: "snapshot", id, snapshot };
+			}
+			return null;
+		}
+
+		if (!this.block) return null;
+		const body = line.slice(2);
+		switch (line[0]) {
+			case "I":
+				if (body) this.block.snap.imagePath = body;
+				break;
+			case "F":
+				if (body) this.block.snap.files.push(body);
+				break;
+			case "T":
+				try {
+					this.block.snap.text = Buffer.from(body, "base64").toString("utf8");
+				} catch {
+					this.block.snap.text = "";
+				}
+				break;
+			case "X":
+				if (body) this.block.snap.formats.push(body);
+				break;
+			default:
+				break;
+		}
+		return null;
+	}
+}
+
 export class ClipboardWorker {
 	private child: ChildProcess | undefined;
 	private buf = "";
@@ -191,7 +450,7 @@ export class ClipboardWorker {
 	 * clipboard — that is the auto-attach channel, and it costs Node nothing.
 	 */
 	start(onImage?: (imagePath: string) => void): void {
-		if (process.platform !== "win32" || this.child) return;
+		if (this.child) return;
 		this.onImage = onImage;
 		// Build the readiness promise with LOCALS. Referring to `this.ready` inside its
 		// own executor reads the PREVIOUS promise — which cleared the boot timer the
@@ -209,28 +468,48 @@ export class ClipboardWorker {
 		this.markReady = settle;
 
 		try {
-			// Run from a FILE, not `-Command`.
+			// Run from a FILE, never `-Command` / `-c`.
 			//
-			// The script contains a C# here-string (`@"…"@`) and therefore double quotes.
-			// Passing that through `-Command` means it survives Node's argv quoting, then
-			// CreateProcess's, then PowerShell's own parser — and it does not: the worker
+			// The Windows script carries a C# here-string and therefore double quotes;
+			// the POSIX one carries AppleScript with its own nested quotes. Passing
+			// either inline means it must survive Node's argv quoting, then the OS's,
+			// then the interpreter's own parser — and it does not: the Windows worker
 			// died silently on a parse error and never announced itself, which read
 			// exactly like "the clipboard is slow". A file has no quoting layer at all.
-			const scriptPath = path.join(os.tmpdir(), "brigade-clipboard-worker.ps1");
-			fs.writeFileSync(scriptPath, WINDOWS_WORKER, "utf8");
-			this.child = spawn(
-				"powershell.exe",
-				[
-					"-NoProfile",
-					"-NonInteractive",
-					"-STA",
-					"-ExecutionPolicy",
-					"Bypass",
-					"-File",
-					scriptPath,
-				],
-				{ stdio: ["pipe", "pipe", "pipe"], windowsHide: true },
+			const win = process.platform === "win32";
+			const scriptPath = path.join(
+				os.tmpdir(),
+				win ? "brigade-clipboard-worker.ps1" : "brigade-clipboard-worker.sh",
 			);
+			fs.writeFileSync(scriptPath, win ? WINDOWS_WORKER : POSIX_WORKER, {
+				encoding: "utf8",
+				...(win ? {} : { mode: 0o700 }),
+			});
+
+			const [bin, args] = win
+				? ([
+						"powershell.exe",
+						[
+							"-NoProfile",
+							"-NonInteractive",
+							// The clipboard is an OLE single-threaded-apartment API; pwsh runs MTA
+							// by default, where GetImage() returns null for reasons unrelated to
+							// the clipboard's contents.
+							"-STA",
+							"-ExecutionPolicy",
+							"Bypass",
+							"-File",
+							scriptPath,
+						],
+					] as const)
+				: // `bash`, not `sh`: the script uses `${var#prefix}` / `${var%%suffix}`
+					// parameter expansion and `command -v`, and Debian's `sh` is dash.
+					(["bash", [scriptPath, process.platform]] as const);
+
+			this.child = spawn(bin, [...args], {
+				stdio: ["pipe", "pipe", "pipe"],
+				windowsHide: true,
+			});
 			// A worker that by design never exits must never be the reason the process
 			// stays alive. This hung the whole test suite once.
 			this.child.unref();
@@ -257,50 +536,23 @@ export class ClipboardWorker {
 		});
 	}
 
+	private assembler = new SnapshotAssembler();
+
 	private consume(text: string): void {
 		this.buf += text;
 		let nl: number;
 		while ((nl = this.buf.indexOf("\n")) >= 0) {
-			const line = this.buf.slice(0, nl).trim();
+			// Strip a trailing CR: PowerShell emits CRLF, the POSIX worker emits LF.
+			const line = this.buf.slice(0, nl).replace(/\r$/, "");
 			this.buf = this.buf.slice(nl + 1);
-			if (!line) continue;
-			if (line === "READY") {
-				this.markReady(true);
-				continue;
-			}
-			if (line.startsWith("IMAGE ")) {
-				this.onImage?.(line.slice("IMAGE ".length).trim());
-				continue;
-			}
-			if (line.startsWith("SNAPSHOT ")) {
-				const rest = line.slice("SNAPSHOT ".length);
-				const sp = rest.indexOf(" ");
-				if (sp < 0) continue;
-				const id = Number.parseInt(rest.slice(0, sp), 10);
-				const resolve = this.inflight.get(id);
-				this.inflight.delete(id);
-				if (!resolve) continue; // a reply to a request that already timed out
-				try {
-					const raw = JSON.parse(rest.slice(sp + 1)) as {
-						imagePath?: string | null;
-						files?: string[] | string | null;
-						text?: string | null;
-						formats?: string[] | string | null;
-					};
-					// PowerShell's ConvertTo-Json collapses a one-element array to a bare
-					// scalar. Normalising here is not pedantry: without it, a single copied
-					// file arrives as a string and `files.map` throws.
-					const arr = (v: string[] | string | null | undefined): string[] =>
-						Array.isArray(v) ? v : typeof v === "string" && v ? [v] : [];
-					resolve({
-						...(raw.imagePath ? { imagePath: raw.imagePath } : {}),
-						files: arr(raw.files),
-						text: typeof raw.text === "string" ? raw.text : "",
-						formats: arr(raw.formats),
-					});
-				} catch {
-					resolve(EMPTY);
-				}
+			const ev = this.assembler.feed(line);
+			if (!ev) continue;
+			if (ev.type === "ready") this.markReady(true);
+			else if (ev.type === "image") this.onImage?.(ev.path);
+			else {
+				const resolve = this.inflight.get(ev.id);
+				this.inflight.delete(ev.id);
+				resolve?.(ev.snapshot); // a reply to a timed-out request simply drops
 			}
 		}
 	}

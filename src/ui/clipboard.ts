@@ -466,22 +466,45 @@ export interface ClipboardService {
  * clipboard — the auto-attach channel, and the reason Ctrl+V is unnecessary.
  */
 export function startClipboardService(onImage?: (imagePath: string) => void): ClipboardService {
-	// Windows gets the persistent worker: one PowerShell, held open, answering in
-	// milliseconds and pushing images for free. This is the whole difference between
-	// a paste that feels instant and one that feels broken.
-	if (process.platform === "win32") {
-		const worker = new ClipboardWorker();
-		worker.start(onImage);
-		if (worker.available) {
-			return {
-				read: (dest) => worker.snapshot(dest),
-				stop: () => worker.kill(),
-			};
-		}
-		// Worker refused to start — fall through to the per-call backend rather than
-		// losing the clipboard entirely.
+	// EVERY platform gets the persistent worker. One interpreter, held open, reading
+	// the whole clipboard in a single round-trip — the shape that was wrong before,
+	// on all three: four separate reads issued as four separate processes, in series,
+	// for one paste.
+	const worker = new ClipboardWorker();
+	worker.start(onImage);
+
+	if (worker.available) {
+		// PUSH. Windows carries change notification inside the worker itself (a free
+		// Win32 sequence counter). POSIX cannot: polling the clipboard from the worker
+		// loop would mean spawning `osascript` every tick — the exact per-tick process
+		// cost this design exists to remove. So the platform's own cheap primitive
+		// does it: `wl-paste --watch` is genuinely event-driven, and macOS gets ONE
+		// long-lived osascript `repeat` loop. Either way the operator sees the same
+		// thing: a screenshot attaches itself.
+		const backend = clipboardBackend();
+		const pushWatcher =
+			onImage && process.platform !== "win32"
+				? backend.watch(() => {
+						void (async () => {
+							const dest = path.join(clipboardSpoolDir(), `clipboard-${Date.now()}.png`);
+							const snap = await worker.snapshot(dest);
+							if (snap.imagePath) onImage(snap.imagePath);
+						})();
+					})
+				: null;
+
+		return {
+			read: (dest) => worker.snapshot(dest),
+			stop: () => {
+				pushWatcher?.stop();
+				worker.kill();
+			},
+		};
 	}
 
+	// The worker refused to start (no bash, no PowerShell, a locked-down box). Fall
+	// back to per-call reads rather than losing the clipboard entirely — correct, just
+	// slower. Losing a convenience beats losing the feature.
 	const backend = clipboardBackend();
 	const watcher = onImage
 		? backend.watch(() => {
@@ -494,9 +517,8 @@ export function startClipboardService(onImage?: (imagePath: string) => void): Cl
 
 	return {
 		read: async (imageDest) => {
-			// Fire the three reads CONCURRENTLY. They are independent, and running them
-			// in series is what made `/paste` feel like it hung — three sequential
-			// process spawns, one after another, for no reason.
+			// CONCURRENTLY, not in series. Even on the slow path there is no reason to
+			// wait for one spawn before starting the next — they are independent reads.
 			const [imageSaved, files, text, formats] = await Promise.all([
 				backend.hasImage().then((has) => (has ? backend.saveImage(imageDest) : false)),
 				backend.readFiles(),
