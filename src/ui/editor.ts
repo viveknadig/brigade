@@ -24,7 +24,27 @@
  * Outside the popup, Enter retains its normal "submit" semantics.
  */
 
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
 import { Editor } from "@earendil-works/pi-tui";
+
+/** Where `BRIGADE_DEBUG_INPUT=1` writes the raw input trace. */
+export const INPUT_TRACE_PATH = path.join(os.tmpdir(), "brigade-input-trace.log");
+
+/** Append one raw input chunk, JSON-escaped so control bytes survive the round-trip. */
+function traceInput(data: string): void {
+	try {
+		fs.appendFileSync(
+			INPUT_TRACE_PATH,
+			`${JSON.stringify({ len: data.length, data })}\n`,
+			"utf8",
+		);
+	} catch {
+		/* tracing must never break the editor */
+	}
+}
 
 // Slash commands whose argument is OPTIONAL (or absent) — Enter should
 // submit immediately even when the autocomplete popup is showing. Kept
@@ -67,31 +87,43 @@ export class BrigadeEditor extends Editor {
 	onImagePaste?: () => void;
 
 	/**
-	 * Fired right after a MULTI-CHARACTER chunk lands in the editor — i.e. a paste,
-	 * or a file dropped onto the terminal window.
+	 * Fired whenever the editor's text CHANGES, by any means.
 	 *
-	 * This is the hook that makes drag-and-drop feel like an attachment instead of
-	 * like typing. A terminal responds to a dropped file by pasting its PATH as
-	 * text, so without this the operator stares at
-	 * `C:\Users\me\Downloads\plant-cell.png` sitting in the input box with nothing
-	 * staged, no bar, no confirmation — and no reason to believe anything happened.
-	 * The handler swaps that path for a pill and stages the file on the spot.
+	 * This is the hook that makes a dropped file become an attachment instead of a
+	 * wall of raw path. A terminal answers a drop by writing the file's PATH into
+	 * stdin as text; without this the operator stares at
+	 * `C:\Users\me\Downloads\plant-cell.png` sitting in the input box — nothing
+	 * staged, no bar, no confirmation, no reason to think it worked.
 	 *
-	 * Detected by watching how much TEXT the editor actually gained, NOT by
-	 * inspecting the input bytes. That distinction is the whole fix: pi-tui wraps
-	 * every paste in bracketed-paste markers before handing it over ("pasted data
-	 * will always contain \x1b[200~" — pi-tui/keys.js), so a dropped file arrives as
-	 * a chunk STARTING with an escape byte. An earlier version of this tried to skip
-	 * escape sequences to avoid firing on arrow keys, and thereby skipped every
-	 * paste there has ever been — the hook never fired once.
+	 * It fires on EVERY text change rather than trying to recognise "a paste",
+	 * because two successive attempts to recognise one were both wrong:
 	 *
-	 * Growth of more than one character means text arrived from outside; a human
-	 * typing adds exactly one. Arrow and function keys add none. No terminal
-	 * encoding to keep up with.
+	 *   1. `!data.startsWith("\x1b")`, to avoid firing on arrow keys — but pi-tui
+	 *      wraps every paste in bracketed-paste markers before handing it over
+	 *      ("pasted data will always contain \x1b[200~" — pi-tui/keys.js), so this
+	 *      excluded every paste that has ever existed. It never fired once.
+	 *   2. "text grew by more than one character" — which assumes the terminal
+	 *      delivers a drop as ONE chunk. Not guaranteed: stdin coalescing and each
+	 *      terminal's own drop implementation decide that, and VS Code's does not
+	 *      behave like Windows Terminal's.
+	 *
+	 * Both bugs came from trying to infer intent from the SHAPE of the input. So we
+	 * no longer infer anything: the host re-reads the whole line on any change and
+	 * looks for a path that names a real file. Whether it arrived as one chunk, ten
+	 * chunks, bracketed, unbracketed, or typed by hand stops mattering entirely.
 	 */
-	onPasteChunk?: () => void;
+	onTextChanged?: () => void;
 
 	override handleInput(data: string): void {
+		// `BRIGADE_DEBUG_INPUT=1` appends every raw input chunk to a trace file.
+		//
+		// Terminals disagree — loudly — about what they send for a dropped file and
+		// for Ctrl+V, and two bugs in this editor came from guessing wrong about it.
+		// When an operator reports "drag-drop does nothing in <terminal>", this is how
+		// we find out what their terminal ACTUALLY sends instead of reasoning about
+		// what it ought to.
+		if (process.env.BRIGADE_DEBUG_INPUT) traceInput(data);
+
 		// Ctrl+V (0x16) and Alt+V (ESC v) both mean "paste an image from the clipboard".
 		//
 		// BOTH exist because Ctrl+V alone is not enough on Windows. Windows Terminal
@@ -129,12 +161,12 @@ export class BrigadeEditor extends Editor {
 			super.handleInput("\t");
 			return;
 		}
-		const before = this.getText().length;
+		const before = this.getText();
 		super.handleInput(data);
-		// A dropped file / pasted blob just landed. Let the host turn any real path in
-		// the line into a staged attachment while the operator is still looking at it.
-		if (this.getText().length - before > 1 && this.onPasteChunk) {
-			this.onPasteChunk();
+		// Any change at all — dropped, pasted, or typed. The host decides whether the
+		// line now contains a real file path. No guessing about chunk shapes.
+		if (this.getText() !== before && this.onTextChanged) {
+			this.onTextChanged();
 		}
 	}
 }

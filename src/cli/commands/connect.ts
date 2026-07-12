@@ -902,7 +902,7 @@ export async function wireConnectUi(
 	);
 	tui.addChild(
 		new Text(
-			brand.dim("  Enter to send · Ctrl+C abort · attach: drag a file in · @path · Alt+V or Ctrl+V (screenshot) · /paste · /help"),
+			brand.dim("  Enter to send · Ctrl+C abort · attach: drag a file in · @path · /paste or Alt+V for a screenshot · /help"),
 			0,
 			0,
 		),
@@ -2321,15 +2321,25 @@ export async function wireConnectUi(
 	 * stripped again at send (the model gets the real image bytes / file content, so
 	 * a dangling filename in the prose would just be a confusing reference).
 	 */
-	editor.onPasteChunk = () => {
-		if (!gatewayIsLocal) return;
+	let rewritingLine = false;
+	editor.onTextChanged = () => {
+		if (!gatewayIsLocal || rewritingLine) return;
 		const line = editor.getText();
 		if (!line) return;
+		// Cheap pre-filter: a path needs a separator. Skips the regex + stat work on
+		// the overwhelming majority of keystrokes, which are ordinary prose.
+		if (!/[\\/]/.test(line)) return;
 		const { text: pilled, staged } = extractAttachmentPaths(line, { pill: true });
 		if (staged.length === 0) return;
-		const added = stagePaths(staged.map((s) => s.path));
-		if (added === 0) return;
-		editor.setText(pilled);
+		if (stagePaths(staged.map((s) => s.path)) === 0) return;
+		// setText re-enters handleInput's change check; the flag keeps us from
+		// re-scanning our own rewrite.
+		rewritingLine = true;
+		try {
+			editor.setText(pilled);
+		} finally {
+			rewritingLine = false;
+		}
 		tui.requestRender();
 	};
 
@@ -2417,7 +2427,9 @@ export async function wireConnectUi(
 						`- ${chalk.bold("/thinking <level>")} — set reasoning effort (off|minimal|low|medium|high|xhigh)\n` +
 						`- ${chalk.bold("/compact")} — summarize older turns to free up context\n` +
 					`- ${chalk.bold("/attach [<path>]")} — attach a file to the next turn (no arg = show staged files)\n` +
-					`- ${chalk.bold("/paste")} — attach the image or file on your clipboard (screenshot → paste)\n` +
+					`- ${chalk.bold("/paste")} — attach the image or file on your clipboard (screenshot → /paste)\n` +
+					`  ${brand.dim("Alt+V does the same. Ctrl+V only reaches Brigade in terminals that don't bind it to")}\n` +
+					`  ${brand.dim("their own paste — VS Code and Windows Terminal both do, so it never arrives. /paste always works.")}\n` +
 					`- ${chalk.bold("/detach [<n>|all]")} — unstage an attached file\n` +
 					`  ${brand.dim("…or just type")} ${chalk.bold("@path/to/file")} ${brand.dim("in your message, or drag a file onto the terminal.")}\n` +
 						`- ${chalk.bold("/update")} — install a newer Brigade (sessions, memory and config are untouched)\n` +

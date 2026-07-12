@@ -211,12 +211,75 @@ describe("TUI attachments — end to end, real editor + real wiring", () => {
 
 	it("typing a path by hand (not pasting) also attaches it on submit", async () => {
 		const { editor, sent } = await bootUi();
-		// Character-by-character: the drop hook must NOT fire, but submit-time
-		// extraction still catches it.
 		for (const ch of png) editor.handleInput(ch);
 		await editor.onSubmit?.(editor.getText());
 
 		const prompt = sent.find((s) => s.method === "prompt");
 		assert.equal((prompt?.params?.attachments as unknown[])?.length, 1);
+	});
+});
+
+/**
+ * TERMINALS DISAGREE about how a dropped file reaches the application, and every
+ * bug in this feature so far came from assuming one particular shape:
+ *
+ *   • Windows Terminal and VS Code do not implement drops identically.
+ *   • pi-tui wraps pastes in bracketed-paste markers — but only pastes it sees as
+ *     pastes.
+ *   • stdin coalescing decides whether 45 characters arrive as one chunk or five.
+ *
+ * So detection no longer looks at the input's SHAPE at all — it re-reads the line
+ * on any change. These cases exist to hold that line: every delivery shape below
+ * must produce an identical, staged, pilled result.
+ */
+describe("TUI attachments — a drop must work however the terminal delivers it", () => {
+	const expectPilled = (editor: { getText(): string }) =>
+		assert.equal(editor.getText(), "[plant-cell.png]");
+
+	it("bracketed paste (what pi-tui documents)", async () => {
+		const { editor } = await bootUi();
+		editor.handleInput(`\x1b[200~${png}\x1b[201~`);
+		expectPilled(editor);
+	});
+
+	it("RAW paste, no bracketed markers at all", async () => {
+		const { editor } = await bootUi();
+		editor.handleInput(png);
+		expectPilled(editor);
+	});
+
+	it("split across several stdin chunks", async () => {
+		const { editor } = await bootUi();
+		const third = Math.ceil(png.length / 3);
+		editor.handleInput(png.slice(0, third));
+		editor.handleInput(png.slice(third, third * 2));
+		editor.handleInput(png.slice(third * 2));
+		expectPilled(editor);
+	});
+
+	it("one character at a time — the worst case, and it still pills", async () => {
+		const { editor } = await bootUi();
+		for (const ch of png) editor.handleInput(ch);
+		expectPilled(editor);
+	});
+
+	it("a quoted drop (path with spaces) — what a terminal sends for `my report.pdf`", async () => {
+		const { editor } = await bootUi();
+		const spaced = path.join(dir, "my report.pdf");
+		fs.writeFileSync(spaced, "%PDF-1.4 x");
+		editor.handleInput(`\x1b[200~"${spaced}"\x1b[201~`);
+		assert.equal(editor.getText(), "[my report.pdf]");
+	});
+
+	it("typing ordinary prose containing a slash never stages anything", async () => {
+		const { editor } = await bootUi();
+		for (const ch of "use the and/or operator") editor.handleInput(ch);
+		assert.equal(editor.getText(), "use the and/or operator");
+	});
+
+	it("typing a slash command is left alone", async () => {
+		const { editor } = await bootUi();
+		for (const ch of "/model") editor.handleInput(ch);
+		assert.equal(editor.getText(), "/model");
 	});
 });
