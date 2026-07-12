@@ -20,12 +20,27 @@
  *   4. `/attach <path>` — the explicit backbone.
  *
  * ── The disambiguation rule ───────────────────────────────────────────────
- * A bare path in prose ("check /etc/hosts for me") must NOT silently become an
- * attachment, and normal prose containing an `@` ("email me @ work") must not
- * either. The rule that makes this safe is: **a token is only an attachment if
- * it names a file that actually EXISTS on disk right now.** Existence is the
- * disambiguator. It costs one `statSync` per candidate token and it is what
- * lets us be aggressive about drag-drop detection without ever mangling prose.
+ * Silently attaching a file the operator merely MENTIONED, or rewriting a
+ * sentence they didn't mean as a path, are the two worst things this module can
+ * do. Existence on disk is necessary but NOT sufficient — `check /etc/hosts for
+ * me` names a file that really is there on every Linux box. So intent is graded:
+ *
+ *   at        `@token` from the file completer → any file, any extension.
+ *   pureDrop  the line is nothing but a path   → any file, but ABSOLUTE only
+ *                                                (a terminal drop always pastes
+ *                                                an absolute path; a bare
+ *                                                relative word is a message).
+ *   inferred  a path loose in a sentence       → absolute AND a media/document
+ *                                                extension. Source, config, log
+ *                                                and data files are excluded:
+ *                                                in prose those are cited, not
+ *                                                enclosed.
+ *
+ * A candidate that fails its tier is left in the text EXACTLY as typed. And when
+ * nothing matches at all, the original line is returned byte-for-byte — this
+ * function runs on every submitted message, so anything it normalises it
+ * normalises for the whole product (it once collapsed the indentation of every
+ * pasted code block).
  */
 
 import { execFile } from "node:child_process";
@@ -45,8 +60,6 @@ export interface StagedAttachment {
 	mimeType: string;
 	fileName: string;
 	bytes: number;
-	/** True when we spooled this ourselves (clipboard image) — safe to clean up. */
-	ephemeral?: boolean;
 }
 
 /* ───────────────────────────── kind + mime ───────────────────────────── */
@@ -226,7 +239,7 @@ export function isAttachableExtension(filePath: string): boolean {
  * readable regular file — the caller reports that to the operator rather than
  * staging something that will only fail later on the gateway.
  */
-export function stageAttachment(rawPath: string, opts?: { ephemeral?: boolean }): StagedAttachment | null {
+export function stageAttachment(rawPath: string): StagedAttachment | null {
 	const resolved = path.resolve(expandHome(rawPath));
 	let st: fs.Stats;
 	try {
@@ -241,7 +254,6 @@ export function stageAttachment(rawPath: string, opts?: { ephemeral?: boolean })
 		mimeType: inferMimeType(resolved),
 		fileName: path.basename(resolved),
 		bytes: st.size,
-		...(opts?.ephemeral ? { ephemeral: true } : {}),
 	};
 }
 
@@ -281,9 +293,29 @@ const TOKEN_PATTERNS: RegExp[] = [
 	/"([^"]+)"/g, // quoted
 	/'([^']+)'/g,
 	/\bfile:\/\/(\/[^\s"']+)/g, // file:// URI
-	/@((?:\\ |[^\s@"'])+)/g, // @bare — backslash-aware, escaped-space-first
+	// @bare. The `(?<=^|\s)` lookbehind is what stops an EMAIL from feeding this:
+	// without it, `ping bob@corp.com` offers `corp.com` as a candidate, which is
+	// then resolved against the cwd — and silently attaches if a file of that name
+	// happens to be sitting there. pi-tui's completion only ever inserts `@` at a
+	// token boundary anyway, so nothing legitimate is lost.
+	/(?<=^|\s)@((?:\\ |[^\s@"'])+)/g,
 	/((?:[A-Za-z]:[\\/]|\/|~[\\/])(?:\\ |[^\s"'])+)/g, // bare absolute / ~-relative
 ];
+
+/**
+ * Trailing characters that belong to the SENTENCE, not to the filename.
+ *
+ * `did you read C:\docs\report.pdf?` — the `?` is punctuation, but the token
+ * matcher swallows it, the stat fails, and the file silently does not attach.
+ * The `@` case is the cruellest: the path came from a file picker, so the
+ * operator has every reason to believe it worked. Same for a trailing full stop,
+ * comma, or a closing paren from `(see C:\shots\bug.png)`.
+ *
+ * So a candidate that doesn't resolve gets its trailing punctuation peeled off,
+ * one character at a time, and is retried. The peeled characters are put back
+ * into the text — the sentence keeps its punctuation, the file gets attached.
+ */
+const TRAILING_PUNCT = /[.,;:!?)\]}'"]+$/;
 
 export interface ExtractedAttachments {
 	/** The line with each matched path token replaced by the file's basename. */
@@ -338,22 +370,33 @@ export function extractAttachmentPaths(line: string): ExtractedAttachments {
 		// Fresh regex per pass — these are module-level /g literals and would carry
 		// `lastIndex` state across calls otherwise.
 		const re = new RegExp(pattern.source, pattern.flags);
-		const isAtToken = pattern.source.startsWith("@");
+		// `@`-tokens are EXPLICIT: the operator picked the file from a completer. The
+		// `(?<=…)` lookbehind means the source no longer starts with a literal `@`, so
+		// test for it rather than for the first character.
+		const isAtToken = pattern.source.includes("@");
+		const tier: Tier = isAtToken ? "at" : isPureDrop ? "pureDrop" : "inferred";
 		text = text.replace(re, (whole, captured: string) => {
-			const candidate = decodeCandidate(captured);
-			const explicit = isAtToken || isPureDrop;
-			// INFERRED tier: must be absolute AND look like attachable media.
-			if (!explicit) {
-				if (!path.isAbsolute(expandHome(candidate))) return whole;
-				if (!isAttachableExtension(candidate)) return whole;
+			// Try the token as captured; if it doesn't resolve, peel trailing sentence
+			// punctuation and try again, restoring the punctuation to the text.
+			let candidate = decodeCandidate(captured);
+			let trailer = "";
+			let att = tryStage(candidate, tier);
+			if (!att) {
+				const peeled = candidate.replace(TRAILING_PUNCT, "");
+				if (peeled !== candidate && peeled !== "") {
+					trailer = candidate.slice(peeled.length);
+					candidate = peeled;
+					att = tryStage(candidate, tier);
+				}
 			}
-			const att = stageAttachment(candidate);
-			// Not a real file → leave the ORIGINAL token exactly as the user typed it.
+
+			// Not a real file (or refused by the tier rules) → leave the ORIGINAL token
+			// exactly as the operator typed it. Prose is never rewritten.
 			if (!att) return whole;
-			if (seen.has(att.path)) return att.fileName;
+			if (seen.has(att.path)) return att.fileName + trailer;
 			seen.add(att.path);
 			staged.push(att);
-			return att.fileName;
+			return att.fileName + trailer;
 		});
 	}
 
@@ -371,6 +414,33 @@ export function extractAttachmentPaths(line: string): ExtractedAttachments {
 	// here we only trim the ends — we never collapse interior whitespace, because a
 	// message can perfectly well attach a screenshot AND paste indented code.
 	return { text: text.trim(), staged };
+}
+
+/** Which tier of intent produced this candidate. See `extractAttachmentPaths`. */
+type Tier = "at" | "pureDrop" | "inferred";
+
+/**
+ * Apply the tier rules to one candidate, then stage it if it's a real file.
+ */
+function tryStage(candidate: string, tier: Tier): StagedAttachment | null {
+	// `at`: the operator picked this from a file completer. Deliberate by
+	// construction — any file, any extension, relative paths resolved against cwd.
+	if (tier === "at") return stageAttachment(candidate);
+
+	const absolute = path.isAbsolute(expandHome(candidate));
+
+	// `pureDrop`: the line was nothing BUT this token. Unambiguous for a dropped
+	// file — but a terminal drop always pastes an ABSOLUTE path, whereas a bare
+	// relative word is just as likely to be a one-word message. `"package.json"`
+	// alone would otherwise resolve against the cwd and silently attach a file the
+	// operator was merely naming.
+	if (tier === "pureDrop") return absolute ? stageAttachment(candidate) : null;
+
+	// `inferred`: a path found loose in a sentence. Must be absolute AND look like
+	// attachable media — see `isAttachableExtension` for why existence alone is not
+	// a safe rule on POSIX.
+	if (!absolute || !isAttachableExtension(candidate)) return null;
+	return stageAttachment(candidate);
 }
 
 /** Undo the escaping a terminal applies when it pastes a dropped path. */
@@ -482,7 +552,7 @@ export async function readClipboardImage(): Promise<StagedAttachment | null> {
 			const script = [
 				"try",
 				"  set png to (the clipboard as «class PNGf»)",
-				`  set fp to (open for access POSIX file "${out}" with write permission)`,
+				`  set fp to (open for access POSIX file "${escapeAppleScript(out)}" with write permission)`,
 				"  write png to fp",
 				"  close access fp",
 				'  return "ok"',
@@ -499,6 +569,7 @@ export async function readClipboardImage(): Promise<StagedAttachment | null> {
 				["xclip", ["-selection", "clipboard", "-t", "image/png", "-o"]],
 			];
 			let wrote = false;
+			let anyToolPresent = false;
 			for (const [bin, args] of tools) {
 				try {
 					const { stdout } = await execFileAsync(bin, args, {
@@ -506,22 +577,50 @@ export async function readClipboardImage(): Promise<StagedAttachment | null> {
 						encoding: "buffer",
 						maxBuffer: 64 * 1024 * 1024,
 					});
+					anyToolPresent = true;
 					const buf = stdout as unknown as Buffer;
 					if (buf?.length > 0) {
 						fs.writeFileSync(out, buf);
 						wrote = true;
 						break;
 					}
-				} catch {
-					continue; // tool absent or clipboard has no image — try the next
+				} catch (err) {
+					// ENOENT means the TOOL isn't installed — a completely different
+					// situation from "your clipboard is empty", and reporting the latter
+					// when the former is true sends the operator hunting for a bug in
+					// their clipboard instead of running `apt install wl-clipboard`.
+					if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") anyToolPresent = true;
 				}
+			}
+			if (!anyToolPresent) {
+				missingClipboardTool = true;
+				return null;
 			}
 			if (!wrote) return null;
 		}
 	} catch {
-		return null; // no clipboard tooling, or the OS refused — not an error worth throwing
+		return null; // the OS refused — not an error worth throwing at the operator
 	}
-	return stageAttachment(out, { ephemeral: true });
+	return stageAttachment(out);
+}
+
+/**
+ * Set when a Linux `/paste` failed because neither `wl-paste` nor `xclip` exists.
+ * Read once by `clipboardUnavailableReason` so the TUI can say what's actually
+ * wrong instead of claiming the clipboard was empty.
+ */
+let missingClipboardTool = false;
+
+/** Why the last clipboard read came back empty, when the reason isn't "it was empty". */
+export function clipboardUnavailableReason(): string | null {
+	if (!missingClipboardTool) return null;
+	missingClipboardTool = false;
+	return "no clipboard tool found — install wl-clipboard (Wayland) or xclip (X11) to paste images.";
+}
+
+/** AppleScript string literals escape with a backslash, same as C. */
+function escapeAppleScript(s: string): string {
+	return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 /**
@@ -548,12 +647,27 @@ export async function readClipboardFiles(): Promise<StagedAttachment[]> {
 			return stageAll(stdout.split(/\r?\n/));
 		}
 		if (process.platform === "darwin") {
+			// `the clipboard as «class furl»` returns only the FIRST file — copy three
+			// files in Finder and two vanish, silently. Ask for the full list instead
+			// and convert each entry, falling back to the single-URL form when the
+			// clipboard holds one item that isn't list-shaped.
 			const script = [
+				"set out to {}",
 				"try",
-				'  return POSIX path of (the clipboard as «class furl»)',
-				"on error",
-				'  return ""',
+				"  set items_ to (the clipboard as list)",
+				"  repeat with i in items_",
+				"    try",
+				"      set end of out to POSIX path of (i as alias)",
+				"    end try",
+				"  end repeat",
 				"end try",
+				"if (count of out) is 0 then",
+				"  try",
+				"    set end of out to POSIX path of (the clipboard as «class furl»)",
+				"  end try",
+				"end if",
+				'set text item delimiters to linefeed',
+				"return out as text",
 			].join("\n");
 			const { stdout } = await execFileAsync("osascript", ["-e", script], { timeout: 10_000 });
 			return stageAll(stdout.split(/\r?\n/));

@@ -35,6 +35,7 @@ import {
 import { BrigadeEditor } from "../../ui/editor.js";
 import {
 	attachmentIcon,
+	clipboardUnavailableReason,
 	extractAttachmentPaths,
 	formatBytes as formatAttachmentBytes,
 	MAX_STAGED_ATTACHMENTS,
@@ -327,7 +328,7 @@ export async function runConnectCommand(opts: ConnectCommandOptions = {}): Promi
 		}
 	}
 
-	chatHandle = await wireConnectUi(tui, client, initialAgentId, initialSessionKey);
+	chatHandle = await wireConnectUi(tui, client, initialAgentId, initialSessionKey, host);
 	return chatHandle;
 }
 
@@ -341,6 +342,13 @@ export async function wireConnectUi(
 	client: BrigadeClient,
 	initialAgentId?: string,
 	initialSessionKey?: string,
+	/**
+	 * The gateway host this client is attached to. Only file attachments care:
+	 * they travel as PATHS, so they are meaningful only when the gateway shares
+	 * this machine's filesystem. Defaults to loopback — the shape every existing
+	 * caller (and every test) already gets.
+	 */
+	gatewayHost = "127.0.0.1",
 ): Promise<ConnectHandle> {
 	// Static (last-frame) wordmark — `brigade connect` is the chat surface
 	// just like `brigade chat`, so we want the same still rendering here. The
@@ -1953,6 +1961,20 @@ export async function wireConnectUi(
 	 */
 	let stagedAttachments: StagedAttachment[] = [];
 
+	/**
+	 * Attachments travel as PATHS, not bytes — which is what lets a 400 MB video
+	 * cost nothing on the wire, but only works because the TUI and its gateway
+	 * normally share a filesystem (the TUI auto-spawns one on 127.0.0.1).
+	 *
+	 * Against a REMOTE gateway (`brigade expose`, or an explicit `--host`), those
+	 * paths mean nothing on the far side: every file would be rejected there, and a
+	 * `prompt` response carries no payload to tell us so. The operator would watch
+	 * their chips echo and get an answer that quietly ignored the file. Refusing at
+	 * staging — loudly, with the reason — is the only honest option until the wire
+	 * grows the `data` field that `PromptAttachment` documents.
+	 */
+	const gatewayIsLocal = ["127.0.0.1", "localhost", "::1", "0.0.0.0"].includes(gatewayHost);
+
 	/** Render the chip tray. Called after any staging change so the operator can always see what will ride the next turn. */
 	const showTray = (): void => {
 		if (stagedAttachments.length === 0) {
@@ -2006,6 +2028,16 @@ export async function wireConnectUi(
 	 * the moment of staging is the only point at which we can actually say so.
 	 */
 	const stagePaths = (paths: readonly string[]): number => {
+		if (!gatewayIsLocal) {
+			insertBeforeEditor(
+				new Text(
+					`  ${brand.error("✗")} ${brand.dim(`can't attach files to a remote gateway (${gatewayHost}) — it can't read paths on this machine.`)}`,
+					0,
+					0,
+				),
+			);
+			return 0;
+		}
 		let added = 0;
 		for (const p of paths) {
 			if (stagedAttachments.length >= MAX_STAGED_ATTACHMENTS) {
@@ -2032,6 +2064,123 @@ export async function wireConnectUi(
 		return added;
 	};
 
+	/**
+	 * THE send path. Every route that turns operator input into a `prompt` RPC goes
+	 * through here — the normal submit AND the "nothing to steer" recovery below.
+	 *
+	 * It is one function on purpose. When there were two, the recovery path quietly
+	 * lacked the attachment handling: it re-sent the text, dropped the staged files
+	 * from that turn, left them armed for the next one, and updated `lastUserPrompt`
+	 * without `lastUserAttachments` — so a later `/switch` would replay the NEW text
+	 * carrying the PREVIOUS turn's files. Every one of those bugs was a consequence
+	 * of the duplication, not of the logic.
+	 */
+	const sendTurn = async (rawText: string): Promise<void> => {
+		// Capture files named IN the line itself — a `@path` completed by pi-tui's file
+		// autocomplete, or the path a terminal pasted when a file was dropped on it.
+		//
+		// Skipped wholesale against a remote gateway: parsing there would rewrite the
+		// path token to a basename (mangling the message) while `stagePaths` refused
+		// the file — the worst of both outcomes. A remote operator's line goes through
+		// untouched.
+		const { text: cleanedText, staged: inlineStaged } = gatewayIsLocal
+			? extractAttachmentPaths(rawText)
+			: { text: rawText, staged: [] as StagedAttachment[] };
+		if (inlineStaged.length > 0) stagePaths(inlineStaged.map((s) => s.path));
+
+		const attachments = stagedAttachments;
+		const outgoing = cleanedText || rawText;
+
+		// `showTray` warns about a blind model when files are staged EXPLICITLY
+		// (/attach, /paste). But the most natural flow — drag an image in and press
+		// Enter — stages and sends in one breath and never opens the tray, so it would
+		// miss the warning entirely and the operator would read the agent's
+		// tool-mediated description as though the model had actually looked. Warn here
+		// too. Non-blocking: the turn still goes (analyze_media reads the file); we
+		// just refuse to let it look like vision when it isn't.
+		if (attachments.some((a) => a.kind === "image") && lastSnapshot?.supportsVision === false) {
+			insertBeforeEditor(
+				new Text(
+					`  ${brand.error("⚠")} ${brand.dim(`${lastSnapshot?.modelName ?? "this model"} cannot see images — reading the file with a tool instead. `)}${brand.amber("/model")}${brand.dim(" to switch to a vision model.")}`,
+					0,
+					0,
+				),
+			);
+		}
+
+		const chips =
+			attachments.length > 0
+				? ` ${brand.dim("·")} ${attachments.map((a) => `${attachmentIcon(a.kind)} ${a.fileName}`).join(" ")}`
+				: "";
+		insertBeforeEditor(new Markdown(`${brand.user("you")}  ${outgoing}${chips}`, 1, 0, markdownTheme));
+		editor.setText("");
+		// Unstage BEFORE the await so a file can never ride a second, unrelated turn.
+		stagedAttachments = [];
+		try {
+			// Carry the connection's bound agentId when set so the gateway routes this
+			// turn to that agent's session lane + runtime entry. Legacy single-agent
+			// gateways receive the same boot agent the snapshot reported, so behaviour
+			// is unchanged.
+			//
+			// Remember the message AND its files as the replay payload for a later
+			// `/switch` (Carrow) handoff — replaying the text without the image would
+			// defeat the commonest reason to switch (moving to a model that can see).
+			lastUserPrompt = outgoing;
+			lastUserAttachments = toPromptAttachments(attachments);
+			await client.request(
+				"prompt",
+				withBinding({
+					text: outgoing,
+					// Omitted entirely when nothing is attached, so a plain text turn is
+					// byte-identical on the wire to what a pre-attachment TUI sent.
+					...(attachments.length > 0
+						? { attachments: toPromptAttachments(attachments) }
+						: {}),
+				}),
+				{ timeoutMs: 0 },
+			);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0));
+			// RE-STAGE on failure. The files never reached the gateway, and silently
+			// discarding them would mean an operator who pasted an 8 MiB screenshot has
+			// to go and paste it again — without being told that they must. Re-arming is
+			// safe precisely because we say so.
+			if (attachments.length > 0) {
+				stagedAttachments = attachments;
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim(`${attachments.length} file${attachments.length === 1 ? " is" : "s are"} still staged — resend when you're ready.`)}`,
+						0,
+						0,
+					),
+				);
+			}
+		}
+	};
+
+	/**
+	 * Unstage everything on a context switch (`/new`, `/session`, `/agent`).
+	 *
+	 * A staged file belongs to the conversation the operator staged it IN. Carrying
+	 * it across is worse than losing it: `/new` also clears the transcript region, so
+	 * the chips scroll away while the files stay armed — and the image then rides the
+	 * FRESH thread invisibly. `/agent research` would likewise hand a file staged for
+	 * `main` to a different agent entirely. Announce the drop; never do it quietly.
+	 */
+	const clearTrayForContextSwitch = (what: string): void => {
+		if (stagedAttachments.length === 0) return;
+		const n = stagedAttachments.length;
+		stagedAttachments = [];
+		insertBeforeEditor(
+			new Text(
+				`  ${brand.dim(`unstaged ${n} file${n === 1 ? "" : "s"} — ${what} starts clean.`)}`,
+				0,
+				0,
+			),
+		);
+	};
+
 	editor.onSubmit = async (value: string) => {
 		// SECURITY — scrub terminal escape sequences, leaked bracketed-paste markers,
 		// and lone surrogates from input BEFORE it reaches command dispatch, the model
@@ -2039,10 +2188,17 @@ export async function wireConnectUi(
 		// from a malicious page) can otherwise corrupt the terminal or smuggle control
 		// bytes into the transcript. The single submit chokepoint covers every path.
 		const trimmed = sanitizeTerminalInput(value).trim();
-		// An empty line still submits when files are staged — "drop an image, hit
-		// Enter" is a legitimate turn (the media note alone is a valid prompt and
-		// the agent describes what it sees).
-		if (!trimmed && stagedAttachments.length === 0) return;
+		// An empty line normally does nothing. The ONE exception is a wordless send of
+		// staged files — "drop an image, press Enter" is a legitimate turn (the media
+		// note alone is a valid prompt, and the agent describes what it sees).
+		//
+		// The two exclusions are not theoretical. Blank Enter while `pendingProviderEntry`
+		// is armed would be consumed as THE API KEY and persisted as an empty
+		// credential; blank Enter mid-turn would be sent as an empty `steer`. Both were
+		// harmless no-ops before this exception existed, and both must stay no-ops.
+		if (!trimmed && (stagedAttachments.length === 0 || pendingProviderEntry || isAgentRunning)) {
+			return;
+		}
 
 		// API-key capture for `/provider <new-provider>`. When armed, this line
 		// IS the key — consume it here before any command dispatch or echo so it
@@ -2171,6 +2327,9 @@ export async function wireConnectUi(
 					0,
 				),
 			);
+			// AFTER clearTranscriptRegion, or the notice is wiped along with the chips —
+			// which is precisely the silent-carry this call exists to prevent.
+			clearTrayForContextSwitch("the new thread");
 			updateHeader();
 			void applySubscription();
 			return;
@@ -2214,6 +2373,7 @@ export async function wireConnectUi(
 			}
 
 			boundSessionKey = target;
+			clearTrayForContextSwitch("that thread");
 			insertBeforeEditor(
 				new Text(
 					`  ${brand.amber("✓")} ${brand.dim("bound to session")} ${brand.amber(target)}`,
@@ -2429,6 +2589,7 @@ export async function wireConnectUi(
 				return;
 			}
 			boundAgentId = arg;
+			clearTrayForContextSwitch(`agent ${arg}`);
 			insertBeforeEditor(
 				new Text(
 					`  ${brand.amber("✓")} ${brand.dim("bound to agent")} ${brand.amber(arg)}`,
@@ -2690,10 +2851,120 @@ export async function wireConnectUi(
 			return;
 		}
 
+		/* ─── attachments ───────────────────────────────────────────────────
+		 *
+		 * These three MUST sit above the `isAgentRunning` steer gate below.
+		 * Everything past that gate is unreachable while a turn is in flight — it
+		 * gets queued at the model as chat text instead of running as a command. And
+		 * "stage a file while the agent is working" is not an edge case, it is the
+		 * natural rhythm: you watch it work, you see what it needs, you paste a
+		 * screenshot. Below the gate, `/paste` would have been typed AT the model.
+		 */
+
+		// /attach [path] — no arg lists what's staged.
+		if (trimmed === "/attach" || trimmed.startsWith("/attach ")) {
+			editor.setText("");
+			const arg = trimmed === "/attach" ? "" : trimmed.slice("/attach ".length).trim();
+			if (!arg) {
+				showTray();
+				return;
+			}
+			// Reuse the submit-line parser so `/attach` accepts every shape a terminal
+			// might hand us — quoted, escaped, `file://`, or bare. The arg is nothing
+			// but a path, so the parser reads it as a "pure drop" and applies no
+			// extension gate: `/attach` is explicit intent and takes ANY file.
+			const { staged } = extractAttachmentPaths(arg);
+			// Fallback for an unquoted path with spaces (`/attach C:\my files\a.png`),
+			// which no token pattern can bound — but which, as the whole argument, is
+			// unambiguous. Strip any wrapping the operator typed and take it verbatim.
+			const bare = arg.replace(/^@/, "").replace(/^["'](.*)["']$/, "$1");
+			const added = staged.length > 0 ? stagePaths(staged.map((s) => s.path)) : stagePaths([bare]);
+			if (added > 0) showTray();
+			return;
+		}
+
+		// /detach [n | all]
+		if (trimmed === "/detach" || trimmed.startsWith("/detach ")) {
+			editor.setText("");
+			const arg = trimmed === "/detach" ? "" : trimmed.slice("/detach ".length).trim();
+			if (!arg || arg === "all") {
+				const n = stagedAttachments.length;
+				stagedAttachments = [];
+				insertBeforeEditor(
+					new Text(`  ${brand.dim(`detached ${n} file${n === 1 ? "" : "s"}.`)}`, 0, 0),
+				);
+				return;
+			}
+			const idx = Number.parseInt(arg, 10);
+			if (!Number.isInteger(idx) || idx < 1 || idx > stagedAttachments.length) {
+				insertBeforeEditor(
+					new Text(`  ${brand.error("✗")} ${brand.dim(`no staged file #${arg}.`)}`, 0, 0),
+				);
+				return;
+			}
+			const [gone] = stagedAttachments.splice(idx - 1, 1);
+			insertBeforeEditor(new Text(`  ${brand.dim(`detached ${gone?.fileName ?? ""}.`)}`, 0, 0));
+			showTray();
+			return;
+		}
+
+		// /paste — pull whatever is on the OS clipboard.
+		//
+		// Two DIFFERENT clipboard mechanisms, and we try both:
+		//   - a screenshot lives on the clipboard as raw BITMAP data with no file
+		//     behind it, so we spool the bytes to a temp PNG;
+		//   - a file copied in Explorer/Finder puts a FILE REFERENCE on the
+		//     clipboard, not its bytes — which is exactly why copy-pasting a 400 MB
+		//     video is fine here: only the path moves.
+		// Files first: when you copy a file in Explorer, Windows ALSO exposes a
+		// thumbnail bitmap, and the operator meant the file, not its thumbnail.
+		if (trimmed === "/paste") {
+			editor.setText("");
+			insertBeforeEditor(new Text(`  ${brand.dim("reading clipboard…")}`, 0, 0));
+			const files = await readClipboardFiles();
+			if (files.length > 0) {
+				const added = stagePaths(files.map((f) => f.path));
+				if (added > 0) showTray();
+				return;
+			}
+			const img = await readClipboardImage();
+			if (!img) {
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim(clipboardUnavailableReason() ?? "nothing to attach — the clipboard holds no image or file.")}`,
+						0,
+						0,
+					),
+				);
+				return;
+			}
+			// Through `stagePaths`, not straight onto the array — otherwise the pasted
+			// image would sidestep the count cap, the dedupe, and the remote-gateway
+			// refusal that every other route honours.
+			if (stagePaths([img.path]) > 0) showTray();
+			return;
+		}
+
 		// Mid-turn submit → STEER. The gateway has the same Pi semantics; queueing
 		// the message lets the model see it on the next iteration without abort.
 		if (isAgentRunning) {
 			editor.setText("");
+			// A steer injects TEXT into a turn that is already running — there is no
+			// place in that mechanism for a file. Staged attachments therefore stay
+			// staged, and we SAY so. Saying so is the whole point: silently carrying
+			// them into whatever the operator types next is the single worst behaviour
+			// this feature could have, and it is what happened before these handlers
+			// moved above the gate.
+			if (stagedAttachments.length > 0) {
+				const n = stagedAttachments.length;
+				insertBeforeEditor(
+					new Text(
+						`  ${brand.dim(`↳ steering can't carry files — your ${n} staged file${n === 1 ? "" : "s"} stay staged and will ride your next message.`)}`,
+						0,
+						0,
+					),
+				);
+			}
 			try {
 				await client.request("steer", withBinding({ text: trimmed }));
 				insertBeforeEditor(
@@ -2714,16 +2985,11 @@ export async function wireConnectUi(
 					// one-way snapshot rule existed). The operator's message must
 					// never be lost: clear the flag and send it as a normal prompt.
 					isAgentRunning = false;
-					insertBeforeEditor(
-						new Markdown(`${brand.user("you")}  ${trimmed}`, 1, 0, markdownTheme),
-					);
-					try {
-						lastUserPrompt = trimmed; // remember it as the replay message for a later `/switch` (Carrow) handoff
-			await client.request("prompt", withBinding({ text: trimmed }), { timeoutMs: 0 });
-					} catch (err2) {
-						const msg2 = err2 instanceof Error ? err2.message : String(err2);
-						insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg2)}`, 0, 0));
-					}
+					// Through the ONE send path — which echoes, attaches, clears the tray
+					// and records the replay payload. Hand-rolling the `prompt` request
+					// here is what silently dropped staged files from this turn while
+					// leaving them armed for the next.
+					await sendTurn(trimmed);
 					return;
 				}
 				insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0));
@@ -3191,88 +3457,6 @@ export async function wireConnectUi(
 			return;
 		}
 
-		// /attach [path] — no arg lists what's staged.
-		if (trimmed === "/attach" || trimmed.startsWith("/attach ")) {
-			editor.setText("");
-			const arg = trimmed === "/attach" ? "" : trimmed.slice("/attach ".length).trim();
-			if (!arg) {
-				showTray();
-				return;
-			}
-			// Reuse the submit-line parser so `/attach` accepts every shape a terminal
-			// might hand us — quoted, escaped, `file://`, or bare. The arg is nothing
-			// but a path, so the parser reads it as a "pure drop" and applies no
-			// extension gate: `/attach` is explicit intent and takes ANY file.
-			const { staged } = extractAttachmentPaths(arg);
-			// Fallback for an unquoted path with spaces (`/attach C:\my files\a.png`),
-			// which no token pattern can bound — but which, as the whole argument, is
-			// unambiguous. Strip any wrapping the operator typed and take it verbatim.
-			const bare = arg.replace(/^@/, "").replace(/^["'](.*)["']$/, "$1");
-			const added = staged.length > 0 ? stagePaths(staged.map((s) => s.path)) : stagePaths([bare]);
-			if (added > 0) showTray();
-			return;
-		}
-
-		// /detach [n | all]
-		if (trimmed === "/detach" || trimmed.startsWith("/detach ")) {
-			editor.setText("");
-			const arg = trimmed === "/detach" ? "" : trimmed.slice("/detach ".length).trim();
-			if (!arg || arg === "all") {
-				const n = stagedAttachments.length;
-				stagedAttachments = [];
-				insertBeforeEditor(
-					new Text(`  ${brand.dim(`detached ${n} file${n === 1 ? "" : "s"}.`)}`, 0, 0),
-				);
-				return;
-			}
-			const idx = Number.parseInt(arg, 10);
-			if (!Number.isInteger(idx) || idx < 1 || idx > stagedAttachments.length) {
-				insertBeforeEditor(
-					new Text(`  ${brand.error("✗")} ${brand.dim(`no staged file #${arg}.`)}`, 0, 0),
-				);
-				return;
-			}
-			const [gone] = stagedAttachments.splice(idx - 1, 1);
-			insertBeforeEditor(new Text(`  ${brand.dim(`detached ${gone?.fileName ?? ""}.`)}`, 0, 0));
-			showTray();
-			return;
-		}
-
-		// /paste — pull whatever is on the OS clipboard.
-		//
-		// Two DIFFERENT clipboard mechanisms, and we try both:
-		//   - a screenshot lives on the clipboard as raw BITMAP data with no file
-		//     behind it, so we spool the bytes to a temp PNG;
-		//   - a file copied in Explorer/Finder puts a FILE REFERENCE on the
-		//     clipboard, not its bytes — which is exactly why copy-pasting a 400 MB
-		//     video is fine here: only the path moves.
-		// Image first: when you copy a file in Explorer, Windows sometimes exposes a
-		// thumbnail bitmap TOO, and the operator meant the file.
-		if (trimmed === "/paste") {
-			editor.setText("");
-			insertBeforeEditor(new Text(`  ${brand.dim("reading clipboard…")}`, 0, 0));
-			const files = await readClipboardFiles();
-			if (files.length > 0) {
-				const added = stagePaths(files.map((f) => f.path));
-				if (added > 0) showTray();
-				return;
-			}
-			const img = await readClipboardImage();
-			if (!img) {
-				insertBeforeEditor(
-					new Text(
-						`  ${brand.dim("nothing to attach — the clipboard holds no image or file.")}`,
-						0,
-						0,
-					),
-				);
-				return;
-			}
-			if (!stagedAttachments.some((s) => s.path === img.path)) stagedAttachments.push(img);
-			showTray();
-			return;
-		}
-
 		// /thinking [level]
 		if (trimmed === "/thinking" || trimmed.startsWith("/thinking ")) {
 			editor.setText("");
@@ -3305,80 +3489,8 @@ export async function wireConnectUi(
 			return;
 		}
 
-		// Default — send as a prompt. Override timeout to 0 (disabled): the
-		// SERVER bounds turn duration via the 6-layer wrapper chain (heartbeat,
-		// stream-timeout, length-continuation). A client-side 60s cap would
-		// reject WHILE the server keeps processing, producing silent state
-		// desync — next user message would interleave with the in-flight reply.
-		// Capture files named IN the line itself — a `@path` completed by pi-tui's
-		// file autocomplete, or the path a terminal pasted when you dropped a file
-		// on it. A token only counts if it names a file that EXISTS on disk, so
-		// ordinary prose ("email me @ work", "check /etc/hosts") is never rewritten.
-		// Each captured token is replaced by the file's basename, keeping the
-		// sentence readable — the full path still reaches the model in the media
-		// note the gateway prepends.
-		const { text: cleanedText, staged: inlineStaged } = extractAttachmentPaths(trimmed);
-		if (inlineStaged.length > 0) stagePaths(inlineStaged.map((s) => s.path));
-
-		const attachments = stagedAttachments;
-		const outgoing = cleanedText || trimmed;
-
-		// `showTray` warns about a blind model when files are staged EXPLICITLY
-		// (/attach, /paste). But the most natural flow — drag an image in and press
-		// Enter — stages and sends in one breath and never opens the tray, so it
-		// would miss the warning entirely and the operator would read the agent's
-		// tool-mediated description as if the model had actually looked. Warn here
-		// too. Non-blocking: the turn still goes (analyze_media reads the file), we
-		// just refuse to let it look like vision when it isn't.
-		if (
-			attachments.some((a) => a.kind === "image") &&
-			lastSnapshot?.supportsVision === false
-		) {
-			insertBeforeEditor(
-				new Text(
-					`  ${brand.error("⚠")} ${brand.dim(`${lastSnapshot?.modelName ?? "this model"} cannot see images — reading the file with a tool instead. `)}${brand.amber("/model")}${brand.dim(" to switch to a vision model.")}`,
-					0,
-					0,
-				),
-			);
-		}
-
-		const chips =
-			attachments.length > 0
-				? ` ${brand.dim("·")} ${attachments.map((a) => `${attachmentIcon(a.kind)} ${a.fileName}`).join(" ")}`
-				: "";
-		insertBeforeEditor(new Markdown(`${brand.user("you")}  ${outgoing}${chips}`, 1, 0, markdownTheme));
-		editor.setText("");
-		// Clear the tray BEFORE the await. If the request throws, the files are
-		// already gone from the stage — which is correct: a failed send should not
-		// leave an image armed to ambush the operator's next, unrelated message.
-		stagedAttachments = [];
-		try {
-			// Carry the connection's bound agentId when set so the gateway
-			// routes this turn to that agent's session lane + runtime entry.
-			// Legacy single-agent gateways receive the same boot agent the
-			// snapshot reported, so behaviour is unchanged.
-			// Remember the message AND its files as the replay payload for a later
-			// `/switch` (Carrow) handoff — replaying the text without the image would
-			// defeat the most common reason to switch (moving to a model that can see).
-			lastUserPrompt = outgoing;
-			lastUserAttachments = attachments.length > 0 ? toPromptAttachments(attachments) : [];
-			await client.request(
-				"prompt",
-				withBinding({
-					text: outgoing,
-					// Omitted entirely when nothing is attached, so a plain text turn is
-					// byte-identical on the wire to what a pre-attachment TUI sent.
-					...(attachments.length > 0
-						? { attachments: toPromptAttachments(attachments) }
-						: {}),
-				}),
-				{ timeoutMs: 0 },
-			);
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			insertBeforeEditor(new Text(`  ${brand.error("✗")} ${brand.error(msg)}`, 0, 0));
-		}
+		// Default — send as a prompt, through the ONE send path.
+		await sendTurn(trimmed);
 	};
 
 	tui.requestRender();

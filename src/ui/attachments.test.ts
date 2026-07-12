@@ -301,3 +301,64 @@ describe("extractAttachmentPaths — the disambiguation rule", () => {
 		assert.equal(r.text, "shot.png");
 	});
 });
+
+/**
+ * Trailing punctuation belongs to the SENTENCE, not the filename. Before this was
+ * handled, the token matcher swallowed it, the stat failed, and the file silently
+ * did not attach — with no chip and no error. The `@` form is the cruellest: the
+ * path came out of a file picker, so the operator has every reason to think it
+ * worked.
+ */
+describe("extractAttachmentPaths — punctuation must not silently kill an attachment", () => {
+	it("attaches despite a trailing full stop, and keeps the stop", () => {
+		const r = extractAttachmentPaths(`look at ${png}.`);
+		assert.equal(r.staged.length, 1);
+		assert.equal(r.text, "look at shot.png.");
+	});
+
+	it("attaches despite a trailing question mark", () => {
+		const r = extractAttachmentPaths(`did you read ${pdf}?`);
+		assert.equal(r.staged.length, 1);
+		assert.equal(r.text, "did you read spec.pdf?");
+	});
+
+	it("attaches despite a trailing comma on an @token", () => {
+		const r = extractAttachmentPaths(`see @${png}, then tell me`);
+		assert.equal(r.staged.length, 1);
+		assert.equal(r.text, "see shot.png, then tell me");
+	});
+
+	it("attaches inside parentheses", () => {
+		const r = extractAttachmentPaths(`(see ${png})`);
+		assert.equal(r.staged.length, 1);
+		assert.equal(r.text, "(see shot.png)");
+	});
+});
+
+describe("extractAttachmentPaths — cwd-relative traps", () => {
+	it("does NOT attach a bare quoted word that happens to name a file in cwd", () => {
+		// `"package.json"` as the whole line: the residue is empty, so it reads as a
+		// pure drop — and path.resolve would cheerfully find the repo's own
+		// package.json and attach it. A one-word quoted reply is a message.
+		const r = extractAttachmentPaths('"package.json"');
+		assert.equal(r.staged.length, 0);
+		assert.equal(r.text, '"package.json"');
+	});
+
+	it("does NOT let an EMAIL feed the @ matcher", () => {
+		// `bob@corp.com` offered `corp.com` as a candidate, resolved against cwd. Any
+		// @word colliding with a file in cwd would be silently attached and the `@`
+		// stripped out of the operator's text.
+		const line = "ping bob@corp.com and sue@x.org about it";
+		const r = extractAttachmentPaths(line);
+		assert.equal(r.staged.length, 0);
+		assert.equal(r.text, line);
+	});
+
+	it("DOES honour an explicit @token for a cwd-relative file — that's the picker working", () => {
+		const rel = path.relative(process.cwd(), png).split(path.sep).join("/");
+		const r = extractAttachmentPaths(`review @${rel}`);
+		assert.equal(r.staged.length, 1);
+		assert.equal(r.staged[0]?.path, png);
+	});
+});
