@@ -14,6 +14,7 @@ import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 
 import {
+	MAX_INLINE_TEXT_BYTES,
 	PROMPT_ATTACHMENT_MAX_COUNT,
 	composeAttachmentTurn,
 	resolvePromptAttachments,
@@ -214,5 +215,72 @@ describe("composeAttachmentTurn", () => {
 		const r = await composeAttachmentTurn("", [att({})], { config: cfg });
 		assert.match(r.text, /^\[attached image/);
 		assert.equal(r.images?.length, 1);
+	});
+});
+
+/**
+ * An attachment whose content the model never sees is not an attachment — it's a
+ * suggestion. Images already ride as real bytes; these tests pin the other half:
+ * a text file's CONTENT reaches the model directly, with no tool call and no
+ * "here's a path, go read it".
+ */
+describe("composeAttachmentTurn — text files are really ingested, not just pointed at", () => {
+	const cfg = {} as BrigadeConfig;
+	const doc = (p: string, name: string): PromptAttachment => ({
+		kind: "document",
+		path: p,
+		fileName: name,
+	});
+
+	it("inlines a source file's actual content", async () => {
+		const ts = path.join(dir, "app.ts");
+		fs.writeFileSync(ts, "export const answer = 42;");
+		const r = await composeAttachmentTurn("what does this do?", [doc(ts, "app.ts")], {
+			config: cfg,
+		});
+		assert.match(r.text, /export const answer = 42;/, "the CONTENT must be in the prompt");
+		assert.match(r.text, /app\.ts/);
+		// And it must NOT be told to go call a tool for something it can already read.
+		assert.doesNotMatch(r.text, /analyze_media/);
+	});
+
+	it("inlines yaml/json/log/markdown too", async () => {
+		for (const [name, body] of [
+			["conf.yaml", "server:\n  port: 7777"],
+			["data.json", '{"a":1}'],
+			["run.log", "ERROR boom"],
+			["notes.md", "# Title"],
+		] as Array<[string, string]>) {
+			const p = path.join(dir, name);
+			fs.writeFileSync(p, body);
+			const r = await composeAttachmentTurn("", [doc(p, name)], { config: cfg });
+			assert.match(r.text, new RegExp(body.split("\n")[0]!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), name);
+		}
+	});
+
+	it("keeps the operator's question AFTER the file content", async () => {
+		const ts = path.join(dir, "q.ts");
+		fs.writeFileSync(ts, "const x = 1;");
+		const r = await composeAttachmentTurn("is this right?", [doc(ts, "q.ts")], { config: cfg });
+		assert.ok(
+			r.text.indexOf("const x = 1;") < r.text.indexOf("is this right?"),
+			"content first, question last — the channel pipeline's order",
+		);
+	});
+
+	it("truncates a huge text file loudly rather than detonating the context window", async () => {
+		const big = path.join(dir, "huge.log");
+		fs.writeFileSync(big, "x".repeat(MAX_INLINE_TEXT_BYTES + 5000));
+		const r = await composeAttachmentTurn("", [doc(big, "huge.log")], { config: cfg });
+		assert.match(r.text, /truncated at/);
+		assert.match(r.text, /read .* for the rest/);
+		assert.ok(r.text.length < MAX_INLINE_TEXT_BYTES + 2000);
+	});
+
+	it("does NOT inline a binary document — a PDF still routes to analyze_media", async () => {
+		const pdf = path.join(dir, "x.pdf");
+		fs.writeFileSync(pdf, "%PDF-1.4 binary");
+		const r = await composeAttachmentTurn("", [doc(pdf, "x.pdf")], { config: cfg });
+		assert.match(r.text, /analyze_media/, "Pi has no content block a PDF can ride in");
 	});
 });

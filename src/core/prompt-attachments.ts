@@ -102,6 +102,80 @@ const VALID_KINDS: ReadonlySet<string> = new Set([
 	"sticker",
 ]);
 
+/**
+ * ── Text-like files are INLINED, not merely pointed at ────────────────────
+ *
+ * An attachment whose content the model never sees is not really an attachment.
+ * For an image on a vision model we already send the bytes; for a PDF or an MP4
+ * we cannot (Pi's content model is text + image), so a tool has to fetch it. But
+ * for a text file there is no excuse: reading it is free, and handing the model a
+ * PATH and hoping it calls `read` is a worse experience in every way — an extra
+ * round-trip, an extra chance to not bother, and nothing in the transcript to
+ * show the operator that their file was actually looked at.
+ *
+ * So text-like attachments are read at compose time and their content goes into
+ * the turn directly. That is what makes `@config.yaml` behave like an attachment
+ * instead of like a suggestion.
+ */
+const TEXT_INLINE_EXT: ReadonlySet<string> = new Set([
+	"txt", "text", "md", "markdown", "log", "csv", "tsv", "json", "jsonl", "ndjson",
+	"xml", "yaml", "yml", "toml", "ini", "cfg", "conf", "env", "properties",
+	"ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "rb", "go", "rs", "java", "kt",
+	"c", "h", "cpp", "hpp", "cc", "cs", "swift", "php", "sh", "bash", "zsh", "ps1",
+	"sql", "html", "htm", "css", "scss", "vue", "svelte", "diff", "patch",
+	"dockerfile", "gitignore", "editorconfig",
+]);
+
+/**
+ * Ceiling on inlined text. Generous enough for essentially any source file or
+ * config, small enough that attaching a 200 MB log can't detonate the context
+ * window. Past it the file is truncated with an explicit marker — never silently
+ * — and the path stays in the note so the agent can `read` the rest on purpose.
+ */
+export const MAX_INLINE_TEXT_BYTES = 256 * 1024;
+
+function isTextLike(m: InboundMediaAttachment): boolean {
+	if (m.kind !== "document") return false;
+	const base = path.basename(m.path).toLowerCase();
+	const ext = path.extname(base).slice(1).toLowerCase();
+	// Extensionless-but-known config files (Dockerfile, Makefile) read as text too.
+	if (!ext) return ["dockerfile", "makefile", "rakefile", "gemfile", "procfile"].includes(base);
+	return TEXT_INLINE_EXT.has(ext);
+}
+
+/**
+ * Read a text attachment into a fenced block the model can just… read.
+ *
+ * Not wrapped in the untrusted-content envelope: the operator picked this file
+ * off their own disk, which is exactly the trust position of the `read` tool,
+ * and `read` doesn't wrap either. Wrapping here would be inconsistent theatre.
+ */
+async function inlineTextAttachment(m: InboundMediaAttachment): Promise<string> {
+	let body: string;
+	try {
+		const fh = await fsp.open(m.path, "r");
+		try {
+			const buf = Buffer.alloc(MAX_INLINE_TEXT_BYTES);
+			const { bytesRead } = await fh.read(buf, 0, MAX_INLINE_TEXT_BYTES, 0);
+			body = buf.subarray(0, bytesRead).toString("utf8");
+		} finally {
+			await fh.close();
+		}
+	} catch {
+		// Unreadable → fall back to the path stub so the agent can still try a tool.
+		return `[attached file → ${m.path}] (could not be read inline)`;
+	}
+
+	const st = await fsp.stat(m.path).catch(() => null);
+	const truncated = st !== null && st.size > MAX_INLINE_TEXT_BYTES;
+	const name = m.fileName ?? path.basename(m.path);
+	const head = `[attached file: ${name} → ${m.path}]`;
+	const tail = truncated
+		? `\n… truncated at ${formatBytes(MAX_INLINE_TEXT_BYTES)} of ${formatBytes(st.size)} — read ${m.path} for the rest.`
+		: "";
+	return `${head}\n\`\`\`\n${body}\n\`\`\`${tail}`;
+}
+
 /** An attachment we refused, and why — surfaced to the operator verbatim. */
 export interface RejectedAttachment {
 	path: string;
@@ -263,12 +337,29 @@ export async function composeAttachmentTurn(
 		return { text, rejected };
 	}
 
-	const note = await buildMediaNote(media, {
-		...(deps.registry ? { registry: deps.registry } : {}),
-		config: deps.config,
-	});
-	const composed = [note, text.trim()].filter(Boolean).join("\n").trim();
-	const images = await buildInboundImageBlocks(media);
+	// Split by how the content actually REACHES the model:
+	//   • text-like  → we read it here and inline it. A real attachment.
+	//   • everything → the channel's media note (image stub / STT transcript /
+	//     else                analyze_media call-to-action), because Pi has no
+	//                         content block a PDF or an MP4 can ride in.
+	const textDocs = media.filter(isTextLike);
+	const rest = media.filter((m) => !isTextLike(m));
+
+	const note =
+		rest.length > 0
+			? await buildMediaNote(rest, {
+					...(deps.registry ? { registry: deps.registry } : {}),
+					config: deps.config,
+				})
+			: "";
+	const inlined = await Promise.all(textDocs.map((m) => inlineTextAttachment(m)));
+
+	// Note + inlined files FIRST, the operator's words LAST — the same order the
+	// channel inbound pipeline composes, so the model sees an identical layout
+	// however the file arrived.
+	const composed = [note, ...inlined, text.trim()].filter(Boolean).join("\n").trim();
+	// Only `rest` can contain images; a text doc is never kind:"image".
+	const images = await buildInboundImageBlocks(rest);
 	return {
 		text: composed,
 		...(images.length > 0 ? { images } : {}),

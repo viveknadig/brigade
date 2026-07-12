@@ -49,7 +49,37 @@ const NO_REQUIRED_ARG = new Set([
 ]);
 
 export class BrigadeEditor extends Editor {
+	/**
+	 * Fired on a raw Ctrl+V (0x16) — "paste an image from the clipboard".
+	 *
+	 * A terminal forwards keystrokes and TEXT; it never forwards binary clipboard
+	 * data. So an image paste cannot arrive as input — we have to notice the
+	 * keypress and go ask the OS ourselves. That is the whole trick.
+	 *
+	 * The catch, stated plainly because it decides how we document this: many
+	 * terminals (Windows Terminal among them) bind Ctrl+V to their OWN paste and
+	 * consume it, so 0x16 never reaches us — and when the clipboard holds an image
+	 * with no text, their paste inserts nothing and we see no input at all. There
+	 * is no way for an application to intercept a keystroke the terminal ate. So
+	 * `/paste` exists as the guaranteed path, and this handles every terminal that
+	 * does forward the key.
+	 */
+	onImagePaste?: () => void;
+
 	override handleInput(data: string): void {
+		// Ctrl+V (0x16) and Alt+V (ESC v) both mean "paste an image from the clipboard".
+		//
+		// BOTH exist because Ctrl+V alone is not enough on Windows. Windows Terminal
+		// binds Ctrl+V to its OWN paste action, which inserts the clipboard's TEXT —
+		// and when the clipboard holds an image with no text, it inserts nothing at
+		// all. The keypress is consumed by the terminal and never reaches us, so
+		// there is nothing for this method to hook. Alt+V is not bound by any
+		// mainstream terminal, so it reaches the application intact and gives Windows
+		// operators a real keystroke instead of a command they have to type.
+		if ((data === "\x16" || data === "\x1bv" || data === "\x1bV") && this.onImagePaste) {
+			this.onImagePaste();
+			return;
+		}
 		// Pi's handleInput recognises both `\r` and `\n` as Enter (see
 		// `editor.js:586-613`). Translate either to Tab `\t` ONLY when the
 		// autocomplete popup is showing AND the command needs a required

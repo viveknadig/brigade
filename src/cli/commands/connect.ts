@@ -738,6 +738,18 @@ export async function wireConnectUi(
 	const editor = new BrigadeEditor(tui, editorTheme);
 	tui.addChild(editor);
 	tui.setFocus(editor);
+	/**
+	 * The attachment bar. Lives in the BOTTOM region — with the editor and footer —
+	 * because that is the only part Pi-TUI keeps pinned on screen.
+	 *
+	 * The first version of this printed chips into the scrollback instead, which
+	 * meant that the moment anything else happened they scrolled away and there was
+	 * no way to tell, at the instant you press Enter, whether a file was armed. An
+	 * attachment you cannot SEE is one you cannot trust; this is the difference
+	 * between the feature working and the feature feeling like it works.
+	 */
+	const attachBar = new Text("", 0, 0);
+	tui.addChild(attachBar);
 	// Pin the live status line directly under the editor — the bottom region
 	// Pi-TUI keeps in view (the hint lines below also live here). This is what
 	// keeps `provider · model · tokens · cost` visible while a reply streams.
@@ -890,7 +902,7 @@ export async function wireConnectUi(
 	);
 	tui.addChild(
 		new Text(
-			brand.dim("  Enter to send · Ctrl+C abort · /usage /abort /reasoning · /help for full list"),
+			brand.dim("  Enter to send · Ctrl+C abort · attach: drag a file in · @path · Alt+V or Ctrl+V (screenshot) · /paste · /help"),
 			0,
 			0,
 		),
@@ -1975,8 +1987,39 @@ export async function wireConnectUi(
 	 */
 	const gatewayIsLocal = ["127.0.0.1", "localhost", "::1", "0.0.0.0"].includes(gatewayHost);
 
-	/** Render the chip tray. Called after any staging change so the operator can always see what will ride the next turn. */
+	/**
+	 * Repaint the always-visible attachment bar. Called after EVERY change to the
+	 * staged list — staging, detaching, sending, switching context — so what the bar
+	 * says and what will actually ride the next turn can never drift apart.
+	 */
+	const renderAttachBar = (): void => {
+		if (stagedAttachments.length === 0) {
+			attachBar.setText("");
+			tui.requestRender();
+			return;
+		}
+		const vision = lastSnapshot?.supportsVision;
+		const chips = stagedAttachments
+			.map((a, i) => {
+				const blind = a.kind === "image" && vision === false;
+				const mark = blind ? brand.error("⚠") : "";
+				return `${brand.amber(`${i + 1}`)}${brand.dim(".")}${attachmentIcon(a.kind)} ${brand.white(a.fileName)} ${brand.dim(`(${formatAttachmentBytes(a.bytes)})`)}${mark}`;
+			})
+			.join(brand.dim(" · "));
+		const n = stagedAttachments.length;
+		const blindWarning =
+			stagedAttachments.some((a) => a.kind === "image") && vision === false
+				? ` ${brand.error("⚠ this model can't see images —")} ${brand.amber("/model")}`
+				: "";
+		attachBar.setText(
+			`  ${brand.amber("📎")} ${brand.dim(`${n} attached:`)} ${chips}${blindWarning} ${brand.dim("· /detach to remove")}`,
+		);
+		tui.requestRender();
+	};
+
+	/** Verbose listing — only for an explicit bare `/attach`, which is a question. */
 	const showTray = (): void => {
+		renderAttachBar();
 		if (stagedAttachments.length === 0) {
 			insertBeforeEditor(new Text(`  ${brand.dim("no files staged.")}`, 0, 0));
 			return;
@@ -2061,6 +2104,7 @@ export async function wireConnectUi(
 			stagedAttachments.push(att);
 			added++;
 		}
+		if (added > 0) renderAttachBar();
 		return added;
 	};
 
@@ -2089,7 +2133,15 @@ export async function wireConnectUi(
 		if (inlineStaged.length > 0) stagePaths(inlineStaged.map((s) => s.path));
 
 		const attachments = stagedAttachments;
-		const outgoing = cleanedText || rawText;
+		// Strip the visual `[image #1]` / `[file.pdf]` pills the paste handler dropped
+		// into the line. They exist so the operator can SEE the attachment land; the
+		// model gets the real thing (an inline image block, or the file's content), so
+		// leaving the pill in the text would just be a confusing dangling reference.
+		// Deliberately allowed to end up EMPTY: pasting a screenshot and pressing Enter
+		// with no words is a legitimate turn — the attachment carries it, and the
+		// gateway composes a note-plus-image prompt. Falling back to the raw line here
+		// would send the literal text "[image #1]" instead.
+		const outgoing = (cleanedText || rawText).replace(/\[image #\d+\]\s*/g, "").trim();
 
 		// `showTray` warns about a blind model when files are staged EXPLICITLY
 		// (/attach, /paste). But the most natural flow — drag an image in and press
@@ -2116,6 +2168,7 @@ export async function wireConnectUi(
 		editor.setText("");
 		// Unstage BEFORE the await so a file can never ride a second, unrelated turn.
 		stagedAttachments = [];
+		renderAttachBar();
 		try {
 			// Carry the connection's bound agentId when set so the gateway routes this
 			// turn to that agent's session lane + runtime entry. Legacy single-agent
@@ -2148,6 +2201,7 @@ export async function wireConnectUi(
 			// safe precisely because we say so.
 			if (attachments.length > 0) {
 				stagedAttachments = attachments;
+				renderAttachBar();
 				insertBeforeEditor(
 					new Text(
 						`  ${brand.dim(`${attachments.length} file${attachments.length === 1 ? " is" : "s are"} still staged — resend when you're ready.`)}`,
@@ -2172,6 +2226,7 @@ export async function wireConnectUi(
 		if (stagedAttachments.length === 0) return;
 		const n = stagedAttachments.length;
 		stagedAttachments = [];
+		renderAttachBar();
 		insertBeforeEditor(
 			new Text(
 				`  ${brand.dim(`unstaged ${n} file${n === 1 ? "" : "s"} — ${what} starts clean.`)}`,
@@ -2179,6 +2234,62 @@ export async function wireConnectUi(
 				0,
 			),
 		);
+	};
+
+	/**
+	 * Pull whatever is on the OS clipboard and stage it. Shared by Ctrl+V and `/paste`.
+	 *
+	 * Two DIFFERENT clipboard mechanisms, and we try both:
+	 *   • a screenshot lives on the clipboard as raw BITMAP data with no file behind
+	 *     it, so we spool the bytes to a temp PNG;
+	 *   • a file copied in Explorer/Finder puts a FILE REFERENCE on the clipboard,
+	 *     not its bytes — which is exactly why copy-pasting a 400 MB video is free
+	 *     here: only the path moves.
+	 *
+	 * Files first: copying a file in Explorer ALSO exposes a thumbnail bitmap, and
+	 * the operator meant the file, not its thumbnail.
+	 */
+	const pasteFromClipboard = async (opts?: { quiet?: boolean }): Promise<void> => {
+		const before = stagedAttachments.length;
+		const files = await readClipboardFiles();
+		if (files.length > 0) {
+			stagePaths(files.map((f) => f.path));
+		} else {
+			const img = await readClipboardImage();
+			if (!img) {
+				if (!opts?.quiet) {
+					insertBeforeEditor(
+						new Text(
+							`  ${brand.dim(clipboardUnavailableReason() ?? "nothing to attach — the clipboard holds no image or file.")}`,
+							0,
+							0,
+						),
+					);
+				}
+				return;
+			}
+			// Through `stagePaths`, not straight onto the array — otherwise a pasted
+			// image would sidestep the count cap, the dedupe and the remote-gateway
+			// refusal that every other route honours.
+			stagePaths([img.path]);
+		}
+		// Drop a VISIBLE marker into the line you're typing, the way a chat client
+		// shows an inline attachment pill. Without it, Ctrl+V looks like it did
+		// nothing at all — the bytes are on the clipboard, there is no path to echo,
+		// and the operator has no way to know the paste registered.
+		for (let i = before; i < stagedAttachments.length; i++) {
+			const a = stagedAttachments[i];
+			if (!a) continue;
+			editor.insertTextAtCursor(a.kind === "image" ? `[image #${i + 1}] ` : `[${a.fileName}] `);
+		}
+		tui.requestRender();
+	};
+
+	// Ctrl+V / Alt+V. Ctrl+V only reaches us in terminals that don't bind it to their
+	// own paste (Windows Terminal does); Alt+V nobody binds, so it always arrives.
+	// `/paste` remains the guaranteed path. See `BrigadeEditor.onImagePaste`.
+	editor.onImagePaste = () => {
+		void pasteFromClipboard({ quiet: false });
 	};
 
 	editor.onSubmit = async (value: string) => {
@@ -2890,6 +3001,7 @@ export async function wireConnectUi(
 			if (!arg || arg === "all") {
 				const n = stagedAttachments.length;
 				stagedAttachments = [];
+				renderAttachBar();
 				insertBeforeEditor(
 					new Text(`  ${brand.dim(`detached ${n} file${n === 1 ? "" : "s"}.`)}`, 0, 0),
 				);
@@ -2903,8 +3015,8 @@ export async function wireConnectUi(
 				return;
 			}
 			const [gone] = stagedAttachments.splice(idx - 1, 1);
+			renderAttachBar();
 			insertBeforeEditor(new Text(`  ${brand.dim(`detached ${gone?.fileName ?? ""}.`)}`, 0, 0));
-			showTray();
 			return;
 		}
 
@@ -2921,27 +3033,7 @@ export async function wireConnectUi(
 		if (trimmed === "/paste") {
 			editor.setText("");
 			insertBeforeEditor(new Text(`  ${brand.dim("reading clipboard…")}`, 0, 0));
-			const files = await readClipboardFiles();
-			if (files.length > 0) {
-				const added = stagePaths(files.map((f) => f.path));
-				if (added > 0) showTray();
-				return;
-			}
-			const img = await readClipboardImage();
-			if (!img) {
-				insertBeforeEditor(
-					new Text(
-						`  ${brand.dim(clipboardUnavailableReason() ?? "nothing to attach — the clipboard holds no image or file.")}`,
-						0,
-						0,
-					),
-				);
-				return;
-			}
-			// Through `stagePaths`, not straight onto the array — otherwise the pasted
-			// image would sidestep the count cap, the dedupe, and the remote-gateway
-			// refusal that every other route honours.
-			if (stagePaths([img.path]) > 0) showTray();
+			await pasteFromClipboard();
 			return;
 		}
 
