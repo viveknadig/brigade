@@ -300,6 +300,27 @@ merge / split / stamp / watermark PDFs — all with pure-JS libraries, no sandbo
 Drop a document into a channel and Brigade sees it; ask for a report and it hands
 one back with `send_media`.
 
+### 📎 Attach files in the terminal
+Send your crew an image, a PDF, a screenshot, a video — from the chat TUI, with
+no ceremony. Four ways in, and they all land as a real attachment:
+
+- **Drag a file onto the window** — the path turns into a `[filename]` chip the
+  instant it lands, before you press anything.
+- **`Ctrl+V`** — paste an image and it attaches; paste text and it types, exactly
+  as before. Brigade reads the clipboard on the paste event your terminal sends,
+  so a copied screenshot just works.
+- **`@path`** — an autocompleting file picker; type `@` and fuzzy-find.
+- **`/attach <path>`**, **`/paste`**, **`/detach`** — the explicit backbone, plus
+  `/clipboard` to see what's on your clipboard and which build is running.
+
+An **image** on a vision-capable model rides the turn inline — the model actually
+*sees* it. A **text or source file** is read and its contents are inlined
+directly. **PDFs, Office docs, video and audio** go through `analyze_media` (see
+above). A persistent clipboard worker keeps a paste to a few milliseconds on every
+platform, and a `📎 attached` bar shows what will ride your next message. Works
+against a local gateway (files travel as paths, so a 400 MB video costs nothing on
+the wire).
+
 ### 🎬 Motion-graphics video (HyperFrames)
 `render_video` turns an HTML composition into a **deterministic MP4** — animated
 charts and dashboards, data explainers, quote/announcement cards, kinetic
@@ -681,11 +702,14 @@ When you're in the chat TUI (`brigade` or `brigade connect`):
 | `/reasoning [on\|off]` | Toggle whether thinking blocks render |
 | `/compact` | Force a context compaction now |
 | `/abort`, `/steer "<text>"` | Stop the current turn, or inject mid-turn guidance |
+| `/attach <path>`, `/paste`, `/detach [<n>\|all]` | Stage a file, pull from the clipboard, or unstage |
+| `/clipboard` | What's on your clipboard, plus the running build + worker health |
 | `/usage` | Token + cost usage for this session |
 | `/help`, `/exit` | Show all commands / quit |
 
 Keyboard: **Enter** sends · **Ctrl+C** stops the current response · **Ctrl+D**
-quits · **↑/↓** history.
+quits · **↑/↓** history · **Ctrl+V** pastes an image as an attachment · drag a
+file onto the window to attach it.
 
 ---
 
