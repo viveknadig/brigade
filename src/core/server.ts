@@ -66,10 +66,21 @@ import { nextSeq } from "../protocol/stream-seq.js";
 // session is surfaced for the turn's lifetime via `onSessionReady` so the
 // gateway can steer / abort / switch-model mid-stream.
 import { applyAutoEnableA2AAtBoot } from "../agents/a2a-policy-canonicalize.js";
-import { flattenAssistantContent, runResilientTurn, type RunSingleTurnResult } from "../agents/agent-loop.js";
+import {
+	flattenAssistantContent,
+	modelSupportsImageInput,
+	runResilientTurn,
+	type RunSingleTurnResult,
+} from "../agents/agent-loop.js";
 import { BrigadeExtensionRegistry, BUNDLED_MODULES, clearDiscoveryCache, loadModules } from "../agents/extensions/index.js";
-import { setActiveRegistry } from "../agents/extensions/active-registry.js";
+import { getActiveRegistry, setActiveRegistry } from "../agents/extensions/active-registry.js";
 import type { GatewayCaller, GatewayMethodHandler, HttpRoute, Service } from "../agents/extensions/index.js";
+import {
+	buildInboundImageBlocks,
+	buildMediaNote,
+	type InboundImageBlock,
+} from "../agents/channels/media-capture.js";
+import { resolvePromptAttachments } from "./prompt-attachments.js";
 import { createMcpHttpRoute } from "../agents/mcp/http-route.js";
 import { createMcpTurnRegistry, setActiveMcpToolPlaneHost } from "../agents/mcp/tool-plane-host.js";
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_TIMEOUT_MS, readBodyWithLimit } from "./webhook-guards.js";
@@ -1744,6 +1755,10 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 			modelName: rt.model?.name,
 			thinkingLevel: rt.thinkingLevel,
 			supportsThinking,
+			// Same derivation the turn itself uses (`resolveInboundImagePrompt` gates
+			// inline image blocks on exactly this), so the TUI's "this model can't see
+			// images" warning can never disagree with what the turn does with them.
+			supportsVision: modelSupportsImageInput(rt.model) === true,
 			availableThinkingLevels,
 			...(latestUpdate ? { updateAvailable: latestUpdate } : {}),
 			contextUsagePercent: lastContextUsagePercent,
@@ -3012,6 +3027,40 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 					(err as Error & { code?: string }).code = "forbidden";
 					throw err;
 				}
+				// Files the client attached to this turn (TUI `@path` tokens, a file
+				// dropped on the terminal, a screenshot pasted from the clipboard).
+				// Resolved to the SAME `InboundMediaAttachment[]` a channel produces,
+				// then run through the SAME two helpers the channel inbound pipeline
+				// uses — so a pasted screenshot behaves exactly like a WhatsApp photo:
+				// inline `ImageContent` on a vision-capable model, an STT transcript
+				// for a voice note, an `analyze_media` call-to-action for a PDF.
+				// Undefined for every historical caller (cron / sub-agent / RPC / a
+				// pre-attachment TUI), whose turn stays byte-identical.
+				let promptText = p.text;
+				let promptImages: InboundImageBlock[] | undefined;
+				if (p.attachments && p.attachments.length > 0) {
+					const { media, rejected } = await resolvePromptAttachments(p.attachments);
+					if (rejected.length > 0) {
+						// Surfaced, never swallowed — an attachment that vanished with no
+						// explanation is worse than one that failed out loud.
+						createSubsystemLogger("gateway/attachments").warn("prompt attachments rejected", {
+							sessionKey: targetSessionKey,
+							rejected: rejected.map((r) => `${r.path}: ${r.reason}`),
+						});
+					}
+					if (media.length > 0) {
+						const note = await buildMediaNote(media, {
+							registry: getActiveRegistry(),
+							config: await loadConfig(),
+						});
+						// Note FIRST, then the operator's text — the same order the channel
+						// inbound pipeline composes (`inbound-pipeline.ts`), so the model
+						// sees an identical layout regardless of which surface sent the file.
+						promptText = [note, p.text.trim()].filter(Boolean).join("\n").trim();
+						const blocks = await buildInboundImageBlocks(media);
+						if (blocks.length > 0) promptImages = blocks;
+					}
+				}
 				// Wave N4 — no hasLiveSession pre-flight. The session-lane FIFO
 				// inside `runGatewayTurn` (sessionLane(turn.sessionKey)) already
 				// serialises every prompt on the same session: a second client's
@@ -3022,7 +3071,8 @@ async function continueBoot(args: BootContinueArgs): Promise<ServerHandle> {
 				// session multi-client (e.g. TUI + chat both attached to
 				// `agent:main:main`).
 				await runGatewayTurn({
-					text: p.text,
+					text: promptText,
+					...(promptImages ? { images: promptImages } : {}),
 					sessionKey: targetSessionKey,
 					agentId: targetAgentId,
 				});

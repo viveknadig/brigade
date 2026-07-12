@@ -439,6 +439,37 @@ export interface WireMessage {
 
 /* ─────────────────────────── payload types ─────────────────────────── */
 
+/**
+ * A file the client attached to a turn — the TUI's `@path` tokens, a file
+ * dropped onto the terminal, or an image pasted from the OS clipboard.
+ *
+ * Deliberately the same shape as a channel's `InboundMediaAttachment` (minus
+ * `caption`), because the gateway feeds these straight into the SAME
+ * `buildMediaNote` + `buildInboundImageBlocks` pair the channel inbound
+ * pipeline uses. That's what makes a pasted screenshot behave exactly like a
+ * WhatsApp photo: images ride inline to a vision-capable model, audio gets
+ * transcribed by any configured STT provider, and a PDF/video arrives as an
+ * `analyze_media` call-to-action carrying its path.
+ *
+ * `path` must be absolute AND resolvable ON THE GATEWAY HOST. The TUI normally
+ * shares a filesystem with its gateway (it auto-spawns one on 127.0.0.1), so
+ * sending the path — rather than base64 bytes — keeps a 400 MB video off the
+ * wire entirely and imposes no payload ceiling. A future remote-gateway client
+ * (`brigade expose`) adds an optional `data` field here and the gateway spools
+ * it to a temp file, collapsing back into this same path case; that is why the
+ * transport is a path and not a blob.
+ */
+export interface PromptAttachment {
+	/** What it is — drives inline-vision vs. `analyze_media` routing downstream. */
+	kind: "image" | "video" | "audio" | "voice" | "document" | "sticker";
+	/** Absolute path, resolvable on the GATEWAY host. */
+	path: string;
+	/** Detected MIME type, e.g. `image/png`. Inferred from the extension when absent. */
+	mimeType?: string;
+	/** Display name — what the operator sees in the chip tray + the media note. */
+	fileName?: string;
+}
+
 /** Params for each request method. `void` = no params required. */
 export interface RequestParams {
 	prompt: {
@@ -447,6 +478,12 @@ export interface RequestParams {
 		agentId?: string;
 		/** Canonical session key; defaults to `defaultSessionKey(agentId)` when omitted. */
 		sessionKey?: string;
+		/**
+		 * OPTIONAL files attached to THIS turn. Absent for every historical
+		 * caller (cron / sub-agent / RPC / a pre-attachment TUI), so their turn
+		 * is byte-identical to before.
+		 */
+		attachments?: ReadonlyArray<PromptAttachment>;
 	};
 	abort: {
 		/** Session key to abort; defaults to the gateway's boot session for back-compat. */
@@ -743,6 +780,13 @@ export interface SessionStateSnapshot {
 	modelName: string | undefined;
 	thinkingLevel: string;
 	supportsThinking: boolean;
+	/**
+	 * Whether the RESOLVED turn model accepts image input. The TUI reads this to
+	 * warn — before the turn is sent — that a staged image will not actually be
+	 * seen (it falls back to an `analyze_media` path note instead). Optional for
+	 * wire-compat with a gateway older than this field.
+	 */
+	supportsVision?: boolean;
 	availableThinkingLevels: string[];
 	contextUsagePercent: number | null;
 	totalTokensIn: number;

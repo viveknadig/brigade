@@ -43,6 +43,9 @@ const NO_REQUIRED_ARG = new Set([
 	"model", // [<model-id>] — optional
 	"provider", // [<provider>] — optional (no arg lists providers)
 	"reasoning", // [on|off] — optional toggle
+	"paste", // no arg — reads the clipboard
+	"attach", // [<path>] — optional (no arg lists what's staged)
+	"detach", // [<n>|all] — optional (no arg detaches everything)
 ]);
 
 export class BrigadeEditor extends Editor {
