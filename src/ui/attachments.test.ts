@@ -371,6 +371,42 @@ describe("extractAttachmentPaths — pill mode (drag-and-drop)", () => {
 	});
 });
 
+/**
+ * Real filenames are hostile. `ChatGPT Image Jul 11, 2026, 11_45_54 AM (1).png`
+ * has spaces, commas and parentheses — and a terminal pastes it UNQUOTED. Every
+ * token pattern stops at the first space, so the candidate became
+ * `…\Downloads\ChatGPT`, which is not a file, and the whole thing fell through as
+ * prose: no pill, no attachment, no explanation. The whole-line check exists for
+ * exactly this.
+ */
+describe("extractAttachmentPaths — filenames with spaces, commas and parens", () => {
+	it("attaches an UNQUOTED path full of spaces and punctuation", () => {
+		const nasty = path.join(dir, "ChatGPT Image Jul 11, 2026, 11_45_54 AM (1).png");
+		fs.writeFileSync(nasty, Buffer.from([0x89, 0x50, 0x4e, 0x47, 1]));
+		const r = extractAttachmentPaths(nasty, { pill: true });
+		assert.equal(r.staged.length, 1, "an unquoted spacey path must still attach");
+		assert.equal(r.staged[0]?.path, nasty);
+		assert.equal(r.text, "[ChatGPT Image Jul 11, 2026, 11_45_54 AM (1).png]");
+	});
+
+	it("attaches it when quoted too", () => {
+		const nasty = path.join(dir, "ChatGPT Image Jul 11, 2026, 11_45_54 AM (1).png");
+		const r = extractAttachmentPaths(`"${nasty}"`, { pill: true });
+		assert.equal(r.staged.length, 1);
+	});
+
+	it("still refuses a whole-line RELATIVE word — cwd resolution must not sneak back in", () => {
+		const r = extractAttachmentPaths("package.json");
+		assert.equal(r.staged.length, 0);
+		assert.equal(r.text, "package.json");
+	});
+
+	it("a multi-line paste is never treated as one whole-line path", () => {
+		const code = "def f(x):\n    return x";
+		assert.equal(extractAttachmentPaths(code).text, code);
+	});
+});
+
 describe("extractAttachmentPaths — cwd-relative traps", () => {
 	it("does NOT attach a bare quoted word that happens to name a file in cwd", () => {
 		// `"package.json"` as the whole line: the residue is empty, so it reads as a

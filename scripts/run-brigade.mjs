@@ -178,6 +178,31 @@ async function runBrigadeBin({ repoRoot, args }) {
   });
 }
 
+/**
+ * Stop a running gateway after a rebuild.
+ *
+ * THE developer footgun of this repo, and it is a nasty one because everything
+ * LOOKS right. `npm run tui` rebuilds `dist/` and then launches the TUI — but the
+ * TUI is a thin client that ATTACHES to the long-lived gateway daemon, and the
+ * gateway is still executing the code it was started with. So the client is new,
+ * the server is old, and every server-side change you just made — a model's
+ * capabilities, a tool, the whole agent loop — is silently not there. You then go
+ * hunting for a bug in code that is not running.
+ *
+ * Rebuilt code means the daemon is stale by definition, so retire it here and let
+ * the next `tui`/`chat` auto-spawn a fresh one. Best-effort and quiet: if no
+ * gateway is up, `gateway stop` is a harmless no-op.
+ */
+async function stopStaleGateway({ repoRoot }) {
+  const binPath = path.join(repoRoot, "brigade.mjs");
+  logRunner("restarting the gateway so it picks up the rebuild.");
+  await runChildProcess(process.execPath, [binPath, "gateway", "stop"], {
+    cwd: process.cwd(),
+    env: { ...process.env, BRIGADE_RUNNER_LOG: "0" },
+    stdio: "ignore",
+  }).catch(() => 0);
+}
+
 export async function runDevMain(params = {}) {
   const repoRoot = params.repoRoot ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const args = params.args ?? process.argv.slice(2);
@@ -194,6 +219,8 @@ export async function runDevMain(params = {}) {
       logRunner(`build failed (exit ${buildExit}).`);
       return buildExit;
     }
+    // The daemon is now running code we just replaced. See stopStaleGateway.
+    await stopStaleGateway({ repoRoot });
   }
   return await runBrigadeBin({ repoRoot, args });
 }

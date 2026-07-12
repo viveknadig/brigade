@@ -368,6 +368,24 @@ export function extractAttachmentPaths(
 	const label = (name: string): string => (opts?.pill ? `[${name}]` : name);
 	let text = line;
 
+	// WHOLE-LINE PATH — checked before any tokenising, because tokenising is exactly
+	// what breaks here.
+	//
+	// A real filename: `ChatGPT Image Jul 11, 2026, 11_45_54 AM (1).png`. Spaces,
+	// commas, parentheses. Terminals paste a dropped/copied path like that WITHOUT
+	// quotes, and every token pattern below stops at the first space — so the
+	// candidate becomes `…\Downloads\ChatGPT`, which is not a file, and the whole
+	// thing silently falls through as prose. No pill, no attachment, no explanation.
+	//
+	// When the entire line IS the path there is nothing to tokenise and nothing to
+	// disambiguate: take it verbatim. Absolute-only, so a one-word message can never
+	// resolve against the cwd and attach something the operator merely typed.
+	const whole = line.trim().replace(/^["'](.*)["']$/, "$1");
+	if (whole && path.isAbsolute(expandHome(whole))) {
+		const att = stageAttachment(whole);
+		if (att) return { text: label(att.fileName), staged: [att] };
+	}
+
 	// Is this line nothing but paths? Strip every candidate token and see whether
 	// any words survive. A bare drop ("C:\shots\bug.png" + Enter) leaves nothing,
 	// which is unambiguous intent and lifts the extension gate below — so you can
