@@ -35,7 +35,6 @@ import {
 import { BrigadeEditor } from "../../ui/editor.js";
 import {
 	attachmentIcon,
-	clipboardUnavailableReason,
 	describeClipboard,
 	readClipboardPathText,
 	extractAttachmentPaths,
@@ -2295,7 +2294,7 @@ export async function wireConnectUi(
 						// Name what the clipboard ACTUALLY holds. "Nothing to attach" states
 						// the outcome and hides the cause, and is indistinguishable from a bug
 						// in Brigade — which is exactly how it was read.
-						const why = clipboardUnavailableReason() ?? `clipboard: ${await describeClipboard()}`;
+						const why = await describeClipboard();
 						insertBeforeEditor(new Text(`  ${brand.dim(why)}`, 0, 0));
 					}
 					return;
