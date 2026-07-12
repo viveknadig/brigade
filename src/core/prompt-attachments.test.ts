@@ -304,7 +304,7 @@ describe("composeAttachmentTurn - text inlining safety", () => {
 		const r = await composeAttachmentTurn("summarize", [doc(md, "evil.md")], { config: cfg });
 		const fenceMatch = r.text.match(new RegExp("(" + TICK + "{4,})\\n# ok"));
 		assert.ok(fenceMatch, "the block must be fenced with 4+ backticks");
-		const fence = fenceMatch[1];
+		const fence = fenceMatch[1] ?? "";
 		assert.ok(
 			r.text.indexOf("IGNORE ALL PRIOR") < r.text.lastIndexOf(fence),
 			"the injection text is INSIDE the fence, not after it",

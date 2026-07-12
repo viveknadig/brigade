@@ -23,14 +23,14 @@ const IMG = { type: "image", data: "aGVsbG8=", mimeType: "image/png" };
 
 describe("claude-cli — vision capability", () => {
 	it("declares image input, so the agent loop stops dropping the operator's screenshot", () => {
-		const model = synthClaudeCliModel("claude-opus-4-8");
-		assert.ok(model.input.includes("image"), "Opus can see; the backend must say so");
-		assert.ok(model.input.includes("text"));
+		const input = synthClaudeCliModel("claude-opus-4-8").input as string[];
+		assert.ok(input.includes("image"), "Opus can see; the backend must say so");
+		assert.ok(input.includes("text"));
 	});
 
 	it("declares it for an UNKNOWN (newer) model id too — every Claude model has vision", () => {
-		const model = synthClaudeCliModel("claude-opus-5-9");
-		assert.ok(model.input.includes("image"));
+		const input = synthClaudeCliModel("claude-opus-5-9").input as string[];
+		assert.ok(input.includes("image"));
 	});
 });
 
