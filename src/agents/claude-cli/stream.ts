@@ -52,6 +52,63 @@ interface CtxMessage {
 	toolName?: unknown;
 }
 
+/** An Anthropic image content block, the shape the CLI accepts on stream-json stdin. */
+export interface ClaudeCliImageBlock {
+	type: "image";
+	source: { type: "base64"; media_type: string; data: string };
+}
+
+/**
+ * Pull the image blocks out of the LAST user message.
+ *
+ * Only the last one: this backend replays prior turns as a flattened `Human:` /
+ * `Assistant:` transcript, and re-sending every historical image on every turn
+ * would re-bill and re-transmit the whole album each time the operator says
+ * "and?". The current message is the one being asked about.
+ *
+ * Pi's `ImageContent` is `{ type:"image", data, mimeType }`; Anthropic wants
+ * `{ type:"image", source:{ type:"base64", media_type, data } }`. This is the
+ * only place the two shapes meet.
+ */
+export function collectPromptImages(messages: CtxMessage[]): ClaudeCliImageBlock[] {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (!msg || msg.role !== "user") continue;
+		if (!Array.isArray(msg.content)) return [];
+		const out: ClaudeCliImageBlock[] = [];
+		for (const block of msg.content as Array<Record<string, unknown>>) {
+			if (!block || block.type !== "image") continue;
+			const data = block.data;
+			const mime = block.mimeType ?? block.media_type;
+			if (typeof data !== "string" || !data) continue;
+			out.push({
+				type: "image",
+				source: {
+					type: "base64",
+					media_type: typeof mime === "string" && mime ? mime : "image/png",
+					data,
+				},
+			});
+		}
+		return out;
+	}
+	return [];
+}
+
+/**
+ * Build the single stdin line for an image-carrying turn: one Anthropic user
+ * message whose content is the flattened conversation text plus the image blocks.
+ */
+export function serializeStreamJsonPrompt(
+	text: string,
+	images: readonly ClaudeCliImageBlock[],
+): string {
+	const content: Array<Record<string, unknown>> = [];
+	if (text.trim()) content.push({ type: "text", text });
+	for (const img of images) content.push(img as unknown as Record<string, unknown>);
+	return `${JSON.stringify({ type: "user", message: { role: "user", content } })}\n`;
+}
+
 /** Flatten a Pi content value (string | blocks[]) to plain text. */
 function contentToText(content: unknown): string {
 	if (typeof content === "string") return content;
@@ -388,6 +445,13 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 			try {
 				const ctx = (context ?? {}) as { systemPrompt?: string; messages?: CtxMessage[] };
 				const prompt = serializeConversationPrompt(ctx.messages ?? []);
+				// Images on THIS turn. Plain-text stdin has nowhere to put them — which is
+				// why the flattener used to replace an attached photo with the literal
+				// "[image omitted]" and the backend declared itself text-only. It isn't:
+				// `--input-format stream-json` carries real Anthropic content blocks and the
+				// model sees the picture. Empty for every text turn, which then takes the
+				// unchanged plain-text path.
+				const promptImages = collectPromptImages(ctx.messages ?? []);
 				// A structured (JSON-distiller) turn — the memory/skill utility subagents —
 				// must be reinforced toward JSON, never nudged toward prose. Detected from
 				// the pinned system prompt so this backend returns a clean envelope and the
@@ -438,7 +502,12 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 				// A full-plane spawn denies EVERY built-in the binary ships: Brigade serves
 				// guarded equivalents bound to the REAL cwd, while the binary's own would
 				// act on the throwaway one it is sandboxed in.
-				const args = buildClaudeCliArgs({ modelId: model.id, structured, fullPlane });
+				const args = buildClaudeCliArgs({
+					modelId: model.id,
+					structured,
+					fullPlane,
+					...(promptImages.length > 0 ? { streamJsonInput: true } : {}),
+				});
 				// System prompt goes via a file (not argv) — see spawn.ts. Composed here so
 				// the right nudge (prose vs JSON-only vs which tools) is included.
 				const systemPrompt = composeClaudeCliSystemPrompt({
@@ -450,7 +519,12 @@ export function createClaudeCliStreamFn(opts: CreateClaudeCliStreamFnOpts = {}):
 
 				handle = spawnClaudeCli({
 					args,
-					stdin: prompt,
+					// A JSON content-block line when the turn carries an image; otherwise the
+					// byte-identical plain-text stdin every turn has always used.
+					stdin:
+						promptImages.length > 0
+							? serializeStreamJsonPrompt(prompt, promptImages)
+							: prompt,
 					systemPrompt,
 					...(mcpConfigJson !== undefined ? { mcpConfigJson } : {}),
 					// The args above already denied every built-in. If the plane can't attach,

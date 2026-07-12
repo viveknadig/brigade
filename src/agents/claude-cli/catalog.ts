@@ -424,6 +424,12 @@ export interface BuildArgsInput {
 	 */
 	conversational?: boolean;
 	/**
+	 * Feed stdin as `stream-json` (Anthropic content blocks) rather than plain text.
+	 * Set ONLY when the turn carries an image — that is the sole thing plain text
+	 * cannot express. See the comment in `buildClaudeCliArgs`.
+	 */
+	streamJsonInput?: boolean;
+	/**
 	 * This turn is a structured-JSON distiller. Defaults to detection from
 	 * `systemPrompt`. Tool-less like a conversational turn, but reinforced toward
 	 * a raw JSON envelope instead of prose.
@@ -484,6 +490,18 @@ export function composeClaudeCliSystemPrompt(input: {
  */
 export function buildClaudeCliArgs(input: BuildArgsInput): string[] {
 	const args = [...CLAUDE_CLI_BASE_ARGS];
+	// IMAGES. The default stdin protocol is plain text, which has nowhere to put an
+	// image — which is why this backend used to flatten every attached picture to
+	// the literal string "[image omitted]" and declare itself text-only. The binary
+	// itself was never the limitation: with `--input-format stream-json` it accepts
+	// Anthropic content blocks on stdin, image blocks included, and Opus describes
+	// the picture perfectly.
+	//
+	// Switched on ONLY for a turn that actually carries an image, so every existing
+	// text turn keeps the byte-identical plain-text stdin it has always had. Two
+	// protocols is a cost, but it is a smaller cost than re-serialising every turn
+	// in the product through a new path to fix a case most turns don't have.
+	if (input.streamJsonInput === true) args.push("--input-format", "stream-json");
 	args.push("--model", resolveCliModelArg(input.modelId));
 	const structured = input.structured ?? isStructuredJsonPrompt(input.systemPrompt);
 	const conversational = input.conversational !== false;

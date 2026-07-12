@@ -74,7 +74,17 @@ export function synthClaudeCliModel(modelId: string): SynthClaudeCliModel {
 		// 'includes')" on a missing baseUrl. This placeholder is never dialed.
 		baseUrl: "https://api.anthropic.com",
 		reasoning: known?.reasoning ?? /opus|sonnet|fable/i.test(id),
-		input: ["text"] as ("text" | "image")[],
+		// VISION. Every Claude model this backend can name is vision-capable, and the
+		// binary accepts image content blocks on `--input-format stream-json` (verified
+		// live: Opus 4.8 through `claude -p` describes an attached PNG in detail).
+		//
+		// This said `["text"]` for as long as the backend flattened messages to plain
+		// text and replaced attached pictures with the literal string "[image omitted]".
+		// That made the declaration honest but the capability wrong — and because the
+		// agent loop gates inline images on exactly this field
+		// (`resolveInboundImagePrompt`), the operator's screenshot was silently DROPPED
+		// and the TUI told them "this model can't see images" about Opus.
+		input: ["text", "image"] as ("text" | "image")[],
 		cost: { ...ZERO_COST },
 		contextWindow: known?.contextWindow ?? 200_000,
 		maxTokens: known?.maxTokens ?? 32_000,
