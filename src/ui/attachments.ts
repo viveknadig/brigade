@@ -47,7 +47,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { clipboardBackend, clipboardSpoolDir, type ClipboardWatcher } from "./clipboard.js";
+import {
+	clipboardSpoolDir,
+	startClipboardService,
+	type ClipboardService,
+	type ClipboardWatcher,
+} from "./clipboard.js";
 import type { PromptAttachment } from "../protocol.js";
 
 export type { ClipboardWatcher } from "./clipboard.js";
@@ -514,94 +519,106 @@ function spoolPath(): string {
 }
 
 /**
- * The clipboard's IMAGE — a screenshot, or an image copied from a browser.
+ * The ONE clipboard service for the TUI's lifetime.
  *
- * This is the one mechanism that CANNOT arrive through the terminal: a terminal
- * forwards keystrokes and text, never binary clipboard data. So we ask the OS
- * directly and materialise a file, because a bitmap with no path is a thing the
- * rest of the pipeline has no way to hold.
+ * Lazily started, because a CLI that never opens a TUI has no business holding a
+ * PowerShell process open. Once started it stays: that is the whole point — the
+ * cost of the clipboard used to be a process spawn PER READ (200–500 ms each,
+ * and `/paste` did four of them in series), and now it is one round-trip on a
+ * pipe that is already open.
  */
-export async function readClipboardImage(): Promise<StagedAttachment | null> {
-	const backend = clipboardBackend();
-	// Cheap containment probe before decoding anything — on a clipboard holding a 4K
-	// screenshot, `GetImage()` does real work just to answer "is there one?".
-	if (!(await backend.hasImage())) return null;
-	const out = spoolPath();
-	if (!(await backend.saveImage(out))) return null;
-	return stageAttachment(out);
+let service: ClipboardService | undefined;
+let serviceOnImage: ((att: StagedAttachment) => void) | undefined;
+
+function clipboard(): ClipboardService {
+	if (!service) {
+		service = startClipboardService((imagePath) => {
+			const att = stageAttachment(imagePath);
+			if (att) serviceOnImage?.(att);
+		});
+	}
+	return service;
 }
 
 /**
- * FILES copied in Explorer/Finder — the second, entirely different mechanism.
+ * Read the WHOLE clipboard once, and return whatever it can be attached from.
  *
- * Copying a file does NOT put its bytes on the clipboard; it puts a reference.
- * That is exactly why copy-pasting a 400 MB video is free here: only the path
- * moves, and the bytes are read from disk like any other attachment.
+ * One call, one answer. The shape this replaces asked four separate questions —
+ * files, then image, then text, then formats — down four separate PowerShell
+ * spawns, in series, which is exactly why a paste felt like it hung.
+ *
+ * The order of preference is not arbitrary: copying a file in Explorer ALSO puts
+ * a thumbnail bitmap on the clipboard, and the operator meant the file, not its
+ * thumbnail.
  */
-export async function readClipboardFiles(): Promise<StagedAttachment[]> {
-	const lines = await clipboardBackend().readFiles();
-	return stageAll(lines.map((l) => decodeCandidate(l)));
+export async function readClipboardAttachments(): Promise<{
+	staged: StagedAttachment[];
+	/** What the clipboard holds, when nothing could be attached from it. */
+	reason?: string;
+}> {
+	const snap = await clipboard().read(spoolPath());
+
+	// 1. FILES copied in the file manager — a reference, not bytes, which is why
+	//    copy-pasting a 400 MB video is free.
+	const files = stageAll(snap.files.map((f) => decodeCandidate(f)));
+	if (files.length > 0) return { staged: files };
+
+	// 2. An IMAGE — the one mechanism that cannot arrive through the terminal.
+	if (snap.imagePath) {
+		const att = stageAttachment(snap.imagePath);
+		if (att) return { staged: [att] };
+	}
+
+	// 3. TEXT that is a PATH — "Copy as path", a path out of a log, or a terminal's
+	//    own Ctrl+V of a copied file. The mechanism most Windows operators hit.
+	const text = snap.text.trim().replace(/^["'](.*)["']$/, "$1");
+	if (text) {
+		const candidate = decodeCandidate(text);
+		if (path.isAbsolute(expandHome(candidate))) {
+			const att = stageAttachment(candidate);
+			if (att) return { staged: [att] };
+		}
+	}
+
+	// Nothing attachable. Say what IS there — "nothing to attach" states the outcome,
+	// hides the cause, and is indistinguishable from a bug in Brigade.
+	const formats = snap.formats.filter(Boolean);
+	const reason =
+		formats.length > 0
+			? `the clipboard holds ${formats.slice(0, 4).join(", ")} — no image and no file.`
+			: "the clipboard appears to be empty.";
+	return { staged: [], reason };
 }
 
 /**
- * TEXT that is a PATH — the third mechanism, and the one Windows operators hit most.
- *
- * "Copy as path" in Explorer, a path lifted out of a log, or a terminal's own
- * Ctrl+V of a copied file all produce a path as plain TEXT — not an image, not a
- * file-drop reference. Without this, `/paste` says "nothing to attach" while the
- * operator is staring at a perfectly good path they just copied.
- *
- * Absolute-only, and it must name a real file — the same rule as everywhere else,
- * so copying the word "hello" can never attach something out of the cwd.
- */
-export async function readClipboardPathText(): Promise<StagedAttachment | null> {
-	const text = await clipboardBackend().readText();
-	if (!text.trim()) return null;
-	const candidate = decodeCandidate(text.trim().replace(/^["'](.*)["']$/, "$1"));
-	if (!candidate || !path.isAbsolute(expandHome(candidate))) return null;
-	return stageAttachment(candidate);
-}
-
-/**
- * What the clipboard ACTUALLY holds — used only when a paste came back empty.
- *
- * "Nothing to attach" is a useless error: it states the outcome, hides the cause,
- * and is indistinguishable from a bug in Brigade — which is exactly how it got
- * read. Naming the contents ("it holds text, not an image") turns a dead end into
- * an instruction.
- */
-export async function describeClipboard(): Promise<string> {
-	return clipboardBackend().describe();
-}
-
-/**
- * AUTO-ATTACH: watch the clipboard and stage any image the moment it appears.
+ * AUTO-ATTACH: hand back every image that lands on the clipboard from now on.
  *
  * This is the answer to "I should just be able to paste, without a command", and
- * it exists because Ctrl+V CANNOT be made to work. Every mainstream terminal binds
- * that key to its own paste, which inserts the clipboard's TEXT; a screenshot has
- * no text, so it inserts nothing and sends nothing, and the application never
- * receives a keystroke. There is no byte to intercept.
+ * it exists because Ctrl+V CANNOT be made to work. Windows Terminal's own
+ * settings.json binds `ctrl+v` to `Terminal.PasteFromClipboard`; the terminal
+ * consumes the key, and its paste inserts the clipboard's TEXT — which a
+ * screenshot does not have. Nothing is sent, so there is no keystroke to hook.
  *
- * So we stop watching the keypress and watch the clipboard. Snip a screenshot and
- * it is simply there. See `clipboard.ts` for why this costs almost nothing.
+ * The worker pushes the SAVED path, so an auto-attach costs Node nothing at all:
+ * no spawn, no poll, no clipboard read on our side.
  */
 export function watchClipboardImages(
 	onImage: (att: StagedAttachment) => void,
 ): ClipboardWatcher {
 	// No terminal, no watcher. This is a convenience for a human sitting in front of
-	// a TUI; there is nobody to convenience in a test, a pipe, or a cron run — and a
+	// a TUI; there is nobody to convenience in a test, a pipe or a cron run — and a
 	// never-exiting child process in those contexts is how you hang a suite (it did)
 	// or leak a process nobody knows to kill.
 	if (!process.stdout.isTTY) return { stop: () => {} };
-
-	const watcher = clipboardBackend().watch(() => {
-		void (async () => {
-			const att = await readClipboardImage();
-			if (att) onImage(att);
-		})();
-	});
-	return watcher ?? { stop: () => {} };
+	serviceOnImage = onImage;
+	clipboard(); // starts the worker + its push channel
+	return {
+		stop: () => {
+			service?.stop();
+			service = undefined;
+			serviceOnImage = undefined;
+		},
+	};
 }
 
 function stageAll(lines: string[]): StagedAttachment[] {

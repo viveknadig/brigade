@@ -35,16 +35,13 @@ import {
 import { BrigadeEditor } from "../../ui/editor.js";
 import {
 	attachmentIcon,
-	describeClipboard,
-	readClipboardPathText,
 	extractAttachmentPaths,
 	formatBytes as formatAttachmentBytes,
 	MAX_STAGED_ATTACHMENTS,
-	readClipboardFiles,
-	readClipboardImage,
+	readClipboardAttachments,
 	stageAttachment,
-	watchClipboardImages,
 	toPromptAttachments,
+	watchClipboardImages,
 	type StagedAttachment,
 } from "../../ui/attachments.js";
 import { PROVIDERS, findProvider } from "../../providers/catalog.js";
@@ -2266,41 +2263,22 @@ export async function wireConnectUi(
 	 */
 	const pasteFromClipboard = async (opts?: { quiet?: boolean }): Promise<void> => {
 		const before = stagedAttachments.length;
-		// THREE clipboard mechanisms, tried in the order that respects what the
-		// operator most likely meant:
-		//   1. a file REFERENCE (copied in Explorer/Finder) — only the path moves, so
-		//      a 400 MB video is free. Tried first because copying a file in Explorer
-		//      also exposes a thumbnail bitmap, and they meant the file, not its
-		//      thumbnail.
-		//   2. raw BITMAP data (a screenshot) — no file exists, so we spool one.
-		//   3. TEXT that happens to be a PATH — "Copy as path", a path out of a log,
-		//      or a terminal's own Ctrl+V of a copied file. Without this, /paste says
-		//      "nothing to attach" while the operator stares at a path they just
-		//      copied.
-		const files = await readClipboardFiles();
-		if (files.length > 0) {
-			stagePaths(files.map((f) => f.path));
-		} else {
-			// Through `stagePaths`, not straight onto the array — otherwise a pasted
-			// image would sidestep the count cap, the dedupe and the remote-gateway
-			// refusal that every other route honours.
-			const img = await readClipboardImage();
-			if (img) stagePaths([img.path]);
-			else {
-				const fromText = await readClipboardPathText();
-				if (fromText) stagePaths([fromText.path]);
-				else {
-					if (!opts?.quiet) {
-						// Name what the clipboard ACTUALLY holds. "Nothing to attach" states
-						// the outcome and hides the cause, and is indistinguishable from a bug
-						// in Brigade — which is exactly how it was read.
-						const why = await describeClipboard();
-						insertBeforeEditor(new Text(`  ${brand.dim(why)}`, 0, 0));
-					}
-					return;
-				}
+		// ONE read of the whole clipboard. This used to be up to four PowerShell spawns
+		// in series — files, then image, then text, then formats — at 200-500 ms each,
+		// which is exactly why a paste felt like it had hung. It is now a single
+		// round-trip on a pipe that is already open.
+		const { staged, reason } = await readClipboardAttachments();
+		if (staged.length === 0) {
+			if (!opts?.quiet && reason) {
+				insertBeforeEditor(new Text(`  ${brand.dim(reason)}`, 0, 0));
 			}
+			return;
 		}
+		// Through `stagePaths`, not straight onto the array — otherwise a pasted image
+		// would sidestep the count cap, the dedupe and the remote-gateway refusal that
+		// every other route honours.
+		stagePaths(staged.map((s) => s.path));
+
 		// Drop a VISIBLE marker into the line you're typing, the way a chat client
 		// shows an inline attachment pill. Without it, Ctrl+V looks like it did
 		// nothing at all — the bytes are on the clipboard, there is no path to echo,

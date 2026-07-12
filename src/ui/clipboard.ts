@@ -47,6 +47,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 
+import { ClipboardWorker, type ClipboardSnapshot } from "./clipboard-worker.js";
+
+export type { ClipboardSnapshot } from "./clipboard-worker.js";
+
 const execFileAsync = promisify(execFile);
 
 /** Ten seconds is generous for a clipboard read; past it something is wrong. */
@@ -123,12 +127,19 @@ const WINDOWS: ClipboardBackend = {
 	async saveImage(dest) {
 		// The containment check first, so a text clipboard costs one cheap call rather
 		// than a full bitmap decode.
+		//
+		// `$img.Save()` to a bad path raises a NON-TERMINATING error, so without the
+		// try/catch the script sailed on and printed 'ok' for a file it had not
+		// written — this reported success for a save that never happened, and only a
+		// test with an image actually on the clipboard exposed it. `-ErrorAction Stop`
+		// via a trapping try is what makes the failure real.
 		const q = dest.replace(/'/g, "''");
 		const { stdout } = await ps(
 			"Add-Type -AssemblyName System.Windows.Forms,System.Drawing; " +
 				"if (-not [Windows.Forms.Clipboard]::ContainsImage()) { exit 1 }; " +
 				"$img = [Windows.Forms.Clipboard]::GetImage(); if ($null -eq $img) { exit 1 }; " +
-				`$img.Save('${q}', [System.Drawing.Imaging.ImageFormat]::Png); $img.Dispose(); 'ok'`,
+				`try { $img.Save('${q}', [System.Drawing.Imaging.ImageFormat]::Png); $img.Dispose(); ` +
+				`if (Test-Path -LiteralPath '${q}') { 'ok' } } catch { exit 1 }`,
 		);
 		return stdout.includes("ok");
 	},
@@ -158,10 +169,9 @@ const WINDOWS: ClipboardBackend = {
 	},
 
 	watch(onChange) {
-		// GetClipboardSequenceNumber is the whole trick: a Win32 counter that ticks on
-		// ANY clipboard write and costs nothing to read. The steady-state cost of this
-		// watcher is one integer compare every 400 ms inside a process that already
-		// exists — not a process spawn per tick.
+		// Superseded by the persistent worker, which pushes the SAVED image path
+		// directly (see `startClipboardService`). Kept only so a Windows box whose
+		// worker refused to start still gets change notification — at the old cost.
 		const script = `
 $ErrorActionPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms
@@ -428,6 +438,80 @@ export function clipboardBackend(): ClipboardBackend {
 	if (process.platform === "win32") return WINDOWS;
 	if (process.platform === "darwin") return MACOS;
 	return LINUX;
+}
+
+/* ─────────────────────────── the service ─────────────────────────────── */
+
+/**
+ * The clipboard, as the product actually consumes it: ONE call that reads
+ * everything, and a push channel for images.
+ *
+ * The split matters. On Windows a persistent worker holds PowerShell open, so a
+ * read is a few milliseconds and an auto-attach costs Node nothing at all. On
+ * every other platform we fall back to the per-call backend — still correct, just
+ * paying a process spawn. The rest of the product cannot tell which it got, and
+ * must not care.
+ */
+export interface ClipboardService {
+	/** Read the whole clipboard in one pass, saving any image to `imageDest`. */
+	read(imageDest: string): Promise<ClipboardSnapshot>;
+	/** Stop any background process. Idempotent; must never throw. */
+	stop(): void;
+}
+
+/**
+ * Start the clipboard service.
+ *
+ * `onImage` is called with a saved PNG path whenever an image lands on the
+ * clipboard — the auto-attach channel, and the reason Ctrl+V is unnecessary.
+ */
+export function startClipboardService(onImage?: (imagePath: string) => void): ClipboardService {
+	// Windows gets the persistent worker: one PowerShell, held open, answering in
+	// milliseconds and pushing images for free. This is the whole difference between
+	// a paste that feels instant and one that feels broken.
+	if (process.platform === "win32") {
+		const worker = new ClipboardWorker();
+		worker.start(onImage);
+		if (worker.available) {
+			return {
+				read: (dest) => worker.snapshot(dest),
+				stop: () => worker.kill(),
+			};
+		}
+		// Worker refused to start — fall through to the per-call backend rather than
+		// losing the clipboard entirely.
+	}
+
+	const backend = clipboardBackend();
+	const watcher = onImage
+		? backend.watch(() => {
+				void (async () => {
+					const dest = path.join(clipboardSpoolDir(), `clipboard-${Date.now()}.png`);
+					if (await backend.saveImage(dest)) onImage(dest);
+				})();
+			})
+		: null;
+
+	return {
+		read: async (imageDest) => {
+			// Fire the three reads CONCURRENTLY. They are independent, and running them
+			// in series is what made `/paste` feel like it hung — three sequential
+			// process spawns, one after another, for no reason.
+			const [imageSaved, files, text, formats] = await Promise.all([
+				backend.hasImage().then((has) => (has ? backend.saveImage(imageDest) : false)),
+				backend.readFiles(),
+				backend.readText(),
+				backend.describe().then((d) => [d]),
+			]);
+			return {
+				...(imageSaved ? { imagePath: imageDest } : {}),
+				files: files.filter(Boolean),
+				text,
+				formats,
+			};
+		},
+		stop: () => watcher?.stop(),
+	};
 }
 
 /** Where clipboard bitmaps are materialised. OS temp — never `~/.brigade`, which
