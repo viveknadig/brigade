@@ -77,10 +77,17 @@ export class BrigadeEditor extends Editor {
 	 * staged, no bar, no confirmation — and no reason to believe anything happened.
 	 * The handler swaps that path for a pill and stages the file on the spot.
 	 *
-	 * A chunk, not a keystroke: real typing arrives one character at a time, so the
-	 * length test cleanly separates "the human is typing" from "a blob of text just
-	 * arrived from outside". Escape sequences are excluded — arrow keys and function
-	 * keys are multi-byte too, and they are not pastes.
+	 * Detected by watching how much TEXT the editor actually gained, NOT by
+	 * inspecting the input bytes. That distinction is the whole fix: pi-tui wraps
+	 * every paste in bracketed-paste markers before handing it over ("pasted data
+	 * will always contain \x1b[200~" — pi-tui/keys.js), so a dropped file arrives as
+	 * a chunk STARTING with an escape byte. An earlier version of this tried to skip
+	 * escape sequences to avoid firing on arrow keys, and thereby skipped every
+	 * paste there has ever been — the hook never fired once.
+	 *
+	 * Growth of more than one character means text arrived from outside; a human
+	 * typing adds exactly one. Arrow and function keys add none. No terminal
+	 * encoding to keep up with.
 	 */
 	onPasteChunk?: () => void;
 
@@ -122,13 +129,11 @@ export class BrigadeEditor extends Editor {
 			super.handleInput("\t");
 			return;
 		}
+		const before = this.getText().length;
 		super.handleInput(data);
-
 		// A dropped file / pasted blob just landed. Let the host turn any real path in
 		// the line into a staged attachment while the operator is still looking at it.
-		// `\x1b` guard: escape sequences (arrows, function keys, bracketed-paste
-		// markers pi has already consumed) are multi-byte but are not pastes.
-		if (data.length > 1 && !data.startsWith("\x1b") && this.onPasteChunk) {
+		if (this.getText().length - before > 1 && this.onPasteChunk) {
 			this.onPasteChunk();
 		}
 	}
