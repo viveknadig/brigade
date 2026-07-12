@@ -351,9 +351,21 @@ export interface ExtractedAttachments {
  * /etc/hosts on Linux (it exists! an existence-only rule attaches it) and stops
  * `edit "package.json"` from attaching a cwd-relative file out of a quoted word.
  */
-export function extractAttachmentPaths(line: string): ExtractedAttachments {
+export function extractAttachmentPaths(
+	line: string,
+	opts?: {
+		/**
+		 * Render each captured path as a `[plant-cell.png]` PILL rather than a bare
+		 * basename. Used when rewriting the editor line at drop-time, where the pill's
+		 * brackets are what make it read as an attachment chip instead of as a word
+		 * the operator typed. Pills are stripped again before the turn is sent.
+		 */
+		pill?: boolean;
+	},
+): ExtractedAttachments {
 	const staged: StagedAttachment[] = [];
 	const seen = new Set<string>();
+	const label = (name: string): string => (opts?.pill ? `[${name}]` : name);
 	let text = line;
 
 	// Is this line nothing but paths? Strip every candidate token and see whether
@@ -393,10 +405,10 @@ export function extractAttachmentPaths(line: string): ExtractedAttachments {
 			// Not a real file (or refused by the tier rules) → leave the ORIGINAL token
 			// exactly as the operator typed it. Prose is never rewritten.
 			if (!att) return whole;
-			if (seen.has(att.path)) return att.fileName + trailer;
+			if (seen.has(att.path)) return label(att.fileName) + trailer;
 			seen.add(att.path);
 			staged.push(att);
-			return att.fileName + trailer;
+			return label(att.fileName) + trailer;
 		});
 	}
 

@@ -66,6 +66,24 @@ export class BrigadeEditor extends Editor {
 	 */
 	onImagePaste?: () => void;
 
+	/**
+	 * Fired right after a MULTI-CHARACTER chunk lands in the editor — i.e. a paste,
+	 * or a file dropped onto the terminal window.
+	 *
+	 * This is the hook that makes drag-and-drop feel like an attachment instead of
+	 * like typing. A terminal responds to a dropped file by pasting its PATH as
+	 * text, so without this the operator stares at
+	 * `C:\Users\me\Downloads\plant-cell.png` sitting in the input box with nothing
+	 * staged, no bar, no confirmation — and no reason to believe anything happened.
+	 * The handler swaps that path for a pill and stages the file on the spot.
+	 *
+	 * A chunk, not a keystroke: real typing arrives one character at a time, so the
+	 * length test cleanly separates "the human is typing" from "a blob of text just
+	 * arrived from outside". Escape sequences are excluded — arrow keys and function
+	 * keys are multi-byte too, and they are not pastes.
+	 */
+	onPasteChunk?: () => void;
+
 	override handleInput(data: string): void {
 		// Ctrl+V (0x16) and Alt+V (ESC v) both mean "paste an image from the clipboard".
 		//
@@ -105,5 +123,13 @@ export class BrigadeEditor extends Editor {
 			return;
 		}
 		super.handleInput(data);
+
+		// A dropped file / pasted blob just landed. Let the host turn any real path in
+		// the line into a staged attachment while the operator is still looking at it.
+		// `\x1b` guard: escape sequences (arrows, function keys, bracketed-paste
+		// markers pi has already consumed) are multi-byte but are not pastes.
+		if (data.length > 1 && !data.startsWith("\x1b") && this.onPasteChunk) {
+			this.onPasteChunk();
+		}
 	}
 }

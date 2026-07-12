@@ -2137,11 +2137,24 @@ export async function wireConnectUi(
 		// into the line. They exist so the operator can SEE the attachment land; the
 		// model gets the real thing (an inline image block, or the file's content), so
 		// leaving the pill in the text would just be a confusing dangling reference.
-		// Deliberately allowed to end up EMPTY: pasting a screenshot and pressing Enter
-		// with no words is a legitimate turn — the attachment carries it, and the
-		// gateway composes a note-plus-image prompt. Falling back to the raw line here
-		// would send the literal text "[image #1]" instead.
-		const outgoing = (cleanedText || rawText).replace(/\[image #\d+\]\s*/g, "").trim();
+		// Strip the visual pills the drop/paste handlers put in the line — `[image #1]`
+		// for a clipboard bitmap, `[plant-cell.png]` for a dropped file. They exist so
+		// the operator can SEE the attachment land; the model gets the real thing (the
+		// image bytes, or the file's content), so leaving a bare filename in the prose
+		// would just be a dangling reference to something already present.
+		//
+		// Deliberately allowed to end up EMPTY: dropping a file and pressing Enter with
+		// no words is a legitimate turn — the attachment carries it. Falling back to the
+		// raw line here would send the literal text "[plant-cell.png]" instead.
+		// Each pill is removed WITH its own trailing space — never by collapsing
+		// whitespace globally, which would wreck the indentation of a pasted code block
+		// that happens to also carry an attachment.
+		let outgoing = (cleanedText || rawText).replace(/\[image #\d+\][ \t]*/g, "");
+		for (const a of attachments) {
+			outgoing = outgoing.split(`[${a.fileName}] `).join("");
+			outgoing = outgoing.split(`[${a.fileName}]`).join("");
+		}
+		outgoing = outgoing.trim();
 
 		// `showTray` warns about a blind model when files are staged EXPLICITLY
 		// (/attach, /paste). But the most natural flow — drag an image in and press
@@ -2290,6 +2303,34 @@ export async function wireConnectUi(
 	// `/paste` remains the guaranteed path. See `BrigadeEditor.onImagePaste`.
 	editor.onImagePaste = () => {
 		void pasteFromClipboard({ quiet: false });
+	};
+
+	/**
+	 * DRAG-AND-DROP, resolved the instant the file lands.
+	 *
+	 * A terminal answers a dropped file by pasting its PATH into stdin as text. The
+	 * first version of this only noticed that path when the message was SUBMITTED —
+	 * which meant you dropped a file and just… watched
+	 * `C:\Users\me\Downloads\plant-cell.png` appear in the input box. Nothing staged,
+	 * no bar, no pill, no reason to think it had worked. Deferred feedback is no
+	 * feedback: an attachment has to become an attachment while you are still looking
+	 * at it.
+	 *
+	 * So on every dropped/pasted chunk we re-read the line, stage any path that names
+	 * a real file, and rewrite it in place as a `[plant-cell.png]` pill. The pill is
+	 * stripped again at send (the model gets the real image bytes / file content, so
+	 * a dangling filename in the prose would just be a confusing reference).
+	 */
+	editor.onPasteChunk = () => {
+		if (!gatewayIsLocal) return;
+		const line = editor.getText();
+		if (!line) return;
+		const { text: pilled, staged } = extractAttachmentPaths(line, { pill: true });
+		if (staged.length === 0) return;
+		const added = stagePaths(staged.map((s) => s.path));
+		if (added === 0) return;
+		editor.setText(pilled);
+		tui.requestRender();
 	};
 
 	editor.onSubmit = async (value: string) => {

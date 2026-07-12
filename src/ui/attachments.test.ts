@@ -335,6 +335,42 @@ describe("extractAttachmentPaths — punctuation must not silently kill an attac
 	});
 });
 
+/**
+ * The drop-time rewrite. A terminal answers a dropped file by pasting its PATH as
+ * text, so without this the operator drops `plant-cell.png` and just watches
+ * `C:\Users\me\Downloads\plant-cell.png` sit in the input box — nothing staged, no
+ * bar, no pill, no reason to believe it worked. `{ pill: true }` is what the editor
+ * uses to swap the path for an attachment chip the instant it lands.
+ */
+describe("extractAttachmentPaths — pill mode (drag-and-drop)", () => {
+	it("turns a dropped path into a pill, not a bare word", () => {
+		const r = extractAttachmentPaths(png, { pill: true });
+		assert.equal(r.staged.length, 1);
+		assert.equal(r.text, "[shot.png]");
+	});
+
+	it("pills a dropped path sitting inside a half-typed sentence", () => {
+		const r = extractAttachmentPaths(`what is in ${png}`, { pill: true });
+		assert.equal(r.staged.length, 1);
+		assert.equal(r.text, "what is in [shot.png]");
+	});
+
+	it("pills a quoted dropped path (spaces in the name)", () => {
+		const r = extractAttachmentPaths(`"${spaced}"`, { pill: true });
+		assert.equal(r.staged.length, 1);
+		assert.equal(r.text, "[my report.pdf]");
+	});
+
+	it("leaves the line ALONE when the drop wasn't a real file", () => {
+		const line = "just some words";
+		assert.equal(extractAttachmentPaths(line, { pill: true }).text, line);
+	});
+
+	it("defaults to plain basenames when pill mode is off", () => {
+		assert.equal(extractAttachmentPaths(png).text, "shot.png");
+	});
+});
+
 describe("extractAttachmentPaths — cwd-relative traps", () => {
 	it("does NOT attach a bare quoted word that happens to name a file in cwd", () => {
 		// `"package.json"` as the whole line: the residue is empty, so it reads as a
